@@ -1,0 +1,11 @@
+[package]
+name = "workload-compose"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+compose_spec.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]

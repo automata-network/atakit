@@ -1,0 +1,15 @@
+services:
+  secure-signer:
+    image: secure-signer:latest
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+      - secure-signer-data:/data
+      - secure-signer-data2:/data2
+volumes:
+  secure-signer-data:
+  secure-signer-data2:
