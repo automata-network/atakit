@@ -1,7 +1,7 @@
-mod deploy;
 mod deploy_raw;
 mod manage;
 mod publish_workload;
+mod register_session;
 mod security;
 mod sim_agent;
 
@@ -14,9 +14,6 @@ use crate::Config;
 pub enum Internal {
     /// Publish a built workload to the on-chain registry
     PublishWorkload(publish_workload::PublishWorkload),
-
-    /// Deploy workloads to cloud platforms using atakit.json
-    Deploy(deploy::Deploy),
 
     /// Start a simulated CVM agent for local development
     SimAgent(sim_agent::SimAgent),
@@ -32,6 +29,9 @@ pub enum Internal {
     /// Security operations (provenance, signing, livepatch)
     #[command(subcommand)]
     Security(security::Security),
+
+    /// Register a session from CVM attestation evidence
+    RegisterSession(register_session::RegisterSession),
 }
 
 impl Internal {
@@ -41,11 +41,11 @@ impl Internal {
 
         match self {
             Internal::PublishWorkload(cmd) => cmd.run(&config),
-            Internal::Deploy(cmd) => cmd.run(&config),
             Internal::SimAgent(cmd) => cmd.run().await,
             Internal::DeployRaw(cmd) => cmd.run(&config),
             Internal::Manage(cmd) => cmd.run(&config),
             Internal::Security(cmd) => cmd.run(&config),
+            Internal::RegisterSession(cmd) => cmd.run().await,
         }
     }
 }

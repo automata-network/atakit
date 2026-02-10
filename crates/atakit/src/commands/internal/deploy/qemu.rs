@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use super::CloudPlatform;
@@ -111,8 +111,9 @@ impl Qemu {
     /// we can kill it after QEMU exits.
     fn start_swtpm(&self) -> Result<Child> {
         let state_dir = std::env::temp_dir().join(format!("swtpm-{}", self.vm_name));
-        std::fs::create_dir_all(&state_dir)
-            .with_context(|| format!("Failed to create swtpm state dir: {}", state_dir.display()))?;
+        std::fs::create_dir_all(&state_dir).with_context(|| {
+            format!("Failed to create swtpm state dir: {}", state_dir.display())
+        })?;
 
         info!(state_dir = %state_dir.display(), "Starting swtpm");
 
@@ -236,8 +237,7 @@ impl CloudPlatform for Qemu {
             if path.file_name().map(|f| f == "disk.raw").unwrap_or(false) {
                 let mut out = std::fs::File::create(&dest)
                     .with_context(|| format!("Failed to create {}", dest.display()))?;
-                std::io::copy(&mut entry, &mut out)
-                    .context("Failed to extract disk.raw")?;
+                std::io::copy(&mut entry, &mut out).context("Failed to extract disk.raw")?;
                 found = true;
                 break;
             }
@@ -269,13 +269,20 @@ impl CloudPlatform for Qemu {
         };
 
         let mut args: Vec<String> = vec![
-            "-smp".into(), "2".into(),
-            "-machine".into(), "accel=tcg".into(),
-            "-m".into(), "4096".into(),
-            "-netdev".into(), netdev_arg,
-            "-device".into(), "e1000,netdev=net0".into(),
-            "--bios".into(), ovmf_path.to_string_lossy().into_owned(),
-            "-drive".into(), format!("file={},format=raw,if=virtio", disk_raw.display()),
+            "-smp".into(),
+            "2".into(),
+            "-machine".into(),
+            "accel=tcg".into(),
+            "-m".into(),
+            "4096".into(),
+            "-netdev".into(),
+            netdev_arg,
+            "-device".into(),
+            "e1000,netdev=net0".into(),
+            "--bios".into(),
+            ovmf_path.to_string_lossy().into_owned(),
+            "-drive".into(),
+            format!("file={},format=raw,if=virtio", disk_raw.display()),
         ];
 
         for (i, disk) in self.data_disks.iter().enumerate() {
@@ -301,11 +308,16 @@ impl CloudPlatform for Qemu {
         }
 
         args.extend([
-            "-boot".into(), "c".into(),
-            "-chardev".into(), "socket,id=chrtpm,path=/tmp/swtpm-sock".into(),
-            "-tpmdev".into(), "emulator,id=tpm0,chardev=chrtpm".into(),
-            "-device".into(), "tpm-tis,tpmdev=tpm0".into(),
-            "-serial".into(), "mon:stdio".into(),
+            "-boot".into(),
+            "c".into(),
+            "-chardev".into(),
+            "socket,id=chrtpm,path=/tmp/swtpm-sock".into(),
+            "-tpmdev".into(),
+            "emulator,id=tpm0,chardev=chrtpm".into(),
+            "-device".into(),
+            "tpm-tis,tpmdev=tpm0".into(),
+            "-serial".into(),
+            "mon:stdio".into(),
             "-nographic".into(),
         ]);
 
@@ -352,25 +364,6 @@ impl CloudPlatform for Qemu {
     }
 
     fn setup_network(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn attach_additional_data_disk(&mut self, img_path: Option<&Path>) -> Result<()> {
-        let src = match img_path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        let dest = self.instance_dir.join("additional-data.img");
-        std::fs::copy(src, &dest).with_context(|| {
-            format!(
-                "Failed to copy {} → {}",
-                src.display(),
-                dest.display()
-            )
-        })?;
-        info!(path = %dest.display(), "Copied additional-data image into instance directory");
-        self.additional_data_disk_path = Some(dest);
         Ok(())
     }
 }

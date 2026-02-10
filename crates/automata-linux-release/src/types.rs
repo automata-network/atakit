@@ -1,6 +1,69 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
+pub struct ImageRef {
+    pub repository: String,
+    pub tag: String,
+}
+
+impl Serialize for ImageRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+impl ImageRef {
+    pub fn new(repository: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            repository: repository.into(),
+            tag: tag.into(),
+        }
+    }
+}
+
+impl FromStr for ImageRef {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.splitn(2, ':').collect();
+        anyhow::ensure!(
+            parts.len() == 2,
+            "Invalid image reference '{}': expected format 'repository:tag'",
+            s
+        );
+        let repository = parts[0].to_string();
+        anyhow::ensure!(
+            !repository.contains('/'),
+            "Invalid repository '{}': must not contain '/'",
+            repository
+        );
+        Ok(ImageRef {
+            repository,
+            tag: parts[1].to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.repository, self.tag)
+    }
+}
 
 /// Target cloud platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +94,7 @@ pub enum VersionSelector {
     /// platform.
     LatestImageFor(Platform),
     /// A specific release identified by its Git tag.
-    Tag(String),
+    Tag(ImageRef),
 }
 
 /// Classification of a release asset by its filename.
@@ -101,7 +164,9 @@ impl Release {
 
     /// Whether this release contains at least one disk image asset.
     pub fn has_disk_images(&self) -> bool {
-        self.assets.iter().any(|a| matches!(a.kind(), AssetKind::DiskImage(_)))
+        self.assets
+            .iter()
+            .any(|a| matches!(a.kind(), AssetKind::DiskImage(_)))
     }
 
     /// Classify every asset in this release.

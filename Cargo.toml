@@ -9,8 +9,8 @@ authors = ["Automata Team"]
 edition = "2024"
 license = "Apache-2.0"
 
-[profile.dev]
-opt-level = 3
+#[profile.dev]
+#opt-level = 3
 
 [profile.release]
 debug = 1
@@ -22,6 +22,8 @@ automata-linux-release = { path = "crates/automata-linux-release" }
 csp = { path = "crates/csp" }
 cvm-agent = { path = "crates/cvm-agent" }
 workload-compose = { path = "crates/workload-compose" }
+#automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
+automata-tee-workload-measurement = { path = "../tee-workload-attestation/crates/automata-tee-workload-measurement/" }
 
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
@@ -47,4 +49,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 sha3 = "0.10"
 hex = "0.4"
-alloy = "1.6.1"
+alloy = { git = "https://github.com/automata-network/alloy-ext.git", package = "alloy-ext" }

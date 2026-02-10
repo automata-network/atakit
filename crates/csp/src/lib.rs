@@ -109,8 +109,10 @@ pub trait ImageManager: CloudProvider {
     ///
     /// If `version` is provided, it's used to create a versioned image name
     /// (e.g., "myvm-v0.5.0"). If an image with that name already exists,
-    /// the upload is skipped.
-    async fn upload_image(&mut self, disk_path: &Path, version: Option<&str>) -> Result<()>;
+    /// the upload is skipped unless `force` is true.
+    ///
+    /// When `force` is true, the existing image is deleted before uploading.
+    async fn upload_image(&mut self, disk_path: &Path, version: Option<&str>, force: bool) -> Result<()>;
 
     /// Check if an image with the given version already exists.
     async fn image_exists(&self, version: Option<&str>) -> bool;

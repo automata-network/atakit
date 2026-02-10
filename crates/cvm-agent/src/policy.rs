@@ -73,6 +73,7 @@ pub struct DiskConfig {
 #[derive(Debug, Serialize)]
 pub struct DiskEntry {
     pub serial: String,
+    pub service: String,
     pub disk_mount_point: String,
     pub disk_encryption: DiskEncryptionConfig,
 }
@@ -94,7 +95,7 @@ pub struct ServicePolicy {
     pub allow_remove: bool,
     pub allow_add_new_service: bool,
     pub allow_update: Vec<String>,
-    pub skip_measurement: Vec<String>,
+    pub agent_socket_targets: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,7 +114,7 @@ impl Default for CvmAgentPolicy {
                     cloud_provider: "azure".into(),
                     tee_type: "snp".into(),
                     emulation_data_path: "./emulation_mode_data".into(),
-                    enable_emulation_data_update: true,
+                    enable_emulation_data_update: false,
                 },
                 firewall: Firewall {
                     allowed_ports: vec![
@@ -154,7 +155,7 @@ impl Default for CvmAgentPolicy {
                     allow_remove: false,
                     allow_add_new_service: false,
                     allow_update: vec![],
-                    skip_measurement: vec![],
+                    agent_socket_targets: vec![],
                 },
                 image_signature_verification: ImgSigVerify {
                     enable: false,
@@ -181,6 +182,7 @@ pub struct PortInput {
 /// A disk configuration input, decoupled from atakit config types.
 pub struct DiskInput {
     pub serial: String,
+    pub service: String,
     pub mount_point: String,
     pub encryption_enabled: bool,
     pub encryption_key_security: String,
@@ -205,6 +207,7 @@ impl CvmAgentPolicy {
         self.cvm_config.disk_config.enable = true;
         self.cvm_config.disk_config.disks.push(DiskEntry {
             serial: disk.serial,
+            service: disk.service,
             disk_mount_point: disk.mount_point,
             disk_encryption: DiskEncryptionConfig {
                 enable: disk.encryption_enabled,

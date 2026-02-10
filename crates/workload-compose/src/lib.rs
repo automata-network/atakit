@@ -2,6 +2,7 @@ mod convert;
 mod summarize;
 pub mod types;
 
+pub use summarize::{ComposeAnalysis, analyze};
 pub use types::*;
 
 use anyhow::Result;
@@ -13,6 +14,6 @@ pub fn from_yaml_str(yaml: &str) -> Result<WorkloadCompose> {
     let compose = Compose::options()
         .apply_merge(true)
         .from_yaml_str(yaml)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("parse compose file failed: {e:#}"))?;
     convert::convert(&compose)
 }

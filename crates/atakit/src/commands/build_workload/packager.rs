@@ -2,20 +2,20 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
-use flate2::write::GzEncoder;
+use anyhow::{Context, Result, bail};
+use automata_linux_release::ImageRef;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
 
-use workload_compose::ImageKind;
+use workload_compose::{ComposeAnalysis, ImageKind};
 
 use crate::types::{AtakitConfig, DockerImageEntry, WorkloadDef, WorkloadManifest};
 
-use super::analyze::ComposeAnalysis;
 use super::ImageMode;
 
 // ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ pub fn create_package(
     artifact_dir: &Path,
     atakit_config: &AtakitConfig,
     image_mode: ImageMode,
-    image_version: Option<&str>,
+    image_ref: Option<ImageRef>,
 ) -> Result<()> {
     let output_path = artifact_dir.join(format!("{}.tar.gz", package_name));
     let file = fs::File::create(&output_path)
@@ -101,6 +101,7 @@ pub fn create_package(
     let enc = GzEncoder::new(file, Compression::default());
     let mut tar = tar::Builder::new(enc);
     tar.mode(tar::HeaderMode::Deterministic);
+    let image_ref = image_ref.unwrap_or(wl_def.image.clone());
 
     let prefix = ".";
 
@@ -109,21 +110,28 @@ pub fn create_package(
     let compose_content = fs::read_to_string(&compose_abs)
         .with_context(|| format!("Failed to read {}", compose_abs.display()))?;
     // Match each named volume to its DiskDef in atakit.json.
-    let disk_mappings: Vec<(&str, &crate::types::DiskDef, String)> = analysis
+    let disk_mappings: Vec<(&str, &str, &crate::types::DiskDef, String)> = analysis
         .summary
         .named_volumes
         .iter()
-        .filter_map(|vol| {
+        .filter_map(|(service, vol)| {
             atakit_config
                 .disks
                 .iter()
                 .find(|d| d.name == *vol)
-                .map(|d| (vol.as_str(), d, format!("/data/volumes/{}", d.name)))
+                .map(|d| {
+                    (
+                        service.as_str(),
+                        vol.as_str(),
+                        d,
+                        format!("/data/volumes/{}", d.name),
+                    )
+                })
         })
         .collect();
     let volume_mounts: Vec<(&str, &str)> = disk_mappings
         .iter()
-        .map(|(vol, _, mp)| (*vol, mp.as_str()))
+        .map(|(_, vol, _, mp)| (*vol, mp.as_str()))
         .collect();
     let rewritten = rewrite_compose(&compose_content, &volume_mounts)?;
     let rewritten_bytes = rewritten.as_bytes();
@@ -140,41 +148,51 @@ pub fn create_package(
     )
     .context("Failed to add docker-compose.yml")?;
 
-    // Directory containing the compose file, relative to the project root.
-    let compose_parent = compose_abs.parent().unwrap_or(project_dir);
-    let compose_rel_dir = compose_parent
-        .strip_prefix(project_dir)
-        .unwrap_or(Path::new(""));
-
     // 2. Add measured files.
-    for rel in &analysis.measured_files {
-        let abs = project_dir.join(rel);
+    for (real, compose_rel) in &analysis.measured_files {
+        let abs = project_dir.join(real);
         if !abs.exists() {
-            warn!(path = %rel.display(), "Measured file not found, skipping");
+            warn!(path = %compose_rel.display(), "Measured file not found, skipping");
             continue;
         }
-        let compose_rel = rel.strip_prefix(compose_rel_dir).unwrap_or(rel);
+        if let Some(file_name) = compose_rel.file_name() {
+            if let Some(file_name) = file_name.to_str() {
+                if file_name == "cvm-agent.sock" {
+                    info!(path = %compose_rel.display(), "Skipping cvm-agent sock file");
+                    continue;
+                }
+            }
+        }
         let archive_name = format!("{}/{}", prefix, compose_rel.display());
         if abs.is_file() {
             tar.append_path_with_name(&abs, &archive_name)
-                .with_context(|| format!("Failed to add {}", rel.display()))?;
+                .with_context(|| format!("Failed to add {}", compose_rel.display()))?;
         }
     }
 
-    // 3. Add additional-data files under secrets/ directory.
-    for rel in &analysis.additional_data_files {
-        let abs = project_dir.join(rel);
-        if !abs.exists() {
-            warn!(path = %rel.display(), "Additional data file not found, skipping");
-            continue;
-        }
-        let compose_rel = rel.strip_prefix(compose_rel_dir).unwrap_or(rel);
-        let archive_name = format!("{}/secrets/{}", prefix, compose_rel.display());
-        if abs.is_file() {
-            tar.append_path_with_name(&abs, &archive_name)
-                .with_context(|| format!("Failed to add {}", rel.display()))?;
-        }
-    }
+    // 3. Add additional-data files under additional-data/ directory.
+    // for _rel in &analysis.additional_data_files {
+    // skip the additional data
+    // let abs = project_dir.join(rel);
+    // if !abs.exists() {
+    //     warn!(path = %rel.display(), "Additional data file not found, skipping");
+    //     continue;
+    // }
+    // let compose_rel = rel.strip_prefix(compose_rel_dir).unwrap_or(rel);
+    // let archive_name = format!("{}/{}", prefix, compose_rel.display());
+    // if abs.is_file() {
+    //     tar.append_path_with_name(&abs, &archive_name)
+    //         .with_context(|| format!("Failed to add {}", rel.display()))?;
+    // }
+    // }
+
+    let agent_socket_targets = analysis
+        .summary
+        .referenced_files
+        .iter()
+        .filter(|f| f.path == "./cvm-agent.sock")
+        .map(|n| n.service.clone())
+        .collect::<Vec<_>>();
 
     // 4. Add CVM agent config files.
     let port_inputs: Vec<PortInput> = analysis
@@ -190,15 +208,13 @@ pub fn create_package(
         })
         .collect();
     let mut policy = CvmAgentPolicy::default().with_ports(&port_inputs);
-    for (_, disk, mount_point) in &disk_mappings {
+    policy.workload_config.services.agent_socket_targets = agent_socket_targets.clone();
+    for (service, _, disk, mount_point) in &disk_mappings {
         policy = policy.with_disk(DiskInput {
             serial: disk.name.clone(),
+            service: service.to_string(),
             mount_point: mount_point.clone(),
-            encryption_enabled: disk
-                .encryption
-                .as_ref()
-                .map(|e| e.enable)
-                .unwrap_or(false),
+            encryption_enabled: disk.encryption.as_ref().map(|e| e.enable).unwrap_or(false),
             encryption_key_security: disk
                 .encryption
                 .as_ref()
@@ -283,29 +299,24 @@ pub fn create_package(
     }
 
     // 6. Create and add manifest.json.
+
     let manifest = WorkloadManifest {
-        name: package_name.to_string(),
+        name: ImageRef::new(&wl_def.name, &wl_def.version),
         docker_compose: "docker-compose.yml".to_string(),
-        image: image_version.map(|s| s.to_string()),
+        image: image_ref.clone(),
         measured_files: analysis
             .measured_files
             .iter()
-            .map(|p| {
-                p.strip_prefix(compose_rel_dir)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|(_, original)| original.to_string_lossy().into_owned())
             .collect(),
         additional_data_files: analysis
             .additional_data_files
             .iter()
-            .map(|p| {
-                let cr = p.strip_prefix(compose_rel_dir).unwrap_or(p);
-                format!("secrets/{}", cr.to_string_lossy())
-            })
+            .map(|(_, original)| original.to_string_lossy().into_owned())
             .collect(),
         docker_images: manifest_images,
+        enable_cvm_agent: agent_socket_targets,
+        atakit_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -331,15 +342,15 @@ pub fn create_package(
 }
 
 /// Rewrite docker-compose file paths so they match the archive layout.
-fn rewrite_compose(content: &str, volume_mounts: &[(&str, &str)]) -> Result<String> {
+fn rewrite_compose(content: &str, _volume_mounts: &[(&str, &str)]) -> Result<String> {
     let mut compose: DockerCompose =
         serde_yaml::from_str(content).context("Failed to parse docker-compose for rewriting")?;
 
     // Remove top-level `volumes:` section when named volumes are present --
     // the CVM agent manages the data disk mounts directly.
-    if !volume_mounts.is_empty() {
-        compose.volumes = None;
-    }
+    // if !volume_mounts.is_empty() {
+    //     compose.volumes = None;
+    // }
 
     for (_name, service) in compose.services.iter_mut() {
         // Rewrite env_file paths.
@@ -360,12 +371,12 @@ fn rewrite_compose(content: &str, volume_mounts: &[(&str, &str)]) -> Result<Stri
             service.image = Some(resolve_image_short_name(img));
         }
 
-        // Rewrite volume bind-mount host paths and named volumes.
-        service.volumes = service
-            .volumes
-            .iter()
-            .map(|v| rewrite_volume_path(v, volume_mounts))
-            .collect();
+        // // Rewrite volume bind-mount host paths and named volumes.
+        // service.volumes = service
+        //     .volumes
+        //     .iter()
+        //     .map(|v| rewrite_volume_path(v, volume_mounts))
+        //     .collect();
     }
 
     serde_yaml::to_string(&compose).context("Failed to serialize rewritten compose")
@@ -373,16 +384,12 @@ fn rewrite_compose(content: &str, volume_mounts: &[(&str, &str)]) -> Result<Stri
 
 /// Map a compose-relative file path to its archive location.
 fn rewrite_file_path(raw: &str) -> String {
-    let clean = raw.strip_prefix("./").unwrap_or(raw);
-    if clean.contains("additional-data/") || clean.starts_with("additional-data") {
-        format!("./secrets/{}", clean)
-    } else {
-        format!("./{}", clean)
-    }
+    return raw.to_string();
 }
 
 /// Rewrite the host portion of a volume bind-mount to its archive location,
 /// or replace a named volume with the disk mount point from atakit.json.
+#[allow(dead_code)]
 fn rewrite_volume_path(vol: &str, volume_mounts: &[(&str, &str)]) -> String {
     let parts: Vec<&str> = vol.splitn(3, ':').collect();
     if parts.len() < 2 {

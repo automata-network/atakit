@@ -1,9 +1,8 @@
-mod analyze;
 mod packager;
 
 use std::fs;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use tracing::info;
 
@@ -44,16 +43,16 @@ impl BuildWorkload {
         let deployments = self.resolve_deployments(&atakit_config)?;
 
         for (deploy_name, deploy_def) in deployments {
-            // Create output directory: ata_artifacts/{deploy_name}/
-            let output_dir = env.project_artifact_dir.join(&deploy_name);
-            fs::create_dir_all(&output_dir)
-                .with_context(|| format!("Failed to create {}", output_dir.display()))?;
-
             // Find the workload referenced by this deployment.
             let wl_def = self.find_workload(&atakit_config, deploy_def)?;
 
+            // Create output directory: ata_artifacts/{workload_name}/
+            let output_dir = env.project_artifact_dir.join(&wl_def.name);
+            fs::create_dir_all(&output_dir)
+                .with_context(|| format!("Failed to create {}", output_dir.display()))?;
+
             // Analyze the workload's docker-compose.
-            let analysis = analyze::analyze(&project_dir, wl_def)
+            let analysis = workload_compose::analyze(&project_dir, &wl_def.docker_compose)
                 .with_context(|| format!("Failed to analyze workload {:?}", wl_def.name))?;
 
             info!(
@@ -65,41 +64,50 @@ impl BuildWorkload {
                 "Compose analysis complete"
             );
 
-            // Build workload package into the deployment directory.
+            let image = deploy_def.image.as_ref().unwrap_or(&wl_def.image);
+
+            // Build workload package: {workload_name}-{version}.tar.gz
+            let package_name = format!("{}-{}", wl_def.name, wl_def.version);
             info!(
                 deployment = %deploy_name,
-                image = deploy_def.image.as_deref().unwrap_or("(latest)"),
+                %image,
                 "Building package"
             );
 
             packager::create_package(
-                "workload", // Always named workload.tar.gz
+                &package_name,
                 wl_def,
                 &analysis,
                 &project_dir,
-                &output_dir, // Output to deployment-specific directory
+                &output_dir,
                 &atakit_config,
                 self.image_mode,
-                deploy_def.image.as_deref(),
+                deploy_def.image.clone(),
             )?;
-            info!(output = %format!("ata_artifacts/{}/workload.tar.gz", deploy_name), "Package created");
+            info!(output = %format!("ata_artifacts/{}/{}.tar.gz", wl_def.name, package_name), "Package created");
 
-            // Generate deployment.json for each platform.
+            // Generate deployment configs: {deploy_name}-{platform}-deployment.json
+            let project_name = project_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("atakit");
             for (platform_name, platform_config) in &deploy_def.platforms {
                 let config = build_from_deployment(
                     &deploy_name,
                     deploy_def,
+                    wl_def,
                     platform_name,
                     platform_config,
-                    &analysis.summary,
+                    &analysis,
                     &atakit_config,
+                    project_name,
                 )?;
-                let filename = format!("{}.json", platform_name);
+                let filename = format!("{}-{}-deployment.json", deploy_name, platform_name);
                 let output_path = output_dir.join(&filename);
                 let json = to_json(&config)?;
                 fs::write(&output_path, json)
                     .with_context(|| format!("Failed to write {}", output_path.display()))?;
-                info!(output = %format!("ata_artifacts/{}/{}", deploy_name, filename), "Deployment config created");
+                info!(output = %format!("ata_artifacts/{}/{}", wl_def.name, filename), "Deployment config created");
             }
         }
 
@@ -146,10 +154,7 @@ impl BuildWorkload {
         config: &'a AtakitConfig,
         deploy_def: &DeploymentDef,
     ) -> Result<&'a WorkloadDef> {
-        let workload_name = deploy_def
-            .workload
-            .as_ref()
-            .context("Deployment must specify a workload")?;
+        let workload_name = &deploy_def.workload;
 
         config
             .workloads

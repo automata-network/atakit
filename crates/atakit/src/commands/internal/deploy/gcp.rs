@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use super::CloudPlatform;
@@ -175,13 +175,9 @@ impl Gcp {
 
             if exists {
                 // Check if we need to convert pd-standard → pd-balanced for c3-* VMs.
-                if let Some(converted) = maybe_convert_disk_type(
-                    &disk_name,
-                    &vm_type,
-                    quiet,
-                    &zone_flag,
-                    &project_flag,
-                )? {
+                if let Some(converted) =
+                    maybe_convert_disk_type(&disk_name, &vm_type, quiet, &zone_flag, &project_flag)?
+                {
                     disk.attached_name = Some(converted);
                 } else {
                     info!(disk = %disk_name, "Attaching existing data disk");
@@ -312,121 +308,6 @@ impl CloudPlatform for Gcp {
 
     fn disk_filename(&self) -> &str {
         "gcp_disk.tar.gz"
-    }
-
-    fn attach_additional_data_disk(&mut self, img_path: Option<&Path>) -> Result<()> {
-        let raw_path = match img_path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        let project_flag = format!("--project={}", self.project_id);
-        let zone_flag = format!("--zone={}", self.zone);
-        let disk_name = format!("{}-additional-data", self.vm_name);
-        let image_name = format!("{}-additional-data-img", self.vm_name);
-
-        // 1. Package raw image as tar.gz for GCP.
-        let tar_gz_path = raw_path.with_extension("img.tar.gz");
-        super::fat_image::package_as_tar_gz(raw_path, &tar_gz_path)?;
-
-        // 2. Upload tar.gz to GCS bucket.
-        let dest_uri = format!("{}/additional-data.tar.gz", self.bucket_url);
-        info!("Uploading additional-data image to GCS");
-        super::run_cmd(
-            "gsutil",
-            &["cp", &tar_gz_path.to_string_lossy(), &dest_uri],
-            self.quiet,
-        )?;
-
-        // 3. Delete old GCP image if exists.
-        if super::run_cmd_silent(
-            "gcloud",
-            &[
-                "compute",
-                "images",
-                "describe",
-                &image_name,
-                &project_flag,
-            ],
-        ) {
-            info!("Deleting existing additional-data image");
-            super::run_cmd(
-                "gcloud",
-                &[
-                    "compute",
-                    "images",
-                    "delete",
-                    &image_name,
-                    &project_flag,
-                    "--quiet",
-                ],
-                self.quiet,
-            )?;
-        }
-
-        // 4. Create GCP image from uploaded tar.gz.
-        info!("Creating additional-data GCP image");
-        super::run_cmd(
-            "gcloud",
-            &[
-                "compute",
-                "images",
-                "create",
-                &image_name,
-                "--source-uri",
-                &dest_uri,
-                &project_flag,
-            ],
-            self.quiet,
-        )?;
-
-        // 5. Delete old disk if exists.
-        if super::run_cmd_silent(
-            "gcloud",
-            &[
-                "compute",
-                "disks",
-                "describe",
-                &disk_name,
-                &zone_flag,
-                &project_flag,
-            ],
-        ) {
-            info!("Deleting existing additional-data disk");
-            super::run_cmd(
-                "gcloud",
-                &[
-                    "compute",
-                    "disks",
-                    "delete",
-                    &disk_name,
-                    &zone_flag,
-                    &project_flag,
-                    "--quiet",
-                ],
-                self.quiet,
-            )?;
-        }
-
-        // 6. Create disk from image.
-        info!("Creating additional-data disk");
-        super::run_cmd(
-            "gcloud",
-            &[
-                "compute",
-                "disks",
-                "create",
-                &disk_name,
-                &format!("--image={}", image_name),
-                "--type=pd-balanced",
-                &zone_flag,
-                &project_flag,
-            ],
-            self.quiet,
-        )?;
-
-        self.additional_data_disk = Some(disk_name);
-        Ok(())
     }
 
     fn check_deps(&self, cfg: &Config) -> Result<()> {

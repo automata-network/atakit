@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 use tracing::info;
 
 use crate::cmd;
-use crate::{BlockStorage, CloudProvider, Compute, DiskFormat, ImageManager, InstanceInfo, Metadata, PortRule, Protocol};
+use crate::{
+    BlockStorage, CloudProvider, Compute, DiskFormat, ImageManager, InstanceInfo, Metadata,
+    PortRule, Protocol,
+};
 
 // ── Configuration ─────────────────────────────────────────────────
 
@@ -37,14 +40,13 @@ pub struct Qemu {
     /// QEMU hostfwd rules derived from port_rules.
     host_forwards: Vec<String>,
     /// Data disks managed via BlockStorage.
-    data_disk_paths: Vec<PathBuf>,
+    data_disk_paths: Vec<(String, PathBuf)>,
 }
 
 impl Qemu {
     pub fn new(config: QemuConfig) -> Result<Self> {
-        std::fs::create_dir_all(&config.instance_dir).with_context(|| {
-            format!("Failed to create {}", config.instance_dir.display())
-        })?;
+        std::fs::create_dir_all(&config.instance_dir)
+            .with_context(|| format!("Failed to create {}", config.instance_dir.display()))?;
 
         let host_forwards = build_host_forwards(&config.port_rules);
 
@@ -140,7 +142,12 @@ impl CloudProvider for Qemu {
 
 #[async_trait]
 impl ImageManager for Qemu {
-    async fn upload_image(&mut self, _disk_path: &Path, _version: Option<&str>) -> Result<()> {
+    async fn upload_image(
+        &mut self,
+        _disk_path: &Path,
+        _version: Option<&str>,
+        _force: bool,
+    ) -> Result<()> {
         // Extract disk.raw from the tar.gz into instance_dir.
         // For QEMU, we always extract fresh since it's a local operation.
         let tar_gz_path = &self.disk_tar_gz;
@@ -163,8 +170,7 @@ impl ImageManager for Qemu {
             if path.file_name().map(|f| f == "disk.raw").unwrap_or(false) {
                 let mut out = std::fs::File::create(&dest)
                     .with_context(|| format!("Failed to create {}", dest.display()))?;
-                std::io::copy(&mut entry, &mut out)
-                    .context("Failed to extract disk.raw")?;
+                std::io::copy(&mut entry, &mut out).context("Failed to extract disk.raw")?;
                 found = true;
                 break;
             }
@@ -224,7 +230,7 @@ impl Compute for Qemu {
         ];
 
         // Attach data disks.
-        for (i, path) in self.data_disk_paths.iter().enumerate() {
+        for (i, (name, path)) in self.data_disk_paths.iter().enumerate() {
             let id = format!("datadisk{i}");
             args.push("-drive".into());
             args.push(format!(
@@ -233,7 +239,7 @@ impl Compute for Qemu {
                 id
             ));
             args.push("-device".into());
-            args.push(format!("virtio-blk-pci,drive={id}"));
+            args.push(format!("virtio-blk-pci,drive={id},serial={}", name));
         }
 
         // Pass metadata as SMBIOS type=11 (OEM strings).
@@ -292,8 +298,7 @@ impl Compute for Qemu {
 
         // Wait for QEMU to exit. This yields to the tokio runtime,
         // allowing other tasks (like init_workload) to run concurrently.
-        let status = child.wait().await
-            .context("Failed to wait for QEMU")?;
+        let status = child.wait().await.context("Failed to wait for QEMU")?;
 
         // Clean up swtpm.
         info!("QEMU exited, cleaning up swtpm");
@@ -329,8 +334,8 @@ impl BlockStorage for Qemu {
         let raw_path = self.instance_dir.join(format!("{name}.raw"));
         if raw_path.exists() {
             info!(disk = %raw_path.display(), "Using existing data disk");
-            if !self.data_disk_paths.contains(&raw_path) {
-                self.data_disk_paths.push(raw_path);
+            if !self.data_disk_paths.iter().any(|(n, _)| n == name) {
+                self.data_disk_paths.push((name.to_string(), raw_path));
             }
             return Ok(());
         }
@@ -347,12 +352,18 @@ impl BlockStorage for Qemu {
 
         cmd::run_cmd(
             "qemu-img",
-            &["create", "-f", "raw", &raw_path.to_string_lossy(), &size_arg],
+            &[
+                "create",
+                "-f",
+                "raw",
+                &raw_path.to_string_lossy(),
+                &size_arg,
+            ],
             self.quiet,
         )
         .await?;
 
-        self.data_disk_paths.push(raw_path);
+        self.data_disk_paths.push((name.to_string(), raw_path));
         Ok(())
     }
 
@@ -362,7 +373,7 @@ impl BlockStorage for Qemu {
             std::fs::remove_file(&raw_path)
                 .with_context(|| format!("Failed to delete {}", raw_path.display()))?;
         }
-        self.data_disk_paths.retain(|p| p != &raw_path);
+        self.data_disk_paths.retain(|(_, p)| p != &raw_path);
         Ok(())
     }
 

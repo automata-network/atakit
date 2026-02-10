@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use automata_linux_release::{ImageStore, Platform};
+use anyhow::{Result, bail};
+use automata_linux_release::{ImageRef, ImageStore, Platform, REPO};
 use clap::Args;
 
 use crate::Env;
@@ -9,9 +9,9 @@ const ALL_PLATFORMS: [Platform; 3] = [Platform::Gcp, Platform::Aws, Platform::Az
 /// Pull CVM base images for a specific release.
 #[derive(Args)]
 pub struct Download {
-    /// Release tag to pull (e.g. "v0.5.0").
+    /// Release tag to pull (e.g. "automata-linux:v0.5.0").
     /// If omitted, the latest release containing disk images is used.
-    pub tag: Option<String>,
+    pub image: Option<ImageRef>,
 
     /// Comma-separated list of platforms: gcp,aws,azure.
     /// If omitted, all platforms are pulled.
@@ -27,20 +27,20 @@ impl Download {
 
         let store = ImageStore::new(&ctx.image_dir).with_token_from_env();
 
-        let tag = match self.tag {
-            Some(t) => t,
+        let image_ref = match self.image {
+            Some(i) => i,
             None => {
-                println!("No tag specified, finding latest image release...");
-                let release = store.client().find_latest_image_release().await?;
-                println!("Using {}", release.tag_name);
-                release.tag_name
+                println!("No image specified, finding latest image release...");
+                let release = store.client().find_latest_image_release(REPO).await?;
+                println!("Using {}{}", REPO, release.tag_name);
+                ImageRef::new(REPO, &release.tag_name)
             }
         };
 
         let names: Vec<_> = platforms.iter().map(|p| p.to_string()).collect();
-        println!("Pulling {} image(s) for {tag}...", names.join(", "));
+        println!("Pulling {} image(s) for {image_ref}...", names.join(", "));
 
-        let paths = store.download(&tag, &platforms).await?;
+        let paths = store.download(&image_ref, &platforms).await?;
         for path in &paths {
             println!("  {}", path.display());
         }

@@ -578,6 +578,16 @@ fn convert_service_volumes(
     result
 }
 
+/// Bind mount paths that are allowed to be writable (not require :ro).
+const WRITABLE_BIND_MOUNT_EXCEPTIONS: &[&str] = &[
+    "./cvm-agent.sock",
+];
+
+/// Returns true if the bind mount path is allowed to be writable.
+fn is_writable_bind_allowed(host_path: &str) -> bool {
+    WRITABLE_BIND_MOUNT_EXCEPTIONS.iter().any(|&p| p == host_path)
+}
+
 fn convert_short_volume(
     name: &str,
     short: &ShortVolume,
@@ -601,11 +611,20 @@ fn convert_short_volume(
                     container_path,
                     read_only,
                 }),
-                Source::HostPath(host_path) => Some(WorkloadVolumeMount::Bind {
-                    host_path: host_path.as_path().to_string_lossy().to_string(),
-                    container_path,
-                    read_only,
-                }),
+                Source::HostPath(host_path) => {
+                    let host_path_str = host_path.as_path().to_string_lossy().to_string();
+                    if !read_only && !is_writable_bind_allowed(&host_path_str) {
+                        errors.push(format!(
+                            "Unsupported: service '{name}' bind mount '{host_path_str}' must be read-only (add :ro suffix)"
+                        ));
+                        return None;
+                    }
+                    Some(WorkloadVolumeMount::Bind {
+                        host_path: host_path_str,
+                        container_path,
+                        read_only,
+                    })
+                }
             }
         }
     }
@@ -635,11 +654,20 @@ fn convert_mount(
                 read_only: vol.common.read_only,
             })
         }
-        Mount::Bind(bind) => Some(WorkloadVolumeMount::Bind {
-            host_path: bind.source.as_path().to_string_lossy().to_string(),
-            container_path: bind.common.target.as_path().to_string_lossy().to_string(),
-            read_only: bind.common.read_only,
-        }),
+        Mount::Bind(bind) => {
+            let host_path = bind.source.as_path().to_string_lossy().to_string();
+            if !bind.common.read_only && !is_writable_bind_allowed(&host_path) {
+                errors.push(format!(
+                    "Unsupported: service '{name}' bind mount '{host_path}' must be read-only (add read_only: true)"
+                ));
+                return None;
+            }
+            Some(WorkloadVolumeMount::Bind {
+                host_path,
+                container_path: bind.common.target.as_path().to_string_lossy().to_string(),
+                read_only: bind.common.read_only,
+            })
+        }
         Mount::Tmpfs(_) => {
             errors.push(format!(
                 "Unsupported: service '{name}' uses tmpfs volume mount which is not supported by workload-compose"
@@ -786,13 +814,13 @@ volumes:
     }
 
     #[test]
-    fn test_bind_mount() {
+    fn test_bind_mount_readonly() {
         let yaml = r#"
 services:
   app:
     image: app:latest
     volumes:
-      - ./config:/app/config
+      - ./config:/app/config:ro
 "#;
         let wc = parse_and_convert(yaml).unwrap();
         let svc = &wc.services["app"];
@@ -805,7 +833,47 @@ services:
             } => {
                 assert_eq!(host_path, "./config");
                 assert_eq!(container_path, "/app/config");
-                assert!(!read_only);
+                assert!(*read_only);
+            }
+            _ => panic!("Expected Bind volume"),
+        }
+    }
+
+    #[test]
+    fn test_bind_mount_rejects_writable() {
+        let yaml = r#"
+services:
+  app:
+    image: app:latest
+    volumes:
+      - ./config:/app/config
+"#;
+        let err = parse_and_convert(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read-only"), "Should require read-only: {msg}");
+    }
+
+    #[test]
+    fn test_bind_mount_writable_exception() {
+        let yaml = r#"
+services:
+  app:
+    image: app:latest
+    volumes:
+      - ./cvm-agent.sock:/run/cvm-agent.sock
+"#;
+        let wc = parse_and_convert(yaml).unwrap();
+        let svc = &wc.services["app"];
+        assert_eq!(svc.volumes.len(), 1);
+        match &svc.volumes[0] {
+            WorkloadVolumeMount::Bind {
+                host_path,
+                container_path,
+                read_only,
+            } => {
+                assert_eq!(host_path, "./cvm-agent.sock");
+                assert_eq!(container_path, "/run/cvm-agent.sock");
+                assert!(!read_only); // Exception path is allowed to be writable
             }
             _ => panic!("Expected Bind volume"),
         }

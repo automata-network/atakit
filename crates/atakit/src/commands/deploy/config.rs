@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result, bail};
-use automata_linux_release::{ImageStore, Platform};
+use automata_linux_release::{ImageRef, ImageStore, Platform};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use workload_compose::ComposeSummary;
+use workload_compose::ComposeAnalysis;
 
-use crate::types::{AtakitConfig, DeploymentDef, PlatformConfig};
+use crate::types::{AtakitConfig, DeploymentDef, PlatformConfig, WorkloadDef};
 
 // ── Core deployment configuration ────────────────────────────────
 
@@ -22,15 +23,15 @@ pub struct DeploymentConfig {
     pub provider: ProviderKind,
     /// Relative path to the workload package (e.g., "workload.tar.gz").
     /// Resolved relative to the deployment.json file's directory.
-    pub workload: String,
-    /// Release tag for automata-linux disk images (e.g., "v0.5.0").
+    pub workload_path: String,
+    // Optional image reference (e.g., "tee-base-image:v1") to override the config value.
+    pub workload: ImageRef,
+    /// Release tag for automata-linux disk images (e.g., "automata-linux:v0.5.0").
     /// If omitted, the latest local release is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub image: Option<ImageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quiet: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +44,12 @@ pub struct DeploymentConfig {
     pub azure: Option<AzureOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qemu: Option<QemuOptions>,
+    /// Agent environment configuration for session registry
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_env: Option<AgentEnvConfig>,
+    /// Additional data files that need to be provided at deploy time
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_data_files: Vec<PathBuf>,
 }
 
 /// Resolved paths from ImageStore (for the runner).
@@ -50,8 +57,7 @@ pub struct DeploymentConfig {
 pub struct ResolvedPaths {
     pub image: PathBuf,
     pub secure_boot_dir: Option<PathBuf>,
-    /// The release version tag (e.g., "v0.5.0") for image naming.
-    pub version: Option<String>,
+    pub image_ref: Option<ImageRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +73,15 @@ pub struct PortDef {
     pub port: u16,
     #[serde(default = "default_protocol")]
     pub protocol: String,
+}
+
+impl PortDef {
+    pub fn tcp(port: u16) -> Self {
+        PortDef {
+            port,
+            protocol: "tcp".to_string(),
+        }
+    }
 }
 
 fn default_protocol() -> String {
@@ -111,6 +126,22 @@ pub struct QemuOptions {
     pub ovmf_path: Option<PathBuf>,
 }
 
+/// Agent environment configuration for session registry.
+/// Can be specified in deployment config or via CLI arguments.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct AgentEnvConfig {
+    /// Private key for relay operations (hex encoded)
+    pub relay_private_key: B256,
+    /// RPC URL for blockchain connection
+    pub rpc_url: String,
+    /// Session registry contract address
+    pub session_registry: Address,
+    /// Owner private key for session registration (hex encoded)
+    pub owner_private_key: B256,
+    /// Session expiration offset in seconds (default: 3600)
+    pub expire_offset: u64,
+}
+
 // ── Loading ──────────────────────────────────────────────────────
 
 /// Load a DeploymentConfig from a standalone JSON file.
@@ -127,23 +158,24 @@ pub fn load_from_file(path: &Path) -> Result<DeploymentConfig> {
 pub async fn resolve_deployment(
     config: &DeploymentConfig,
     store: &ImageStore,
-    image_version_override: Option<&str>,
+    repo: &str,
+    image_ref_override: Option<&ImageRef>,
 ) -> Result<ResolvedPaths> {
     let platform = provider_to_platform(&config.provider);
 
     // CLI override takes precedence over config.
-    let image_version = image_version_override.or(config.image.as_deref());
-    let (image_path, resolved_tag) = resolve_image(store, platform, image_version).await?;
+    let image_ref = image_ref_override.or(config.image.as_ref());
+    let (image_path, resolved_image_ref) = resolve_image(store, platform, repo, image_ref).await?;
 
     // Get secure boot dir if available (GCP only).
-    let secure_boot_dir = resolved_tag.as_ref().and_then(|tag| {
-        let dir = store.certs_dir(tag);
+    let secure_boot_dir = resolved_image_ref.as_ref().and_then(|image_ref| {
+        let dir = store.certs_dir(image_ref);
         dir.exists().then_some(dir)
     });
 
     info!(
         deployment = %config.name,
-        image = resolved_tag.as_deref().unwrap_or("(latest)"),
+        image = resolved_image_ref.as_ref().map(|r| r.to_string()).unwrap_or("(latest)".to_string()),
         path = %image_path.display(),
         "Resolved deployment"
     );
@@ -151,7 +183,7 @@ pub async fn resolve_deployment(
     Ok(ResolvedPaths {
         image: image_path,
         secure_boot_dir,
-        version: resolved_tag,
+        image_ref: resolved_image_ref,
     })
 }
 
@@ -163,9 +195,10 @@ pub async fn resolve_deployment(
 /// `config_dir` is the directory containing atakit.json.
 pub async fn resolve_from_atakit_json(
     atakit_config: &AtakitConfig,
+    image_repo: &str,
     deployment_name: &str,
     platform_override: Option<&str>,
-    image_version_override: Option<&str>,
+    image_ref_override: Option<&ImageRef>,
     image_dir: &Path,
     config_dir: &Path,
 ) -> Result<(DeploymentConfig, ResolvedPaths)> {
@@ -191,38 +224,33 @@ pub async fn resolve_from_atakit_json(
 
     let (platform_name, platform_config) = resolve_platform(deploy_def, platform_override)?;
 
-    let provider = match platform_name.as_str() {
-        "gcp" => ProviderKind::Gcp,
-        "azure" => ProviderKind::Azure,
-        "qemu" => ProviderKind::Qemu,
-        other => bail!("Unsupported provider '{other}'. Supported: gcp, azure, qemu"),
-    };
+    // Find the workload definition.
+    let wl_def = find_workload_def(atakit_config, &deploy_def.workload)?;
 
-    // Extract ports and disks from workload's docker-compose if available.
-    let (ports, volume_names) = extract_workload_info(atakit_config, deploy_def, config_dir)?;
+    // Analyze workload compose file.
+    let analysis = workload_compose::analyze(config_dir, &wl_def.docker_compose)?;
 
-    // Match named volumes to disk definitions in atakit.json.
-    let disks = resolve_disks(atakit_config, &volume_names);
+    // Extract project name from config directory.
+    let project_name = config_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("atakit");
 
-    // Build the config (without resolved image).
-    let config = DeploymentConfig {
-        name: deployment_name.to_string(),
-        provider,
-        workload: "workload.tar.gz".to_string(),
-        image: deploy_def.image.clone(),
-        vm_type: platform_config.vmtype.clone(),
-        quiet: None,
-        ports,
-        disks,
-        metadata: HashMap::new(),
-        gcp: build_gcp_options_simple(&platform_name, platform_config),
-        azure: build_azure_options(&platform_name, platform_config),
-        qemu: None,
-    };
+    // Build the config using shared logic.
+    let config = build_from_deployment(
+        deployment_name,
+        deploy_def,
+        wl_def,
+        &platform_name,
+        platform_config,
+        &analysis,
+        atakit_config,
+        project_name,
+    )?;
 
     // Resolve to get the actual image path (auto-downloads if needed).
     let store = ImageStore::new(image_dir).with_token_from_env();
-    let paths = resolve_deployment(&config, &store, image_version_override).await?;
+    let paths = resolve_deployment(&config, &store, image_repo, image_ref_override).await?;
     Ok((config, paths))
 }
 
@@ -272,6 +300,18 @@ fn provider_to_platform(provider: &ProviderKind) -> Platform {
     }
 }
 
+/// Find a workload definition by name in the atakit config.
+fn find_workload_def<'a>(
+    atakit_config: &'a AtakitConfig,
+    workload_name: &str,
+) -> Result<&'a WorkloadDef> {
+    atakit_config
+        .workloads
+        .iter()
+        .find(|w| w.name == workload_name)
+        .with_context(|| format!("Workload '{}' not found in atakit.json workloads[]", workload_name))
+}
+
 /// Resolve disk image path using ImageStore.
 ///
 /// If the image is not found locally, it will be automatically downloaded.
@@ -279,127 +319,58 @@ fn provider_to_platform(provider: &ProviderKind) -> Platform {
 async fn resolve_image(
     store: &ImageStore,
     platform: Platform,
-    image: Option<&str>,
-) -> Result<(PathBuf, Option<String>)> {
+    repo: &str,
+    image: Option<&ImageRef>,
+) -> Result<(PathBuf, Option<ImageRef>)> {
     // If a specific release tag is requested, use that.
-    if let Some(tag) = image {
-        let path = store.image_path(tag, platform);
+    if let Some(image_ref) = image {
+        let path = store.image_path(image_ref, platform);
         if path.exists() {
-            info!(tag, %platform, "Using local disk image");
-            return Ok((path, Some(tag.to_string())));
+            info!(image_ref = ?image_ref, %platform, "Using local disk image");
+            return Ok((path, Some(image_ref.clone())));
         }
 
         // Not found locally, download it.
-        info!(tag, %platform, "Disk image not found locally, downloading...");
-        let paths = store.download(tag, &[platform]).await?;
+        info!(%image_ref, %platform, "Disk image not found locally, downloading...");
+        let paths = store.download(image_ref, &[platform]).await?;
         if let Some(path) = paths.into_iter().next() {
-            return Ok((path, Some(tag.to_string())));
+            return Ok((path, Some(image_ref.clone())));
         }
-        bail!("Failed to download disk image for release {tag}");
+        bail!(
+            "Failed to download disk image for release {}",
+            image_ref.tag
+        );
     }
 
     // No specific tag requested, check local images first.
     let local_tags = store.list_local()?;
-    for tag in local_tags.iter().rev() {
-        let path = store.image_path(tag, platform);
+    for image_ref in local_tags.iter().rev() {
+        let path = store.image_path(image_ref, platform);
         if path.exists() {
-            info!(tag, %platform, "Using local disk image");
-            return Ok((path, Some(tag.clone())));
+            info!(%image_ref, %platform, "Using local disk image");
+            return Ok((path, Some(image_ref.clone())));
         }
     }
 
     // No local images, find and download the latest release with disk images.
     info!(%platform, "No local images found, fetching latest release...");
-    let release = store.client().find_latest_image_release().await?;
-    let tag = &release.tag_name;
+    let release = store.client().find_latest_image_release(repo).await?;
+    let image_ref = ImageRef::new(repo, release.tag_name);
 
-    info!(tag, %platform, "Downloading disk image...");
-    let paths = store.download(tag, &[platform]).await?;
+    info!(%image_ref, %platform, "Downloading disk image...");
+    let paths = store.download(&image_ref, &[platform]).await?;
     if let Some(path) = paths.into_iter().next() {
-        return Ok((path, Some(tag.clone())));
+        return Ok((path, Some(image_ref.clone())));
     }
 
-    bail!("Failed to download disk image for latest release {tag}");
+    bail!("Failed to download disk image for latest release {image_ref}");
 }
 
-/// Extract port and volume information from the workload's docker-compose.
-fn extract_workload_info(
-    atakit_config: &AtakitConfig,
-    deploy_def: &DeploymentDef,
-    config_dir: &Path,
-) -> Result<(Vec<PortDef>, Vec<String>)> {
-    let workload_name = match &deploy_def.workload {
-        Some(name) => name,
-        None => return Ok((Vec::new(), Vec::new())),
-    };
-
-    let wl_def = atakit_config
-        .workloads
-        .iter()
-        .find(|w| &w.name == workload_name)
-        .with_context(|| {
-            format!(
-                "Workload '{workload_name}' referenced in deployment but not found in workloads[]"
-            )
-        })?;
-
-    let compose_path = config_dir.join(&wl_def.docker_compose);
-    let content = match std::fs::read_to_string(&compose_path) {
-        Ok(c) => c,
-        Err(_) => {
-            info!(path = %compose_path.display(), "Docker-compose not found, skipping port/volume extraction");
-            return Ok((Vec::new(), Vec::new()));
-        }
-    };
-
-    let compose = workload_compose::from_yaml_str(&content)
-        .with_context(|| format!("Failed to parse {}", compose_path.display()))?;
-
-    let mut ports = Vec::new();
-    let mut volume_names = Vec::new();
-
-    for (_service_name, service) in &compose.services {
-        for port in &service.ports {
-            if let Some(host_port) = port.host_port {
-                ports.push(PortDef {
-                    port: host_port,
-                    protocol: port.protocol.clone(),
-                });
-            }
-        }
-
-        for vol in &service.volumes {
-            if let workload_compose::WorkloadVolumeMount::Named { name, .. } = vol {
-                if !volume_names.contains(name) {
-                    volume_names.push(name.clone());
-                }
-            }
-        }
-    }
-
-    Ok((ports, volume_names))
-}
-
-/// Match named volumes from docker-compose to disk definitions in atakit.json.
-fn resolve_disks(atakit_config: &AtakitConfig, volume_names: &[String]) -> Vec<DiskDef> {
-    volume_names
-        .iter()
-        .filter_map(|vol_name| {
-            atakit_config
-                .disks
-                .iter()
-                .find(|d| d.name == *vol_name)
-                .map(|d| DiskDef {
-                    name: d.name.clone(),
-                    size: d.size.clone(),
-                })
-        })
-        .collect()
-}
 
 fn build_gcp_options_simple(
     platform_name: &str,
     platform_config: &PlatformConfig,
+    project_name: &str,
 ) -> Option<GcpOptions> {
     if platform_name != "gcp" {
         return None;
@@ -407,21 +378,82 @@ fn build_gcp_options_simple(
     Some(GcpOptions {
         zone: platform_config.region.clone(),
         project_id: platform_config.project.clone(),
+        bucket_name: Some(sanitize_bucket_name(project_name)),
         ..Default::default()
     })
+}
+
+/// Sanitize a string to be a valid GCS bucket name.
+/// GCS bucket names must be 3-63 chars, lowercase, start with letter, contain only a-z, 0-9, hyphens.
+fn sanitize_bucket_name(name: &str) -> String {
+    let sanitized: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // Remove leading/trailing hyphens and collapse multiple hyphens
+    let sanitized: String = sanitized
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    // Ensure it starts with a letter
+    let sanitized = if sanitized
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(true)
+    {
+        format!("ata-{}", sanitized)
+    } else {
+        sanitized
+    };
+    // Truncate to 63 chars max
+    sanitized.chars().take(63).collect()
 }
 
 fn build_azure_options(
     platform_name: &str,
     platform_config: &PlatformConfig,
+    project_name: &str,
 ) -> Option<AzureOptions> {
     if platform_name != "azure" {
         return None;
     }
     Some(AzureOptions {
         region: platform_config.region.clone(),
+        storage_account: Some(sanitize_azure_storage_name(project_name)),
+        container_name: Some(sanitize_bucket_name(project_name)),
         ..Default::default()
     })
+}
+
+/// Sanitize a string to be a valid Azure storage account name.
+/// Azure storage names must be 3-24 chars, lowercase letters and numbers only (no hyphens).
+fn sanitize_azure_storage_name(name: &str) -> String {
+    let sanitized: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    // Ensure it starts with a letter
+    let sanitized = if sanitized
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(true)
+    {
+        format!("ata{}", sanitized)
+    } else {
+        sanitized
+    };
+    // Ensure minimum length of 3 and max of 24
+    let sanitized = if sanitized.len() < 3 {
+        format!("{}atakit", sanitized)
+    } else {
+        sanitized
+    };
+    sanitized.chars().take(24).collect()
 }
 
 // ── Build from deployment definition (for build-workload) ────────
@@ -433,10 +465,12 @@ fn build_azure_options(
 pub fn build_from_deployment(
     deployment_name: &str,
     deploy_def: &DeploymentDef,
+    wl_def: &WorkloadDef,
     platform_name: &str,
     platform_config: &PlatformConfig,
-    summary: &ComposeSummary,
+    summary: &ComposeAnalysis,
     atakit_config: &AtakitConfig,
+    project_name: &str,
 ) -> Result<DeploymentConfig> {
     let provider = match platform_name {
         "gcp" => ProviderKind::Gcp,
@@ -446,7 +480,7 @@ pub fn build_from_deployment(
     };
 
     // Extract ports from compose summary.
-    let ports: Vec<PortDef> = summary
+    let ports: Vec<PortDef> = summary.summary
         .ports
         .iter()
         .filter_map(|sp| {
@@ -458,10 +492,10 @@ pub fn build_from_deployment(
         .collect();
 
     // Match named volumes to disk definitions.
-    let disks: Vec<DiskDef> = summary
+    let disks: Vec<DiskDef> = summary.summary
         .named_volumes
         .iter()
-        .filter_map(|vol| {
+        .filter_map(|(_, vol)| {
             atakit_config
                 .disks
                 .iter()
@@ -476,20 +510,26 @@ pub fn build_from_deployment(
     Ok(DeploymentConfig {
         name: deployment_name.to_string(),
         provider: provider.clone(),
-        workload: "workload.tar.gz".to_string(),
+        workload: ImageRef::new(&wl_def.name, &wl_def.version),
+        workload_path: format!("{}-{}.tar.gz", wl_def.name, wl_def.version),
         image: deploy_def.image.clone(),
         vm_type: platform_config.vmtype.clone(),
-        quiet: None,
         ports,
         disks,
         metadata: HashMap::new(),
-        gcp: build_gcp_options_simple(platform_name, platform_config),
-        azure: build_azure_options(platform_name, platform_config),
+        gcp: build_gcp_options_simple(platform_name, platform_config, project_name),
+        azure: build_azure_options(platform_name, platform_config, project_name),
         qemu: if matches!(provider, ProviderKind::Qemu) {
             Some(QemuOptions::default())
         } else {
             None
         },
+        agent_env: None,
+        additional_data_files: summary
+            .additional_data_files
+            .iter()
+            .map(|(_, original)| original.clone())
+            .collect(),
     })
 }
 

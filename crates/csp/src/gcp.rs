@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tracing::info;
 
@@ -56,9 +56,7 @@ impl Gcp {
             None => cmd::try_capture("gcloud", &["config", "get-value", "project"])
                 .await
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "GCP project not set. Specify project_id or run: gcloud init"
-                    )
+                    anyhow::anyhow!("GCP project not set. Specify project_id or run: gcloud init")
                 })?,
         };
 
@@ -121,7 +119,10 @@ impl CloudProvider for Gcp {
     }
 
     async fn check_deps(&self) -> Result<()> {
-        let required = [("gcloud", "Google Cloud SDK"), ("gsutil", "Google Cloud SDK")];
+        let required = [
+            ("gcloud", "Google Cloud SDK"),
+            ("gsutil", "Google Cloud SDK"),
+        ];
         let mut missing: Vec<&str> = Vec::new();
 
         for (cmd_name, _pkg) in &required {
@@ -145,21 +146,45 @@ impl CloudProvider for Gcp {
 
 #[async_trait]
 impl ImageManager for Gcp {
-    async fn upload_image(&mut self, disk_path: &Path, version: Option<&str>) -> Result<()> {
+    async fn upload_image(
+        &mut self,
+        disk_path: &Path,
+        version: Option<&str>,
+        force: bool,
+    ) -> Result<()> {
+        let version = version.map(|n| n.replace(":", "-"));
+        let version = version.as_deref();
         // Use versioned image name if version provided.
         let image_name = match version {
             Some(v) => format!("{}-{}", self.vm_name, v),
             None => self.image_name.clone(),
         };
 
+        let project_flag = format!("--project={}", self.project_id);
+
         // Check if image already exists with this version.
         if version.is_some() && self.image_exists(version).await {
-            info!(image = %image_name, "Image already exists, skipping upload");
-            self.image_name = image_name;
-            return Ok(());
+            if force {
+                info!(image = %image_name, "Force flag set, deleting existing image");
+                cmd::run_cmd(
+                    "gcloud",
+                    &[
+                        "compute",
+                        "images",
+                        "delete",
+                        &image_name,
+                        &project_flag,
+                        "--quiet",
+                    ],
+                    self.quiet,
+                )
+                .await?;
+            } else {
+                info!(image = %image_name, "Image already exists, skipping upload");
+                self.image_name = image_name;
+                return Ok(());
+            }
         }
-
-        let project_flag = format!("--project={}", self.project_id);
 
         // 1. Create bucket if it doesn't exist.
         if !cmd::run_cmd_silent("gsutil", &["ls", "-b", &self.bucket_url]).await {
@@ -294,7 +319,13 @@ impl ImageManager for Gcp {
 
         if cmd::run_cmd_silent(
             "gcloud",
-            &["compute", "images", "describe", &self.image_name, &project_flag],
+            &[
+                "compute",
+                "images",
+                "describe",
+                &self.image_name,
+                &project_flag,
+            ],
         )
         .await
         {
@@ -553,13 +584,7 @@ impl BlockStorage for Gcp {
 
                 if disk_type.contains("pd-standard") {
                     info!(disk = %name, "Disk is pd-standard, converting to pd-balanced for c3-* VM");
-                    convert_disk_to_balanced(
-                        name,
-                        self.quiet,
-                        &zone_flag,
-                        &project_flag,
-                    )
-                    .await?;
+                    convert_disk_to_balanced(name, self.quiet, &zone_flag, &project_flag).await?;
                 }
             }
 

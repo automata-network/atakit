@@ -132,7 +132,7 @@ impl CloudProvider for Azure {
 
 #[async_trait]
 impl ImageManager for Azure {
-    async fn upload_image(&mut self, disk_path: &Path, version: Option<&str>) -> Result<()> {
+    async fn upload_image(&mut self, disk_path: &Path, version: Option<&str>, force: bool) -> Result<()> {
         // Use versioned blob name if version provided.
         let blob_name = match version {
             Some(v) => format!("{}-{}.vhd", self.vm_name, v),
@@ -196,12 +196,12 @@ impl ImageManager for Azure {
         .await?;
 
         // 4. Check if blob already exists with this version.
-        if version.is_some() && self.image_exists(version).await {
+        if !force && version.is_some() && self.image_exists(version).await {
             info!(blob = %blob_name, "Image already exists, skipping upload");
             return Ok(());
         }
 
-        // 5. Upload disk image.
+        // 5. Upload disk image (uses --overwrite, so force just skips the check).
         info!(blob = %blob_name, "Uploading disk image to blob storage");
         cmd::run_cmd(
             "az",

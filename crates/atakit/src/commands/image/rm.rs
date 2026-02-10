@@ -1,5 +1,5 @@
 use anyhow::Result;
-use automata_linux_release::ImageStore;
+use automata_linux_release::{ImageRef, ImageStore};
 use clap::Args;
 
 use crate::Env;
@@ -8,7 +8,7 @@ use crate::Env;
 #[derive(Args)]
 pub struct Delete {
     /// Release tag to remove (e.g. "v0.5.0")
-    pub tag: String,
+    pub tag: ImageRef,
 }
 
 impl Delete {

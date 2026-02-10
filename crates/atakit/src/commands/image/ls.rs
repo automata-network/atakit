@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use automata_linux_release::{ImageStore, Platform, Release};
+use automata_linux_release::{ImageRef, ImageStore, Platform, Release};
 use clap::Args;
 
 use crate::Env;
@@ -19,7 +19,10 @@ pub struct List {
 
     /// Show a specific release by tag
     #[arg(long)]
-    pub tag: Option<String>,
+    pub tag: Option<ImageRef>,
+
+    #[arg(long, default_value = "automata-linux")]
+    pub repo: String,
 
     /// Show only local images (skip remote query)
     #[arg(long)]
@@ -32,7 +35,7 @@ impl List {
 
         if let Some(tag) = &self.tag {
             let release = store.client().get_release(tag).await?;
-            print_release_detail(&release, &store);
+            print_release_detail(&self.repo, &release, &store);
             return Ok(());
         }
 
@@ -53,18 +56,21 @@ impl List {
         let local_tags = store.list_local()?;
 
         // Get remote releases.
-        let remote_tags: HashSet<String>;
+        let remote_tags: HashSet<ImageRef>;
         let remote_lines: Vec<String>;
 
         if self.all {
-            let releases = store.client().list_releases(self.limit).await?;
-            remote_tags = releases.iter().map(|r| r.tag_name.clone()).collect();
+            let releases = store.client().list_releases(&self.repo, self.limit).await?;
+            remote_tags = releases
+                .iter()
+                .map(|r| ImageRef::new(&self.repo, &r.tag_name))
+                .collect();
             remote_lines = releases.iter().map(|r| format!("{r}")).collect();
         } else {
-            let statuses = store.list(self.limit).await?;
+            let statuses = store.list(&self.repo, self.limit).await?;
             remote_tags = statuses
                 .iter()
-                .map(|s| s.release.tag_name.clone())
+                .map(|s| ImageRef::new(&self.repo, &s.release.tag_name))
                 .collect();
             remote_lines = statuses.iter().map(|s| format!("{s}")).collect();
         }
@@ -93,14 +99,14 @@ impl List {
 }
 
 /// Print a local-only tag with its available platforms.
-fn print_local_tag(store: &ImageStore, tag: &str) {
+fn print_local_tag(store: &ImageStore, image_ref: &ImageRef) {
     let mut platforms = Vec::new();
     for p in [Platform::Gcp, Platform::Aws, Platform::Azure] {
-        if store.image_path(tag, p).exists() {
+        if store.image_path(image_ref, p).exists() {
             platforms.push(p.to_string());
         }
     }
-    let has_certs = store.certs_dir(tag).exists();
+    let has_certs = store.certs_dir(image_ref).exists();
 
     let mut info = platforms.join(", ");
     if has_certs {
@@ -112,11 +118,12 @@ fn print_local_tag(store: &ImageStore, tag: &str) {
     if info.is_empty() {
         info = "empty".to_string();
     }
-    println!("{tag}  [local: {info}]");
+    println!("{image_ref}  [local: {info}]");
 }
 
-fn print_release_detail(release: &Release, store: &ImageStore) {
-    println!("{}", release.tag_name);
+fn print_release_detail(repo: &str, release: &Release, store: &ImageStore) {
+    let image_ref = ImageRef::new(repo, &release.tag_name);
+    println!("{}", image_ref);
 
     if let Some(date) = &release.published_at {
         let short = date.get(..10).unwrap_or(date);
@@ -130,7 +137,7 @@ fn print_release_detail(release: &Release, store: &ImageStore) {
         for p in &platforms {
             let asset = release.disk_image(*p).unwrap();
             let size_mb = asset.size / (1024 * 1024);
-            let local = if store.image_path(&release.tag_name, *p).exists() {
+            let local = if store.image_path(&image_ref, *p).exists() {
                 " [local]"
             } else {
                 ""
@@ -141,7 +148,7 @@ fn print_release_detail(release: &Release, store: &ImageStore) {
 
     if let Some(certs) = release.secure_boot_certs() {
         let size_kb = certs.size / 1024;
-        let local = if store.certs_dir(&release.tag_name).exists() {
+        let local = if store.certs_dir(&image_ref).exists() {
             " [local]"
         } else {
             ""

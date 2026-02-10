@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 pub mod env;
 pub mod instances;
+pub mod registry;
 mod types;
 
 pub use env::Env;
@@ -39,6 +40,13 @@ enum AtaKit {
     #[cfg(feature = "internal")]
     #[command(subcommand)]
     Internal(commands::internal::Internal),
+
+    /// Publish a workload to the WorkloadRegistry contract
+    PublishWorkload(commands::publish_workload::PublishWorkload),
+
+    /// Manage contract registry information
+    #[command(subcommand)]
+    Registry(commands::registry::Registry),
 }
 
 impl AtaKit {
@@ -49,6 +57,8 @@ impl AtaKit {
             AtaKit::Deploy(cmd) => cmd.run(env).await,
             #[cfg(feature = "internal")]
             AtaKit::Internal(cmd) => cmd.run().await,
+            AtaKit::PublishWorkload(cmd) => cmd.run(env).await,
+            AtaKit::Registry(cmd) => cmd.run(env).await,
         }
     }
 }

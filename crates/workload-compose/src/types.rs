@@ -83,8 +83,9 @@ pub struct WorkloadDependency {
 pub struct ComposeSummary {
     /// All file paths referenced by bind mounts and env_files.
     pub referenced_files: Vec<ReferencedFile>,
-    /// Named volumes used by services (deduplicated).
-    pub named_volumes: Vec<String>,
+    /// Named volumes used by services: (service_name, volume_name).
+    /// Each volume must be used by exactly one service.
+    pub named_volumes: Vec<(String, String)>,
     /// Port mappings with service names attached.
     pub ports: Vec<ServicePort>,
     /// Image specs per service.
@@ -92,7 +93,7 @@ pub struct ComposeSummary {
 }
 
 impl ComposeSummary {
-    /// Returns files that should be included in measurement (not under additional-data/).
+    /// Returns files that should be measured (not under additional-data/).
     pub fn measured_files(&self) -> Vec<&ReferencedFile> {
         self.referenced_files
             .iter()
@@ -100,7 +101,7 @@ impl ComposeSummary {
             .collect()
     }
 
-    /// Returns files under additional-data/ that are excluded from measurement.
+    /// Returns files that are operator-provided additional data.
     pub fn additional_data_files(&self) -> Vec<&ReferencedFile> {
         self.referenced_files
             .iter()

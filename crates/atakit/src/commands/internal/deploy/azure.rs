@@ -17,8 +17,6 @@ pub(crate) struct Azure {
     /// Path to the workload tar.gz artifact.
     tar_path: PathBuf,
     quiet: bool,
-    /// Path to the additional-data source directory (for individual blob uploads).
-    additional_data_dir: PathBuf,
 }
 
 impl Azure {
@@ -27,7 +25,6 @@ impl Azure {
         platform_config: &PlatformConfig,
         tar_path: &Path,
         quiet: bool,
-        additional_data_dir: &Path,
     ) -> Result<Self> {
         let vm_type = platform_config
             .vmtype
@@ -74,7 +71,6 @@ impl Azure {
             container_name: "workloads".to_string(),
             tar_path: tar_path.to_path_buf(),
             quiet,
-            additional_data_dir: additional_data_dir.to_path_buf(),
         })
     }
 }
@@ -177,66 +173,6 @@ impl CloudPlatform for Azure {
             ],
             self.quiet,
         )?;
-
-        Ok(())
-    }
-
-    fn attach_additional_data_disk(&mut self, img_path: Option<&Path>) -> Result<()> {
-        // Upload the FAT image as a single blob.
-        if let Some(img) = img_path {
-            info!("Uploading additional-data image to blob storage");
-            super::run_cmd(
-                "az",
-                &[
-                    "storage",
-                    "blob",
-                    "upload",
-                    "--account-name",
-                    &self.storage_account,
-                    "--container-name",
-                    &self.container_name,
-                    "--name",
-                    "additional-data.img",
-                    "--file",
-                    &img.to_string_lossy(),
-                    "--overwrite",
-                ],
-                self.quiet,
-            )?;
-        }
-
-        // Also upload individual files for backward compatibility
-        // (CVM agent downloads blobs individually).
-        let dir = &self.additional_data_dir;
-        if !dir.is_dir() {
-            return Ok(());
-        }
-
-        info!("Uploading individual additional-data files");
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                super::run_cmd(
-                    "az",
-                    &[
-                        "storage",
-                        "blob",
-                        "upload",
-                        "--account-name",
-                        &self.storage_account,
-                        "--container-name",
-                        &self.container_name,
-                        "--name",
-                        &format!("additional-data/{}", name),
-                        "--file",
-                        &entry.path().to_string_lossy(),
-                        "--overwrite",
-                    ],
-                    self.quiet,
-                )?;
-            }
-        }
 
         Ok(())
     }

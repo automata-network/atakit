@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::instances::InstanceStore;
+use crate::registry::RegistryStore;
 use crate::types::AtakitConfig;
 
 const CONFIG_FILENAME: &str = "atakit.json";
@@ -20,6 +21,7 @@ pub struct Env {
     /// Path to the `atakit.json` config file, if found.
     pub config_file: Option<PathBuf>,
     pub project_artifact_dir: PathBuf,
+    pub image_repo: String,
 }
 
 impl Env {
@@ -45,15 +47,14 @@ impl Env {
             image_dir: atakit_dir.join("images"),
             config_file,
             project_artifact_dir,
+            image_repo: automata_linux_release::REPO.to_string(),
         }
     }
 
     /// Return the directory containing `atakit.json`, if found.
     pub fn config_dir(&self) -> Result<&std::path::Path> {
         let config_path = self.config_file.as_ref().context("atakit.json not found")?;
-        Ok(config_path
-            .parent()
-            .unwrap_or(std::path::Path::new(".")))
+        Ok(config_path.parent().unwrap_or(std::path::Path::new(".")))
     }
 
     pub fn config(&self) -> Result<AtakitConfig> {
@@ -102,6 +103,21 @@ impl Env {
     /// Get an instance store for managing deployed instances.
     pub fn instance_store(&self) -> InstanceStore {
         InstanceStore::new(self.instances_dir())
+    }
+
+    /// Directory for dev platform profiles (`~/.atakit/images/dev/profiles`).
+    pub fn dev_profiles_dir(&self) -> PathBuf {
+        self.image_dir.join("dev").join("profiles")
+    }
+
+    /// Directory for registry data (`~/.atakit/registry`).
+    pub fn registry_dir(&self) -> PathBuf {
+        self.atakit_dir.join("registry")
+    }
+
+    /// Get a registry store for managing contract deployments.
+    pub fn registry_store(&self) -> RegistryStore {
+        RegistryStore::new(self.registry_dir())
     }
 }
 

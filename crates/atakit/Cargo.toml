@@ -30,7 +30,8 @@ k256.workspace = true
 sha3.workspace = true
 hex.workspace = true
 alloy.workspace = true
+automata-tee-workload-measurement.workspace = true
 
 [features]
-default = []
-internal = ["csp/clap"]
+default = ["csp/clap", "internal"]
+internal = []

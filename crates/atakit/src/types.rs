@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use automata_linux_release::ImageRef;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -42,6 +43,8 @@ pub struct WorkloadDef {
     pub name: String,
     /// Relative path to the docker-compose file.
     pub docker_compose: String,
+    pub image: ImageRef,
+    pub version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,13 +68,11 @@ fn default_key_security() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct DeploymentDef {
-    /// Name of the workload (must match a workloads[] entry).
-    #[serde(default)]
-    pub workload: Option<String>,
+    pub workload: String,
     /// Image version tag for automata-linux disk images (e.g. "v0.5.0").
     /// If omitted, uses the latest available release with disk images.
     #[serde(default)]
-    pub image: Option<String>,
+    pub image: Option<ImageRef>,
     #[serde(default)]
     pub platforms: IndexMap<String, PlatformConfig>,
 }
@@ -92,15 +93,14 @@ pub struct PlatformConfig {
 
 #[derive(Debug, serde::Serialize)]
 pub struct WorkloadManifest {
-    pub name: String,
+    pub name: ImageRef,
     pub docker_compose: String,
-    /// Target automata-linux disk image version (e.g., "v0.5.0").
-    /// If None, deployment should use the latest available version.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub image: ImageRef,
     pub measured_files: Vec<String>,
     pub additional_data_files: Vec<String>,
     pub docker_images: Vec<DockerImageEntry>,
+    pub enable_cvm_agent: Vec<String>,
+    pub atakit_version: String,
 }
 
 #[derive(Debug, serde::Serialize)]

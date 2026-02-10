@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use automata_linux_release::ImageRef;
 use serde::{Deserialize, Serialize};
 
 /// Metadata for a deployed instance.
@@ -28,7 +29,7 @@ pub struct InstanceRecord {
     pub resource_group: Option<String>,
     /// Image version used for deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_version: Option<String>,
+    pub image_ref: Option<ImageRef>,
     /// Timestamp when the instance was created (Unix seconds).
     #[serde(default)]
     pub created_at: u64,
@@ -177,7 +178,7 @@ pub fn create_record(
     zone: Option<String>,
     project_id: Option<String>,
     resource_group: Option<String>,
-    image_version: Option<String>,
+    image_ref: Option<ImageRef>,
 ) -> InstanceRecord {
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -191,7 +192,7 @@ pub fn create_record(
         zone,
         project_id,
         resource_group,
-        image_version,
+        image_ref,
         created_at,
     }
 }

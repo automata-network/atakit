@@ -1,16 +1,18 @@
 use std::env;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use tracing::debug;
 
-use crate::types::{Platform, Release, VersionSelector};
+use crate::{
+    REPO,
+    types::{ImageRef, Platform, Release, VersionSelector},
+};
 
 /// Async client for the GitHub Releases API.
 ///
 /// Works with any `owner/repo`, not tied to a specific repository.
 pub struct ReleasesClient {
-    repo: String,
     token: Option<String>,
     http: reqwest::Client,
 }
@@ -19,9 +21,8 @@ impl ReleasesClient {
     /// Create a new client for the given repository.
     ///
     /// `repo` must be in `"owner/repo"` format.
-    pub fn new(repo: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            repo: repo.into(),
             token: None,
             http: reqwest::Client::new(),
         }
@@ -47,31 +48,33 @@ impl ReleasesClient {
 
     // ── low-level API ──────────────────────────────────────────────
 
+    fn map_repo<'a>(&self, repo: &'a str) -> &'a str {
+        if repo == "automata-linux" { REPO } else { repo }
+    }
+
     /// List the most recent releases (up to `per_page`, max 100).
-    pub async fn list_releases(&self, per_page: u32) -> Result<Vec<Release>> {
+    pub async fn list_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>> {
         let url = format!(
             "https://api.github.com/repos/{}/releases?per_page={}",
-            self.repo,
+            self.map_repo(repo),
             per_page.min(100),
         );
         self.get_json(&url).await
     }
 
     /// Fetch a specific release by its Git tag.
-    pub async fn get_release(&self, tag: &str) -> Result<Release> {
+    pub async fn get_release(&self, image_ref: &ImageRef) -> Result<Release> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/tags/{}",
-            self.repo, tag,
+            self.map_repo(&image_ref.repository),
+            image_ref.tag,
         );
         self.get_json(&url).await
     }
 
     /// Fetch the release marked as "latest" by GitHub.
-    pub async fn get_latest_release(&self) -> Result<Release> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            self.repo,
-        );
+    pub async fn get_latest_release(&self, repo: &str) -> Result<Release> {
+        let url = format!("https://api.github.com/repos/{}/releases/latest", self.map_repo(&repo));
         self.get_json(&url).await
     }
 
@@ -81,9 +84,9 @@ impl ReleasesClient {
     ///
     /// Scans up to 20 recent releases and returns the first one with disk
     /// image assets.
-    pub async fn find_latest_image_release(&self) -> Result<Release> {
+    pub async fn find_latest_image_release(&self, repo: &str) -> Result<Release> {
         debug!("scanning recent releases for disk images");
-        let releases = self.list_releases(20).await?;
+        let releases = self.list_releases(repo, 20).await?;
 
         releases
             .into_iter()
@@ -93,9 +96,12 @@ impl ReleasesClient {
 
     /// Find the most recent release that contains a disk image for the given
     /// platform.
-    pub async fn find_latest_release_for(&self, platform: Platform) -> Result<Release> {
-        debug!(?platform, "scanning recent releases for platform disk image");
-        let releases = self.list_releases(20).await?;
+    pub async fn find_latest_release_for(&self, repo: &str, platform: Platform) -> Result<Release> {
+        debug!(
+            ?platform,
+            "scanning recent releases for platform disk image"
+        );
+        let releases = self.list_releases(repo, 20).await?;
 
         releases
             .into_iter()
@@ -111,18 +117,18 @@ impl ReleasesClient {
     ///
     /// This is the primary entry-point for "select a version": callers
     /// describe *what* they want and this method figures out how to get it.
-    pub async fn resolve(&self, selector: &VersionSelector) -> Result<Release> {
+    pub async fn resolve(&self, repo: &str, selector: &VersionSelector) -> Result<Release> {
         match selector {
-            VersionSelector::Latest => self.get_latest_release().await,
-            VersionSelector::LatestImage => self.find_latest_image_release().await,
-            VersionSelector::LatestImageFor(p) => self.find_latest_release_for(*p).await,
-            VersionSelector::Tag(tag) => self.get_release(tag).await,
+            VersionSelector::Latest => self.get_latest_release(repo).await,
+            VersionSelector::LatestImage => self.find_latest_image_release(repo).await,
+            VersionSelector::LatestImageFor(p) => self.find_latest_release_for(repo, *p).await,
+            VersionSelector::Tag(image_ref) => self.get_release(image_ref).await,
         }
     }
 
     /// List recent releases that contain at least one disk image.
-    pub async fn list_image_releases(&self, per_page: u32) -> Result<Vec<Release>> {
-        let all = self.list_releases(per_page).await?;
+    pub async fn list_image_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>> {
+        let all = self.list_releases(repo, per_page).await?;
         Ok(all.into_iter().filter(|r| r.has_disk_images()).collect())
     }
 
@@ -140,10 +146,7 @@ impl ReleasesClient {
 
     fn auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::USER_AGENT,
-            HeaderValue::from_static("ata-releases"),
-        );
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("ata-releases"));
         if let Some(ref token) = self.token {
             if let Ok(val) = HeaderValue::from_str(&format!("Bearer {token}")) {
                 headers.insert(header::AUTHORIZATION, val);
@@ -169,6 +172,8 @@ impl ReleasesClient {
             bail!("GitHub API returned {status}: {body}");
         }
 
-        resp.json().await.context("failed to parse GitHub API response")
+        resp.json()
+            .await
+            .context("failed to parse GitHub API response")
     }
 }

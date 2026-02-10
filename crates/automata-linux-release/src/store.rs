@@ -6,9 +6,9 @@ use tracing::info;
 
 use crate::client::ReleasesClient;
 use crate::download::DownloadOptions;
-use crate::types::{Platform, Release};
+use crate::types::{ImageRef, Platform, Release};
 
-const REPO: &str = "automata-network/automata-linux";
+pub const REPO: &str = "automata-network/automata-linux";
 
 /// Manages local disk image storage for automata-linux releases.
 ///
@@ -66,7 +66,7 @@ impl ImageStore {
     /// The directory is created lazily on first download.
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
-            client: ReleasesClient::new(REPO),
+            client: ReleasesClient::new(),
             base_dir: base_dir.into(),
         }
     }
@@ -96,49 +96,77 @@ impl ImageStore {
     // ── paths ──────────────────────────────────────────────────────
 
     /// Directory for a specific release tag.
-    pub fn tag_dir(&self, tag: &str) -> PathBuf {
-        self.base_dir.join(tag)
+    ///
+    /// Structure: `base_dir/<repository>/<tag>/`
+    /// e.g. `base_dir/automata-linux/v0.5.0/`
+    pub fn tag_dir(&self, image_ref: &ImageRef) -> PathBuf {
+        self.base_dir.join(&image_ref.repository).join(&image_ref.tag)
     }
 
     /// Expected path of a disk image file (after decompression).
-    pub fn image_path(&self, tag: &str, platform: Platform) -> PathBuf {
-        self.tag_dir(tag).join(disk_filename(platform))
+    pub fn image_path(&self, image_ref: &ImageRef, platform: Platform) -> PathBuf {
+        self.tag_dir(image_ref).join(disk_filename(platform))
     }
 
     /// Expected path of the `secure_boot/` directory for a tag.
-    pub fn certs_dir(&self, tag: &str) -> PathBuf {
-        self.tag_dir(tag).join("secure_boot")
+    pub fn certs_dir(&self, image_ref: &ImageRef) -> PathBuf {
+        self.tag_dir(image_ref).join("secure_boot")
     }
 
     // ── 1. list ────────────────────────────────────────────────────
 
     /// Query remote image releases and annotate each with local status.
-    pub async fn list(&self, per_page: u32) -> Result<Vec<ReleaseStatus>> {
-        let releases = self.client.list_image_releases(per_page).await?;
-        Ok(releases.into_iter().map(|r| self.annotate(r)).collect())
+    pub async fn list(&self, repo: &str, per_page: u32) -> Result<Vec<ReleaseStatus>> {
+        let releases = self.client.list_image_releases(repo, per_page).await?;
+        Ok(releases.into_iter().map(|r| self.annotate(repo, r)).collect())
     }
 
-    /// List tags that have been downloaded locally (by scanning `base_dir`).
+    /// List images that have been downloaded locally (by scanning `base_dir`).
     ///
+    /// Scans the two-level directory structure: `base_dir/<repository>/<tag>/`
     /// Returns an empty vec if `base_dir` does not exist.
-    pub fn list_local(&self) -> Result<Vec<String>> {
+    pub fn list_local(&self) -> Result<Vec<ImageRef>> {
         if !self.base_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let mut tags = Vec::new();
-        for entry in std::fs::read_dir(&self.base_dir)
-            .context("failed to read image store directory")?
+        let mut images = Vec::new();
+
+        // Scan repository directories
+        for repo_entry in
+            std::fs::read_dir(&self.base_dir).context("failed to read image store directory")?
         {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    tags.push(name.to_string());
+            let repo_entry = repo_entry?;
+            if !repo_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(repository) = repo_entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+
+            // Scan tag directories within each repository
+            let repo_path = repo_entry.path();
+            for tag_entry in
+                std::fs::read_dir(&repo_path).context("failed to read repository directory")?
+            {
+                let tag_entry = tag_entry?;
+                if !tag_entry.file_type()?.is_dir() {
+                    continue;
                 }
+                let Some(tag) = tag_entry.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+
+                images.push(ImageRef {
+                    repository: repository.clone(),
+                    tag,
+                });
             }
         }
-        tags.sort();
-        Ok(tags)
+
+        // Sort by repository, then by tag
+        images.sort_by(|a, b| (&a.repository, &a.tag).cmp(&(&b.repository, &b.tag)));
+        Ok(images)
     }
 
     // ── 2. download ────────────────────────────────────────────────
@@ -150,11 +178,11 @@ impl ImageStore {
     /// Returns the paths to all downloaded disk image files.
     pub async fn download(
         &self,
-        tag: &str,
+        image_ref: &ImageRef,
         platforms: &[Platform],
     ) -> Result<Vec<PathBuf>> {
-        let release = self.client.get_release(tag).await?;
-        let dir = self.tag_dir(tag);
+        let release = self.client.get_release(image_ref).await?;
+        let dir = self.tag_dir(image_ref);
         let opts = DownloadOptions::default()
             .dest_dir(&dir)
             .skip_existing(true);
@@ -163,16 +191,16 @@ impl ImageStore {
         for &platform in platforms {
             let asset = release
                 .disk_image(platform)
-                .with_context(|| format!("release {tag} has no {platform} disk image"))?;
+                .with_context(|| format!("release {image_ref:?} has no {platform} disk image"))?;
 
             let path = self.client.download_asset(asset, &opts).await?;
-            info!(tag, %platform, path = %path.display(), "image ready");
+            info!(?image_ref, %platform, path = %path.display(), "image ready");
             paths.push(path);
         }
 
         // Download secure-boot certs once into a secure_boot/ subdirectory.
         if let Some(certs) = release.secure_boot_certs() {
-            let certs_dir = self.certs_dir(tag);
+            let certs_dir = self.certs_dir(image_ref);
             if !certs_dir.exists() {
                 let certs_opts = DownloadOptions::default()
                     .dest_dir(&certs_dir)
@@ -187,46 +215,46 @@ impl ImageStore {
     // ── 3. delete ──────────────────────────────────────────────────
 
     /// Delete all locally downloaded files for a release tag.
-    pub async fn delete(&self, tag: &str) -> Result<()> {
-        let dir = self.tag_dir(tag);
+    pub async fn delete(&self, image_ref: &ImageRef) -> Result<()> {
+        let dir = self.tag_dir(image_ref);
         if dir.exists() {
             tokio::fs::remove_dir_all(&dir)
                 .await
                 .with_context(|| format!("failed to remove {}", dir.display()))?;
-            info!(tag, dir = %dir.display(), "deleted local images");
+            info!(%image_ref, dir = %dir.display(), "deleted local images");
         }
         Ok(())
     }
 
     /// Delete only a specific platform's disk image for a tag.
-    pub async fn delete_platform(
-        &self,
-        tag: &str,
-        platform: Platform,
-    ) -> Result<()> {
-        let path = self.image_path(tag, platform);
+    pub async fn delete_platform(&self, image_ref: &ImageRef, platform: Platform) -> Result<()> {
+        let path = self.image_path(image_ref, platform);
         if path.exists() {
             tokio::fs::remove_file(&path)
                 .await
                 .with_context(|| format!("failed to remove {}", path.display()))?;
-            info!(tag, %platform, path = %path.display(), "deleted image");
+            info!(%image_ref, %platform, path = %path.display(), "deleted image");
         }
         Ok(())
     }
 
     // ── internal ───────────────────────────────────────────────────
 
-    fn annotate(&self, release: Release) -> ReleaseStatus {
+    fn annotate(&self, repo: &str, release: Release) -> ReleaseStatus {
         let tag = &release.tag_name;
+        let image_ref = ImageRef {
+            repository: repo.to_string(),
+            tag: tag.clone(),
+        };
 
         let mut local_platforms = Vec::new();
         for p in [Platform::Gcp, Platform::Aws, Platform::Azure] {
-            if self.image_path(tag, p).exists() {
+            if self.image_path(&image_ref, p).exists() {
                 local_platforms.push(p);
             }
         }
 
-        let local_certs = self.certs_dir(tag).exists();
+        let local_certs = self.certs_dir(&image_ref).exists();
 
         ReleaseStatus {
             release,
