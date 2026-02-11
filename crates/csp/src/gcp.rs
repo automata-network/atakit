@@ -183,7 +183,7 @@ impl ImageManager for Gcp {
         version: Option<&str>,
         force: bool,
     ) -> Result<()> {
-        let version = version.map(|n| n.replace(":", "-"));
+        let version = version.map(|n| n.replace(":", "-").replace(".", "-"));
         let version = version.as_deref();
         // Use versioned image name if version provided.
         let image_name = match version {
@@ -332,6 +332,7 @@ impl ImageManager for Gcp {
     }
 
     async fn image_exists(&self, version: Option<&str>) -> bool {
+        let version = version.map(|n| n.replace(":", "-").replace(".", "-"));
         let image_name = match version {
             Some(v) => format!("{}", v),
             None => self.image_name.clone(),
@@ -345,7 +346,12 @@ impl ImageManager for Gcp {
         .await
     }
 
-    async fn delete_image(&mut self) -> Result<()> {
+    async fn delete_image(&mut self, version: Option<&str>) -> Result<()> {
+        let version = version.map(|n| n.replace(":", "-").replace(".", "-"));
+        let image_name = match version {
+            Some(v) => format!("{}", v),
+            None => self.image_name.clone(),
+        };
         let project_flag = format!("--project={}", self.project_id);
 
         if cmd::run_cmd_silent(
@@ -354,7 +360,7 @@ impl ImageManager for Gcp {
                 "compute",
                 "images",
                 "describe",
-                &self.image_name,
+                &image_name,
                 &project_flag,
             ],
         )

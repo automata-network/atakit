@@ -189,7 +189,7 @@ impl ImageManager for Qemu {
         false
     }
 
-    async fn delete_image(&mut self) -> Result<()> {
+    async fn delete_image(&mut self, _version: Option<&str>) -> Result<()> {
         let disk_raw = self.instance_dir.join("disk.raw");
         if disk_raw.exists() {
             std::fs::remove_file(&disk_raw)

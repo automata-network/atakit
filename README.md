@@ -28,10 +28,10 @@ Atakit is a command-line tool for deploying containerized workloads to [Automata
 ```bash
 git clone https://github.com/automata-network/atakit
 cd atakit
-cargo build --release
+just install
 ```
 
-The binary will be available at `target/release/atakit`.
+The binary will be available at `atakit`.
 
 ### Prerequisites
 
@@ -78,7 +78,7 @@ Create an `atakit.json` configuration file in your project directory:
     ],
     "deployment": {
         "my-deployment": {
-            "workload": "my-workload",
+            "workload": "my-workload-tdx",
             "platforms": {
                 "gcp": { "vmtype": "c3-standard-4" }
             }
@@ -98,6 +98,7 @@ services:
       - "8080:8080"
     volumes:
       - ./config:/app/config:ro
+      - ./cvm-agent.sock:/app/cvm-agent.sock
       - app-data:/data
 
 volumes:
@@ -130,11 +131,16 @@ This creates a `.tar.gz` package containing:
 
 ### 4. Publish the Workload
 
+Check the SessionRegistry Address
+```bash
+atakit registry ls
+```
+
 ```bash
 atakit workload publish my-workload \
   --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY \
-  --session-registry $REGISTRY_ADDRESS
+  --owner-private-key $PRIVATE_KEY \
+  --session-registry $SESSION_REGISTRY
 ```
 
 ### 5. Deploy
@@ -147,79 +153,10 @@ atakit deploy my-deployment --platform gcp
 atakit deploy my-deployment --qemu
 ```
 
-## Commands
-
-### `atakit image`
-
-Manage CVM base images.
+### 6. Check log
 
 ```bash
-atakit image ls              # List available releases
-atakit image pull <image>  # Download a base image
-atakit image rm <image>    # Remove a downloaded image
-```
-
-### `atakit workload build`
-
-Build a workload package from Docker Compose definitions.
-
-```bash
-atakit workload build [DEPLOYMENTS...] [OPTIONS]
-
-Options:
-  --image-mode <MODE>  Image handling: bundle (include images) or pull (fetch at runtime)
-```
-
-### `atakit deploy`
-
-Deploy a CVM instance.
-
-```bash
-atakit deploy <deployment-name> [OPTIONS]
-
-Options:
-  --platform <PLATFORM>  Target platform (gcp, azure)
-  --qemu                 Deploy locally using QEMU
-  --image <VERSION>      Override base image version
-  --workload <PATH>      Path to workload package
-  --private-key <KEY>    Operator private key for signing
-  --quiet                Skip confirmation prompts
-```
-
-### `atakit registry`
-
-Manage smart contract registry information.
-
-```bash
-atakit registry ls       # List contract addresses
-atakit registry pull     # Pull deployment files from remote
-atakit registry switch   # Switch between registry branches
-```
-
-### `atakit workload measure`
-
-Measure a workload package and output event logs for PCR23 extension.
-
-```bash
-atakit workload measure <package.tar.gz> [OPTIONS]
-
-Options:
-  --format <FORMAT>  Output format: text or json
-```
-
-### `atakit workload publish`
-
-Register a workload on-chain.
-
-```bash
-atakit workload publish <workload-name> [OPTIONS]
-
-Options:
-  --ttl <SECONDS>           Session time-to-live
-  --private-key <KEY>       Signing key
-  --rpc-url <URL>           Blockchain RPC endpoint
-  --session-registry <ADDR> WorkloadRegistry contract address
-  --dry-run                 Simulate without submitting
+gcloud compute instances get-serial-port-output ${instance_name} --zone=${zone}
 ```
 
 ## Configuration
@@ -289,6 +226,118 @@ volumes:
   app-data:
 ```
 
+### CVM Agent API
+
+Inside the CVM, workloads can access the CVM agent via a Unix socket at `/app/cvm-agent.sock`. The agent provides cryptographic signing and key management APIs.
+
+**Socket Access with curl:**
+
+```bash
+curl --unix-socket /app/cvm-agent.sock http://localhost/<endpoint>
+```
+
+#### POST /sign-message
+
+Sign an arbitrary message using the session key. Returns a secp256k1 signature along with session metadata.
+
+**Request:**
+
+```json
+{
+  "message": "0x48656c6c6f"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | hex string | Message bytes to sign (hex-encoded with `0x` prefix) |
+
+**Response:**
+
+```json
+{
+  "signature": "0x...",
+  "sessionId": "0x...",
+  "sessionKeyPublic": {
+    "typeId": 3,
+    "key": "0x..."
+  },
+  "sessionKeyFingerprint": "0x...",
+  "ownerKeyPublic": {
+    "typeId": 3,
+    "key": "0x..."
+  },
+  "ownerFingerprint": "0x...",
+  "workloadId": "0x...",
+  "baseImageId": "0x..."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `signature` | hex string | secp256k1 signature (65 bytes: r \|\| s \|\| v) |
+| `sessionId` | bytes32 | Current session ID |
+| `sessionKeyPublic.typeId` | uint8 | Key type: 2=P-256, 3=secp256k1 |
+| `sessionKeyPublic.key` | hex string | Public key bytes |
+| `sessionKeyFingerprint` | bytes32 | Session key fingerprint |
+| `ownerKeyPublic` | object | Owner key public identity |
+| `ownerFingerprint` | bytes32 | Owner identity fingerprint |
+| `workloadId` | bytes32 | Workload ID |
+| `baseImageId` | bytes32 | Base image ID |
+
+**Example:**
+
+```bash
+# Sign a message (hex-encoded "Hello")
+curl --unix-socket /app/cvm-agent.sock \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"message": "0x48656c6c6f"}' \
+  http://localhost/sign-message
+```
+
+#### POST /rotate-key
+
+Rotate the session key and register the new key on-chain. This generates a new session keypair and submits a transaction to update the session registry.
+
+**Request:**
+
+```json
+{}
+```
+
+**Response:**
+
+```json
+{
+  "sessionId": "0x...",
+  "sessionKeyFingerprint": "0x...",
+  "sessionKeyPublic": {
+    "typeId": 3,
+    "key": "0x..."
+  },
+  "txHash": "0x..."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sessionId` | bytes32 | New session ID after rotation |
+| `sessionKeyFingerprint` | bytes32 | New session key fingerprint |
+| `sessionKeyPublic` | object | New session key public identity |
+| `txHash` | bytes32 | On-chain transaction hash |
+
+**Example:**
+
+```bash
+# Rotate the session key
+curl --unix-socket /app/cvm-agent.sock \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost/rotate-key
+```
+
 ### Directory Structure
 
 Workloads use a standard directory layout:
@@ -319,15 +368,6 @@ cargo build
 
 # Release build
 cargo build --release
-
-# With internal commands
-cargo build --features internal
-```
-
-### Running Tests
-
-```bash
-cargo test
 ```
 
 ### Local QEMU Testing

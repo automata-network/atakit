@@ -18,6 +18,32 @@ pub fn to_yaml(compose: &WorkloadCompose) -> anyhow::Result<String> {
     serde_yaml::to_string(&output).map_err(|e| anyhow::anyhow!("Failed to serialize compose: {e}"))
 }
 
+/// Validate that a docker-compose YAML string is already normalized.
+///
+/// A normalized compose file:
+/// - Parses without errors
+/// - When re-serialized, produces identical output
+///
+/// Returns `Ok(())` if normalized, or an error describing the difference.
+pub fn validate_normalized(yaml: &str) -> anyhow::Result<()> {
+    // Parse the input
+    let compose = crate::from_yaml_str(yaml)?;
+
+    // Re-serialize
+    let reserialized = to_yaml(&compose)?;
+
+    // Compare
+    if yaml.trim() == reserialized.trim() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Compose file is not normalized.\n\nExpected:\n{}\n\nGot:\n{}",
+            reserialized.trim(),
+            yaml.trim()
+        )
+    }
+}
+
 /// Generate an isolated docker-compose YAML for a single service.
 ///
 /// The output is normalized:
@@ -261,6 +287,44 @@ fn restart_to_string(restart: &WorkloadRestart) -> String {
     }
 }
 
+/// Extract the image name and tag from a full image reference, stripping
+/// any registry or namespace prefix.
+///
+/// Examples:
+/// - `ghcr.io/org/myapp:v1` -> `myapp:v1`
+/// - `docker.io/library/nginx:latest` -> `nginx:latest`
+/// - `docker.io/user/image:tag` -> `image:tag`
+/// - `myapp:v1` -> `myapp:v1`
+/// - `user/myapp:v1` -> `myapp:v1`
+pub fn extract_image_name_tag(image: &str) -> &str {
+    if image.is_empty() {
+        return image;
+    }
+
+    // Find the tag separator position (last colon that's not part of a port)
+    // We need to be careful: registry:port/image:tag
+    let tag_start = image.rfind(':').filter(|&pos| {
+        // Make sure this colon is after any slash (i.e., it's the tag separator)
+        image[pos..].chars().all(|c| c != '/')
+    });
+
+    // Get the part before the tag (or the whole string if no tag)
+    let name_part = match tag_start {
+        Some(pos) => &image[..pos],
+        None => image,
+    };
+
+    // Find the last slash to get just the image name
+    let name = match name_part.rfind('/') {
+        Some(pos) => &name_part[pos + 1..],
+        None => name_part,
+    };
+
+    // Return name + tag
+    let start = name.as_ptr() as usize - image.as_ptr() as usize;
+    &image[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +548,43 @@ volumes:
             value: None,
         };
         assert_eq!(env_var_to_string(&env), "BAZ");
+    }
+
+    #[test]
+    fn test_extract_image_name_tag() {
+        // Full registry path
+        assert_eq!(
+            extract_image_name_tag("ghcr.io/org/myapp:v1"),
+            "myapp:v1"
+        );
+        // Docker Hub official image
+        assert_eq!(
+            extract_image_name_tag("docker.io/library/nginx:latest"),
+            "nginx:latest"
+        );
+        // Docker Hub user image
+        assert_eq!(
+            extract_image_name_tag("docker.io/user/image:tag"),
+            "image:tag"
+        );
+        // Simple image with tag
+        assert_eq!(extract_image_name_tag("myapp:v1"), "myapp:v1");
+        // User/namespace image
+        assert_eq!(extract_image_name_tag("user/myapp:v1"), "myapp:v1");
+        // Registry with port
+        assert_eq!(
+            extract_image_name_tag("registry:5000/myapp:v1"),
+            "myapp:v1"
+        );
+        // No tag
+        assert_eq!(extract_image_name_tag("myapp"), "myapp");
+        assert_eq!(extract_image_name_tag("ghcr.io/org/myapp"), "myapp");
+        // Empty
+        assert_eq!(extract_image_name_tag(""), "");
+        // Deep path
+        assert_eq!(
+            extract_image_name_tag("ghcr.io/org/sub/deep/myapp:v1"),
+            "myapp:v1"
+        );
     }
 }

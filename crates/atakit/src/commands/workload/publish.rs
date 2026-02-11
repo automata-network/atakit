@@ -8,7 +8,8 @@ use automata_tee_workload_measurement::{WorkloadMeasurement, WorkloadMeasurement
 use clap::Parser;
 use tracing::info;
 
-use automata_tee_workload_measurement::stubs::WorkloadRegistry::WorkloadSpec;
+use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
+use workload_compose::measure::measure_package;
 
 use crate::Env;
 use crate::types::AtakitConfig;
@@ -44,7 +45,7 @@ pub struct PublishWorkload {
 }
 
 impl PublishWorkload {
-    pub async fn run(self, _env: &Env) -> Result<()> {
+    pub async fn run(self, env: &Env) -> Result<()> {
         // Load atakit.json to verify workload exists
         let config = AtakitConfig::load()?;
 
@@ -77,6 +78,14 @@ impl PublishWorkload {
         let base_image_ref = AppRef::new(&workload.image.repository, &workload.image.tag);
         let base_image_id = base_image_ref.id("CVM_BASEIMAGE_V1");
 
+        let measurement = measure_package(env.workload_package(workload))?;
+
+        let pcrs = vec![PcrSpec {
+            pcrIndex: 23,
+            verifyType: 0,
+            matchData: vec![measurement.pcr_value()],
+        }];
+
         // Build WorkloadSpec
         let spec = WorkloadSpec {
             name: workload.name.clone(),
@@ -85,7 +94,7 @@ impl PublishWorkload {
             baseImageMode: 2, // AccessMode::WHITELIST
             baseImageIds: vec![base_image_id],
             requirements: vec![],
-            pcrs: vec![],
+            pcrs,
         };
 
         // Print summary
@@ -95,6 +104,7 @@ impl PublishWorkload {
         println!("Base Image ID: {}", base_image_id);
 
         if self.dry_run {
+            dbg!(&spec);
             println!();
             println!("Dry run mode - not submitting transaction");
             return Ok(());

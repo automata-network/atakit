@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::instances::InstanceStore;
 use crate::registry::RegistryStore;
-use crate::types::AtakitConfig;
+use crate::types::{AtakitConfig, WorkloadDef};
 
 const CONFIG_FILENAME: &str = "atakit.json";
 
@@ -74,6 +74,12 @@ impl Env {
     /// Path to the OVMF firmware file (`~/.atakit/qemu/ovmf.fd`).
     pub fn ovmf_path(&self) -> PathBuf {
         self.qemu_dir().join("ovmf.fd")
+    }
+
+    pub fn workload_package(&self, workload: &WorkloadDef) -> PathBuf {
+        self.project_artifact_dir
+            .join(&workload.name)
+            .join(workload.package_name())
     }
 
     /// Ensure OVMF firmware is extracted to `~/.atakit/qemu/ovmf.fd`.

@@ -13,32 +13,37 @@
 //! IMPORTANT: All outputs are deterministic - services are processed in
 //! docker-compose file order, and files within directories are sorted.
 //!
-//! The measure function automatically skips:
+//! The measure function automatically skips measurement of:
 //! - manifest.json itself
 //! - Docker image tars referenced in manifest.json (docker_images[].image_tar)
 //! - Additional data files listed in manifest.json (additional_data_files)
-//! - Any files in config.skip_files
+//! - Any files matching config.skip_files (exact path or directory prefix)
+//!
+//! Files in skip_files are excluded from measurement even if referenced by
+//! docker-compose bind mounts or env_file directives.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alloy::primitives::{B256, keccak256};
 use anyhow::{Context, bail};
+use flate2::read::GzDecoder;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
 use thiserror::Error;
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::serialize::service_to_yaml;
 use crate::types::{WorkloadCompose, WorkloadService, WorkloadVolumeMount};
-use crate::{WorkloadManifest, from_yaml_str};
+use crate::{WorkloadManifest, from_yaml_str, validate_normalized};
 
 /// Configuration for workload measurement.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MeasureConfig {
     /// Additional files to skip during measurement (relative paths from workload folder).
     /// Note: manifest.json, image tars, and additional_data_files from manifest are auto-skipped.
@@ -155,6 +160,9 @@ pub enum MeasureError {
 
     #[error("Failed to parse compose file: {0}")]
     ParseCompose(#[source] anyhow::Error),
+
+    #[error("Failed to validate compose file: {0}")]
+    ValidateCompose(#[source] anyhow::Error),
 
     #[error("Service '{service}' is missing image digest in config")]
     MissingImageDigest { service: String },
@@ -300,6 +308,48 @@ struct OciPlatform {
     os: String,
 }
 
+pub fn measure_package(package_path: PathBuf) -> anyhow::Result<WorkloadMeasurement> {
+    // Create a temporary directory for extraction
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let extract_path = temp_dir.path();
+
+    // Extract the tar.gz
+    extract_tar_gz(&package_path, extract_path)?;
+
+    info!(package = %package_path.display(), "Extracting workload package");
+
+    // Read the manifest.json
+    let manifest_path = extract_path.join("manifest.json");
+    let manifest = WorkloadManifest::from_file(&manifest_path)?;
+
+    info!(workload = %manifest.name, "Loaded manifest");
+
+    // Extract image digests using workload-compose helper
+    let image_digests = manifest.extract_image_digests(extract_path)?;
+
+    let mut config = MeasureConfig::cvm();
+    config.image_digests = image_digests;
+
+    let measurement = measure(extract_path, &manifest.docker_compose, config)
+        .map_err(|e| anyhow::anyhow!("Measurement failed: {}", e))?;
+
+    Ok(measurement)
+}
+
+/// Extract a tar.gz archive to the specified directory.
+fn extract_tar_gz(archive_path: &Path, dest: &Path) -> anyhow::Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open {}", archive_path.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    archive
+        .unpack(dest)
+        .with_context(|| format!("Failed to extract {}", archive_path.display()))?;
+
+    Ok(())
+}
+
 /// Measure a workload folder and return measurement results.
 ///
 /// # Arguments
@@ -322,7 +372,7 @@ struct OciPlatform {
 pub fn measure(
     workload_folder: &Path,
     compose_file: &str,
-    config: &MeasureConfig,
+    mut config: MeasureConfig,
 ) -> Result<WorkloadMeasurement, MeasureError> {
     // 1. Read and parse manifest.json (required)
     let manifest_path = workload_folder.join("manifest.json");
@@ -338,6 +388,8 @@ pub fn measure(
         std::fs::read_to_string(&compose_path).map_err(MeasureError::ReadCompose)?;
     let compose = from_yaml_str(&compose_content).map_err(MeasureError::ParseCompose)?;
 
+    validate_normalized(&compose_content).map_err(MeasureError::ValidateCompose)?;
+
     // 3. Enumerate all files in the workload folder
     let all_files = enumerate_files(workload_folder)?;
 
@@ -348,16 +400,16 @@ pub fn measure(
     used_files.insert(compose_file.to_string());
     used_files.insert("manifest.json".to_string());
 
-    // Auto-skip docker image tars from manifest
+    // Auto-skip docker image tars from manifest (both mark as used and add to skip_files)
     for img in &manifest.docker_images {
         if let Some(tar_name) = &img.image_tar {
-            used_files.insert(tar_name.clone());
+            config.skip_files.insert(normalize_path(&tar_name));
         }
     }
 
-    // Auto-skip additional data files from manifest
+    // Auto-skip additional data files from manifest (both mark as used and add to skip_files)
     for file in &manifest.additional_data_files {
-        used_files.insert(file.clone());
+        config.skip_files.insert(normalize_path(&file));
     }
 
     // Add user-provided skip_files to used set
@@ -374,7 +426,7 @@ pub fn measure(
             service_name,
             service,
             &compose,
-            config,
+            &config,
             &mut used_files,
         )?;
         services.push(measurement);
@@ -399,6 +451,26 @@ pub fn measure(
     })
 }
 
+/// Check if a path should be skipped from measurement.
+fn should_skip(path: &str, skip_files: &HashSet<String>) -> bool {
+    // Exact match
+    if skip_files.contains(path) {
+        return true;
+    }
+    // Check if path is under a skipped directory
+    for skip in skip_files {
+        let skip_dir = if skip.ends_with('/') {
+            skip.clone()
+        } else {
+            format!("{}/", skip)
+        };
+        if path.starts_with(&skip_dir) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Measure a single service.
 fn measure_service(
     workload_folder: &Path,
@@ -409,12 +481,13 @@ fn measure_service(
     used_files: &mut HashSet<String>,
 ) -> Result<ServiceMeasurement, MeasureError> {
     // Get image digest from config - must start with "sha256:", then strip prefix
-    let raw_digest = config
-        .image_digests
-        .get(service_name)
-        .ok_or_else(|| MeasureError::MissingImageDigest {
-            service: service_name.to_string(),
-        })?;
+    let raw_digest =
+        config
+            .image_digests
+            .get(service_name)
+            .ok_or_else(|| MeasureError::MissingImageDigest {
+                service: service_name.to_string(),
+            })?;
     let image_digest = raw_digest
         .strip_prefix("sha256:")
         .ok_or_else(|| MeasureError::InvalidImageDigest {
@@ -435,7 +508,11 @@ fn measure_service(
                 let abs_path = workload_folder.join(&normalized);
 
                 if abs_path.is_file() {
-                    // Single file mount
+                    // Single file mount - skip if in skip_files
+                    if should_skip(&normalized, &config.skip_files) {
+                        used_files.insert(normalized);
+                        continue;
+                    }
                     let hash = hash_file(&abs_path)?;
                     mount_files.push(MountedFile {
                         path: normalized.clone(),
@@ -448,6 +525,11 @@ fn measure_service(
                     files.sort(); // Sort by path for deterministic ordering
 
                     for rel_path in files {
+                        // Skip files in skip_files
+                        if should_skip(&rel_path, &config.skip_files) {
+                            used_files.insert(rel_path);
+                            continue;
+                        }
                         let abs_file = workload_folder.join(&rel_path);
                         let hash = hash_file(&abs_file)?;
                         mount_files.push(MountedFile {
@@ -471,6 +553,11 @@ fn measure_service(
         let abs_path = workload_folder.join(&normalized);
 
         if abs_path.is_file() {
+            // Skip if in skip_files
+            if should_skip(&normalized, &config.skip_files) {
+                used_files.insert(normalized);
+                continue;
+            }
             let hash = hash_file(&abs_path)?;
             mount_files.push(MountedFile {
                 path: normalized.clone(),
@@ -574,12 +661,18 @@ mod tests {
         // Write docker-compose.yml
         fs::write(workload_path.join("docker-compose.yml"), compose_content).unwrap();
 
-        // Write a minimal manifest.json
-        fs::write(
-            workload_path.join("manifest.json"),
-            r#"{"name":"test","docker_compose":"docker-compose.yml","docker_images":[]}"#,
-        )
-        .unwrap();
+        // Write a minimal manifest.json with all required fields
+        let manifest = r#"{
+            "name": "test:v1.0.0",
+            "docker_compose": "docker-compose.yml",
+            "image": "test:v1.0.0",
+            "measured_files": [],
+            "additional_data_files": [],
+            "docker_images": [],
+            "enable_cvm_agent": [],
+            "atakit_version": "0.1.0"
+        }"#;
+        fs::write(workload_path.join("manifest.json"), manifest).unwrap();
 
         // Create additional files
         for (path, content) in files {
@@ -617,12 +710,11 @@ mod tests {
 
     #[test]
     fn test_measure_basic() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+    - ./config.yaml:/app/config.yaml:ro
 "#;
         let (_dir, workload_path) = create_test_workload(compose, &[("config.yaml", "key: value")]);
 
@@ -631,7 +723,7 @@ services:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
 
         // Check manifest is included
         assert!(!result.manifest.is_empty());
@@ -640,24 +732,28 @@ services:
         assert_eq!(result.services.len(), 1);
         let svc = &result.services[0];
         assert_eq!(svc.service_name, "app");
-        assert_eq!(svc.image_digest, "sha256:abc123");
+        assert_eq!(svc.image_digest, "abc123"); // sha256: prefix is stripped
         assert_eq!(svc.mount_files.len(), 1);
         assert_eq!(svc.mount_files[0].path, "config.yaml");
     }
 
     #[test]
     fn test_measure_auto_skip_image_tar() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
 "#;
         let manifest = r#"{
-            "name": "test",
+            "name": "test:v1.0.0",
             "docker_compose": "docker-compose.yml",
+            "image": "test:v1.0.0",
+            "measured_files": [],
+            "additional_data_files": [],
             "docker_images": [
-                {"service": "app", "image_tar": "app-image.tar"}
-            ]
+                {"service": "app", "image_tag": "myapp:latest", "image_tar": "app-image.tar"}
+            ],
+            "enable_cvm_agent": [],
+            "atakit_version": "0.1.0"
         }"#;
 
         let (_dir, workload_path) = create_test_workload_with_manifest(
@@ -672,22 +768,25 @@ services:
             .insert("app".to_string(), "sha256:abc123".to_string());
 
         // Should succeed - app-image.tar is auto-skipped
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
         assert_eq!(result.services.len(), 1);
     }
 
     #[test]
     fn test_measure_auto_skip_additional_data() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
 "#;
         let manifest = r#"{
-            "name": "test",
+            "name": "test:v1.0.0",
             "docker_compose": "docker-compose.yml",
+            "image": "test:v1.0.0",
+            "measured_files": [],
+            "additional_data_files": ["secrets/key.pem", "data/config.json"],
             "docker_images": [],
-            "additional_data_files": ["secrets/key.pem", "data/config.json"]
+            "enable_cvm_agent": [],
+            "atakit_version": "0.1.0"
         }"#;
 
         let (_dir, workload_path) = create_test_workload_with_manifest(
@@ -705,18 +804,17 @@ services:
             .insert("app".to_string(), "sha256:abc123".to_string());
 
         // Should succeed - additional_data_files are auto-skipped
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
         assert_eq!(result.services.len(), 1);
     }
 
     #[test]
     fn test_measure_with_env_file() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
     env_file:
-      - .env
+    - .env
 "#;
         let (_dir, workload_path) = create_test_workload(compose, &[(".env", "FOO=bar")]);
 
@@ -725,7 +823,7 @@ services:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
 
         assert_eq!(result.services.len(), 1);
         let svc = &result.services[0];
@@ -735,12 +833,11 @@ services:
 
     #[test]
     fn test_measure_directory_mount_deterministic_order() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
     volumes:
-      - ./config:/app/config:ro
+    - ./config:/app/config:ro
 "#;
         let (_dir, workload_path) = create_test_workload(
             compose,
@@ -758,8 +855,8 @@ services:
             .insert("app".to_string(), "sha256:abc123".to_string());
 
         // Run twice to verify deterministic ordering
-        let result1 = measure(&workload_path, "docker-compose.yml", &config).unwrap();
-        let result2 = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result1 = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
+        let result2 = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
 
         let svc1 = &result1.services[0];
         let svc2 = &result2.services[0];
@@ -782,14 +879,13 @@ services:
 
     #[test]
     fn test_measure_service_order_preserved() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   web:
-    image: nginx:latest
+    image: docker.io/library/nginx:latest
   api:
-    image: api:latest
+    image: docker.io/library/api:latest
   db:
-    image: postgres:latest
+    image: docker.io/library/postgres:latest
 "#;
         let (_dir, workload_path) = create_test_workload(compose, &[]);
 
@@ -804,7 +900,7 @@ services:
             .image_digests
             .insert("db".to_string(), "sha256:db".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
 
         assert_eq!(result.services.len(), 3);
         // Services should be in docker-compose order
@@ -815,10 +911,9 @@ services:
 
     #[test]
     fn test_measure_unused_file_error() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
 "#;
         let (_dir, workload_path) =
             create_test_workload(compose, &[("unused.txt", "should not be here")]);
@@ -828,7 +923,7 @@ services:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config);
+        let result = measure(&workload_path, "docker-compose.yml", config.clone());
 
         assert!(result.is_err());
         match result {
@@ -841,10 +936,9 @@ services:
 
     #[test]
     fn test_measure_skip_files() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
 "#;
         let (_dir, workload_path) =
             create_test_workload(compose, &[("readme.md", "documentation")]);
@@ -855,23 +949,92 @@ services:
             .insert("app".to_string(), "sha256:abc123".to_string());
         config.skip_files.insert("readme.md".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
         assert_eq!(result.services.len(), 1);
     }
 
     #[test]
-    fn test_measure_missing_image_digest() {
-        let compose = r#"
-services:
+    fn test_skip_files_excludes_from_measurement() {
+        // Test that skip_files excludes files from measurement even when
+        // they are referenced by docker-compose bind mounts
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
+    env_file:
+    - .env
+    volumes:
+    - ./config:/app/config:ro
+"#;
+        let (_dir, workload_path) = create_test_workload(
+            compose,
+            &[
+                ("config/app.yaml", "key: value"),
+                ("config/secret.yaml", "password: secret"),
+                (".env", "FOO=bar"),
+            ],
+        );
+
+        let mut config = MeasureConfig::default();
+        config
+            .image_digests
+            .insert("app".to_string(), "sha256:abc123".to_string());
+        // Skip specific file and env_file
+        config.skip_files.insert("config/secret.yaml".to_string());
+        config.skip_files.insert(".env".to_string());
+
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
+
+        let svc = &result.services[0];
+        // Only config/app.yaml should be measured (secret.yaml and .env are skipped)
+        assert_eq!(svc.mount_files.len(), 1);
+        assert_eq!(svc.mount_files[0].path, "config/app.yaml");
+    }
+
+    #[test]
+    fn test_skip_files_directory_prefix() {
+        // Test that skip_files can skip entire directories
+        let compose = r#"services:
+  app:
+    image: docker.io/library/myapp:latest
+    volumes:
+    - ./config:/app/config:ro
+"#;
+        let (_dir, workload_path) = create_test_workload(
+            compose,
+            &[
+                ("config/app.yaml", "key: value"),
+                ("config/secrets/key.pem", "secret key"),
+                ("config/secrets/cert.pem", "cert"),
+            ],
+        );
+
+        let mut config = MeasureConfig::default();
+        config
+            .image_digests
+            .insert("app".to_string(), "sha256:abc123".to_string());
+        // Skip entire secrets directory
+        config.skip_files.insert("config/secrets".to_string());
+
+        let result = measure(&workload_path, "docker-compose.yml", config).unwrap();
+
+        let svc = &result.services[0];
+        // Only config/app.yaml should be measured
+        assert_eq!(svc.mount_files.len(), 1);
+        assert_eq!(svc.mount_files[0].path, "config/app.yaml");
+    }
+
+    #[test]
+    fn test_measure_missing_image_digest() {
+        let compose = r#"services:
+  app:
+    image: docker.io/library/myapp:latest
 "#;
         let (_dir, workload_path) = create_test_workload(compose, &[]);
 
         let config = MeasureConfig::default();
         // No image digest provided
 
-        let result = measure(&workload_path, "docker-compose.yml", &config);
+        let result = measure(&workload_path, "docker-compose.yml", config);
 
         assert!(result.is_err());
         match result {
@@ -890,7 +1053,7 @@ services:
         // Only create docker-compose.yml, no manifest.json
         fs::write(
             workload_path.join("docker-compose.yml"),
-            "services:\n  app:\n    image: test\n",
+            "services:\n  app:\n    image: docker.io/library/test:latest\n",
         )
         .unwrap();
 
@@ -899,22 +1062,22 @@ services:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(workload_path, "docker-compose.yml", &config);
+        let result = measure(workload_path, "docker-compose.yml", config);
 
         assert!(result.is_err());
-        assert!(matches!(result, Err(MeasureError::ReadManifest(_))));
+        // ParseManifest wraps the io error when file doesn't exist
+        assert!(matches!(result, Err(MeasureError::ParseManifest(_))));
     }
 
     #[test]
     fn test_measure_with_named_volumes() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
+    image: docker.io/library/myapp:latest
     volumes:
-      - app-data:/data
+    - app-data:/data
 volumes:
-  app-data:
+  app-data: null
 "#;
         let (_dir, workload_path) = create_test_workload(compose, &[]);
 
@@ -923,7 +1086,7 @@ volumes:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
 
         assert_eq!(result.services.len(), 1);
         let svc = &result.services[0];
@@ -957,13 +1120,12 @@ volumes:
 
     #[test]
     fn test_isolated_compose_output() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
-    restart: always
+    image: docker.io/library/myapp:latest
     volumes:
-      - ./config:/app/config:ro
+    - ./config:/app/config:ro
+    restart: always
 "#;
         let (_dir, workload_path) =
             create_test_workload(compose, &[("config/app.yaml", "key: value")]);
@@ -973,7 +1135,7 @@ services:
             .image_digests
             .insert("app".to_string(), "sha256:abc123".to_string());
 
-        let result = measure(&workload_path, "docker-compose.yml", &config).unwrap();
+        let result = measure(&workload_path, "docker-compose.yml", config.clone()).unwrap();
         let svc = &result.services[0];
 
         // Verify the isolated compose has expected structure
@@ -991,15 +1153,14 @@ services:
 
     #[test]
     fn test_deterministic_output() {
-        let compose = r#"
-services:
+        let compose = r#"services:
   app:
-    image: myapp:latest
-    volumes:
-      - ./config:/app/config:ro
-      - ./data:/app/data:ro
+    image: docker.io/library/myapp:latest
     env_file:
-      - .env
+    - .env
+    volumes:
+    - ./config:/app/config:ro
+    - ./data:/app/data:ro
 "#;
         let (_dir, workload_path) = create_test_workload(
             compose,
@@ -1018,7 +1179,7 @@ services:
 
         // Run multiple times
         let results: Vec<_> = (0..5)
-            .map(|_| measure(&workload_path, "docker-compose.yml", &config).unwrap())
+            .map(|_| measure(&workload_path, "docker-compose.yml", config.clone()).unwrap())
             .collect();
 
         // All runs should produce identical results

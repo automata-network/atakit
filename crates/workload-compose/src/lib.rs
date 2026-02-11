@@ -11,7 +11,9 @@ pub use measure::{
     MeasureConfig, MeasureError, MountedFile, ServiceMeasurement, WorkloadMeasurement,
     get_digest_from_docker_tar, measure,
 };
-pub use serialize::{resolve_image_short_name, service_to_yaml, to_yaml};
+pub use serialize::{
+    extract_image_name_tag, resolve_image_short_name, service_to_yaml, to_yaml, validate_normalized,
+};
 pub use summarize::{ComposeAnalysis, analyze};
 pub use types::*;
 

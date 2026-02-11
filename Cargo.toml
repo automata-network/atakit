@@ -22,8 +22,8 @@ automata-linux-release = { path = "crates/automata-linux-release" }
 csp = { path = "crates/csp" }
 cvm-agent = { path = "crates/cvm-agent" }
 workload-compose = { path = "crates/workload-compose" }
-#automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
-automata-tee-workload-measurement = { path = "../tee-workload-attestation/crates/automata-tee-workload-measurement/" }
+automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
+#automata-tee-workload-measurement = { path = "../tee-workload-attestation/crates/automata-tee-workload-measurement/" }
 
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
@@ -50,3 +50,4 @@ k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 sha3 = "0.10"
 hex = "0.4"
 alloy = { git = "https://github.com/automata-network/alloy-ext.git", package = "alloy-ext" }
+tempfile = "3"
