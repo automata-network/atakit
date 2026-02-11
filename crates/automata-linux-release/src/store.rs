@@ -100,7 +100,9 @@ impl ImageStore {
     /// Structure: `base_dir/<repository>/<tag>/`
     /// e.g. `base_dir/automata-linux/v0.5.0/`
     pub fn tag_dir(&self, image_ref: &ImageRef) -> PathBuf {
-        self.base_dir.join(&image_ref.repository).join(&image_ref.tag)
+        self.base_dir
+            .join(&image_ref.repository)
+            .join(&image_ref.tag)
     }
 
     /// Expected path of a disk image file (after decompression).
@@ -118,7 +120,10 @@ impl ImageStore {
     /// Query remote image releases and annotate each with local status.
     pub async fn list(&self, repo: &str, per_page: u32) -> Result<Vec<ReleaseStatus>> {
         let releases = self.client.list_image_releases(repo, per_page).await?;
-        Ok(releases.into_iter().map(|r| self.annotate(repo, r)).collect())
+        Ok(releases
+            .into_iter()
+            .map(|r| self.annotate(repo, r))
+            .collect())
     }
 
     /// List images that have been downloaded locally (by scanning `base_dir`).
@@ -201,12 +206,10 @@ impl ImageStore {
         // Download secure-boot certs once into a secure_boot/ subdirectory.
         if let Some(certs) = release.secure_boot_certs() {
             let certs_dir = self.certs_dir(image_ref);
-            if !certs_dir.exists() {
-                let certs_opts = DownloadOptions::default()
-                    .dest_dir(&certs_dir)
-                    .skip_existing(true);
-                self.client.download_asset(certs, &certs_opts).await?;
-            }
+            let certs_opts = DownloadOptions::default()
+                .dest_dir(&certs_dir)
+                .skip_existing(false);
+            self.client.download_asset(certs, &certs_opts).await?;
         }
 
         Ok(paths)

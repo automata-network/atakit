@@ -37,9 +37,9 @@ pub struct Deploy {
     pub image: Option<ImageRef>,
 
     /// Path to workload package (tar.gz) for initialization.
-    /// Defaults to ata_artifacts/{target}.tar.gz
+    /// Overrides deployment.json workload_path if provided.
     #[arg(long)]
-    pub workload: Option<PathBuf>,
+    pub workload_path: Option<PathBuf>,
 
     /// Skip confirmation prompts
     #[arg(long)]
@@ -48,11 +48,6 @@ pub struct Deploy {
     /// Use local QEMU instead of cloud provider
     #[arg(long)]
     pub qemu: bool,
-
-    /// Operator private key for signing init requests (hex encoded).
-    /// Can also be set via ATAKIT_PRIVATE_KEY environment variable.
-    #[arg(long, env = "ATAKIT_PRIVATE_KEY")]
-    pub private_key: Option<B256>,
 
     /// Force re-upload disk image even if it already exists.
     /// Deletes the existing image before uploading.
@@ -83,17 +78,7 @@ pub struct Deploy {
     /// Owner private key for session registration (hex encoded).
     /// Overrides config value if provided.
     #[arg(long, env = "ATAKIT_OWNER_PRIVATE_KEY")]
-    pub owner_private_key: Option<B256>,
-
-    /// Base image reference (e.g., "ata/tee-base-image:v1").
-    /// Overrides config value if provided.
-    #[arg(long)]
-    pub base_image_ref: Option<ImageRef>,
-
-    /// Workload reference (e.g., "ata/secure-signer:v1").
-    /// Overrides config value if provided.
-    #[arg(long)]
-    pub workload_ref: Option<ImageRef>,
+    pub owner_private_key: B256,
 
     /// Session expiration offset in seconds (default: 3600).
     /// Overrides config value if provided.
@@ -103,16 +88,21 @@ pub struct Deploy {
 
 impl Deploy {
     pub async fn run(mut self, ctx: &Env) -> Result<()> {
-        // Private key is required for operator authentication
-        let private_key = self.private_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Operator private key is required.\n\
-                 Provide --private-key or set ATAKIT_PRIVATE_KEY environment variable."
-            )
-        })?;
+        // Validate: rpc_url, session_registry, and relay_private_key must be provided together or not at all
+        let blockchain_opts = [
+            self.rpc_url.is_some(),
+            self.session_registry.is_some(),
+            self.relay_private_key.is_some(),
+        ];
+        let provided_count = blockchain_opts.iter().filter(|&&b| b).count();
+        if provided_count > 0 && provided_count < blockchain_opts.len() {
+            anyhow::bail!(
+                "--rpc-url, --session-registry, and --relay-private-key must all be provided together or not at all"
+            );
+        }
 
         // Derive operator address for VM metadata
-        let operator_address = derive_operator_address(private_key)?;
+        let operator_address = derive_operator_address(self.owner_private_key)?;
         info!(address = %operator_address, "Derived operator address");
 
         let (mut deploy_config, paths, config_dir) = self.resolve_config(ctx).await?;
@@ -178,7 +168,7 @@ impl Deploy {
                     agent_env_clone,
                     None, // qemu_platform_response
                     additional_files_clone,
-                    Some(private_key),
+                    Some(self.owner_private_key),
                     token,
                 )
                 .await
@@ -225,7 +215,7 @@ impl Deploy {
                             agent_env,
                             None, // qemu_platform_response
                             additional_files,
-                            Some(private_key),
+                            Some(self.owner_private_key),
                             cancel,
                         )
                         .await?;
@@ -314,22 +304,13 @@ impl Deploy {
             .or(config_env.map(|c| c.session_registry))
             .ok_or_else(|| anyhow!("session_registry not provided"))?;
 
-        let owner_private_key = self
-            .owner_private_key
-            .or(config_env.map(|c| c.owner_private_key))
-            .ok_or_else(|| anyhow!("owner_private_key not provided"))?;
+        let owner_private_key = self.owner_private_key;
 
-        // base_image_ref: CLI --base-image-ref > config.image
-        let base_image_ref = self
-            .base_image_ref
-            .clone()
-            .unwrap_or_else(|| deploy_config.image.clone());
+        // base_image_ref: config.image
+        let base_image_ref = deploy_config.image.clone();
 
-        // workload_ref: CLI --workload-ref > config.workload
-        let workload_ref = self
-            .workload_ref
-            .clone()
-            .unwrap_or_else(|| deploy_config.workload.clone());
+        // workload_ref: config.workload
+        let workload_ref = deploy_config.workload.clone();
 
         // expire_offset: CLI > config > default
         let expire_offset = self
@@ -408,8 +389,8 @@ impl Deploy {
         deploy_config: &config::DeploymentConfig,
         config_dir: &Path,
     ) -> Result<PathBuf> {
-        // Explicit --workload takes precedence.
-        if let Some(path) = &self.workload {
+        // Explicit --workload_path takes precedence.
+        if let Some(path) = &self.workload_path {
             return Ok(path.clone());
         }
 

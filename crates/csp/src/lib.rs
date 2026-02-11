@@ -118,7 +118,7 @@ pub trait ImageManager: CloudProvider {
     async fn image_exists(&self, version: Option<&str>) -> bool;
 
     /// Delete a previously registered image.
-    async fn delete_image(&mut self) -> Result<()>;
+    async fn delete_image(&mut self, version: Option<&str>) -> Result<()>;
 }
 
 /// VM instance lifecycle.

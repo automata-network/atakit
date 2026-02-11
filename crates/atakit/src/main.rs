@@ -18,7 +18,7 @@ pub(crate) use config::Config;
 pub(crate) use csp::Csp;
 
 #[derive(Parser)]
-#[command(name = "atakit", about = "CVM base image deployment toolkit")]
+#[command(name = "atakit", version, about = "CVM base image deployment toolkit")]
 struct Cli {
     #[command(subcommand)]
     command: AtaKit,

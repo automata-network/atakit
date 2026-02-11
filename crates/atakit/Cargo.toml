@@ -34,5 +34,5 @@ automata-tee-workload-measurement.workspace = true
 tempfile = "3"
 
 [features]
-default = ["csp/clap", "internal"]
+default = ["csp/clap"]
 internal = []

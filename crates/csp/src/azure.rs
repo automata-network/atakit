@@ -253,23 +253,10 @@ impl ImageManager for Azure {
         .await
     }
 
-    async fn delete_image(&mut self) -> Result<()> {
+    async fn delete_image(&mut self, _version: Option<&str>) -> Result<()> {
         // Deleting the resource group removes all associated resources.
         info!("Deleting resource group (and all contained resources)");
-        cmd::run_cmd(
-            "az",
-            &[
-                "group",
-                "delete",
-                "--name",
-                &self.resource_group,
-                "--yes",
-                "--no-wait",
-            ],
-            self.quiet,
-        )
-        .await?;
-        Ok(())
+        unimplemented!("Azure does not support deleting individual images, must delete entire resource group");
     }
 }
 

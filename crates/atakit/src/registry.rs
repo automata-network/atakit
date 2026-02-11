@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 const GITHUB_REPO: &str = "automata-network/automata-tee-workload-measurement";
 const DEPLOYMENTS_PATH: &str = "deployment";
-const DEFAULT_BRANCH: &str = "main";
+const DEFAULT_BRANCH: &str = "develop";
 
 /// Registry configuration stored in `~/.atakit/registry/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
