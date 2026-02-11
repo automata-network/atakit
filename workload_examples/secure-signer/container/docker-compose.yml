@@ -1,6 +1,6 @@
 services:
   secure-signer:
-    image: secure-signer:latest
+    image: secure-signer:v0.0.0-dev-1
     build:
       context: ..
       dockerfile: container/Dockerfile

@@ -1,4 +1,14 @@
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_White%20Text%20with%20Color%20Logo.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_Black%20Text%20with%20Color%20Logo.png">
+    <img src="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_White%20Text%20with%20Color%20Logo.png" width="50%">
+  </picture>
+</div>
+
 # Atakit
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/automata-network/atakit)](https://github.com/automata-network/atakit/releases)
 
 CVM base image deployment toolkit - Build, package, and deploy secure workloads to Confidential Virtual Machines.
 
@@ -77,10 +87,40 @@ Create an `atakit.json` configuration file in your project directory:
 }
 ```
 
+Create a `docker-compose.yml` for your workload:
+
+```yaml
+services:
+  app:
+    build: .
+    image: my-app:v0.0.1
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - app-data:/data
+
+volumes:
+  app-data:
+```
+
+Create a `Dockerfile`:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["python", "main.py"]
+```
+
+> 💡 See [`workload_examples/`](./workload_examples) for complete working examples.
+
 ### 3. Build the Workload Package
 
 ```bash
-atakit build-workload my-workload
+atakit workload build my-deployment
 ```
 
 This creates a `.tar.gz` package containing:
@@ -88,7 +128,16 @@ This creates a `.tar.gz` package containing:
 - Measured files for attestation
 - Docker images (if using bundle mode)
 
-### 4. Deploy
+### 4. Publish the Workload
+
+```bash
+atakit workload publish my-workload \
+  --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --session-registry $REGISTRY_ADDRESS
+```
+
+### 5. Deploy
 
 ```bash
 # Deploy to GCP
@@ -110,16 +159,15 @@ atakit image pull <image>  # Download a base image
 atakit image rm <image>    # Remove a downloaded image
 ```
 
-### `atakit build-workload`
+### `atakit workload build`
 
 Build a workload package from Docker Compose definitions.
 
 ```bash
-atakit build-workload <workload-name> [OPTIONS]
+atakit workload build [DEPLOYMENTS...] [OPTIONS]
 
 Options:
-  --image-mode <MODE>  Image handling: Bundle (include images) or Pull (fetch at runtime)
-  --deployment <NAME>  Build for a specific deployment configuration
+  --image-mode <MODE>  Image handling: bundle (include images) or pull (fetch at runtime)
 ```
 
 ### `atakit deploy`
@@ -148,19 +196,30 @@ atakit registry pull     # Pull deployment files from remote
 atakit registry switch   # Switch between registry branches
 ```
 
-### `atakit publish-workload`
+### `atakit workload measure`
+
+Measure a workload package and output event logs for PCR23 extension.
+
+```bash
+atakit workload measure <package.tar.gz> [OPTIONS]
+
+Options:
+  --format <FORMAT>  Output format: text or json
+```
+
+### `atakit workload publish`
 
 Register a workload on-chain.
 
 ```bash
-atakit publish-workload <workload-name> [OPTIONS]
+atakit workload publish <workload-name> [OPTIONS]
 
 Options:
-  --ttl <SECONDS>        Session time-to-live
-  --private-key <KEY>    Signing key
-  --rpc-url <URL>        Blockchain RPC endpoint
-  --contract <ADDRESS>   WorkloadRegistry contract address
-  --dry-run              Simulate without submitting
+  --ttl <SECONDS>           Session time-to-live
+  --private-key <KEY>       Signing key
+  --rpc-url <URL>           Blockchain RPC endpoint
+  --session-registry <ADDR> WorkloadRegistry contract address
+  --dry-run                 Simulate without submitting
 ```
 
 ## Configuration
@@ -242,28 +301,6 @@ my-workload/
 └── additional-data/         # Runtime data (not measured)
     └── secrets.json
 ```
-
-## Data Directory
-
-Atakit stores data in `~/.atakit/`:
-
-```
-~/.atakit/
-├── images/      # Downloaded CVM base images
-├── instances/   # Deployed instance records
-├── qemu/        # QEMU instance directories
-└── registry/    # Smart contract registry data
-```
-
-## Crate Structure
-
-| Crate | Description |
-|-------|-------------|
-| `atakit` | Main CLI application |
-| `automata-linux-release` | Base image management |
-| `csp` | Cloud service provider abstractions |
-| `cvm-agent` | CVM agent client library |
-| `workload-compose` | Docker Compose analysis |
 
 ## Environment Variables
 
