@@ -59,7 +59,7 @@ impl Measure {
 
         // Run measurement
         info!("Running measurement");
-        let measurement = measure(extract_path, &manifest.docker_compose, &config)
+        let measurement = measure(extract_path, &manifest.docker_compose, config)
             .map_err(|e| anyhow::anyhow!("Measurement failed: {}", e))?;
 
         // Output results

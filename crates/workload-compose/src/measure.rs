@@ -359,13 +359,13 @@ pub fn measure(
     // Auto-skip docker image tars from manifest (both mark as used and add to skip_files)
     for img in &manifest.docker_images {
         if let Some(tar_name) = &img.image_tar {
-            config.skip_files.insert(tar_name.clone());
+            config.skip_files.insert(normalize_path(&tar_name));
         }
     }
 
     // Auto-skip additional data files from manifest (both mark as used and add to skip_files)
     for file in &manifest.additional_data_files {
-        config.skip_files.insert(file.clone());
+        config.skip_files.insert(normalize_path(&file));
     }
 
     // Add user-provided skip_files to used set

@@ -110,19 +110,18 @@ pub fn create_package(
     }
 
     // 3. Add additional-data files under additional-data/ directory.
-    // for _rel in &analysis.additional_data_files {
-    // skip the additional data
-    // let abs = project_dir.join(rel);
-    // if !abs.exists() {
-    //     warn!(path = %rel.display(), "Additional data file not found, skipping");
-    //     continue;
-    // }
-    // let compose_rel = rel.strip_prefix(compose_rel_dir).unwrap_or(rel);
-    // let archive_name = format!("{}/{}", prefix, compose_rel.display());
-    // if abs.is_file() {
-    //     tar.append_path_with_name(&abs, &archive_name)
-    //         .with_context(|| format!("Failed to add {}", rel.display()))?;
-    // }
+    // for (compose, compose_rel) in &analysis.additional_data_files {
+    //     // skip the additional data
+    //     let abs = project_dir.join(compose);
+    //     if !abs.exists() {
+    //         warn!(path = %compose.display(), "Additional data file not found, skipping");
+    //         continue;
+    //     }
+    //     let archive_name = format!("{}/{}", prefix, compose_rel.display());
+    //     if abs.is_file() {
+    //         tar.append_path_with_name(&abs, &archive_name)
+    //             .with_context(|| format!("Failed to add {}", compose_rel.display()))?;
+    //     }
     // }
 
     let agent_socket_targets = analysis
