@@ -18,7 +18,7 @@ pub struct Measure {
     package: PathBuf,
 
     /// Output format
-    #[arg(long, default_value = "text")]
+    #[arg(long, default_value = "json")]
     format: OutputFormat,
 }
 

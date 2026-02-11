@@ -5,6 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use tracing::info;
+use workload_compose::{ImageKind, extract_image_name_tag};
 
 use crate::{
     commands::deploy::config::{build_from_deployment, to_json},
@@ -63,6 +64,10 @@ impl BuildWorkload {
                 images = analysis.summary.images.len(),
                 "Compose analysis complete"
             );
+
+            // Validate that all compose images match workload.name:workload.version
+            let expected_image = format!("{}:{}", wl_def.name, wl_def.version);
+            validate_compose_images(&analysis.summary.images, &expected_image)?;
 
             let image = deploy_def.image.as_ref().unwrap_or(&wl_def.image);
 
@@ -172,5 +177,47 @@ impl BuildWorkload {
                         .join(", ")
                 )
             })
+    }
+}
+
+/// Validate that all docker-compose images match the expected workload name:version.
+///
+/// Images in docker-compose may include a registry prefix (e.g., `ghcr.io/org/myapp:v1`),
+/// but the name:tag portion must match `expected` (e.g., `myapp:v1`).
+fn validate_compose_images(
+    images: &[workload_compose::ServiceImage],
+    expected: &str,
+) -> Result<()> {
+    let mut errors = Vec::new();
+
+    for img in images {
+        let tag = match &img.kind {
+            ImageKind::Build { tag } => tag,
+            ImageKind::Pull { tag } => tag,
+            ImageKind::BuildUntagged => {
+                errors.push(format!(
+                    "Service '{}': image tag is required (add `image: {}` to the service)",
+                    img.service, expected
+                ));
+                continue;
+            }
+        };
+
+        let actual = extract_image_name_tag(tag);
+        if actual != expected {
+            errors.push(format!(
+                "Service '{}': image '{}' does not match expected '{}' (extracted: '{}')",
+                img.service, tag, expected, actual
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Docker compose image validation failed:\n  - {}",
+            errors.join("\n  - ")
+        )
     }
 }
