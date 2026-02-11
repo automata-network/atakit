@@ -1,0 +1,28 @@
+{
+    "workloads": [
+        {
+            "name": "secure-signer",
+            "version": "v0.0.0-dev-1",
+            "image": "automata-linux:v0.0.0-dev-1",
+            "docker_compose": "./container/docker-compose.yml"
+        }
+    ],
+    "disks": [
+        {
+            "name": "secure-signer-data",
+            "size": "10GB"
+        },
+        {
+            "name": "secure-signer-data2",
+            "size": "11GB"
+        }
+    ],
+    "deployment": {
+        "secure-signer-tdx": {
+            "workload": "secure-signer",
+            "platforms": {
+                "gcp": { "vmtype": "c3-standard-4" }
+            }
+        }
+    }
+}

@@ -1,0 +1,18 @@
+services:
+  secure-signer:
+    image: secure-signer:v0.0.0-dev-1
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+      - ./config/hello:/app/config/hello:ro
+      - ./additional-data/signer_key:/app/additional-data/signer_key:ro
+      - secure-signer-data:/data
+      - secure-signer-data2:/data2
+      - ./cvm-agent.sock:/app/cvm-agent.sock
+volumes:
+  secure-signer-data:
+  secure-signer-data2:

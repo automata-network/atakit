@@ -1,0 +1,29 @@
+[package]
+name = "cvm-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+# Client dependencies (optional, for atakit integration)
+alloy = { workspace = true, optional = true }
+anyhow = { version = "1", optional = true }
+hex = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+automata-linux-release.workspace = true
+automata-tee-workload-measurement.workspace = true
+
+# Unix socket client dependencies
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+
+[features]
+default = ["client"]
+client = ["alloy", "anyhow", "hex", "reqwest", "tokio", "tokio-util", "tracing", "hyper", "hyper-util", "http-body-util", "bytes"]

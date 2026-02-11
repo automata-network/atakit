@@ -1,0 +1,18 @@
+[package]
+name = "csp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+rand.workspace = true
+flate2.workspace = true
+tar.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+clap = { workspace = true, optional = true }
+
+[features]
+default = ["clap"]
+clap = ["dep:clap"]
