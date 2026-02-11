@@ -1,7 +1,17 @@
 mod convert;
+pub mod measure;
+pub mod serialize;
 mod summarize;
 pub mod types;
 
+mod manifest;
+pub use manifest::*;
+
+pub use measure::{
+    MeasureConfig, MeasureError, MountedFile, ServiceMeasurement, WorkloadMeasurement,
+    get_digest_from_docker_tar, measure,
+};
+pub use serialize::{resolve_image_short_name, service_to_yaml, to_yaml};
 pub use summarize::{ComposeAnalysis, analyze};
 pub use types::*;
 

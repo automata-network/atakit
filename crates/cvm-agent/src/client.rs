@@ -106,7 +106,7 @@ pub async fn init_workload(
     private_key: Option<B256>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let url = format!("http://{}:{}{}", ip, INIT_PORT, INIT_ENDPOINT);
+    let url = format!("https://{}:{}{}", ip, INIT_PORT, INIT_ENDPOINT);
 
     info!(ip, "Waiting for CVM agent...");
     wait_for_agent(ip, INIT_PORT, Duration::from_secs(300), &cancel).await?;
@@ -142,8 +142,11 @@ pub async fn init_workload(
     // Build multipart body manually so we can hash the exact bytes
     let body = build_multipart_body(filename, &workload_bytes, &config, &additional_files)?;
 
-    // Build request
-    let client = reqwest::Client::new();
+    // Build request with TLS certificate validation disabled (self-signed certs)
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("Failed to build HTTP client")?;
     let content_type = format!("multipart/form-data; boundary={}", MULTIPART_BOUNDARY);
     let mut request = client
         .post(&url)
@@ -224,9 +227,12 @@ async fn wait_for_agent(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let url = format!("http://{}:{}{}", ip, port, PING_ENDPOINT);
+    let url = format!("https://{}:{}{}", ip, port, PING_ENDPOINT);
     let start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("Failed to build HTTP client")?;
 
     loop {
         if cancel.is_cancelled() {

@@ -1,55 +1,74 @@
 use indexmap::IndexMap;
+use serde::Serialize;
 
 /// A normalized representation of a Docker Compose file,
 /// containing only the features supported by workload-compose.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkloadCompose {
     pub services: IndexMap<String, WorkloadService>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkloadService {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(skip)]
     pub build: Option<WorkloadBuild>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<WorkloadCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<WorkloadCommand>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub environment: Vec<EnvVar>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<WorkloadPort>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<WorkloadVolumeMount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub restart: Option<WorkloadRestart>,
+    #[serde(skip)]
     pub depends_on: IndexMap<String, WorkloadDependency>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkloadBuild {
     pub context: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<EnvVar>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum WorkloadCommand {
     Shell(String),
     Exec(Vec<String>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EnvVar {
     pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkloadPort {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_port: Option<u16>,
     pub container_port: u16,
     pub protocol: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum WorkloadVolumeMount {
     Named {
         name: String,
@@ -63,16 +82,20 @@ pub enum WorkloadVolumeMount {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WorkloadRestart {
     No,
     Always,
+    #[serde(rename = "on-failure")]
     OnFailure,
+    #[serde(rename = "unless-stopped")]
     UnlessStopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkloadDependency {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
 }
 

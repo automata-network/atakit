@@ -122,13 +122,6 @@ impl Deploy {
         if self.qemu {
             deploy_config.provider = config::ProviderKind::Qemu;
             self.quiet = true;
-
-            // If agent_env has a localhost RPC URL, expose that port for QEMU
-            if let Some(ref agent_env) = deploy_config.agent_env {
-                if let Some(port) = parse_localhost_port(&agent_env.rpc_url) {
-                    deploy_config.ports.push(PortDef::tcp(port));
-                }
-            }
         }
 
         let workload_path = self.resolve_workload_path(ctx, &deploy_config, &config_dir)?;
@@ -141,13 +134,27 @@ impl Deploy {
         let is_qemu = matches!(deploy_config.provider, config::ProviderKind::Qemu);
 
         // Build agent environment from config + CLI overrides (optional)
-        let agent_env = match self.build_agent_env(&deploy_config) {
+        let mut agent_env = match self.build_agent_env(&deploy_config) {
             Ok(agent_env) => Some(agent_env),
             Err(e) => {
                 warn!("Failed to build agent environment: {e}");
                 None
             }
         };
+
+        if is_qemu {
+            // If agent_env has a localhost RPC URL, expose that port for QEMU
+            if let Some(ref mut agent_env) = agent_env {
+                if let Some(port) = parse_localhost_port(&agent_env.rpc_url) {
+                    deploy_config.ports.push(PortDef::tcp(port));
+                    let rpc_rewrite = agent_env
+                        .rpc_url
+                        .replace("localhost", "10.0.2.2")
+                        .replace("127.0.0.1", "10.0.2.2");
+                    agent_env.rpc_url = rpc_rewrite;
+                }
+            }
+        }
 
         // Load additional files
         let additional_files = self

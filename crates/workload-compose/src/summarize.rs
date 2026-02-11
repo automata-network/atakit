@@ -14,6 +14,8 @@ pub struct ComposeAnalysis {
     pub measured_files: Vec<(PathBuf, PathBuf)>,
     /// Files under additional-data/ that are excluded (operator-provided).
     pub additional_data_files: Vec<(PathBuf, PathBuf)>,
+    /// The parsed and validated WorkloadCompose.
+    pub compose: WorkloadCompose,
     /// The compose summary from workload-compose.
     pub summary: ComposeSummary,
 }
@@ -69,6 +71,7 @@ pub fn analyze(project_dir: &Path, docker_compose: &str) -> anyhow::Result<Compo
         compose_path: compose_rel,
         measured_files,
         additional_data_files,
+        compose,
         summary,
     })
 }

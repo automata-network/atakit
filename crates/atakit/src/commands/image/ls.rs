@@ -65,14 +65,14 @@ impl List {
                 .iter()
                 .map(|r| ImageRef::new(&self.repo, &r.tag_name))
                 .collect();
-            remote_lines = releases.iter().map(|r| format!("{r}")).collect();
+            remote_lines = releases.iter().map(|r| format!("{}:{r}", self.repo)).collect();
         } else {
             let statuses = store.list(&self.repo, self.limit).await?;
             remote_tags = statuses
                 .iter()
                 .map(|s| ImageRef::new(&self.repo, &s.release.tag_name))
                 .collect();
-            remote_lines = statuses.iter().map(|s| format!("{s}")).collect();
+            remote_lines = statuses.iter().map(|s| format!("{}:{}", self.repo, s)).collect();
         }
 
         // Find local-only tags (not in remote).

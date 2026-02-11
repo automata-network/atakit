@@ -6,73 +6,18 @@ use anyhow::{Context, Result, bail};
 use automata_linux_release::ImageRef;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
 
-use workload_compose::{ComposeAnalysis, ImageKind};
+use workload_compose::{
+    ComposeAnalysis, DockerImageEntry, ImageKind, WorkloadManifest, resolve_image_short_name,
+    to_yaml,
+};
 
-use crate::types::{AtakitConfig, DockerImageEntry, WorkloadDef, WorkloadManifest};
+use crate::types::{AtakitConfig, WorkloadDef};
 
 use super::ImageMode;
-
-// ---------------------------------------------------------------------------
-// Docker Compose serde types (for YAML round-trip rewriting)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, Serialize)]
-struct DockerCompose {
-    #[serde(default)]
-    services: IndexMap<String, ComposeService>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    volumes: Option<IndexMap<String, serde_yaml::Value>>,
-    /// Preserves unknown top-level keys (e.g. `version`, `networks`, `configs`).
-    #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ComposeService {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    image: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    build: Option<serde_yaml::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    volumes: Vec<String>,
-    #[serde(default, skip_serializing_if = "EnvFileEntry::is_none")]
-    env_file: EnvFileEntry,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<String>,
-    /// Preserves unknown service-level keys (e.g. `environment`, `depends_on`, `restart`).
-    #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
-}
-
-/// `env_file` can be a single string or a list of strings.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(untagged)]
-enum EnvFileEntry {
-    #[default]
-    None,
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl EnvFileEntry {
-    fn is_none(&self) -> bool {
-        matches!(self, EnvFileEntry::None)
-    }
-
-    fn to_paths(&self) -> Vec<String> {
-        match self {
-            EnvFileEntry::None => vec![],
-            EnvFileEntry::Single(s) => vec![s.clone()],
-            EnvFileEntry::Multiple(v) => v.clone(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Package creation
@@ -105,10 +50,8 @@ pub fn create_package(
 
     let prefix = ".";
 
-    // 1. Rewrite docker-compose paths to match archive layout, then add.
+    // 1. Serialize docker-compose from validated WorkloadCompose (normalized output).
     let compose_abs = project_dir.join(&analysis.compose_path);
-    let compose_content = fs::read_to_string(&compose_abs)
-        .with_context(|| format!("Failed to read {}", compose_abs.display()))?;
     // Match each named volume to its DiskDef in atakit.json.
     let disk_mappings: Vec<(&str, &str, &crate::types::DiskDef, String)> = analysis
         .summary
@@ -129,11 +72,7 @@ pub fn create_package(
                 })
         })
         .collect();
-    let volume_mounts: Vec<(&str, &str)> = disk_mappings
-        .iter()
-        .map(|(_, vol, _, mp)| (*vol, mp.as_str()))
-        .collect();
-    let rewritten = rewrite_compose(&compose_content, &volume_mounts)?;
+    let rewritten = to_yaml(&analysis.compose).context("Failed to serialize docker-compose")?;
     let rewritten_bytes = rewritten.as_bytes();
 
     let mut header = tar::Header::new_gnu();
@@ -251,7 +190,7 @@ pub fn create_package(
                     info!(service = %img.service, tag = %resolved_tag, "Skipping image build (--image-mode=pull)");
                     manifest_images.push(DockerImageEntry {
                         service: img.service.clone(),
-                        image_tag: Some(resolved_tag),
+                        image_tag: resolved_tag,
                         image_tar: None,
                     });
                 } else {
@@ -273,7 +212,7 @@ pub fn create_package(
                     info!(service = %img.service, tag = %resolved_tag, "Skipping image build (--image-mode=pull)");
                     manifest_images.push(DockerImageEntry {
                         service: img.service.clone(),
-                        image_tag: Some(resolved_tag),
+                        image_tag: resolved_tag,
                         image_tar: None,
                     });
                 } else {
@@ -291,7 +230,7 @@ pub fn create_package(
             ImageKind::Pull { tag } => {
                 manifest_images.push(DockerImageEntry {
                     service: img.service.clone(),
-                    image_tag: Some(tag.clone()),
+                    image_tag: tag.clone(),
                     image_tar: None,
                 });
             }
@@ -339,86 +278,6 @@ pub fn create_package(
     enc.finish().context("Failed to finish gzip compression")?;
 
     Ok(())
-}
-
-/// Rewrite docker-compose file paths so they match the archive layout.
-fn rewrite_compose(content: &str, _volume_mounts: &[(&str, &str)]) -> Result<String> {
-    let mut compose: DockerCompose =
-        serde_yaml::from_str(content).context("Failed to parse docker-compose for rewriting")?;
-
-    // Remove top-level `volumes:` section when named volumes are present --
-    // the CVM agent manages the data disk mounts directly.
-    // if !volume_mounts.is_empty() {
-    //     compose.volumes = None;
-    // }
-
-    for (_name, service) in compose.services.iter_mut() {
-        // Rewrite env_file paths.
-        let paths = service.env_file.to_paths();
-        if !paths.is_empty() {
-            let rewritten: Vec<String> = paths.iter().map(|p| rewrite_file_path(p)).collect();
-            service.env_file = match rewritten.len() {
-                1 => EnvFileEntry::Single(rewritten.into_iter().next().unwrap()),
-                _ => EnvFileEntry::Multiple(rewritten),
-            };
-        }
-
-        // Remove build directive -- images are pre-built as tars.
-        service.build = None;
-
-        // Resolve image short names to fully qualified references.
-        if let Some(ref img) = service.image {
-            service.image = Some(resolve_image_short_name(img));
-        }
-
-        // // Rewrite volume bind-mount host paths and named volumes.
-        // service.volumes = service
-        //     .volumes
-        //     .iter()
-        //     .map(|v| rewrite_volume_path(v, volume_mounts))
-        //     .collect();
-    }
-
-    serde_yaml::to_string(&compose).context("Failed to serialize rewritten compose")
-}
-
-/// Map a compose-relative file path to its archive location.
-fn rewrite_file_path(raw: &str) -> String {
-    return raw.to_string();
-}
-
-/// Rewrite the host portion of a volume bind-mount to its archive location,
-/// or replace a named volume with the disk mount point from atakit.json.
-#[allow(dead_code)]
-fn rewrite_volume_path(vol: &str, volume_mounts: &[(&str, &str)]) -> String {
-    let parts: Vec<&str> = vol.splitn(3, ':').collect();
-    if parts.len() < 2 {
-        return vol.to_string();
-    }
-    let host = parts[0];
-    if !(host.starts_with('.') || host.starts_with('/') || host.starts_with('~')) {
-        // Named volume -- replace with disk mount point if it matches any mapping.
-        if let Some((_, mp)) = volume_mounts.iter().find(|(nv, _)| *nv == host) {
-            let mut result = mp.to_string();
-            result.push(':');
-            result.push_str(parts[1]);
-            if parts.len() > 2 {
-                result.push(':');
-                result.push_str(parts[2]);
-            }
-            return result;
-        }
-        return vol.to_string();
-    }
-    let new_host = rewrite_file_path(host);
-    let mut result = new_host;
-    result.push(':');
-    result.push_str(parts[1]);
-    if parts.len() > 2 {
-        result.push(':');
-        result.push_str(parts[2]);
-    }
-    result
 }
 
 /// Add a static file to the tar archive with deterministic headers.
@@ -496,33 +355,9 @@ fn build_and_save_image<W: std::io::Write>(
 
     manifest_images.push(DockerImageEntry {
         service: service.to_string(),
-        image_tag: Some(resolved_tag),
+        image_tag: resolved_tag,
         image_tar: Some(archive_name),
     });
 
     Ok(())
-}
-
-/// Resolve a Docker image short name to a fully qualified reference.
-fn resolve_image_short_name(image: &str) -> String {
-    if image.is_empty() {
-        return image.to_string();
-    }
-
-    match image.find('/') {
-        None => {
-            // No `/` -- official library image (e.g. `nginx`, `nginx:latest`).
-            format!("docker.io/library/{}", image)
-        }
-        Some(slash_pos) => {
-            let first = &image[..slash_pos];
-            if first.contains('.') || first.contains(':') || first == "localhost" {
-                // First component looks like a registry hostname.
-                image.to_string()
-            } else {
-                // Namespace without registry (e.g. `user/image:tag`).
-                format!("docker.io/{}", image)
-            }
-        }
-    }
 }

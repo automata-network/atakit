@@ -47,6 +47,10 @@ enum AtaKit {
     /// Manage contract registry information
     #[command(subcommand)]
     Registry(commands::registry::Registry),
+
+    /// Workload package operations
+    #[command(subcommand)]
+    Workload(commands::workload::Workload),
 }
 
 impl AtaKit {
@@ -59,6 +63,7 @@ impl AtaKit {
             AtaKit::Internal(cmd) => cmd.run().await,
             AtaKit::PublishWorkload(cmd) => cmd.run(env).await,
             AtaKit::Registry(cmd) => cmd.run(env).await,
+            AtaKit::Workload(cmd) => cmd.run(env),
         }
     }
 }

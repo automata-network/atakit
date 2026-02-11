@@ -4,8 +4,19 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+automata-linux-release.workspace = true
+alloy.workspace = true
 anyhow.workspace = true
 compose_spec.workspace = true
-indexmap.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+serde_yaml.workspace = true
+tar.workspace = true
+thiserror = "1"
+walkdir = "2"
+tracing.workspace = true
 
 [dev-dependencies]
+tempfile = "3"

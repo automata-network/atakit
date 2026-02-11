@@ -96,30 +96,3 @@ pub struct PlatformConfig {
     #[serde(default)]
     pub project: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Workload manifest (embedded inside the tar.gz package)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, serde::Serialize)]
-pub struct WorkloadManifest {
-    pub name: ImageRef,
-    pub docker_compose: String,
-    pub image: ImageRef,
-    pub measured_files: Vec<String>,
-    pub additional_data_files: Vec<String>,
-    pub docker_images: Vec<DockerImageEntry>,
-    pub enable_cvm_agent: Vec<String>,
-    pub atakit_version: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct DockerImageEntry {
-    pub service: String,
-    /// For pre-published images (no build directive).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_tag: Option<String>,
-    /// Filename of the saved tar inside the package (for locally built images).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_tar: Option<String>,
-}
