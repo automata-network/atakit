@@ -18,6 +18,32 @@ pub fn to_yaml(compose: &WorkloadCompose) -> anyhow::Result<String> {
     serde_yaml::to_string(&output).map_err(|e| anyhow::anyhow!("Failed to serialize compose: {e}"))
 }
 
+/// Validate that a docker-compose YAML string is already normalized.
+///
+/// A normalized compose file:
+/// - Parses without errors
+/// - When re-serialized, produces identical output
+///
+/// Returns `Ok(())` if normalized, or an error describing the difference.
+pub fn validate_normalized(yaml: &str) -> anyhow::Result<()> {
+    // Parse the input
+    let compose = crate::from_yaml_str(yaml)?;
+
+    // Re-serialize
+    let reserialized = to_yaml(&compose)?;
+
+    // Compare
+    if yaml.trim() == reserialized.trim() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Compose file is not normalized.\n\nExpected:\n{}\n\nGot:\n{}",
+            reserialized.trim(),
+            yaml.trim()
+        )
+    }
+}
+
 /// Generate an isolated docker-compose YAML for a single service.
 ///
 /// The output is normalized:
