@@ -1,4 +1,4 @@
-mod packager;
+use super::packager;
 
 use std::fs;
 

@@ -30,9 +30,6 @@ enum AtaKit {
     #[command(subcommand)]
     Image(commands::image::Image),
 
-    /// Build a workload package from docker-compose definitions
-    BuildWorkload(commands::build_workload::BuildWorkload),
-
     /// Deploy a CVM instance to a cloud provider or local QEMU
     Deploy(commands::deploy::Deploy),
 
@@ -40,9 +37,6 @@ enum AtaKit {
     #[cfg(feature = "internal")]
     #[command(subcommand)]
     Internal(commands::internal::Internal),
-
-    /// Publish a workload to the WorkloadRegistry contract
-    PublishWorkload(commands::publish_workload::PublishWorkload),
 
     /// Manage contract registry information
     #[command(subcommand)]
@@ -57,13 +51,11 @@ impl AtaKit {
     async fn run(self, env: &Env) -> Result<()> {
         match self {
             AtaKit::Image(cmd) => cmd.run(env).await,
-            AtaKit::BuildWorkload(cmd) => cmd.run(env),
             AtaKit::Deploy(cmd) => cmd.run(env).await,
             #[cfg(feature = "internal")]
             AtaKit::Internal(cmd) => cmd.run().await,
-            AtaKit::PublishWorkload(cmd) => cmd.run(env).await,
             AtaKit::Registry(cmd) => cmd.run(env).await,
-            AtaKit::Workload(cmd) => cmd.run(env),
+            AtaKit::Workload(cmd) => cmd.run(env).await,
         }
     }
 }
