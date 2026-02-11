@@ -25,15 +25,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alloy::primitives::{B256, keccak256};
 use anyhow::{Context, bail};
+use flate2::read::GzDecoder;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
 use thiserror::Error;
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::serialize::service_to_yaml;
@@ -304,6 +306,48 @@ struct OciManifestDescriptor {
 struct OciPlatform {
     architecture: String,
     os: String,
+}
+
+pub fn measure_package(package_path: PathBuf) -> anyhow::Result<WorkloadMeasurement> {
+    // Create a temporary directory for extraction
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let extract_path = temp_dir.path();
+
+    // Extract the tar.gz
+    extract_tar_gz(&package_path, extract_path)?;
+
+    info!(package = %package_path.display(), "Extracting workload package");
+
+    // Read the manifest.json
+    let manifest_path = extract_path.join("manifest.json");
+    let manifest = WorkloadManifest::from_file(&manifest_path)?;
+
+    info!(workload = %manifest.name, "Loaded manifest");
+
+    // Extract image digests using workload-compose helper
+    let image_digests = manifest.extract_image_digests(extract_path)?;
+
+    let mut config = MeasureConfig::cvm();
+    config.image_digests = image_digests;
+
+    let measurement = measure(extract_path, &manifest.docker_compose, config)
+        .map_err(|e| anyhow::anyhow!("Measurement failed: {}", e))?;
+
+    Ok(measurement)
+}
+
+/// Extract a tar.gz archive to the specified directory.
+fn extract_tar_gz(archive_path: &Path, dest: &Path) -> anyhow::Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open {}", archive_path.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    archive
+        .unpack(dest)
+        .with_context(|| format!("Failed to extract {}", archive_path.display()))?;
+
+    Ok(())
 }
 
 /// Measure a workload folder and return measurement results.

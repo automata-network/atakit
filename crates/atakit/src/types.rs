@@ -57,6 +57,12 @@ pub struct WorkloadDef {
     pub version: String,
 }
 
+impl WorkloadDef {
+    pub fn package_name(&self) -> String {
+        format!("{}-{}.tar.gz", self.name, self.version)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DiskDef {
     pub name: String,

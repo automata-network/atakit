@@ -57,7 +57,7 @@ pub struct Deploy {
     /// Force re-upload disk image even if it already exists.
     /// Deletes the existing image before uploading.
     #[arg(long)]
-    pub force_update_image: bool,
+    pub force_upload_image: bool,
 
     // ── Agent Environment Configuration ──────────────────────────────
     /// Directory containing additional data files referenced in deployment config.
@@ -192,7 +192,7 @@ impl Deploy {
             &deploy_config,
             &paths,
             operator_address,
-            self.force_update_image,
+            self.force_upload_image,
             ctx,
             self.quiet,
         )

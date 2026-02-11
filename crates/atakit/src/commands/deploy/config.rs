@@ -516,7 +516,7 @@ pub fn build_from_deployment(
         name: deployment_name.to_string(),
         provider: provider.clone(),
         workload: ImageRef::new(&wl_def.name, &wl_def.version),
-        workload_path: format!("{}-{}.tar.gz", wl_def.name, wl_def.version),
+        workload_path: wl_def.package_name(),
         image: image.clone(),
         vm_type: platform_config.vmtype.clone(),
         ports,

@@ -50,3 +50,4 @@ k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 sha3 = "0.10"
 hex = "0.4"
 alloy = { git = "https://github.com/automata-network/alloy-ext.git", package = "alloy-ext" }
+tempfile = "3"

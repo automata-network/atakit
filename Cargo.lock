@@ -5309,6 +5309,7 @@ dependencies = [
  "anyhow",
  "automata-linux-release",
  "compose_spec",
+ "flate2",
  "indexmap 2.13.0",
  "serde",
  "serde_json",
