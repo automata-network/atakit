@@ -26,6 +26,25 @@ pub struct GcpConfig {
     pub quiet: bool,
     /// Port rules for firewall configuration.
     pub port_rules: Vec<PortRule>,
+    /// Data disks to attach to the instance.
+    pub data_disks: Vec<DataDiskConfig>,
+}
+
+/// Configuration for a data disk to attach to an instance.
+#[derive(Clone, Debug)]
+pub struct DataDiskConfig {
+    /// Disk name (used for both GCP disk name and device-name).
+    pub name: String,
+    /// Disk size (e.g., "100GB").
+    pub size: String,
+}
+
+/// Internal state for a data disk to attach during instance creation.
+struct GcpDataDisk {
+    /// Device name exposed to the guest.
+    name: String,
+    /// Actual GCP disk name (may differ after conversion, e.g., `"disk-ssd"`).
+    attached_name: String,
 }
 
 // ── Provider ──────────────────────────────────────────────────────
@@ -43,6 +62,8 @@ pub struct Gcp {
     quiet: bool,
     firewall_rule_name: String,
     firewall_allow: String,
+    /// Data disks to attach during instance creation.
+    data_disks: Vec<GcpDataDisk>,
 }
 
 impl Gcp {
@@ -71,6 +92,15 @@ impl Gcp {
         let firewall_rule_name = format!("{}-ingress", config.vm_name);
         let firewall_allow = build_firewall_allow(&config.port_rules);
 
+        let data_disks: Vec<GcpDataDisk> = config
+            .data_disks
+            .into_iter()
+            .map(|d| GcpDataDisk {
+                name: d.name.clone(),
+                attached_name: d.name,
+            })
+            .collect();
+
         info!(
             platform = "GCP",
             vm_name = %config.vm_name,
@@ -94,6 +124,7 @@ impl Gcp {
             quiet: config.quiet,
             firewall_rule_name,
             firewall_allow,
+            data_disks,
         })
     }
 
@@ -156,7 +187,7 @@ impl ImageManager for Gcp {
         let version = version.as_deref();
         // Use versioned image name if version provided.
         let image_name = match version {
-            Some(v) => format!("{}-{}", self.vm_name, v),
+            Some(v) => format!("{}", v),
             None => self.image_name.clone(),
         };
 
@@ -209,7 +240,7 @@ impl ImageManager for Gcp {
             bail!("Disk image not found: {}", disk_path.display());
         }
         let uploaded_name = match version {
-            Some(v) => format!("{}-{}.tar.gz", self.vm_name, v),
+            Some(v) => format!("{}.tar.gz", v),
             None => format!("{}.tar.gz", self.vm_name),
         };
         let dest_uri = format!("{}/{}", self.bucket_url, uploaded_name);
@@ -302,7 +333,7 @@ impl ImageManager for Gcp {
 
     async fn image_exists(&self, version: Option<&str>) -> bool {
         let image_name = match version {
-            Some(v) => format!("{}-{}", self.vm_name, v),
+            Some(v) => format!("{}", v),
             None => self.image_name.clone(),
         };
         let project_flag = format!("--project={}", self.project_id);
@@ -371,7 +402,7 @@ impl Compute for Gcp {
         }
         let metadata_value = meta_pairs.join(",");
 
-        let args: Vec<String> = vec![
+        let mut args: Vec<String> = vec![
             "compute".into(),
             "instances".into(),
             "create".into(),
@@ -391,6 +422,14 @@ impl Compute for Gcp {
             "--metadata".into(),
             metadata_value,
         ];
+
+        // Attach data disks.
+        for disk in &self.data_disks {
+            args.push(format!(
+                "--disk=name={},device-name={},auto-delete=no,boot=no",
+                disk.attached_name, disk.name
+            ));
+        }
 
         info!("Creating CVM instance");
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -565,29 +604,6 @@ impl BlockStorage for Gcp {
         .await;
 
         if exists {
-            // Check if we need to convert pd-standard -> pd-balanced for c3-* VMs.
-            if self.vm_type.starts_with("c3-") {
-                let disk_type = cmd::try_capture(
-                    "gcloud",
-                    &[
-                        "compute",
-                        "disks",
-                        "describe",
-                        name,
-                        &zone_flag,
-                        &project_flag,
-                        "--format=value(type)",
-                    ],
-                )
-                .await
-                .unwrap_or_default();
-
-                if disk_type.contains("pd-standard") {
-                    info!(disk = %name, "Disk is pd-standard, converting to pd-balanced for c3-* VM");
-                    convert_disk_to_balanced(name, self.quiet, &zone_flag, &project_flag).await?;
-                }
-            }
-
             info!(disk = %name, "Disk already exists");
         } else {
             info!(disk = %name, size = %size, "Creating new data disk");
@@ -608,6 +624,12 @@ impl BlockStorage for Gcp {
             )
             .await?;
         }
+
+        // Track disk for attachment during instance creation.
+        self.data_disks.push(GcpDataDisk {
+            name: name.to_string(),
+            attached_name: name.to_string(),
+        });
 
         Ok(())
     }
@@ -709,70 +731,3 @@ fn build_firewall_allow(port_rules: &[PortRule]) -> String {
     entries.join(",")
 }
 
-/// Snapshot a pd-standard disk and recreate it as pd-balanced.
-async fn convert_disk_to_balanced(
-    disk_name: &str,
-    quiet: bool,
-    zone_flag: &str,
-    project_flag: &str,
-) -> Result<()> {
-    let snap_name = format!(
-        "{}-snap-{}",
-        disk_name,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
-    let new_disk = format!("{disk_name}-ssd");
-
-    // Create snapshot.
-    cmd::run_cmd(
-        "gcloud",
-        &[
-            "compute",
-            "disks",
-            "snapshot",
-            disk_name,
-            &format!("--snapshot-names={snap_name}"),
-            zone_flag,
-            project_flag,
-        ],
-        quiet,
-    )
-    .await?;
-
-    // Create pd-balanced disk from snapshot.
-    cmd::run_cmd(
-        "gcloud",
-        &[
-            "compute",
-            "disks",
-            "create",
-            &new_disk,
-            &format!("--source-snapshot={snap_name}"),
-            "--type=pd-balanced",
-            zone_flag,
-            project_flag,
-        ],
-        quiet,
-    )
-    .await?;
-
-    // Clean up snapshot.
-    let _ = cmd::run_cmd(
-        "gcloud",
-        &[
-            "compute",
-            "snapshots",
-            "delete",
-            &snap_name,
-            project_flag,
-            "--quiet",
-        ],
-        quiet,
-    )
-    .await;
-
-    Ok(())
-}

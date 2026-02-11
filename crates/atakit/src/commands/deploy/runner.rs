@@ -56,6 +56,7 @@ async fn deploy_gcp(
         secure_boot_dir: paths.secure_boot_dir.clone(),
         quiet,
         port_rules: port_rules.to_vec(),
+        data_disks: vec![],
     };
 
     let mut gcp = csp::gcp::Gcp::new(gcp_config).await?;
