@@ -28,8 +28,18 @@ impl AtakitConfig {
         let path = dir.join("atakit.json");
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        let config: Self = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        for wl in &config.workloads {
+            if !wl.version.starts_with("v") {
+                anyhow::bail!(
+                    "Workload {} has invalid version {}, must start with 'v'",
+                    wl.name,
+                    wl.version
+                );
+            }
+        }
+        Ok(config)
     }
 
     /// Load atakit.json from the current working directory.

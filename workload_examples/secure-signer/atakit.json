@@ -2,7 +2,7 @@
     "workloads": [
         {
             "name": "secure-signer",
-            "version": "0.0.0-dev-1",
+            "version": "v0.0.0-dev-1",
             "image": "automata-linux:v0.0.0-dev-1",
             "docker_compose": "./container/docker-compose.yml"
         }

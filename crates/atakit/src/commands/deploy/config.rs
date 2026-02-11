@@ -26,10 +26,7 @@ pub struct DeploymentConfig {
     pub workload_path: String,
     // Optional image reference (e.g., "tee-base-image:v1") to override the config value.
     pub workload: ImageRef,
-    /// Release tag for automata-linux disk images (e.g., "automata-linux:v0.5.0").
-    /// If omitted, the latest local release is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<ImageRef>,
+    pub image: ImageRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -164,7 +161,7 @@ pub async fn resolve_deployment(
     let platform = provider_to_platform(&config.provider);
 
     // CLI override takes precedence over config.
-    let image_ref = image_ref_override.or(config.image.as_ref());
+    let image_ref = image_ref_override.or(Some(&config.image));
     let (image_path, resolved_image_ref) = resolve_image(store, platform, repo, image_ref).await?;
 
     // Get secure boot dir if available (GCP only).
@@ -309,7 +306,12 @@ fn find_workload_def<'a>(
         .workloads
         .iter()
         .find(|w| w.name == workload_name)
-        .with_context(|| format!("Workload '{}' not found in atakit.json workloads[]", workload_name))
+        .with_context(|| {
+            format!(
+                "Workload '{}' not found in atakit.json workloads[]",
+                workload_name
+            )
+        })
 }
 
 /// Resolve disk image path using ImageStore.
@@ -365,7 +367,6 @@ async fn resolve_image(
 
     bail!("Failed to download disk image for latest release {image_ref}");
 }
-
 
 fn build_gcp_options_simple(
     platform_name: &str,
@@ -479,8 +480,11 @@ pub fn build_from_deployment(
         other => bail!("Unsupported platform '{other}'. Supported: gcp, azure, qemu"),
     };
 
+    let image = deploy_def.image.as_ref().unwrap_or(&wl_def.image);
+
     // Extract ports from compose summary.
-    let ports: Vec<PortDef> = summary.summary
+    let ports: Vec<PortDef> = summary
+        .summary
         .ports
         .iter()
         .filter_map(|sp| {
@@ -492,7 +496,8 @@ pub fn build_from_deployment(
         .collect();
 
     // Match named volumes to disk definitions.
-    let disks: Vec<DiskDef> = summary.summary
+    let disks: Vec<DiskDef> = summary
+        .summary
         .named_volumes
         .iter()
         .filter_map(|(_, vol)| {
@@ -512,7 +517,7 @@ pub fn build_from_deployment(
         provider: provider.clone(),
         workload: ImageRef::new(&wl_def.name, &wl_def.version),
         workload_path: format!("{}-{}.tar.gz", wl_def.name, wl_def.version),
-        image: deploy_def.image.clone(),
+        image: image.clone(),
         vm_type: platform_config.vmtype.clone(),
         ports,
         disks,

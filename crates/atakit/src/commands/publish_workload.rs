@@ -80,7 +80,7 @@ impl PublishWorkload {
         // Build WorkloadSpec
         let spec = WorkloadSpec {
             name: workload.name.clone(),
-            version: format!("v{}", workload.version),
+            version: workload.version.clone(),
             ttl: self.ttl,
             baseImageMode: 2, // AccessMode::WHITELIST
             baseImageIds: vec![base_image_id],
@@ -89,7 +89,7 @@ impl PublishWorkload {
         };
 
         // Print summary
-        println!("Workload: {} v{}", spec.name, spec.version);
+        println!("Workload: {}:{}", spec.name, spec.version);
         println!("TTL: {} seconds", spec.ttl);
         println!("Base Image Mode: WHITELIST (allowed: {})", workload.image);
         println!("Base Image ID: {}", base_image_id);

@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use automata_linux_release::{ImageRef, ImageStore};
 use clap::Args;
 use config::PortDef;
 use cvm_agent::client::{AdditionalFile, AgentEnv};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::env::Env;
 use crate::instances;
@@ -57,7 +57,7 @@ pub struct Deploy {
     /// Force re-upload disk image even if it already exists.
     /// Deletes the existing image before uploading.
     #[arg(long)]
-    pub force_image: bool,
+    pub force_update_image: bool,
 
     // ── Agent Environment Configuration ──────────────────────────────
     /// Directory containing additional data files referenced in deployment config.
@@ -141,10 +141,18 @@ impl Deploy {
         let is_qemu = matches!(deploy_config.provider, config::ProviderKind::Qemu);
 
         // Build agent environment from config + CLI overrides (optional)
-        let agent_env = self.build_agent_env(&deploy_config);
+        let agent_env = match self.build_agent_env(&deploy_config) {
+            Ok(agent_env) => Some(agent_env),
+            Err(e) => {
+                warn!("Failed to build agent environment: {e}");
+                None
+            }
+        };
 
         // Load additional files
-        let additional_files = self.load_additional_files(&deploy_config, &config_dir).await?;
+        let additional_files = self
+            .load_additional_files(&deploy_config, &config_dir)
+            .await?;
 
         let cancel = CancellationToken::new();
 
@@ -177,7 +185,7 @@ impl Deploy {
             &deploy_config,
             &paths,
             operator_address,
-            self.force_image,
+            self.force_update_image,
             ctx,
             self.quiet,
         )
@@ -279,32 +287,36 @@ impl Deploy {
     /// Build AgentEnv from deployment config and CLI overrides.
     /// CLI arguments take precedence over config values.
     /// Returns None if required fields are missing from both CLI and config.
-    fn build_agent_env(&self, deploy_config: &config::DeploymentConfig) -> Option<AgentEnv> {
+    fn build_agent_env(&self, deploy_config: &config::DeploymentConfig) -> Result<AgentEnv> {
         let config_env = deploy_config.agent_env.as_ref();
 
         // CLI takes precedence over config for all fields
         let relay_private_key = self
             .relay_private_key
-            .or(config_env.map(|c| c.relay_private_key))?;
+            .or(config_env.map(|c| c.relay_private_key))
+            .ok_or_else(|| anyhow!("relay_private_key not provided"))?;
 
         let rpc_url = self
             .rpc_url
             .clone()
-            .or_else(|| config_env.map(|c| c.rpc_url.clone()))?;
+            .or_else(|| config_env.map(|c| c.rpc_url.clone()))
+            .ok_or_else(|| anyhow!("rpc_url not provided"))?;
 
         let session_registry = self
             .session_registry
-            .or(config_env.map(|c| c.session_registry))?;
+            .or(config_env.map(|c| c.session_registry))
+            .ok_or_else(|| anyhow!("session_registry not provided"))?;
 
         let owner_private_key = self
             .owner_private_key
-            .or(config_env.map(|c| c.owner_private_key))?;
+            .or(config_env.map(|c| c.owner_private_key))
+            .ok_or_else(|| anyhow!("owner_private_key not provided"))?;
 
         // base_image_ref: CLI --base-image-ref > config.image
         let base_image_ref = self
             .base_image_ref
             .clone()
-            .or_else(|| deploy_config.image.clone())?;
+            .unwrap_or_else(|| deploy_config.image.clone());
 
         // workload_ref: CLI --workload-ref > config.workload
         let workload_ref = self
@@ -318,7 +330,7 @@ impl Deploy {
             .or(config_env.map(|c| c.expire_offset))
             .unwrap_or(cvm_agent::client::DEFAULT_EXPIRE_OFFSET);
 
-        Some(AgentEnv {
+        Ok(AgentEnv {
             relay_private_key,
             rpc_url,
             session_registry,
@@ -336,7 +348,10 @@ impl Deploy {
         deploy_config: &config::DeploymentConfig,
         config_dir: &Path,
     ) -> Result<Vec<AdditionalFile>> {
-        info!("Loading additional data files: {:?}", deploy_config.additional_data_files);
+        info!(
+            "Loading additional data files: {:?}",
+            deploy_config.additional_data_files
+        );
         if deploy_config.additional_data_files.is_empty() {
             return Ok(Vec::new());
         }
@@ -361,9 +376,9 @@ impl Deploy {
                 );
             }
 
-            let data = tokio::fs::read(&source_path)
-                .await
-                .with_context(|| format!("Failed to read additional file: {}", source_path.display()))?;
+            let data = tokio::fs::read(&source_path).await.with_context(|| {
+                format!("Failed to read additional file: {}", source_path.display())
+            })?;
 
             // Destination path: /secrets/{relative_path}
             let dest = format!("/{}", file_path.display());

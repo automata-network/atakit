@@ -16,7 +16,7 @@ pub async fn deploy(
     config: &DeploymentConfig,
     paths: &ResolvedPaths,
     operator_address: Address,
-    force_image: bool,
+    force_update_image: bool,
     env: &Env,
     quiet: bool,
 ) -> Result<InstanceInfo> {
@@ -28,8 +28,8 @@ pub async fn deploy(
     let port_rules = build_port_rules(&config.ports);
 
     match config.provider {
-        ProviderKind::Gcp => deploy_gcp(config, paths, quiet, force_image, &metadata, &port_rules).await,
-        ProviderKind::Azure => deploy_azure(config, paths, quiet, force_image, &metadata).await,
+        ProviderKind::Gcp => deploy_gcp(config, paths, quiet, force_update_image, &metadata, &port_rules).await,
+        ProviderKind::Azure => deploy_azure(config, paths, quiet, force_update_image, &metadata).await,
         ProviderKind::Qemu => deploy_qemu(config, paths, env, quiet, &metadata, &port_rules).await,
     }
 }
@@ -40,7 +40,7 @@ async fn deploy_gcp(
     config: &DeploymentConfig,
     paths: &ResolvedPaths,
     quiet: bool,
-    force_image: bool,
+    force_update_image: bool,
     metadata: &Metadata,
     port_rules: &[PortRule],
 ) -> Result<InstanceInfo> {
@@ -65,7 +65,7 @@ async fn deploy_gcp(
     gcp.check_deps().await?;
 
     info!("Uploading disk image");
-    gcp.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_image).await?;
+    gcp.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_update_image).await?;
 
     if !port_rules.is_empty() {
         info!("Configuring firewall rules");
@@ -95,7 +95,7 @@ async fn deploy_azure(
     config: &DeploymentConfig,
     paths: &ResolvedPaths,
     quiet: bool,
-    force_image: bool,
+    force_update_image: bool,
     metadata: &Metadata,
 ) -> Result<InstanceInfo> {
     let azure_opts = config.azure.as_ref().cloned().unwrap_or_default();
@@ -116,7 +116,7 @@ async fn deploy_azure(
     azure.check_deps().await?;
 
     info!("Uploading disk image");
-    azure.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_image).await?;
+    azure.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_update_image).await?;
 
     info!("Creating CVM instance");
     let instance = azure.create_instance(metadata).await?;
