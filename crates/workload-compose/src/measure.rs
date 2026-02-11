@@ -35,7 +35,7 @@ use walkdir::WalkDir;
 
 use crate::serialize::service_to_yaml;
 use crate::types::{WorkloadCompose, WorkloadService, WorkloadVolumeMount};
-use crate::{WorkloadManifest, from_yaml_str};
+use crate::{WorkloadManifest, from_yaml_str, validate_normalized};
 
 /// Configuration for workload measurement.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -155,6 +155,9 @@ pub enum MeasureError {
 
     #[error("Failed to parse compose file: {0}")]
     ParseCompose(#[source] anyhow::Error),
+
+    #[error("Failed to validate compose file: {0}")]
+    ValidateCompose(#[source] anyhow::Error),
 
     #[error("Service '{service}' is missing image digest in config")]
     MissingImageDigest { service: String },
@@ -338,6 +341,8 @@ pub fn measure(
         std::fs::read_to_string(&compose_path).map_err(MeasureError::ReadCompose)?;
     let compose = from_yaml_str(&compose_content).map_err(MeasureError::ParseCompose)?;
 
+    validate_normalized(&compose_content).map_err(MeasureError::ValidateCompose)?;
+
     // 3. Enumerate all files in the workload folder
     let all_files = enumerate_files(workload_folder)?;
 
@@ -409,12 +414,13 @@ fn measure_service(
     used_files: &mut HashSet<String>,
 ) -> Result<ServiceMeasurement, MeasureError> {
     // Get image digest from config - must start with "sha256:", then strip prefix
-    let raw_digest = config
-        .image_digests
-        .get(service_name)
-        .ok_or_else(|| MeasureError::MissingImageDigest {
-            service: service_name.to_string(),
-        })?;
+    let raw_digest =
+        config
+            .image_digests
+            .get(service_name)
+            .ok_or_else(|| MeasureError::MissingImageDigest {
+                service: service_name.to_string(),
+            })?;
     let image_digest = raw_digest
         .strip_prefix("sha256:")
         .ok_or_else(|| MeasureError::InvalidImageDigest {
