@@ -38,7 +38,7 @@ use crate::types::{WorkloadCompose, WorkloadService, WorkloadVolumeMount};
 use crate::{WorkloadManifest, from_yaml_str};
 
 /// Configuration for workload measurement.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MeasureConfig {
     /// Additional files to skip during measurement (relative paths from workload folder).
     /// Note: manifest.json, image tars, and additional_data_files from manifest are auto-skipped.
