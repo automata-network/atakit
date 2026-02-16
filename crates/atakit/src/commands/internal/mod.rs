@@ -43,7 +43,7 @@ impl Internal {
             Internal::PublishWorkload(cmd) => cmd.run(&config),
             Internal::SimAgent(cmd) => cmd.run().await,
             Internal::DeployRaw(cmd) => cmd.run(&config),
-            Internal::Manage(cmd) => cmd.run(&config),
+            Internal::Manage(cmd) => cmd.run(&config).await,
             Internal::Security(cmd) => cmd.run(&config),
             Internal::RegisterSession(cmd) => cmd.run().await,
         }

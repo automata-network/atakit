@@ -1,7 +1,8 @@
 //! HTTP client for communicating with the CVM agent.
 //!
-//! This module provides functionality to initialize a CVM instance by uploading
-//! a workload package to the agent's `/init` endpoint.
+//! This module provides functionality to initialize and update a CVM instance
+//! by uploading workload packages to the agent's `/init` and `/update-workload`
+//! endpoints.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +19,7 @@ use tracing::info;
 
 const INIT_PORT: u16 = 8000;
 const INIT_ENDPOINT: &str = "/init";
+const UPDATE_ENDPOINT: &str = "/update-workload";
 const PING_ENDPOINT: &str = "/ping";
 
 // Header names for operator authentication
@@ -326,4 +328,93 @@ fn build_multipart_body(
     body.extend_from_slice(format!("--{}--\r\n", MULTIPART_BOUNDARY).as_bytes());
 
     Ok(body)
+}
+
+/// Update a workload on a running CVM instance.
+///
+/// Sends a signed POST request to `https://<ip>:8000/update-workload` with the
+/// workload tar.gz file (pre-built via `atakit workload build`) and optional
+/// additional data files.
+pub async fn update_workload(
+    ip: &str,
+    workload_path: &Path,
+    additional_files: Vec<AdditionalFile>,
+    private_key: B256,
+) -> Result<()> {
+    let url = format!("https://{}:{}{}", ip, INIT_PORT, UPDATE_ENDPOINT);
+
+    info!(workload = %workload_path.display(), "Uploading workload update to CVM");
+
+    let workload_bytes = tokio::fs::read(workload_path)
+        .await
+        .with_context(|| format!("Failed to read workload file: {}", workload_path.display()))?;
+
+    let filename = workload_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workload.tar.gz");
+
+    let config = InitConfig {
+        additional_files: additional_files.iter().map(|f| f.dest.clone()).collect(),
+        ..Default::default()
+    };
+
+    let body = build_multipart_body(filename, &workload_bytes, &config, &additional_files)?;
+
+    // Sign request with operator key
+    let signer = PrivateKeySigner::from_bytes(&private_key).context("Invalid private key")?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+
+    let mut message = timestamp.as_bytes().to_vec();
+    message.extend_from_slice(&body);
+    let hash = keccak256(&message);
+
+    let signature = signer
+        .sign_hash(&hash)
+        .await
+        .context("Failed to sign message")?;
+
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..32].copy_from_slice(&signature.r().to_be_bytes::<32>());
+    sig_bytes[32..64].copy_from_slice(&signature.s().to_be_bytes::<32>());
+    sig_bytes[64] = if signature.v() { 1 } else { 0 };
+
+    let sig_hex = format!("0x{}", hex::encode(sig_bytes));
+
+    info!("Request signed with operator key");
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("Failed to build HTTP client")?;
+    let content_type = format!("multipart/form-data; boundary={}", MULTIPART_BOUNDARY);
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", content_type)
+        .header(HEADER_TIMESTAMP, &timestamp)
+        .header(HEADER_SIGNATURE, sig_hex)
+        .body(body)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .with_context(|| format!("Failed to send update request to {}", url))?;
+
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .context("Failed to read update response")?;
+
+    if !status.is_success() {
+        bail!("Update failed ({}): {}", status, response_text);
+    }
+
+    info!(response = %response_text, "Workload update complete");
+    Ok(())
 }

@@ -34,9 +34,9 @@ pub enum Manage {
 }
 
 impl Manage {
-    pub fn run(self, config: &Config) -> Result<()> {
+    pub async fn run(self, config: &Config) -> Result<()> {
         match self {
-            Manage::UpdateWorkload(cmd) => cmd.run(config),
+            Manage::UpdateWorkload(cmd) => cmd.run(config).await,
             Manage::GetDisk(cmd) => cmd.run(config),
             Manage::UpdateDisk(cmd) => cmd.run(config),
             Manage::GetLogs(cmd) => cmd.run(config),
