@@ -146,6 +146,12 @@ pub fn create_package(
         })
         .collect();
     let mut policy = CvmAgentPolicy::default().with_ports(&port_inputs);
+    policy.workload_config.services.allow_update = analysis
+        .summary
+        .images
+        .iter()
+        .map(|img| img.service.clone())
+        .collect();
     policy.workload_config.services.agent_socket_targets = agent_socket_targets.clone();
     for (service, _, disk, mount_point) in &disk_mappings {
         policy = policy.with_disk(DiskInput {

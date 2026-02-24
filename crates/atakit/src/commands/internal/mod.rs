@@ -36,6 +36,11 @@ pub enum Internal {
 
 impl Internal {
     pub async fn run(self) -> Result<()> {
+        // Commands that don't need an atakit installation can bypass Config::detect().
+        if let Internal::Manage(manage::Manage::UpdateWorkload(cmd)) = self {
+            return cmd.run(&Config::default()).await;
+        }
+
         let config = Config::detect()?;
         config.check_dependencies()?;
 

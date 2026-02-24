@@ -15,6 +15,19 @@ pub struct Config {
     pub is_installed: bool,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            script_dir: PathBuf::new(),
+            workload_dir: PathBuf::new(),
+            tools_dir: PathBuf::new(),
+            artifact_dir: PathBuf::new(),
+            disk_dir: PathBuf::new(),
+            is_installed: false,
+        }
+    }
+}
+
 impl Config {
     /// Detect installation mode and resolve all paths.
     pub fn detect() -> Result<Self> {
