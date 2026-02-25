@@ -22,7 +22,7 @@ fatfs.workspace = true
 fscommon.workspace = true
 automata-linux-release.workspace = true
 csp.workspace = true
-cvm-agent = { workspace = true, features = ["client"] }
+automata-cvm-agent = { workspace = true, features = ["client"] }
 workload-compose.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true

@@ -8,7 +8,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use tracing::{info, warn};
 
-use cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
+use automata_cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
 
 use workload_compose::{
     ComposeAnalysis, DockerImageEntry, ImageKind, WorkloadManifest, resolve_image_short_name,

@@ -20,10 +20,10 @@ lto = "thin"
 
 automata-linux-release = { path = "crates/automata-linux-release" }
 csp = { path = "crates/csp" }
-cvm-agent = { path = "crates/cvm-agent" }
+automata-cvm-agent = { path = "crates/automata-cvm-agent" }
 workload-compose = { path = "crates/workload-compose" }
-automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
-#automata-tee-workload-measurement = { path = "../tee-workload-attestation/crates/automata-tee-workload-measurement/" }
+#automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
+automata-tee-workload-measurement = { path = "../tee-workload-attestation/crates/automata-tee-workload-measurement/" }
 
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"

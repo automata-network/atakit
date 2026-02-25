@@ -979,12 +979,12 @@ version = "0.1.0"
 dependencies = [
  "alloy-ext",
  "anyhow",
+ "automata-cvm-agent",
  "automata-linux-release",
  "automata-tee-workload-measurement",
  "axum",
  "clap",
  "csp",
- "cvm-agent",
  "fatfs",
  "flate2",
  "fscommon",
@@ -1029,6 +1029,27 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "automata-cvm-agent"
+version = "0.1.0"
+dependencies = [
+ "alloy-ext",
+ "anyhow",
+ "automata-linux-release",
+ "automata-tee-workload-measurement",
+ "bytes",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "automata-linux-release"
@@ -1834,27 +1855,6 @@ dependencies = [
  "rand 0.8.5",
  "tar",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cvm-agent"
-version = "0.1.0"
-dependencies = [
- "alloy-ext",
- "anyhow",
- "automata-linux-release",
- "automata-tee-workload-measurement",
- "bytes",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
  "tracing",
 ]
 

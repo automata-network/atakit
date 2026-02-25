@@ -1,5 +1,5 @@
 [package]
-name = "cvm-agent"
+name = "automata-cvm-agent"
 version.workspace = true
 edition.workspace = true
 

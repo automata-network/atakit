@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
+use automata_cvm_agent::init_client::DEFAULT_EXPIRE_OFFSET;
 use automata_linux_release::{ImageRef, ImageStore};
 use clap::Args;
 use config::PortDef;
-use cvm_agent::client::{AdditionalFile, AgentEnv};
+use automata_cvm_agent::init_client::{AdditionalFile, AgentEnv};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -316,7 +317,7 @@ impl Deploy {
         let expire_offset = self
             .expire_offset
             .or(config_env.map(|c| c.expire_offset))
-            .unwrap_or(cvm_agent::client::DEFAULT_EXPIRE_OFFSET);
+            .unwrap_or(DEFAULT_EXPIRE_OFFSET);
 
         Ok(AgentEnv {
             relay_private_key,
