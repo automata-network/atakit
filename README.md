@@ -36,7 +36,8 @@ The binary will be available at `atakit`.
 ### Prerequisites
 
 - **Rust**: 2024 edition or later
-- **Cloud CLI tools**: `gcloud`, `az`, or `aws` depending on target platform
+- **just**: Command runner ([installation](https://github.com/casey/just#installation))
+- **Cloud CLI tools**: `gcloud` depending on target platform
 - **QEMU**: For local development (optional)
 
 Cloud account permissions required:
@@ -93,16 +94,16 @@ Create a `docker-compose.yml` for your workload:
 services:
   app:
     build: .
-    image: my-app:v0.0.1
+    image: my-workload:v0.0.1
     ports:
       - "8080:8080"
     volumes:
       - ./config:/app/config:ro
       - ./cvm-agent.sock:/app/cvm-agent.sock
-      - app-data:/data
+      - my-data:/data
 
 volumes:
-  app-data:
+  my-data:
 ```
 
 Create a `Dockerfile`:
@@ -169,7 +170,7 @@ The main project configuration file.
 {
     "workloads": [
         {
-            "name": "string",           // Workload identifier
+            "name": "workload-name",    // Workload identifier
             "version": "v0.0.1",        // Version (must start with 'v')
             "image": "automata-linux:v0.1.0",  // Base image reference
             "docker_compose": "./path/to/docker-compose.yml"
