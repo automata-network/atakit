@@ -236,7 +236,6 @@ pub async fn resolve_from_atakit_json(
     // Build the config using shared logic.
     let config = build_from_deployment(
         deployment_name,
-        deploy_def,
         wl_def,
         &platform_name,
         platform_config,
@@ -465,7 +464,6 @@ fn sanitize_azure_storage_name(name: &str) -> String {
 /// (deployment, platform) pair.
 pub fn build_from_deployment(
     deployment_name: &str,
-    deploy_def: &DeploymentDef,
     wl_def: &WorkloadDef,
     platform_name: &str,
     platform_config: &PlatformConfig,
@@ -480,7 +478,7 @@ pub fn build_from_deployment(
         other => bail!("Unsupported platform '{other}'. Supported: gcp, azure, qemu"),
     };
 
-    let image = deploy_def.image.as_ref().unwrap_or(&wl_def.image);
+    let image = &wl_def.image;
 
     // Extract ports from compose summary.
     let ports: Vec<PortDef> = summary

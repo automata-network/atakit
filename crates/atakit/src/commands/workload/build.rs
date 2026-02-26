@@ -10,7 +10,7 @@ use workload_compose::{ImageKind, extract_image_name_tag};
 use crate::{
     commands::deploy::config::{build_from_deployment, to_json},
     env::Env,
-    types::{AtakitConfig, DeploymentDef, WorkloadDef},
+    types::{AtakitConfig, WorkloadDef},
 };
 
 /// How to handle Docker images in the workload package.
@@ -26,8 +26,9 @@ pub enum ImageMode {
 /// Build a workload package from docker-compose definitions.
 #[derive(Args)]
 pub struct BuildWorkload {
-    /// Names of deployments to build (builds all if omitted)
-    pub deployments: Vec<String>,
+    /// Names of workloads to build (from atakit.json workloads[].name).
+    /// If omitted, all workloads are built.
+    pub workloads: Vec<String>,
 
     /// How to handle Docker images
     #[arg(long, value_enum, default_value_t = ImageMode::Bundle)]
@@ -40,13 +41,10 @@ impl BuildWorkload {
         let project_dir = env.config_dir()?.to_path_buf();
         std::fs::create_dir_all(&env.project_artifact_dir)?;
 
-        // Resolve which deployments to build.
-        let deployments = self.resolve_deployments(&atakit_config)?;
+        // Resolve which workloads to build.
+        let workloads = self.resolve_workloads(&atakit_config)?;
 
-        for (deploy_name, deploy_def) in deployments {
-            // Find the workload referenced by this deployment.
-            let wl_def = self.find_workload(&atakit_config, deploy_def)?;
-
+        for wl_def in &workloads {
             // Create output directory: ata_artifacts/{workload_name}/
             let output_dir = env.project_artifact_dir.join(&wl_def.name);
             fs::create_dir_all(&output_dir)
@@ -57,7 +55,6 @@ impl BuildWorkload {
                 .with_context(|| format!("Failed to analyze workload {:?}", wl_def.name))?;
 
             info!(
-                deployment = %deploy_name,
                 workload = %wl_def.name,
                 measured = analysis.measured_files.len(),
                 additional_data = analysis.additional_data_files.len(),
@@ -69,13 +66,11 @@ impl BuildWorkload {
             let expected_image = format!("{}:{}", wl_def.name, wl_def.version);
             validate_compose_images(&analysis.summary.images, &expected_image)?;
 
-            let image = deploy_def.image.as_ref().unwrap_or(&wl_def.image);
-
             // Build workload package: {workload_name}-{version}.tar.gz
             let package_name = format!("{}-{}", wl_def.name, wl_def.version);
             info!(
-                deployment = %deploy_name,
-                %image,
+                workload = %wl_def.name,
+                image = %wl_def.image,
                 "Building package"
             );
 
@@ -87,32 +82,36 @@ impl BuildWorkload {
                 &output_dir,
                 &atakit_config,
                 self.image_mode,
-                deploy_def.image.clone(),
+                None,
             )?;
             info!(output = %format!("ata_artifacts/{}/{}.tar.gz", wl_def.name, package_name), "Package created");
 
-            // Generate deployment configs: {deploy_name}-{platform}-deployment.json
+            // Generate deployment configs for all deployments referencing this workload
             let project_name = project_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("atakit");
-            for (platform_name, platform_config) in &deploy_def.platforms {
-                let config = build_from_deployment(
-                    &deploy_name,
-                    deploy_def,
-                    wl_def,
-                    platform_name,
-                    platform_config,
-                    &analysis,
-                    &atakit_config,
-                    project_name,
-                )?;
-                let filename = format!("{}-{}-deployment.json", deploy_name, platform_name);
-                let output_path = output_dir.join(&filename);
-                let json = to_json(&config)?;
-                fs::write(&output_path, json)
-                    .with_context(|| format!("Failed to write {}", output_path.display()))?;
-                info!(output = %format!("ata_artifacts/{}/{}", wl_def.name, filename), "Deployment config created");
+            for (deploy_name, deploy_def) in &atakit_config.deployment {
+                if deploy_def.workload != wl_def.name {
+                    continue;
+                }
+                for (platform_name, platform_config) in &deploy_def.platforms {
+                    let config = build_from_deployment(
+                        deploy_name,
+                        wl_def,
+                        platform_name,
+                        platform_config,
+                        &analysis,
+                        &atakit_config,
+                        project_name,
+                    )?;
+                    let filename = format!("{}-{}-deployment.json", deploy_name, platform_name);
+                    let output_path = output_dir.join(&filename);
+                    let json = to_json(&config)?;
+                    fs::write(&output_path, json)
+                        .with_context(|| format!("Failed to write {}", output_path.display()))?;
+                    info!(output = %format!("ata_artifacts/{}/{}", wl_def.name, filename), "Deployment config created");
+                }
             }
         }
 
@@ -120,63 +119,32 @@ impl BuildWorkload {
         Ok(())
     }
 
-    fn resolve_deployments<'a>(
-        &self,
-        config: &'a AtakitConfig,
-    ) -> Result<Vec<(String, &'a DeploymentDef)>> {
-        if self.deployments.is_empty() {
-            if config.deployment.is_empty() {
-                bail!("No deployments defined in atakit.json");
+    fn resolve_workloads<'a>(&self, config: &'a AtakitConfig) -> Result<Vec<&'a WorkloadDef>> {
+        if self.workloads.is_empty() {
+            if config.workloads.is_empty() {
+                bail!("No workloads defined in atakit.json");
             }
-            return Ok(config
-                .deployment
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect());
+            return Ok(config.workloads.iter().collect());
         }
 
-        let mut result = Vec::new();
-        for name in &self.deployments {
-            match config.deployment.get(name) {
-                Some(def) => result.push((name.clone(), def)),
-                None => bail!(
-                    "Deployment '{}' not found in atakit.json. Available: {}",
-                    name,
-                    config
-                        .deployment
-                        .keys()
-                        .map(|k| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }
-        }
-        Ok(result)
-    }
-
-    fn find_workload<'a>(
-        &self,
-        config: &'a AtakitConfig,
-        deploy_def: &DeploymentDef,
-    ) -> Result<&'a WorkloadDef> {
-        let workload_name = &deploy_def.workload;
-
-        config
-            .workloads
+        self.workloads
             .iter()
-            .find(|w| &w.name == workload_name)
-            .with_context(|| {
-                format!(
-                    "Workload '{}' not found in atakit.json. Available: {}",
-                    workload_name,
-                    config
-                        .workloads
-                        .iter()
-                        .map(|w| w.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+            .map(|name| {
+                config
+                    .workloads
+                    .iter()
+                    .find(|w| w.name == *name)
+                    .with_context(|| {
+                        let available: Vec<_> =
+                            config.workloads.iter().map(|w| w.name.as_str()).collect();
+                        format!(
+                            "Workload '{}' not found in atakit.json. Available: {}",
+                            name,
+                            available.join(", ")
+                        )
+                    })
             })
+            .collect()
     }
 }
 

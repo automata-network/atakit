@@ -2,11 +2,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use automata_linux_release::ImageRef;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use tracing::{info, warn};
+use tracing::info;
 
 use automata_cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
 
@@ -89,11 +89,6 @@ pub fn create_package(
 
     // 2. Add measured files.
     for (real, compose_rel) in &analysis.measured_files {
-        let abs = project_dir.join(real);
-        if !abs.exists() {
-            warn!(path = %compose_rel.display(), "Measured file not found, skipping");
-            continue;
-        }
         if let Some(file_name) = compose_rel.file_name() {
             if let Some(file_name) = file_name.to_str() {
                 if file_name == "cvm-agent.sock" {
@@ -102,6 +97,13 @@ pub fn create_package(
                 }
             }
         }
+        let abs = project_dir.join(real);
+        ensure!(
+            abs.exists(),
+            "Measured file not found: {}, workload={}",
+            compose_rel.display(),
+            wl_def.name,
+        );
         let archive_name = format!("{}/{}", prefix, compose_rel.display());
         if abs.is_file() {
             tar.append_path_with_name(&abs, &archive_name)

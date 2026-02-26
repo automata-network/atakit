@@ -11,10 +11,14 @@ serde_json.workspace = true
 alloy = { workspace = true, optional = true }
 anyhow = { version = "1", optional = true }
 hex = { workspace = true, optional = true }
+k256 = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+workload-compose = { workspace = true, optional = true }
 automata-linux-release.workspace = true
 automata-tee-workload-measurement.workspace = true
 
@@ -24,6 +28,11 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 
+# Sim server dependencies
+axum = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
 [features]
 default = ["client"]
-client = ["alloy", "anyhow", "hex", "reqwest", "tokio", "tokio-util", "tracing", "hyper", "hyper-util", "http-body-util", "bytes"]
+client = ["alloy", "anyhow", "hex", "k256", "p256", "rand", "reqwest", "sha2", "tokio", "tokio-util", "tracing", "hyper", "hyper-util", "http-body-util", "bytes"]
+sim = ["client", "axum", "sha2", "workload-compose", "alloy/node-bindings"]

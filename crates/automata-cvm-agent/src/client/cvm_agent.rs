@@ -20,7 +20,7 @@ pub struct SignMessageRequest {
 }
 
 /// Response from the sign-message endpoint
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignMessageResponse {
     /// secp256k1 signature (65 bytes: r || s || v)
     pub signature: Bytes,
@@ -45,7 +45,7 @@ pub struct SignMessageResponse {
 pub struct RotateKeyRequest {}
 
 /// Response from the rotate-key endpoint
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotateKeyResponse {
     /// New session ID after rotation
     pub session_id: B256,

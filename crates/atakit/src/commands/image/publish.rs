@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use alloy::ext::{NetworkProvider, ProviderEx};
 use alloy::primitives::{Address, B256, FixedBytes};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
@@ -9,6 +10,7 @@ use automata_tee_workload_measurement::types::AppRef;
 use automata_tee_workload_measurement::{WorkloadMeasurement, WorkloadMeasurementConfig};
 use clap::Parser;
 use tracing::info;
+use automata_linux_release::ImageRef;
 
 use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
 use automata_tee_workload_measurement::stubs::BaseImageRegistry::{
@@ -22,11 +24,7 @@ use crate::Env;
 pub struct Publish {
     /// Base image name (e.g., "automata-linux")
     #[arg(long)]
-    name: String,
-
-    /// Base image version (e.g., "1.0.0")
-    #[arg(long)]
-    version: String,
+    image: ImageRef,
 
     /// Base image URI (e.g., "ipfs://...")
     #[arg(long)]
@@ -40,9 +38,10 @@ pub struct Publish {
     #[arg(long, env = "ATAKIT_PRIVATE_KEY")]
     private_key: B256,
 
-    /// SessionRegistry contract address
+    /// SessionRegistry contract address.
+    /// If omitted, auto-detected from the registry store.
     #[arg(long, env = "ATAKIT_SESSION_REGISTRY")]
-    session_registry: Address,
+    session_registry: Option<Address>,
 
     /// BaseImageRegistry contract address
     #[arg(long)]
@@ -60,7 +59,7 @@ pub struct Publish {
 impl Publish {
     pub async fn run(self, env: &Env) -> Result<()> {
         // Load all profiles from dev profiles directory
-        let profiles_dir = env.dev_profiles_dir();
+        let profiles_dir = env.image_profiles_dir(&self.image);
         if !profiles_dir.exists() {
             anyhow::bail!(
                 "No dev profiles found. Run 'atakit image fetch-dev-profile' first.\n\
@@ -69,9 +68,14 @@ impl Publish {
             );
         }
 
-        let profiles = load_profiles(&profiles_dir)?;
+        let mut profiles = load_profiles(&profiles_dir)?;
         if profiles.is_empty() {
             anyhow::bail!("No profile files found in {}", profiles_dir.display());
+        }
+
+        // filter out workload pcr (pcr23)
+        for profile in &mut profiles {
+            profile.pcrs.retain(|p| p.pcr_index != 23);
         }
 
         info!(count = profiles.len(), "Loaded platform profiles");
@@ -86,15 +90,15 @@ impl Publish {
 
         // Build base image spec
         let spec = BaseImageSpec {
-            name: self.name.clone(),
-            version: self.version.clone(),
+            name: self.image.repository.clone(),
+            version: self.image.tag.clone(),
             uri: self.uri.clone(),
         };
 
-        let app_ref = AppRef::new(&self.name, &self.version);
+        let app_ref = AppRef::new(&self.image.repository, &self.image.tag);
 
         // Print summary
-        println!("Base Image: {} {}", self.name, self.version);
+        println!("Base Image: {}", self.image);
         println!("URI: {}", self.uri);
         println!("image_id: {}", BaseImageRegistry::get_image_id(&app_ref));
         println!();
@@ -118,9 +122,28 @@ impl Publish {
 
         let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
 
+        // Resolve SessionRegistry address
+        let session_registry = if let Some(addr) = self.session_registry {
+            addr
+        } else {
+            let provider = NetworkProvider::with_http(&self.rpc_url, None, None, 100).await?;
+            let chain_id = provider.chain_id();
+
+            let store = env.registry_store();
+            store.ensure_data(None).await?;
+
+            let addr = store
+                .resolve_contract(None, &chain_id.to_string(), "SessionRegistry")?
+                .context(format!("No SessionRegistry found for chain {chain_id}"))?;
+            println!(
+                "SessionRegistry: {addr} (chain {chain_id})",
+            );
+            addr
+        };
+
         let wm = WorkloadMeasurement::new(WorkloadMeasurementConfig {
             rpc_url: self.rpc_url.clone(),
-            session_registry_address: self.session_registry,
+            session_registry_address: session_registry,
             relay_key: Some(self.private_key),
         })
         .await?;

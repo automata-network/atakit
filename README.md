@@ -67,7 +67,7 @@ Create an `atakit.json` configuration file in your project directory:
         {
             "name": "my-workload",
             "version": "v0.0.1",
-            "image": "automata-linux:v0.1.0",
+            "image": "automata-linux:v0.1.1",
             "docker_compose": "./docker-compose.yml"
         }
     ],
@@ -122,7 +122,7 @@ CMD ["python", "main.py"]
 ### 3. Build the Workload Package
 
 ```bash
-atakit workload build my-deployment
+atakit workload build my-workload
 ```
 
 This creates a `.tar.gz` package containing:
@@ -132,16 +132,10 @@ This creates a `.tar.gz` package containing:
 
 ### 4. Publish the Workload
 
-Check the SessionRegistry Address
-```bash
-atakit registry ls
-```
-
 ```bash
 atakit workload publish my-workload \
   --rpc-url $RPC_URL \
-  --owner-private-key $PRIVATE_KEY \
-  --session-registry $SESSION_REGISTRY
+  --owner-private-key $PRIVATE_KEY
 ```
 
 ### 5. Deploy
@@ -172,7 +166,7 @@ The main project configuration file.
         {
             "name": "workload-name",    // Workload identifier
             "version": "v0.0.1",        // Version (must start with 'v')
-            "image": "automata-linux:v0.1.0",  // Base image reference
+            "image": "automata-linux:v0.1.1",  // Base image reference
             "docker_compose": "./path/to/docker-compose.yml"
         }
     ],
@@ -214,7 +208,7 @@ Example:
 ```yaml
 services:
   app:
-    image: my-app:latest
+    image: my-app:v0.0.1
     ports:
       - "8080:8080"
     volumes:
@@ -351,6 +345,110 @@ my-workload/
 └── additional-data/         # Runtime data (not measured)
     └── secrets.json
 ```
+
+## Local Development with sim-agent
+
+The `sim-agent` command provides a complete local development environment by simulating the CVM agent. It:
+
+- Starts an embedded [Anvil](https://book.getfoundry.sh/reference/anvil/) node that forks from a remote chain
+- Registers a **temporary workload** with a dev version (default: `dev-YYYYMMDD`) to the on-chain WorkloadRegistry
+- Serves mock `/sign-message` and `/rotate-key` endpoints over Unix sockets
+
+### Workflow
+
+#### 1. Start a local Anvil node
+
+We recommend forking from a remote chain so that the Automata contracts (SessionRegistry, BaseImageRegistry, etc.) are already available:
+
+```bash
+anvil --fork-url https://rpc.example.com --hardfork osaka
+```
+
+This gives you a local chain at `http://localhost:8545` with pre-funded test accounts.
+
+#### 2. First run: get the dev workload ID
+
+```bash
+atakit sim-agent --rpc-url http://localhost:8545 my-workload
+```
+
+The output will show the temporary workload reference and its ID:
+
+```
+Workload: my-workload:dev-20260226 (workload_id: 0xabcd...)
+```
+
+The `--rpc-url` points to your local Anvil. The sim-agent starts a **second** embedded Anvil (default port `14345`, configurable with `--anvil-port`) that forks from it. This second Anvil is accessible at `http://0.0.0.0:14345` for external tools like `cast` or your own scripts.
+
+> By default the dev version changes once per day (`dev-YYYYMMDD`). You can pin it with `--dev-version dev`, but make sure that version is not already registered in the WorkloadRegistry.
+
+#### 3. Deploy contracts and whitelist the workload ID
+
+With the first Anvil running at `localhost:8545`, you can deploy your contracts and add the dev `workload_id` from step 2 to your contract's whitelist:
+
+```bash
+# Deploy your contract to the local Anvil
+forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
+
+# Whitelist the dev workload ID
+cast send <YOUR_CONTRACT> "addWorkload(bytes32)" 0xabcd... --rpc-url http://localhost:8545
+```
+
+#### 4. Build the workload package
+
+```bash
+atakit workload build my-workload
+```
+
+#### 5. Restart sim-agent
+
+```bash
+atakit sim-agent --rpc-url http://localhost:8545 my-workload
+```
+
+The sim-agent will register the temporary workload on its embedded Anvil (which forks from `localhost:8545`, inheriting your deployed contracts and whitelist) and start serving the CVM agent API on Unix sockets.
+
+#### 6. Start your services
+
+```bash
+docker compose -f docker-compose.yml up
+```
+
+Your services can now call the simulated CVM agent via the Unix socket (e.g., `./cvm-agent.sock`) just like they would in a real CVM.
+
+### sim-agent CLI Reference
+
+```
+atakit sim-agent [OPTIONS] --rpc-url <RPC_URL> [WORKLOAD]...
+```
+
+| Option | Description |
+|--------|-------------|
+| `[WORKLOAD]...` | Workload names from `atakit.json`. If omitted, all workloads are started |
+| `--rpc-url <URL>` | Remote RPC endpoint (used as Anvil fork URL) |
+| `--dev-version <VER>` | Dev workload version (default: `dev-YYYYMMDD`) |
+| `--anvil-port <PORT>` | Anvil listen port (default: 14345) |
+| `--session-registry <ADDR>` | SessionRegistry address (auto-detected if omitted) |
+
+## Registry Query Commands
+
+Query on-chain registry data.
+
+### Query base image info
+
+```bash
+atakit registry query image automata-linux:v0.1.0 --rpc-url <RPC_URL>
+```
+
+Shows the full base image hierarchy: spec, platform profiles, invariant PCRs, and measurement variants.
+
+### Query workload spec
+
+```bash
+atakit registry query workload guardian:v0.1.0 --rpc-url <RPC_URL>
+```
+
+Queries the WorkloadRegistry contract and prints the workload spec.
 
 ## Environment Variables
 

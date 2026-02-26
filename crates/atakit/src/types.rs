@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use automata_linux_release::ImageRef;
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -46,6 +46,39 @@ impl AtakitConfig {
     pub fn load() -> Result<Self> {
         Self::load_from(&std::env::current_dir()?)
     }
+
+    pub fn workload<'a>(&'a self, name: Option<&str>) -> anyhow::Result<&'a WorkloadDef> {
+        let workload = if self.workloads.len() == 1 && name.is_none() {
+            &self.workloads[0]
+        } else if let Some(ref name) = name {
+            self.workloads
+                .iter()
+                .find(|w| w.name == *name)
+                .ok_or_else(|| {
+                    let available: Vec<_> = self.workloads.iter().map(|w| &w.name).collect();
+                    anyhow::anyhow!(
+                        "Workload '{}' not found. Available: {}",
+                        name,
+                        available
+                            .iter()
+                            .map(|n| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?
+        } else {
+            let names: Vec<_> = self.workloads.iter().map(|w| &w.name).collect();
+            bail!(
+                "Multiple workloads defined. Specify one with available: {}",
+                names
+                    .iter()
+                    .map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        Ok(workload)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,10 +118,6 @@ fn default_key_security() -> String {
 #[derive(Debug, Deserialize)]
 pub struct DeploymentDef {
     pub workload: String,
-    /// Image version tag for automata-linux disk images (e.g. "v0.5.0").
-    /// If omitted, uses the latest available release with disk images.
-    #[serde(default)]
-    pub image: Option<ImageRef>,
     #[serde(default)]
     pub platforms: IndexMap<String, PlatformConfig>,
 }

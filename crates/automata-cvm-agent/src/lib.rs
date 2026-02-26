@@ -2,12 +2,19 @@ mod image_verify;
 mod policy;
 
 #[cfg(feature = "client")]
-pub mod init_client;
+pub mod client;
 
 #[cfg(feature = "client")]
-pub mod cvm_agent;
+pub mod device;
+
 #[cfg(feature = "client")]
-pub use cvm_agent::*;
+pub mod registration;
+
+#[cfg(feature = "sim")]
+pub mod mock;
+
+#[cfg(feature = "sim")]
+pub mod sim;
 
 pub use image_verify::*;
 pub use policy::*;

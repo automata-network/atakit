@@ -18,19 +18,13 @@ pub struct List {
 impl List {
     pub async fn run(self, env: &Env) -> Result<()> {
         let store = env.registry_store();
-        let branch = self.branch.unwrap_or_else(|| {
-            store.current_branch().unwrap_or_else(|_| "main".to_string())
-        });
-
+        let branch = self.branch.as_deref();
         // Auto-pull if no data exists
-        store.ensure_data(&branch).await?;
-
-        println!("Registry: {}", branch);
-        println!();
+        store.ensure_data(branch).await?;
 
         if let Some(chain_id) = &self.chain {
             // Show specific chain
-            match store.load_chain(&branch, chain_id)? {
+            match store.load_chain(branch, chain_id)? {
                 Some(addresses) => {
                     println!("Chain {chain_id}:");
                     for (name, addr) in &addresses {
@@ -43,7 +37,7 @@ impl List {
             }
         } else {
             // Show all chains
-            let chains = store.list_chains(&branch)?;
+            let chains = store.list_chains(branch)?;
             if chains.is_empty() {
                 println!("No contract deployments found.");
                 println!("Run 'atakit registry pull' to fetch from remote.");
@@ -51,7 +45,7 @@ impl List {
             }
 
             for chain_id in &chains {
-                if let Some(addresses) = store.load_chain(&branch, chain_id)? {
+                if let Some(addresses) = store.load_chain(branch, chain_id)? {
                     println!("Chain {chain_id}:");
                     for (name, addr) in &addresses {
                         println!("  {name}: {addr}");

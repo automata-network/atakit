@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
-use automata_cvm_agent::init_client::DEFAULT_EXPIRE_OFFSET;
+use automata_cvm_agent::client::init_client::DEFAULT_EXPIRE_OFFSET;
+use automata_cvm_agent::client::init_client::{AdditionalFile, AgentEnv};
 use automata_linux_release::{ImageRef, ImageStore};
 use clap::Args;
 use config::PortDef;
-use automata_cvm_agent::init_client::{AdditionalFile, AgentEnv};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
