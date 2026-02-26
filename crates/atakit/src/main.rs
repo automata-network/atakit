@@ -45,6 +45,9 @@ enum AtaKit {
     /// Workload package operations
     #[command(subcommand)]
     Workload(commands::workload::Workload),
+
+    /// Start simulated CVM agents on Unix sockets for local development
+    SimAgent(commands::sim_agent::SimAgent),
 }
 
 impl AtaKit {
@@ -56,6 +59,7 @@ impl AtaKit {
             AtaKit::Internal(cmd) => cmd.run().await,
             AtaKit::Registry(cmd) => cmd.run(env).await,
             AtaKit::Workload(cmd) => cmd.run(env).await,
+            AtaKit::SimAgent(cmd) => cmd.run(env).await,
         }
     }
 }

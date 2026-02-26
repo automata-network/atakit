@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 
 /// Request for signing a message
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignMessageRequest {
     /// Message to sign (hex with 0x prefix)
     pub message: Bytes,
 }
 
 /// Response from the sign-message endpoint
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignMessageResponse {
     /// secp256k1 signature (65 bytes: r || s || v)
     pub signature: Bytes,
@@ -41,11 +41,11 @@ pub struct SignMessageResponse {
 }
 
 /// Request for rotating the session key (empty)
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RotateKeyRequest {}
 
 /// Response from the rotate-key endpoint
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotateKeyResponse {
     /// New session ID after rotation
     pub session_id: B256,
@@ -59,11 +59,11 @@ pub struct RotateKeyResponse {
 }
 
 /// CVM Agent session client using Unix socket
-pub struct UnixClient {
+pub struct CvmAgent {
     socket_path: String,
 }
 
-impl UnixClient {
+impl CvmAgent {
     /// Create a new session client with the default socket path
     pub fn new(socket_path: impl Into<String>) -> Self {
         Self {
@@ -86,6 +86,11 @@ impl UnixClient {
             .context("Failed to parse sign-message response")?;
 
         Ok(response)
+    }
+
+    pub async fn get_session_key_public(&self) -> Result<PublicIdentity> {
+        let response = self.sign_message(&[]).await?;
+        Ok(response.session_key_public)
     }
 
     /// Rotate the session key
@@ -151,4 +156,3 @@ impl UnixClient {
         Ok(body.to_vec())
     }
 }
-

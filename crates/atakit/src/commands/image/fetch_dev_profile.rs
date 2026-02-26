@@ -8,6 +8,7 @@ use tracing::info;
 
 use crate::Env;
 use super::types::PlatformProfileResponse;
+use automata_linux_release::ImageRef;
 
 #[derive(Parser)]
 pub struct FetchDevProfile {
@@ -17,6 +18,10 @@ pub struct FetchDevProfile {
     /// Port of the CVM agent (default: 8000)
     #[arg(long, default_value = "8000")]
     port: u16,
+
+    /// Base image version (e.g., "1.0.0")
+    #[arg(long, default_value = "automata-linux:dev")]
+    image: ImageRef,
 }
 
 impl FetchDevProfile {
@@ -59,7 +64,7 @@ impl FetchDevProfile {
         );
 
         // Create dev profiles directory
-        let profiles_dir = env.dev_profiles_dir();
+        let profiles_dir = env.image_profiles_dir(&self.image);
         std::fs::create_dir_all(&profiles_dir)
             .with_context(|| format!("Failed to create directory: {}", profiles_dir.display()))?;
 

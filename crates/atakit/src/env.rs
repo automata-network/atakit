@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use automata_linux_release::ImageRef;
 
 use crate::instances::InstanceStore;
 use crate::registry::RegistryStore;
@@ -112,8 +113,11 @@ impl Env {
     }
 
     /// Directory for dev platform profiles (`~/.atakit/images/dev/profiles`).
-    pub fn dev_profiles_dir(&self) -> PathBuf {
-        self.image_dir.join("dev").join("profiles")
+    pub fn image_profiles_dir(&self, image: &ImageRef) -> PathBuf {
+        self.image_dir
+            .join(&image.repository)
+            .join(&image.tag)
+            .join("profiles")
     }
 
     /// Directory for registry data (`~/.atakit/registry`).

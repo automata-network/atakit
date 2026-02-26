@@ -1,5 +1,6 @@
 mod list;
 mod pull;
+mod query;
 mod switch;
 
 use anyhow::Result;
@@ -16,6 +17,9 @@ pub enum Registry {
     List(list::List),
     /// Pull deployment files from the remote repository
     Pull(pull::Pull),
+    /// Query on-chain registry data
+    #[command(subcommand)]
+    Query(query::Query),
 }
 
 impl Registry {
@@ -24,6 +28,7 @@ impl Registry {
             Registry::Switch(cmd) => cmd.run(env),
             Registry::List(cmd) => cmd.run(env).await,
             Registry::Pull(cmd) => cmd.run(env).await,
+            Registry::Query(cmd) => cmd.run(env).await,
         }
     }
 }

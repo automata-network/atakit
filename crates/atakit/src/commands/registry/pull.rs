@@ -14,13 +14,10 @@ pub struct Pull {
 impl Pull {
     pub async fn run(self, env: &Env) -> Result<()> {
         let store = env.registry_store();
-        let branch = self.branch.unwrap_or_else(|| {
-            store.current_branch().unwrap_or_else(|_| "main".to_string())
-        });
 
-        println!("Pulling deployments for branch '{}'...", branch);
+        println!("Pulling deployments...");
 
-        let chains = store.pull(&branch).await?;
+        let chains = store.pull(self.branch.as_deref()).await?;
 
         if chains.is_empty() {
             println!("No deployment files found.");

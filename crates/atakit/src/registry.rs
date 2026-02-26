@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -52,12 +53,13 @@ impl RegistryStore {
     }
 
     /// Get the directory for a specific branch.
-    fn branch_dir(&self, branch: &str) -> PathBuf {
+    fn branch_dir(&self, branch: Option<&str>) -> PathBuf {
+        let branch = branch.unwrap_or_else(|| DEFAULT_BRANCH);
         self.base_dir.join(branch)
     }
 
     /// Get the path for a chain's contract addresses.
-    fn chain_path(&self, branch: &str, chain_id: &str) -> PathBuf {
+    fn chain_path(&self, branch: Option<&str>, chain_id: &str) -> PathBuf {
         self.branch_dir(branch).join(format!("{}.json", chain_id))
     }
 
@@ -89,8 +91,7 @@ impl RegistryStore {
             .with_context(|| format!("Failed to create directory: {}", self.base_dir.display()))?;
 
         let path = self.config_path();
-        let content = serde_json::to_string_pretty(config)
-            .context("Failed to serialize config")?;
+        let content = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
 
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write config: {}", path.display()))?;
@@ -112,7 +113,7 @@ impl RegistryStore {
     }
 
     /// Check if the branch directory exists and has files.
-    pub fn branch_has_data(&self, branch: &str) -> bool {
+    pub fn branch_has_data(&self, branch: Option<&str>) -> bool {
         let dir = self.branch_dir(branch);
         if !dir.exists() {
             return false;
@@ -120,7 +121,12 @@ impl RegistryStore {
 
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false)
+                {
                     return true;
                 }
             }
@@ -129,7 +135,7 @@ impl RegistryStore {
     }
 
     /// List all chain files for a branch.
-    pub fn list_chains(&self, branch: &str) -> Result<Vec<String>> {
+    pub fn list_chains(&self, branch: Option<&str>) -> Result<Vec<String>> {
         let dir = self.branch_dir(branch);
         if !dir.exists() {
             return Ok(Vec::new());
@@ -153,7 +159,11 @@ impl RegistryStore {
     }
 
     /// Load contract addresses for a specific chain.
-    pub fn load_chain(&self, branch: &str, chain_id: &str) -> Result<Option<ContractAddresses>> {
+    pub fn load_chain(
+        &self,
+        branch: Option<&str>,
+        chain_id: &str,
+    ) -> Result<Option<ContractAddresses>> {
         let path = self.chain_path(branch, chain_id);
         if !path.exists() {
             return Ok(None);
@@ -168,10 +178,33 @@ impl RegistryStore {
         Ok(Some(addresses))
     }
 
+    /// Resolve the Contract address for a chain from stored deployment data.
+    pub fn resolve_contract(
+        &self,
+        branch: Option<&str>,
+        chain_id: &str,
+        contract: &str,
+    ) -> Result<Option<Address>> {
+        let addresses = match self.load_chain(branch, chain_id)? {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        let addr = match addresses.get(contract) {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        let addr = addr
+            .parse::<Address>()
+            .with_context(|| format!("Invalid address for {}", contract))?;
+
+        Ok(Some(addr))
+    }
+
     /// Save contract addresses for a specific chain.
     pub fn save_chain(
         &self,
-        branch: &str,
+        branch: Option<&str>,
         chain_id: &str,
         addresses: &ContractAddresses,
     ) -> Result<()> {
@@ -180,8 +213,8 @@ impl RegistryStore {
             .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
 
         let path = self.chain_path(branch, chain_id);
-        let content = serde_json::to_string_pretty(addresses)
-            .context("Failed to serialize addresses")?;
+        let content =
+            serde_json::to_string_pretty(addresses).context("Failed to serialize addresses")?;
 
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write: {}", path.display()))?;
@@ -190,7 +223,7 @@ impl RegistryStore {
     }
 
     /// Pull deployment files from the remote GitHub repository.
-    pub async fn pull(&self, branch: &str) -> Result<Vec<String>> {
+    pub async fn pull(&self, branch: Option<&str>) -> Result<Vec<String>> {
         // First, list files in the deployments directory
         let files = self.list_remote_files(branch).await?;
 
@@ -213,7 +246,8 @@ impl RegistryStore {
     }
 
     /// List files in the remote deployments directory.
-    async fn list_remote_files(&self, branch: &str) -> Result<Vec<String>> {
+    async fn list_remote_files(&self, branch: Option<&str>) -> Result<Vec<String>> {
+        let branch = branch.unwrap_or_else(|| DEFAULT_BRANCH);
         let url = format!(
             "https://api.github.com/repos/{}/contents/{}?ref={}",
             GITHUB_REPO, DEPLOYMENTS_PATH, branch
@@ -256,7 +290,8 @@ impl RegistryStore {
     }
 
     /// Fetch a file from the remote repository.
-    async fn fetch_remote_file(&self, branch: &str, filename: &str) -> Result<String> {
+    async fn fetch_remote_file(&self, branch: Option<&str>, filename: &str) -> Result<String> {
+        let branch = branch.unwrap_or_else(|| DEFAULT_BRANCH);
         let url = format!(
             "https://raw.githubusercontent.com/{}/{}/{}/{}",
             GITHUB_REPO, branch, DEPLOYMENTS_PATH, filename
@@ -271,11 +306,7 @@ impl RegistryStore {
             .with_context(|| format!("Failed to fetch: {}", url))?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to fetch {}: {}",
-                filename,
-                response.status()
-            );
+            anyhow::bail!("Failed to fetch {}: {}", filename, response.status());
         }
 
         response
@@ -285,9 +316,12 @@ impl RegistryStore {
     }
 
     /// Ensure the branch has data, pulling from remote if needed.
-    pub async fn ensure_data(&self, branch: &str) -> Result<()> {
+    pub async fn ensure_data(&self, branch: Option<&str>) -> Result<()> {
         if !self.branch_has_data(branch) {
-            tracing::info!("No local data for branch '{}', fetching from remote...", branch);
+            tracing::info!(
+                "No local data for branch '{}', fetching from remote...",
+                branch.unwrap_or(DEFAULT_BRANCH)
+            );
             self.pull(branch).await?;
         }
         Ok(())

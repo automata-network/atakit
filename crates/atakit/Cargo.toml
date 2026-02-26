@@ -22,7 +22,7 @@ fatfs.workspace = true
 fscommon.workspace = true
 automata-linux-release.workspace = true
 csp.workspace = true
-cvm-agent = { workspace = true, features = ["client"] }
+automata-cvm-agent = { workspace = true, features = ["client", "sim"] }
 workload-compose.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
@@ -32,6 +32,8 @@ hex.workspace = true
 alloy.workspace = true
 automata-tee-workload-measurement.workspace = true
 tempfile = "3"
+alloy-chains.workspace = true
+chrono.workspace = true
 
 [features]
 default = ["csp/clap"]

@@ -1,5 +1,6 @@
 //! Publish workload to the WorkloadRegistry contract.
 
+use alloy::ext::{NetworkProvider, ProviderEx};
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
@@ -31,9 +32,10 @@ pub struct PublishWorkload {
     #[arg(long, env = "ATAKIT_PRIVATE_KEY")]
     private_key: B256,
 
-    /// WorkloadRegistry contract address
+    /// SessionRegistry contract address.
+    /// If omitted, auto-detected from the registry store.
     #[arg(long, env = "ATAKIT_SESSION_REGISTRY")]
-    session_registry: Address,
+    session_registry: Option<Address>,
 
     /// Signature expiration offset in seconds (default: 3600 = 1 hour)
     #[arg(long, default_value = "3600")]
@@ -109,9 +111,27 @@ impl PublishWorkload {
             println!("Dry run mode - not submitting transaction");
             return Ok(());
         }
+
+        // Resolve SessionRegistry address
+        let session_registry = if let Some(addr) = self.session_registry {
+            addr
+        } else {
+            let provider = NetworkProvider::with_http(&self.rpc_url, None, None, 100).await?;
+            let chain_id = provider.chain_id();
+
+            let store = env.registry_store();
+            store.ensure_data(None).await?;
+
+            let addr = store
+                .resolve_contract(None, &chain_id.to_string(), "SessionRegistry")?
+                .context(format!("No SessionRegistry found for chain {chain_id}"))?;
+            println!("SessionRegistry: {addr} (chain {chain_id})");
+            addr
+        };
+
         let wm = WorkloadMeasurement::new(WorkloadMeasurementConfig {
             rpc_url: self.rpc_url.clone(),
-            session_registry_address: self.session_registry,
+            session_registry_address: session_registry,
             relay_key: Some(self.private_key),
         })
         .await?;
