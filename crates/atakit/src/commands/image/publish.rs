@@ -22,7 +22,7 @@ use crate::Env;
 
 #[derive(Parser)]
 pub struct Publish {
-    /// Base image name (e.g., "automata-linux")
+    /// Base image name (e.g., "automata-linux:v0.1.0")
     #[arg(long)]
     image: ImageRef,
 
@@ -111,6 +111,12 @@ impl Publish {
                     variant.name,
                     variant.overridePcrs.len()
                 );
+                for pcr in &variant.overridePcrs {
+                    println!(
+                        "         - PCR{}: matchData={:?}",
+                        pcr.pcrIndex, pcr.matchData
+                    );
+                }
             }
         }
 

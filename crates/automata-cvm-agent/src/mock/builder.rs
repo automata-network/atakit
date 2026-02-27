@@ -167,13 +167,13 @@ impl P256Key {
         let x: [u8; 32] = point
             .x()
             .expect("x coordinate")
-            .as_slice()
+            .to_vec()
             .try_into()
             .unwrap();
         let y: [u8; 32] = point
             .y()
             .expect("y coordinate")
-            .as_slice()
+            .to_vec()
             .try_into()
             .unwrap();
         Self { x, y, signing_key }

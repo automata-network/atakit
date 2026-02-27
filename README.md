@@ -366,6 +366,12 @@ anvil --fork-url https://rpc.example.com --hardfork osaka
 
 This gives you a local chain at `http://localhost:8545` with pre-funded test accounts.
 
+The sim-agent requires a `SessionRegistryMock` contract on chain. You can check available contract addresses with:
+
+```bash
+atakit registry ls
+```
+
 #### 2. First run: get the dev workload ID
 
 ```bash

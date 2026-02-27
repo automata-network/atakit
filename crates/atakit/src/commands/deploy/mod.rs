@@ -4,6 +4,7 @@ mod runner;
 
 use std::path::{Path, PathBuf};
 
+use alloy::ext::{NetworkProvider, ProviderEx};
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
@@ -67,9 +68,13 @@ pub struct Deploy {
     pub rpc_url: Option<String>,
 
     /// Session registry contract address.
-    /// Overrides config value if provided.
+    /// If omitted, auto-detected from the registry store.
     #[arg(long, env = "ATAKIT_SESSION_REGISTRY")]
     pub session_registry: Option<Address>,
+
+    /// Use SessionRegistryMock instead of SessionRegistry for auto-detection.
+    #[arg(long)]
+    pub mock: bool,
 
     /// Relay private key for session operations (hex encoded).
     /// Overrides config value if provided.
@@ -89,24 +94,44 @@ pub struct Deploy {
 
 impl Deploy {
     pub async fn run(mut self, ctx: &Env) -> Result<()> {
-        // Validate: rpc_url, session_registry, and relay_private_key must be provided together or not at all
-        let blockchain_opts = [
-            self.rpc_url.is_some(),
-            self.session_registry.is_some(),
-            self.relay_private_key.is_some(),
-        ];
-        let provided_count = blockchain_opts.iter().filter(|&&b| b).count();
-        if provided_count > 0 && provided_count < blockchain_opts.len() {
-            anyhow::bail!(
-                "--rpc-url, --session-registry, and --relay-private-key must all be provided together or not at all"
-            );
-        }
-
         // Derive operator address for VM metadata
         let operator_address = derive_operator_address(self.owner_private_key)?;
         info!(address = %operator_address, "Derived operator address");
 
         let (mut deploy_config, paths, config_dir) = self.resolve_config(ctx).await?;
+
+        // Auto-resolve session_registry if not provided via CLI or config
+        if self.session_registry.is_none() {
+            let config_sr = deploy_config.agent_env.as_ref().map(|c| c.session_registry);
+            if config_sr.is_none() {
+                let rpc_url = self
+                    .rpc_url
+                    .clone()
+                    .or_else(|| deploy_config.agent_env.as_ref().map(|c| c.rpc_url.clone()));
+                if let Some(rpc_url) = rpc_url {
+                    let provider = NetworkProvider::with_http(&rpc_url, None, None, 100).await?;
+                    let chain_id = provider.chain_id();
+                    let store = ctx.registry_store();
+                    store.ensure_data(None).await?;
+                    let contract_name = if self.mock {
+                        "SessionRegistryMock"
+                    } else {
+                        "SessionRegistry"
+                    };
+                    if let Some(addr) =
+                        store.resolve_contract(None, &chain_id.to_string(), contract_name)?
+                    {
+                        info!(
+                            address = %addr,
+                            chain_id = chain_id,
+                            contract = contract_name,
+                            "Auto-detected SessionRegistry"
+                        );
+                        self.session_registry = Some(addr);
+                    }
+                }
+            }
+        }
 
         // CLI --qemu overrides the provider to use local QEMU.
         // QEMU mode is always quiet (no confirmation prompts needed for local dev).
@@ -128,8 +153,12 @@ impl Deploy {
         let mut agent_env = match self.build_agent_env(&deploy_config) {
             Ok(agent_env) => Some(agent_env),
             Err(e) => {
-                warn!("Failed to build agent environment: {e}");
-                None
+                if is_qemu {
+                    warn!("Failed to build agent environment: {e}");
+                    None
+                } else {
+                    return Err(e);
+                }
             }
         };
 
@@ -292,18 +321,18 @@ impl Deploy {
         let relay_private_key = self
             .relay_private_key
             .or(config_env.map(|c| c.relay_private_key))
-            .ok_or_else(|| anyhow!("relay_private_key not provided"))?;
+            .ok_or_else(|| anyhow!("--relay-private-key is required"))?;
 
         let rpc_url = self
             .rpc_url
             .clone()
             .or_else(|| config_env.map(|c| c.rpc_url.clone()))
-            .ok_or_else(|| anyhow!("rpc_url not provided"))?;
+            .ok_or_else(|| anyhow!("--rpc-url is required"))?;
 
         let session_registry = self
             .session_registry
             .or(config_env.map(|c| c.session_registry))
-            .ok_or_else(|| anyhow!("session_registry not provided"))?;
+            .ok_or_else(|| anyhow!("--session-registry is required"))?;
 
         let owner_private_key = self.owner_private_key;
 
