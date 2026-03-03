@@ -128,7 +128,7 @@ atakit workload build my-workload
 This creates a `.tar.gz` package containing:
 - Docker Compose definitions
 - Measured files for attestation
-- Docker images (if using bundle mode)
+- Docker images
 
 ### 4. Publish the Workload
 
@@ -456,12 +456,34 @@ atakit registry query workload guardian:v0.1.0 --rpc-url <RPC_URL>
 
 Queries the WorkloadRegistry contract and prints the workload spec.
 
+## Container Engine
+
+Atakit supports both Docker and Podman. The container engine is resolved in this order:
+
+1. `CONTAINER_ENGINE` environment variable (`docker` or `podman`)
+2. Global config preference (`~/.atakit/config.json`)
+3. Auto-detect (tries docker first, then podman)
+
+```bash
+# Set the default container engine
+atakit config default-container-engine podman
+
+# Show the current default
+atakit config default-container-engine
+
+# Override per-invocation via env var
+CONTAINER_ENGINE=docker atakit workload build
+```
+
+> **Note:** Podman does not support cross-platform builds. If the target platform (e.g., `linux/amd64`) does not match your host architecture, switch to Docker.
+
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Logging level (e.g., `info`, `debug`) |
 | `ATAKIT_HOME` | Override default data directory |
+| `CONTAINER_ENGINE` | Container engine override (`docker` or `podman`) |
 
 ## Development
 

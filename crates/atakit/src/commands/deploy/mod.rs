@@ -10,7 +10,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
 use automata_cvm_agent::client::init_client::DEFAULT_EXPIRE_OFFSET;
 use automata_cvm_agent::client::init_client::{AdditionalFile, AgentEnv};
-use automata_linux_release::{ImageRef, ImageStore};
+use automata_linux_release::ImageRef;
 use clap::Args;
 use config::PortDef;
 use tokio_util::sync::CancellationToken;
@@ -433,7 +433,7 @@ impl Deploy {
         env: &Env,
     ) -> Result<(config::DeploymentConfig, config::ResolvedPaths, PathBuf)> {
         let target = &self.target;
-        let store = ImageStore::new(&env.image_dir).with_token_from_env();
+        let store = env.image_store();
 
         // If the target ends with .json or is an existing file, load and resolve.
         if target.ends_with(".json") || Path::new(target).is_file() {
@@ -470,7 +470,7 @@ impl Deploy {
             target,
             self.platform.as_deref(),
             self.image.as_ref(),
-            &env.image_dir,
+            &store,
             &project_dir,
         )
         .await?;

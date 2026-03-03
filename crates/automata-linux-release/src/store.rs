@@ -110,6 +110,11 @@ impl ImageStore {
         self.tag_dir(image_ref).join(disk_filename(platform))
     }
 
+    /// Return the container platform string for an image (e.g., "linux/amd64").
+    pub fn container_platform(&self, _image_ref: &ImageRef) -> &str {
+        "linux/amd64"
+    }
+
     /// Expected path of the `secure_boot/` directory for a tag.
     pub fn certs_dir(&self, image_ref: &ImageRef) -> PathBuf {
         self.tag_dir(image_ref).join("secure_boot")

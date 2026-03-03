@@ -292,7 +292,7 @@ impl ImageManager for Gcp {
             "create".into(),
             image_name.clone(),
             "--source-uri".into(),
-            dest_uri,
+            dest_uri.clone(),
             project_flag,
             "--guest-os-features".into(),
             "TDX_CAPABLE,SEV_SNP_CAPABLE,GVNIC,UEFI_COMPATIBLE,VIRTIO_SCSI_MULTIQUEUE".into(),
@@ -324,6 +324,10 @@ impl ImageManager for Gcp {
 
         let arg_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
         cmd::run_cmd("gcloud", &arg_refs, self.quiet).await?;
+
+        // 5. Clean up uploaded tar.gz from bucket.
+        info!("Removing uploaded disk image from GCS");
+        let _ = cmd::run_cmd("gsutil", &["rm", &dest_uri], self.quiet).await;
 
         // Update image_name to the versioned name for subsequent use.
         self.image_name = image_name;

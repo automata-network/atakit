@@ -31,7 +31,7 @@ pub struct List {
 
 impl List {
     pub async fn run(self, ctx: &Env) -> Result<()> {
-        let store = ImageStore::new(&ctx.image_dir).with_token_from_env();
+        let store = ctx.image_store();
 
         if let Some(tag) = &self.tag {
             let release = store.client().get_release(tag).await?;

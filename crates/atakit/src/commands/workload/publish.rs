@@ -50,6 +50,7 @@ impl PublishWorkload {
     pub async fn run(self, env: &Env) -> Result<()> {
         // Load atakit.json to verify workload exists
         let config = AtakitConfig::load()?;
+        let image_store = env.image_store();
 
         // Verify workload exists in config
         let workload = config
@@ -80,7 +81,7 @@ impl PublishWorkload {
         let base_image_ref = AppRef::new(&workload.image.repository, &workload.image.tag);
         let base_image_id = base_image_ref.id("CVM_BASEIMAGE_V1");
 
-        let measurement = measure_package(env.workload_package(workload))?;
+        let measurement = measure_package(&image_store, env.workload_package(workload))?;
 
         let pcrs = vec![PcrSpec {
             pcrIndex: 23,

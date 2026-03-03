@@ -1037,6 +1037,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "container-engine",
  "csp",
  "fatfs",
  "flate2",
@@ -1806,6 +1807,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-xid",
+]
+
+[[package]]
+name = "container-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
 ]
 
 [[package]]

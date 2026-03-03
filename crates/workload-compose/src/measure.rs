@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{B256, keccak256};
 use anyhow::{Context, bail};
+use automata_linux_release::ImageStore;
 use flate2::read::GzDecoder;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -198,7 +199,7 @@ pub enum MeasureError {
 /// Extract the image digest from a docker save tar file.
 ///
 /// Reads the OCI image index (index.json) directly from the tar without full extraction.
-/// For multi-platform images, selects the linux/amd64 manifest.
+/// For multi-platform images, selects the manifest matching `platform` (e.g., "linux/amd64").
 ///
 /// The index.json format:
 /// ```json
@@ -215,7 +216,7 @@ pub enum MeasureError {
 ///   ]
 /// }
 /// ```
-pub fn get_digest_from_docker_tar(tar_path: &Path) -> anyhow::Result<String> {
+pub fn get_digest_from_docker_tar(tar_path: &Path, platform: &str) -> anyhow::Result<String> {
     let file =
         File::open(tar_path).with_context(|| format!("Failed to open {}", tar_path.display()))?;
     let mut archive = Archive::new(file);
@@ -231,7 +232,7 @@ pub fn get_digest_from_docker_tar(tar_path: &Path) -> anyhow::Result<String> {
             let index: OciImageIndex =
                 serde_json::from_str(&content).with_context(|| "Failed to parse OCI index.json")?;
 
-            return select_manifest_digest(&index, tar_path);
+            return select_manifest_digest(&index, tar_path, platform);
         }
     }
 
@@ -239,8 +240,13 @@ pub fn get_digest_from_docker_tar(tar_path: &Path) -> anyhow::Result<String> {
 }
 
 /// Select the appropriate manifest digest from an OCI image index.
-/// Prefers linux/amd64 for multi-platform images.
-fn select_manifest_digest(index: &OciImageIndex, tar_path: &Path) -> anyhow::Result<String> {
+///
+/// `platform` is in `"os/arch"` format (e.g., `"linux/amd64"`).
+fn select_manifest_digest(
+    index: &OciImageIndex,
+    tar_path: &Path,
+    platform: &str,
+) -> anyhow::Result<String> {
     if index.manifests.is_empty() {
         bail!("OCI index has no manifests: {}", tar_path.display());
     }
@@ -250,21 +256,25 @@ fn select_manifest_digest(index: &OciImageIndex, tar_path: &Path) -> anyhow::Res
         return Ok(index.manifests[0].digest.clone());
     }
 
-    // For multi-platform images, find linux/amd64
+    // Parse target platform (expected format: "os/arch", e.g. "linux/amd64")
+    let (target_os, target_arch) = platform.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("Invalid platform format '{platform}', expected 'os/arch'")
+    })?;
+
+    // For multi-platform images, find matching manifest
     for manifest in &index.manifests {
-        if let Some(platform) = &manifest.platform {
-            if platform.os == "linux" && platform.architecture == "amd64" {
+        if let Some(p) = &manifest.platform {
+            if p.os == target_os && p.architecture == target_arch {
                 return Ok(manifest.digest.clone());
             }
         }
     }
 
-    // Fallback: check annotations for platform info or use first manifest
+    // Fallback: check annotations for platform info
     for manifest in &index.manifests {
         if let Some(annotations) = &manifest.annotations {
-            // Some images use annotations instead of platform field
             if let Some(ref_name) = annotations.get("org.opencontainers.image.ref.name") {
-                if ref_name.contains("amd64") || ref_name.contains("linux") {
+                if ref_name.contains(target_arch) || ref_name.contains(target_os) {
                     return Ok(manifest.digest.clone());
                 }
             }
@@ -308,7 +318,10 @@ struct OciPlatform {
     os: String,
 }
 
-pub fn measure_package(package_path: PathBuf) -> anyhow::Result<WorkloadMeasurement> {
+pub fn measure_package(
+    image_store: &ImageStore,
+    package_path: PathBuf,
+) -> anyhow::Result<WorkloadMeasurement> {
     // Create a temporary directory for extraction
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let extract_path = temp_dir.path();
@@ -324,8 +337,11 @@ pub fn measure_package(package_path: PathBuf) -> anyhow::Result<WorkloadMeasurem
 
     info!(workload = %manifest.name, "Loaded manifest");
 
+    // Resolve platform from the manifest's base image
+    let platform = image_store.container_platform(&manifest.image);
+
     // Extract image digests using workload-compose helper
-    let image_digests = manifest.extract_image_digests(extract_path)?;
+    let image_digests = manifest.extract_image_digests(extract_path, platform)?;
 
     let mut config = MeasureConfig::cvm();
     config.image_digests = image_digests;

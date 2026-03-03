@@ -196,7 +196,7 @@ pub async fn resolve_from_atakit_json(
     deployment_name: &str,
     platform_override: Option<&str>,
     image_ref_override: Option<&ImageRef>,
-    image_dir: &Path,
+    image_store: &ImageStore,
     config_dir: &Path,
 ) -> Result<(DeploymentConfig, ResolvedPaths)> {
     let deploy_def = atakit_config
@@ -245,8 +245,7 @@ pub async fn resolve_from_atakit_json(
     )?;
 
     // Resolve to get the actual image path (auto-downloads if needed).
-    let store = ImageStore::new(image_dir).with_token_from_env();
-    let paths = resolve_deployment(&config, &store, image_repo, image_ref_override).await?;
+    let paths = resolve_deployment(&config, &image_store, image_repo, image_ref_override).await?;
     Ok((config, paths))
 }
 

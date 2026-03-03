@@ -54,6 +54,7 @@ impl WorkloadManifest {
     pub fn extract_image_digests(
         &self,
         workload_dir: &Path,
+        platform: &str,
     ) -> anyhow::Result<IndexMap<String, String>> {
         // Build image digests map from docker images
         let mut image_digests = IndexMap::new();
@@ -65,7 +66,7 @@ impl WorkloadManifest {
                 ));
             };
             let tar_path = workload_dir.join(tar_name);
-            let digest = get_digest_from_docker_tar(&tar_path)?;
+            let digest = get_digest_from_docker_tar(&tar_path, platform)?;
 
             info!(service = %img.service, digest = %digest, "Resolved image digest");
             image_digests.insert(img.service.clone(), digest);
