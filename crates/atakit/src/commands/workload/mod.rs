@@ -8,8 +8,6 @@ use clap::Subcommand;
 
 use crate::Env;
 
-pub use build::ImageMode;
-
 #[derive(Subcommand)]
 pub enum Workload {
     /// Build a workload package from docker-compose definitions

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use automata_linux_release::{ImageRef, ImageStore};
+use automata_linux_release::ImageRef;
 use clap::Args;
 
 use crate::Env;
@@ -13,7 +13,7 @@ pub struct Delete {
 
 impl Delete {
     pub async fn run(self, ctx: &Env) -> Result<()> {
-        let store = ImageStore::new(&ctx.image_dir);
+        let store = ctx.image_store();
         let dir = store.tag_dir(&self.tag);
 
         if !dir.exists() {

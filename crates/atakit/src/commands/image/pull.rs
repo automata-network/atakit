@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use automata_linux_release::{ImageRef, ImageStore, Platform, REPO};
+use automata_linux_release::{ImageRef, Platform, REPO};
 use clap::Args;
 
 use crate::Env;
@@ -25,7 +25,7 @@ impl Download {
             None => ALL_PLATFORMS.to_vec(),
         };
 
-        let store = ImageStore::new(&ctx.image_dir).with_token_from_env();
+        let store = ctx.image_store();
 
         let image_ref = match self.image {
             Some(i) => i,

@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use automata_linux_release::ImageRef;
+use container_engine::{Compose, ContainerEngine, ContainerRuntime};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use tracing::info;
@@ -15,18 +15,15 @@ use workload_compose::{
     to_yaml,
 };
 
-use crate::types::{AtakitConfig, WorkloadDef};
+use automata_linux_release::ImageStore;
 
-use super::ImageMode;
+use crate::types::{AtakitConfig, WorkloadDef};
 
 // ---------------------------------------------------------------------------
 // Package creation
 // ---------------------------------------------------------------------------
 
 /// Create a tar.gz workload package.
-///
-/// When `image_mode` is `Pull`, Docker images are not built or packaged; the
-/// manifest will only record the image tags for runtime pulling.
 ///
 /// `package_name` is the output file name (without extension), e.g., "my-deployment-gcp".
 /// `image_version` is the automata-linux disk image version to embed in the manifest.
@@ -37,8 +34,9 @@ pub fn create_package(
     project_dir: &Path,
     artifact_dir: &Path,
     atakit_config: &AtakitConfig,
-    image_mode: ImageMode,
     image_ref: Option<ImageRef>,
+    engine: &ContainerRuntime,
+    image_store: &ImageStore,
 ) -> Result<()> {
     let output_path = artifact_dir.join(format!("{}.tar.gz", package_name));
     let file = fs::File::create(&output_path)
@@ -47,6 +45,7 @@ pub fn create_package(
     let mut tar = tar::Builder::new(enc);
     tar.mode(tar::HeaderMode::Deterministic);
     let image_ref = image_ref.unwrap_or(wl_def.image.clone());
+    let platform = image_store.container_platform(&image_ref);
 
     let prefix = ".";
 
@@ -182,60 +181,30 @@ pub fn create_package(
     let mut manifest_images: Vec<DockerImageEntry> = Vec::new();
 
     for img in &analysis.summary.images {
-        match &img.kind {
-            ImageKind::Build { tag } => {
-                let image_tag = tag.clone();
-                if matches!(image_mode, ImageMode::Pull) {
-                    // Skip build/save, just record the tag for runtime pulling.
-                    let resolved_tag = resolve_image_short_name(&image_tag);
-                    info!(service = %img.service, tag = %resolved_tag, "Skipping image build (--image-mode=pull)");
-                    manifest_images.push(DockerImageEntry {
-                        service: img.service.clone(),
-                        image_tag: resolved_tag,
-                        image_tar: None,
-                    });
-                } else {
-                    build_and_save_image(
-                        &img.service,
-                        &image_tag,
-                        &compose_abs,
-                        artifact_dir,
-                        &wl_def.name,
-                        &mut tar,
-                        &mut manifest_images,
-                    )?;
-                }
-            }
+        let source = match &img.kind {
+            ImageKind::Build { tag } => ImageSource::Build {
+                tag,
+                compose_file: &compose_abs,
+            },
+            ImageKind::Pull { tag } => ImageSource::Pull { tag },
             ImageKind::BuildUntagged => {
-                let image_tag = format!("{}_{}", wl_def.name, img.service);
-                if matches!(image_mode, ImageMode::Pull) {
-                    let resolved_tag = resolve_image_short_name(&image_tag);
-                    info!(service = %img.service, tag = %resolved_tag, "Skipping image build (--image-mode=pull)");
-                    manifest_images.push(DockerImageEntry {
-                        service: img.service.clone(),
-                        image_tag: resolved_tag,
-                        image_tar: None,
-                    });
-                } else {
-                    build_and_save_image(
-                        &img.service,
-                        &image_tag,
-                        &compose_abs,
-                        artifact_dir,
-                        &wl_def.name,
-                        &mut tar,
-                        &mut manifest_images,
-                    )?;
-                }
+                bail!(
+                    "Service '{}' has `build:` but no `image:` tag. \
+                     Please add an `image:` field to the service in your docker-compose file.",
+                    img.service,
+                );
             }
-            ImageKind::Pull { tag } => {
-                manifest_images.push(DockerImageEntry {
-                    service: img.service.clone(),
-                    image_tag: tag.clone(),
-                    image_tar: None,
-                });
-            }
-        }
+        };
+        acquire_and_save_image(
+            &img.service,
+            source,
+            artifact_dir,
+            &wl_def.name,
+            platform,
+            &mut tar,
+            &mut manifest_images,
+            engine,
+        )?;
     }
 
     // 6. Create and add manifest.json.
@@ -296,55 +265,56 @@ fn add_static_file<W: std::io::Write>(
         .with_context(|| format!("Failed to add {}", archive_path))
 }
 
-/// Build a Docker image via docker compose, save it as a tar, and add to archive.
-fn build_and_save_image<W: std::io::Write>(
+enum ImageSource<'a> {
+    /// Build via docker/podman compose, then save.
+    Build {
+        tag: &'a str,
+        compose_file: &'a Path,
+    },
+    /// Ensure image exists locally (pull if needed), then save.
+    Pull { tag: &'a str },
+}
+
+/// Acquire a container image (build or pull), save it as a tar, and add to archive.
+fn acquire_and_save_image<W: std::io::Write>(
     service: &str,
-    image_tag: &str,
-    compose_abs: &Path,
+    source: ImageSource<'_>,
     artifact_dir: &Path,
     workload_name: &str,
+    platform: &str,
     tar: &mut tar::Builder<W>,
     manifest_images: &mut Vec<DockerImageEntry>,
+    engine: &ContainerRuntime,
 ) -> Result<()> {
+    let image_tag = match &source {
+        ImageSource::Build { tag, .. } | ImageSource::Pull { tag } => *tag,
+    };
     let resolved_tag = resolve_image_short_name(image_tag);
 
-    // Build the image via docker compose.
-    info!(service, "Building Docker image");
-    let status = Command::new("docker")
-        .env("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
-        .args(["compose", "-f"])
-        .arg(compose_abs)
-        .args(["build", service])
-        .status()
-        .context("Failed to run docker compose build")?;
-    if !status.success() {
-        bail!("docker compose build failed for service '{service}'");
+    // Acquire the image.
+    match &source {
+        ImageSource::Build { compose_file, .. } => {
+            engine
+                .compose()
+                .build(compose_file, service, Some(platform))?;
+        }
+        ImageSource::Pull { tag } => {
+            if !engine.image_exists(tag) {
+                info!(service, tag, "Image not found locally, pulling");
+                engine.pull(tag, platform)?;
+            }
+        }
     }
 
-    // Tag with the fully qualified name so docker save embeds it.
+    // Tag with the fully qualified name so save embeds it.
     if resolved_tag != image_tag {
-        let status = Command::new("docker")
-            .args(["tag", image_tag, &resolved_tag])
-            .status()
-            .context("Failed to run docker tag")?;
-        if !status.success() {
-            bail!("docker tag failed: {image_tag} -> {resolved_tag}");
-        }
+        engine.tag(image_tag, &resolved_tag)?;
     }
 
     // Save the image to a temporary tar.
     let image_tar_name = format!("{service}.tar");
     let image_tar_path = artifact_dir.join(&image_tar_name);
-    info!(tag = %resolved_tag, "Saving Docker image");
-    let status = Command::new("docker")
-        .args(["save", "--platform", "linux/amd64", "-o"])
-        .arg(&image_tar_path)
-        .arg(&resolved_tag)
-        .status()
-        .context("Failed to run docker save")?;
-    if !status.success() {
-        bail!("docker save failed for image '{resolved_tag}'");
-    }
+    engine.save(&resolved_tag, &image_tar_path, platform)?;
 
     // Add the image tar to the archive root as {workload}-image.tar.
     let archive_name = format!("{workload_name}-image.tar");

@@ -2,13 +2,21 @@ use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use automata_linux_release::ImageRef;
+use automata_linux_release::{ImageRef, ImageStore};
+use serde::{Deserialize, Serialize};
 
 use crate::instances::InstanceStore;
 use crate::registry::RegistryStore;
 use crate::types::{AtakitConfig, WorkloadDef};
 
 const CONFIG_FILENAME: &str = "atakit.json";
+const GLOBAL_CONFIG_FILENAME: &str = "config.json";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GlobalConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_container_engine: Option<String>,
+}
 
 /// OVMF firmware embedded at compile time.
 const OVMF_BYTES: &[u8] = include_bytes!("../../../deps/ovmf.fd");
@@ -128,6 +136,34 @@ impl Env {
     /// Get a registry store for managing contract deployments.
     pub fn registry_store(&self) -> RegistryStore {
         RegistryStore::new(self.registry_dir())
+    }
+
+    /// Path to the global config file (`~/.atakit/config.json`).
+    fn global_config_path(&self) -> PathBuf {
+        self.atakit_dir.join(GLOBAL_CONFIG_FILENAME)
+    }
+
+    /// Read the global config. Returns `Default` if the file is missing or unreadable.
+    pub fn global_config(&self) -> GlobalConfig {
+        let path = self.global_config_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write the global config to `~/.atakit/config.json`, creating the directory if needed.
+    pub fn save_global_config(&self, config: &GlobalConfig) -> Result<()> {
+        std::fs::create_dir_all(&self.atakit_dir)
+            .with_context(|| format!("Failed to create {}", self.atakit_dir.display()))?;
+        let json = serde_json::to_string_pretty(config)?;
+        std::fs::write(self.global_config_path(), json)
+            .with_context(|| format!("Failed to write {}", self.global_config_path().display()))?;
+        Ok(())
+    }
+
+    pub fn image_store(&self) -> ImageStore {
+        ImageStore::new(self.image_dir.clone())
     }
 }
 

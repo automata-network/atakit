@@ -27,10 +27,11 @@ enum OutputFormat {
 }
 
 impl Measure {
-    pub fn run(self, _env: &Env) -> Result<()> {
+    pub fn run(self, env: &Env) -> Result<()> {
         // Run measurement
         info!("Running measurement");
-        let measurement = measure_package(self.package)?;
+        let image_store = env.image_store();
+        let measurement = measure_package(&image_store, self.package)?;
 
         // Output results
         match self.format {

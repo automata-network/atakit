@@ -3,7 +3,8 @@ use super::packager;
 use std::fs;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, ValueEnum};
+use clap::Args;
+use container_engine::ContainerEngine;
 use tracing::info;
 use workload_compose::{ImageKind, extract_image_name_tag};
 
@@ -13,33 +14,24 @@ use crate::{
     types::{AtakitConfig, WorkloadDef},
 };
 
-/// How to handle Docker images in the workload package.
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub enum ImageMode {
-    /// Build and bundle images into the package (default)
-    #[default]
-    Bundle,
-    /// Skip building; images will be pulled at runtime
-    Pull,
-}
-
 /// Build a workload package from docker-compose definitions.
 #[derive(Args)]
 pub struct BuildWorkload {
     /// Names of workloads to build (from atakit.json workloads[].name).
     /// If omitted, all workloads are built.
     pub workloads: Vec<String>,
-
-    /// How to handle Docker images
-    #[arg(long, value_enum, default_value_t = ImageMode::Bundle)]
-    pub image_mode: ImageMode,
 }
 
 impl BuildWorkload {
     pub fn run(self, env: &Env) -> Result<()> {
         let atakit_config = env.config()?;
         let project_dir = env.config_dir()?.to_path_buf();
+        let image_store = env.image_store();
         std::fs::create_dir_all(&env.project_artifact_dir)?;
+
+        let global = env.global_config();
+        let engine = container_engine::detect(global.default_container_engine.as_deref())?;
+        info!(engine = engine.name(), "Using container engine");
 
         // Resolve which workloads to build.
         let workloads = self.resolve_workloads(&atakit_config)?;
@@ -81,8 +73,9 @@ impl BuildWorkload {
                 &project_dir,
                 &output_dir,
                 &atakit_config,
-                self.image_mode,
                 None,
+                &engine,
+                &image_store,
             )?;
             info!(output = %format!("ata_artifacts/{}/{}.tar.gz", wl_def.name, package_name), "Package created");
 

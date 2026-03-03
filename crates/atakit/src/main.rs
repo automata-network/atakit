@@ -48,6 +48,10 @@ enum AtaKit {
 
     /// Start simulated CVM agents on Unix sockets for local development
     SimAgent(commands::sim_agent::SimAgent),
+
+    /// Manage atakit configuration
+    #[command(subcommand)]
+    Config(commands::config::Config),
 }
 
 impl AtaKit {
@@ -60,6 +64,7 @@ impl AtaKit {
             AtaKit::Registry(cmd) => cmd.run(env).await,
             AtaKit::Workload(cmd) => cmd.run(env).await,
             AtaKit::SimAgent(cmd) => cmd.run(env).await,
+            AtaKit::Config(cmd) => Ok(cmd.run(env)?),
         }
     }
 }
