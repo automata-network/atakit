@@ -22,6 +22,7 @@ automata-linux-release = { path = "crates/automata-linux-release" }
 csp = { path = "crates/csp" }
 automata-cvm-agent = { path = "crates/automata-cvm-agent" }
 workload-compose = { path = "crates/workload-compose" }
+container-engine = { path = "crates/container-engine" }
 automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
 
 clap = { version = "4", features = ["derive", "env"] }

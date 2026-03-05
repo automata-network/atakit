@@ -186,7 +186,7 @@ impl SimCvmAgent {
 
             handles.push(tokio::spawn(async move {
                 if let Err(e) = server::serve_socket(&path, state).await {
-                    tracing::error!(services = %label, error = %e, "Sim agent failed");
+                    tracing::error!(services = %label, error = ?e, "Sim agent failed");
                 }
             }));
         }
