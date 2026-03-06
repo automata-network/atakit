@@ -42,6 +42,11 @@ pub struct SimAgent {
     /// Anvil listen port (default: 14345).
     #[arg(long, default_value_t = 14345)]
     anvil_port: u16,
+
+    /// Owner private key (hex, 32 bytes) for workload registration.
+    /// If omitted, a random key is generated per workload.
+    #[arg(long)]
+    owner_private_key: Option<B256>,
 }
 
 fn default_dev_version() -> String {
@@ -146,12 +151,14 @@ impl SimAgent {
             }
         };
 
-        // Build per-workload registration entries (each gets its own random owner key)
+        // Build per-workload registration entries
         let wl_registrations: Vec<WorkloadRegistration> = workloads
             .iter()
             .map(|wl| {
-                let sk = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-                let owner_private_key = B256::from_slice(&sk.to_bytes());
+                let owner_private_key = self.owner_private_key.unwrap_or_else(|| {
+                    let sk = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+                    B256::from_slice(&sk.to_bytes())
+                });
                 WorkloadRegistration {
                     workload_ref: AppRef::new(&wl.name, &wl.version),
                     temporary_workload_ref: AppRef::new(&wl.name, self.dev_version.clone()),
