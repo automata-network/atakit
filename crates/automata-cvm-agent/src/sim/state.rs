@@ -6,7 +6,7 @@
 use alloy::primitives::{B256, Bytes, keccak256};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use automata_tee_workload_measurement::stubs::PublicIdentity;
 use tokio::sync::RwLock;
 
@@ -21,14 +21,19 @@ pub struct ServiceState {
 }
 
 impl ServiceState {
-    /// Create a new `ServiceState` with random session and owner keys.
-    pub fn new(workload_id: B256, base_image_id: B256) -> Self {
-        Self {
+    /// Create a new `ServiceState` with a random session key and the given owner key.
+    pub fn new(workload_id: B256, base_image_id: B256, owner_private_key: B256) -> Result<Self> {
+        if owner_private_key == B256::ZERO {
+            bail!("owner_private_key must not be zero");
+        }
+        let owner_signer = PrivateKeySigner::from_bytes(&owner_private_key)
+            .context("invalid owner_private_key")?;
+        Ok(Self {
             session_signer: RwLock::new(PrivateKeySigner::random()),
-            owner_signer: PrivateKeySigner::random(),
+            owner_signer,
             workload_id,
             base_image_id,
-        }
+        })
     }
 
     /// Public identity of the current session key.

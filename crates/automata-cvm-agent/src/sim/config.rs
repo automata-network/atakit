@@ -73,12 +73,6 @@ impl ChainConfig {
 pub struct SimConfig {
     /// Services to simulate -- each gets its own Unix socket.
     pub services: Vec<SimServiceConfig>,
-    /// Workload ID returned in sign-message responses.
-    #[serde(default)]
-    pub workload_id: B256,
-    /// Base image ID returned in sign-message responses.
-    #[serde(default)]
-    pub base_image_id: B256,
     /// Optional chain configuration for on-chain auto-registration.
     /// If present, the sim agent will auto-register on startup and
     /// rotate the session periodically in the background.

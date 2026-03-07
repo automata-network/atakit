@@ -178,11 +178,7 @@ impl SimAgent {
             workloads: wl_registrations,
         });
 
-        let sim_config = SimConfig {
-            services,
-            chain,
-            ..Default::default()
-        };
+        let sim_config = SimConfig { services, chain };
 
         SimCvmAgent::new(sim_config).run().await
     }

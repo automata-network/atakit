@@ -11,6 +11,7 @@ use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::B256;
 use alloy::signers::local::PrivateKeySigner;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
+use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 
 use crate::device::PlatformInfo;
 pub use crate::mock;
@@ -130,7 +131,7 @@ impl SimCvmAgent {
         println!();
         println!("Press Ctrl+C to stop.");
 
-        let handles = self.spawn_socket_servers(&by_path).await;
+        let handles = self.spawn_socket_servers(&by_path).await?;
 
         // Block until shutdown signal
         let _ = shutdown.await;
@@ -159,28 +160,75 @@ impl SimCvmAgent {
         by_path
     }
 
+    /// Resolve workload identity for a socket group by matching the service
+    /// name prefix (`workload_name/svc_name`) against chain workload registrations.
+    fn resolve_workload_identity(
+        &self,
+        service_names: &[String],
+    ) -> Result<&WorkloadRegistration> {
+        let chain = self
+            .config
+            .chain
+            .as_ref()
+            .context("chain config is required to resolve workload identity")?;
+
+        let first_name = service_names
+            .first()
+            .context("socket group has no services")?;
+
+        let workload_name = first_name
+            .split('/')
+            .next()
+            .context("service name must be in 'workload/service' format")?;
+
+        chain
+            .workloads
+            .iter()
+            .find(|w| w.workload_ref.name == workload_name)
+            .with_context(|| {
+                let registered: Vec<_> = chain
+                    .workloads
+                    .iter()
+                    .map(|w| w.workload_ref.name.as_str())
+                    .collect();
+                format!(
+                    "no workload registration found for '{workload_name}'. \
+                     Registered workloads: [{}]",
+                    registered.join(", ")
+                )
+            })
+    }
+
     /// Spawn a server task per unique socket path.
     async fn spawn_socket_servers(
         &self,
         by_path: &BTreeMap<PathBuf, Vec<String>>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
         let mut handles = Vec::new();
         for (path, names) in by_path {
             let label = names.join(", ");
             let path = path.clone();
 
+            let w = self.resolve_workload_identity(names)?;
+            let workload_id =
+                WorkloadRegistry::get_workload_id(&w.temporary_workload_ref);
+            let base_image_id = BaseImageRegistry::get_image_id(&w.base_image_ref);
+
             let state = Arc::new(ServiceState::new(
-                self.config.workload_id,
-                self.config.base_image_id,
-            ));
+                workload_id,
+                base_image_id,
+                w.owner_private_key,
+            )?);
 
             let session_public = state.session_public().await;
             let owner_public = state.owner_public();
+            
             tracing::info!(
                 services = %label,
                 socket = %path.display(),
                 session_fingerprint = %session_public.fingerprint(),
                 owner_fingerprint = %owner_public.fingerprint(),
+                owner = ?owner_public.secp256k1_address().unwrap(),
                 "Starting sim agent"
             );
 
@@ -190,7 +238,7 @@ impl SimCvmAgent {
                 }
             }));
         }
-        handles
+        Ok(handles)
     }
 
     /// Spawn a background registration/rotation loop per workload.
