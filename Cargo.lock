@@ -1015,6 +1015,7 @@ dependencies = [
  "anyhow",
  "automata-cvm-agent",
  "automata-linux-release",
+ "automata-tee-workload-compose",
  "automata-tee-workload-measurement",
  "axum",
  "chrono",
@@ -1040,7 +1041,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "workload-compose",
 ]
 
 [[package]]
@@ -1073,6 +1073,7 @@ dependencies = [
  "alloy-ext",
  "anyhow",
  "automata-linux-release",
+ "automata-tee-workload-compose",
  "automata-tee-workload-measurement",
  "axum",
  "bytes",
@@ -1090,7 +1091,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "workload-compose",
 ]
 
 [[package]]
@@ -1105,6 +1105,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "automata-tee-workload-compose"
+version = "0.1.0"
+dependencies = [
+ "alloy-ext",
+ "anyhow",
+ "automata-linux-release",
+ "compose_spec",
+ "flate2",
+ "indexmap 2.13.0",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -5222,27 +5243,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "workload-compose"
-version = "0.1.0"
-dependencies = [
- "alloy-ext",
- "anyhow",
- "automata-linux-release",
- "compose_spec",
- "flate2",
- "indexmap 2.13.0",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "walkdir",
 ]
 
 [[package]]

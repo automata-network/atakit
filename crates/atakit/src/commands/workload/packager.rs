@@ -10,7 +10,7 @@ use tracing::info;
 
 use automata_cvm_agent::{CvmAgentPolicy, DiskInput, ImageVerifyPolicy, PortInput};
 
-use workload_compose::{
+use automata_tee_workload_compose::{
     ComposeAnalysis, DockerImageEntry, ImageKind, WorkloadManifest, resolve_image_short_name,
     to_yaml,
 };

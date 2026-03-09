@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use automata_linux_release::{ImageRef, ImageStore, Platform};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use workload_compose::ComposeAnalysis;
+use automata_tee_workload_compose::ComposeAnalysis;
 
 use crate::types::{AtakitConfig, DeploymentDef, PlatformConfig, WorkloadDef};
 
@@ -186,21 +186,16 @@ pub async fn resolve_deployment(
     })
 }
 
-/// Resolve a deployment by name from atakit.json.
+/// Build a DeploymentConfig from atakit.json without resolving image paths.
 ///
-/// `platform_override` selects the platform when a deployment has multiple.
-/// `image_version_override` overrides the config's image version tag.
-/// `image_dir` is the ImageStore base directory for automata-linux releases.
-/// `config_dir` is the directory containing atakit.json.
-pub async fn resolve_from_atakit_json(
+/// Use this when you only need the config (e.g., for `destroy`).
+/// For deploy, use [`resolve_from_atakit_json`] which also resolves images.
+pub fn config_from_atakit_json(
     atakit_config: &AtakitConfig,
-    image_repo: &str,
     deployment_name: &str,
     platform_override: Option<&str>,
-    image_ref_override: Option<&ImageRef>,
-    image_store: &ImageStore,
     config_dir: &Path,
-) -> Result<(DeploymentConfig, ResolvedPaths)> {
+) -> Result<DeploymentConfig> {
     let deploy_def = atakit_config
         .deployment
         .get(deployment_name)
@@ -222,21 +217,15 @@ pub async fn resolve_from_atakit_json(
         })?;
 
     let (platform_name, platform_config) = resolve_platform(deploy_def, platform_override)?;
-
-    // Find the workload definition.
     let wl_def = find_workload_def(atakit_config, &deploy_def.workload)?;
+    let analysis = automata_tee_workload_compose::analyze(config_dir, &wl_def.docker_compose)?;
 
-    // Analyze workload compose file.
-    let analysis = workload_compose::analyze(config_dir, &wl_def.docker_compose)?;
-
-    // Extract project name from config directory.
     let project_name = config_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("atakit");
 
-    // Build the config using shared logic.
-    let config = build_from_deployment(
+    build_from_deployment(
         deployment_name,
         wl_def,
         &platform_name,
@@ -244,10 +233,27 @@ pub async fn resolve_from_atakit_json(
         &analysis,
         atakit_config,
         project_name,
-    )?;
+    )
+}
 
-    // Resolve to get the actual image path (auto-downloads if needed).
-    let paths = resolve_deployment(&config, &image_store, image_repo, image_ref_override).await?;
+/// Resolve a deployment by name from atakit.json (config + image paths).
+///
+/// `platform_override` selects the platform when a deployment has multiple.
+/// `image_ref_override` overrides the config's image version tag.
+/// `config_dir` is the directory containing atakit.json.
+pub async fn resolve_from_atakit_json(
+    atakit_config: &AtakitConfig,
+    image_repo: &str,
+    deployment_name: &str,
+    platform_override: Option<&str>,
+    image_ref_override: Option<&ImageRef>,
+    image_store: &ImageStore,
+    config_dir: &Path,
+) -> Result<(DeploymentConfig, ResolvedPaths)> {
+    let config =
+        config_from_atakit_json(atakit_config, deployment_name, platform_override, config_dir)?;
+    let paths =
+        resolve_deployment(&config, image_store, image_repo, image_ref_override).await?;
     Ok((config, paths))
 }
 

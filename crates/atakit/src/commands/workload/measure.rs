@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use tracing::info;
 
-use workload_compose::measure::measure_package;
+use automata_tee_workload_compose::measure::measure_package;
 
 use crate::Env;
 

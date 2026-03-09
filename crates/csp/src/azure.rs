@@ -488,7 +488,26 @@ impl ImageManager for Azure {
             }
         }
 
-        // 11. Get gallery image ID.
+        // 11. Clean up the intermediate VHD blob from storage.
+        info!(blob = %blob_name, "Removing uploaded VHD blob");
+        let _ = cmd::run_cmd(
+            "az",
+            &[
+                "storage",
+                "blob",
+                "delete",
+                "--account-name",
+                &self.storage_account,
+                "--container-name",
+                &self.container_name,
+                "--name",
+                &blob_name,
+            ],
+            self.quiet,
+        )
+        .await;
+
+        // 12. Get gallery image ID.
         self.gallery_image_id = Some(self.fetch_gallery_image_id(&def_name).await?);
         info!(gallery_image_id = ?self.gallery_image_id, "SIG image ready");
 
@@ -517,6 +536,10 @@ impl ImageManager for Azure {
     }
 
     async fn delete_image(&mut self, version: Option<&str>) -> Result<()> {
+        // Ensure image_version matches the actual SIG version.
+        // Without this, image_version stays at the default "1.0.0" when
+        // delete_image is called without a prior upload_image (e.g., destroy).
+        self.image_version = extract_image_version(version);
         let def_name = image_def_name(version, &self.vm_name);
         self.delete_sig_image(&def_name).await?;
         self.gallery_image_id = None;
@@ -674,35 +697,58 @@ impl Azure {
     }
 
     /// Create SIG image version without secure boot certificates.
+    /// Create SIG image version without custom secure boot certs via `az rest`.
+    ///
+    /// Uses `MicrosoftUefiCertificateAuthorityTemplate` so the image version
+    /// has a `securityProfile`, which Azure requires for ConfidentialVM (TDX/SNP).
     async fn create_image_version_simple(
         &self,
         blob_url: &str,
         sa_id: &str,
         def_name: &str,
     ) -> Result<()> {
-        info!("Creating SIG image version (without secure boot)");
+        info!("Creating SIG image version (MicrosoftUefiCertificateAuthorityTemplate)");
+
+        let subscription_id = cmd::capture(
+            "az",
+            &["account", "show", "--query", "id", "--output", "tsv"],
+        )
+        .await?;
+
+        let api_url = format!(
+            "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/galleries/{}/images/{}/versions/{}?api-version=2024-03-03",
+            subscription_id, self.resource_group, self.gallery_name, def_name, self.image_version
+        );
+
+        let body = format!(
+            r#"{{
+  "location": "{}",
+  "properties": {{
+    "publishingProfile": {{
+      "targetRegions": [{{ "name": "{}", "regionalReplicaCount": 1 }}]
+    }},
+    "storageProfile": {{
+      "osDiskImage": {{
+        "source": {{
+          "uri": "{}",
+          "storageAccountId": "{}"
+        }},
+        "hostCaching": "ReadOnly"
+      }}
+    }},
+    "securityProfile": {{
+      "uefiSettings": {{
+        "signatureTemplateNames": ["MicrosoftUefiCertificateAuthorityTemplate"]
+      }}
+    }}
+  }}
+}}"#,
+            self.region, self.region, blob_url, sa_id
+        );
+
         cmd::run_cmd(
             "az",
-            &[
-                "sig",
-                "image-version",
-                "create",
-                "--gallery-name",
-                &self.gallery_name,
-                "--gallery-image-definition",
-                def_name,
-                "--gallery-image-version",
-                &self.image_version,
-                "--resource-group",
-                &self.resource_group,
-                "--location",
-                &self.region,
-                "--os-vhd-uri",
-                blob_url,
-                "--os-vhd-storage-account",
-                sa_id,
-                "--no-wait",
-            ],
+            &["rest", "--method", "PUT", "--url", &api_url, "--body", &body],
             self.quiet,
         )
         .await
@@ -1016,6 +1062,8 @@ impl Compute for Azure {
             "Standard".into(),
             "--nsg".into(),
             self.nsg_name.clone(),
+            "--boot-diagnostics-storage".into(),
+            format!("https://{}.blob.core.windows.net/", self.storage_account),
             "--admin-username".into(),
             "dummyuser".into(),
             "--admin-password".into(),
@@ -1045,23 +1093,19 @@ impl Compute for Azure {
         self.instance_info(&self.vm_name.clone()).await
     }
 
-    async fn destroy_instance(&mut self, _name: &str) -> Result<()> {
-        // Azure destroys by resource group, not individual VM name.
-        info!("Deleting resource group");
+    async fn destroy_instance(&mut self, name: &str) -> Result<()> {
+        info!("Deleting VM");
         cmd::run_cmd(
             "az",
             &[
-                "group",
-                "delete",
-                "--name",
-                &self.resource_group,
+                "vm", "delete",
+                "--resource-group", &self.resource_group,
+                "--name", name,
                 "--yes",
-                "--no-wait",
             ],
             self.quiet,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn instance_info(&self, name: &str) -> Result<InstanceInfo> {
@@ -1088,6 +1132,161 @@ impl Compute for Azure {
             public_ip: ip,
         })
     }
+}
+
+// ── VM resource cleanup ───────────────────────────────────────────
+
+/// Resources associated with an Azure VM, captured before deletion.
+pub struct VmResources {
+    pub os_disk: Option<String>,
+    pub nic_ids: Vec<String>,
+    pub public_ip_ids: Vec<String>,
+    pub vnet_ids: Vec<String>,
+}
+
+impl Azure {
+    /// Query the resources associated with a VM (OS disk, NICs, public IPs, VNETs).
+    ///
+    /// Must be called **before** `destroy_instance` — the VM must still exist.
+    pub async fn query_vm_resources(&self, name: &str) -> VmResources {
+        let os_disk = cmd::try_capture(
+            "az",
+            &[
+                "vm", "show",
+                "--resource-group", &self.resource_group,
+                "--name", name,
+                "--query", "storageProfile.osDisk.name",
+                "--output", "tsv",
+            ],
+        )
+        .await;
+
+        let nic_ids: Vec<String> = cmd::try_capture(
+            "az",
+            &[
+                "vm", "show",
+                "--resource-group", &self.resource_group,
+                "--name", name,
+                "--query", "networkProfile.networkInterfaces[].id",
+                "--output", "tsv",
+            ],
+        )
+        .await
+        .map(|s| parse_tsv_lines(&s))
+        .unwrap_or_default();
+
+        let mut public_ip_ids: Vec<String> = Vec::new();
+        let mut vnet_ids: Vec<String> = Vec::new();
+
+        for nic_id in &nic_ids {
+            // Public IPs — filter out ipConfigurations where publicIpAddress is null.
+            if let Some(pip_output) = cmd::try_capture(
+                "az",
+                &[
+                    "network", "nic", "show",
+                    "--ids", nic_id,
+                    "--query", "ipConfigurations[?publicIpAddress].publicIpAddress.id",
+                    "--output", "tsv",
+                ],
+            )
+            .await
+            {
+                for id in parse_tsv_lines(&pip_output) {
+                    if !public_ip_ids.contains(&id) {
+                        public_ip_ids.push(id);
+                    }
+                }
+            }
+
+            // VNETs — extract from subnet resource IDs.
+            // Subnet ID format: .../virtualNetworks/{vnet}/subnets/{subnet}
+            if let Some(subnet_output) = cmd::try_capture(
+                "az",
+                &[
+                    "network", "nic", "show",
+                    "--ids", nic_id,
+                    "--query", "ipConfigurations[].subnet.id",
+                    "--output", "tsv",
+                ],
+            )
+            .await
+            {
+                for subnet_id in parse_tsv_lines(&subnet_output) {
+                    if let Some(vnet_id) = subnet_id.rsplit_once("/subnets/").map(|(v, _)| v.to_string()) {
+                        if !vnet_ids.contains(&vnet_id) {
+                            vnet_ids.push(vnet_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        VmResources { os_disk, nic_ids, public_ip_ids, vnet_ids }
+    }
+
+    /// Delete resources that were associated with a (now-deleted) VM.
+    pub async fn cleanup_vm_resources(
+        &self,
+        resources: &VmResources,
+        preserve_public_ip: bool,
+    ) -> Result<()> {
+        if let Some(ref disk_name) = resources.os_disk {
+            info!(disk = %disk_name, "Deleting OS disk");
+            let _ = cmd::run_cmd(
+                "az",
+                &[
+                    "disk", "delete",
+                    "--resource-group", &self.resource_group,
+                    "--name", disk_name,
+                    "--yes", "--no-wait",
+                ],
+                self.quiet,
+            )
+            .await;
+        }
+
+        for nic_id in &resources.nic_ids {
+            info!("Deleting NIC");
+            let _ = cmd::run_cmd(
+                "az",
+                &["network", "nic", "delete", "--ids", nic_id],
+                self.quiet,
+            )
+            .await;
+        }
+
+        if !preserve_public_ip {
+            for pip_id in &resources.public_ip_ids {
+                info!("Deleting public IP");
+                let _ = cmd::run_cmd(
+                    "az",
+                    &["network", "public-ip", "delete", "--ids", pip_id],
+                    self.quiet,
+                )
+                .await;
+            }
+        }
+
+        for vnet_id in &resources.vnet_ids {
+            info!("Deleting virtual network");
+            let _ = cmd::run_cmd(
+                "az",
+                &["network", "vnet", "delete", "--ids", vnet_id],
+                self.quiet,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+}
+
+/// Parse TSV output lines, filtering empty lines and `None` literals.
+fn parse_tsv_lines(s: &str) -> Vec<String> {
+    s.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && l != "None")
+        .collect()
 }
 
 // ── Networking (NSG) ──────────────────────────────────────────────

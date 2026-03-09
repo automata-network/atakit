@@ -1,9 +1,8 @@
 use alloy::primitives::Address;
 use anyhow::Result;
-use tracing::info;
 
 use csp::{
-    BlockStorage, CloudProvider, Compute, ImageManager, InstanceInfo, Metadata, Networking,
+    CloudResource, CloudResourceConfig, CloudResourceManager, DataDiskConfig, InstanceInfo,
     PortRule, Protocol,
 };
 
@@ -27,179 +26,91 @@ pub async fn deploy(
 
     let port_rules = build_port_rules(&config.ports);
 
-    match config.provider {
-        ProviderKind::Gcp => deploy_gcp(config, paths, quiet, force_upload_image, &metadata, &port_rules).await,
-        ProviderKind::Azure => deploy_azure(config, paths, quiet, force_upload_image, &metadata, &port_rules).await,
-        ProviderKind::Qemu => deploy_qemu(config, paths, env, quiet, &metadata, &port_rules).await,
-    }
-}
+    let data_disks: Vec<DataDiskConfig> = config
+        .disks
+        .iter()
+        .map(|d| DataDiskConfig {
+            name: d.name.clone(),
+            size: d.size.clone(),
+        })
+        .collect();
 
-// ── GCP ──────────────────────────────────────────────────────────
-
-async fn deploy_gcp(
-    config: &DeploymentConfig,
-    paths: &ResolvedPaths,
-    quiet: bool,
-    force_upload_image: bool,
-    metadata: &Metadata,
-    port_rules: &[PortRule],
-) -> Result<InstanceInfo> {
-    let gcp_opts = config.gcp.as_ref().cloned().unwrap_or_default();
-
-    let gcp_config = csp::gcp::GcpConfig {
-        vm_name: config.name.clone(),
-        vm_type: config.vm_type.clone(),
-        zone: gcp_opts.zone,
-        project_id: gcp_opts.project_id,
-        bucket_name: gcp_opts.bucket_name,
-        image_name: gcp_opts.image_name,
-        secure_boot_dir: paths.secure_boot_dir.clone(),
-        quiet,
-        port_rules: port_rules.to_vec(),
-        data_disks: vec![],
+    let resource = match config.provider {
+        ProviderKind::Gcp => {
+            let gcp_opts = config.gcp.as_ref().cloned().unwrap_or_default();
+            let gcp_config = csp::gcp::GcpConfig {
+                vm_name: config.name.clone(),
+                vm_type: config.vm_type.clone(),
+                zone: gcp_opts.zone,
+                project_id: gcp_opts.project_id,
+                bucket_name: gcp_opts.bucket_name,
+                image_name: gcp_opts.image_name,
+                secure_boot_dir: paths.secure_boot_dir.clone(),
+                quiet,
+                port_rules: port_rules.clone(),
+                data_disks: vec![],
+            };
+            CloudResource::Gcp(csp::gcp::Gcp::new(gcp_config).await?)
+        }
+        ProviderKind::Azure => {
+            let azure_opts = config.azure.as_ref().cloned().unwrap_or_default();
+            let azure_config = csp::azure::AzureConfig {
+                vm_name: config.name.clone(),
+                vm_type: config.vm_type.clone(),
+                region: azure_opts.region,
+                resource_group: azure_opts.resource_group,
+                storage_account: azure_opts.storage_account,
+                container_name: azure_opts.container_name,
+                secure_boot_dir: paths.secure_boot_dir.clone(),
+                port_rules: port_rules.clone(),
+                data_disks: vec![],
+                gallery_name: azure_opts.gallery_name,
+                quiet,
+            };
+            CloudResource::Azure(csp::azure::Azure::new(azure_config).await?)
+        }
+        ProviderKind::Qemu => {
+            let qemu_opts = config.qemu.as_ref().cloned().unwrap_or_default();
+            let instance_dir = qemu_opts
+                .instance_dir
+                .unwrap_or_else(|| env.qemu_disk_dir(&config.name));
+            let ovmf_path = match qemu_opts.ovmf_path {
+                Some(p) => p,
+                None => env.ensure_ovmf()?,
+            };
+            let qemu_config = csp::qemu::QemuConfig {
+                vm_name: config.name.clone(),
+                instance_dir,
+                ovmf_path,
+                disk_tar_gz: paths.image.clone(),
+                quiet,
+                port_rules: port_rules.clone(),
+            };
+            CloudResource::Qemu(csp::qemu::Qemu::new(qemu_config)?)
+        }
     };
 
-    let mut gcp = csp::gcp::Gcp::new(gcp_config).await?;
-
-    info!("Checking GCP dependencies");
-    gcp.check_deps().await?;
-
-    info!("Uploading disk image");
-    gcp.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_upload_image).await?;
-
-    if !port_rules.is_empty() {
-        info!("Configuring firewall rules");
-        gcp.open_ports(port_rules).await?;
-    }
-
-    for disk in &config.disks {
-        info!(disk = %disk.name, size = %disk.size, "Creating persistent disk");
-        gcp.create_disk(&disk.name, &disk.size).await?;
-    }
-
-    info!("Creating CVM instance");
-    let instance = gcp.create_instance(metadata).await?;
-
-    info!(
-        name = %instance.name,
-        ip = instance.public_ip.as_deref().unwrap_or("(pending)"),
-        "Deployment complete"
-    );
-
-    Ok(instance)
-}
-
-// ── Azure ────────────────────────────────────────────────────────
-
-async fn deploy_azure(
-    config: &DeploymentConfig,
-    paths: &ResolvedPaths,
-    quiet: bool,
-    force_upload_image: bool,
-    metadata: &Metadata,
-    port_rules: &[PortRule],
-) -> Result<InstanceInfo> {
-    let azure_opts = config.azure.as_ref().cloned().unwrap_or_default();
-
-    let azure_config = csp::azure::AzureConfig {
-        vm_name: config.name.clone(),
-        vm_type: config.vm_type.clone(),
-        region: azure_opts.region,
-        resource_group: azure_opts.resource_group,
-        storage_account: azure_opts.storage_account,
-        container_name: azure_opts.container_name,
-        secure_boot_dir: paths.secure_boot_dir.clone(),
-        port_rules: port_rules.to_vec(),
-        data_disks: vec![],
-        gallery_name: azure_opts.gallery_name,
-        quiet,
+    let rc = CloudResourceConfig {
+        name: config.name.clone(),
+        image_path: paths.image.clone(),
+        image_version: paths
+            .image_ref
+            .as_ref()
+            .map(|r| r.to_string()),
+        force_upload_image,
+        port_rules,
+        data_disks,
+        metadata,
+        preserve: vec![],
     };
 
-    let mut azure = csp::azure::Azure::new(azure_config).await?;
-
-    info!("Checking Azure dependencies");
-    azure.check_deps().await?;
-
-    info!("Uploading disk image");
-    azure.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_upload_image).await?;
-
-    if !port_rules.is_empty() {
-        info!("Configuring network security group");
-        azure.open_ports(port_rules).await?;
-    }
-
-    for disk in &config.disks {
-        info!(disk = %disk.name, size = %disk.size, "Creating persistent disk");
-        azure.create_disk(&disk.name, &disk.size).await?;
-    }
-
-    info!("Creating CVM instance");
-    let instance = azure.create_instance(metadata).await?;
-
-    info!(
-        name = %instance.name,
-        ip = instance.public_ip.as_deref().unwrap_or("(pending)"),
-        "Deployment complete"
-    );
-
-    Ok(instance)
-}
-
-// ── QEMU ─────────────────────────────────────────────────────────
-
-async fn deploy_qemu(
-    config: &DeploymentConfig,
-    paths: &ResolvedPaths,
-    env: &Env,
-    quiet: bool,
-    metadata: &Metadata,
-    port_rules: &[PortRule],
-) -> Result<InstanceInfo> {
-    let qemu_opts = config.qemu.as_ref().cloned().unwrap_or_default();
-
-    let instance_dir = qemu_opts
-        .instance_dir
-        .unwrap_or_else(|| env.qemu_disk_dir(&config.name));
-
-    // Use explicit path from config, or extract embedded OVMF to ~/.atakit/qemu/
-    let ovmf_path = match qemu_opts.ovmf_path {
-        Some(p) => p,
-        None => env.ensure_ovmf()?,
-    };
-
-    let qemu_config = csp::qemu::QemuConfig {
-        vm_name: config.name.clone(),
-        instance_dir,
-        ovmf_path,
-        disk_tar_gz: paths.image.clone(),
-        quiet,
-        port_rules: port_rules.to_vec(),
-    };
-
-    let mut qemu = csp::qemu::Qemu::new(qemu_config)?;
-
-    info!("Checking QEMU dependencies");
-    qemu.check_deps().await?;
-
-    info!("Extracting disk image");
-    qemu.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), false).await?;
-
-    for disk in &config.disks {
-        info!(disk = %disk.name, size = %disk.size, "Creating data disk");
-        qemu.create_disk(&disk.name, &disk.size).await?;
-    }
-
-    info!("Launching QEMU instance");
-    let instance = qemu.create_instance(metadata).await?;
-
-    info!(name = %instance.name, "QEMU session complete");
-
-    Ok(instance)
+    let mut manager = CloudResourceManager::new(resource, rc);
+    manager.deploy().await
 }
 
 // ── Converters ───────────────────────────────────────────────────
 
-fn build_metadata(map: &std::collections::HashMap<String, String>) -> Metadata {
+fn build_metadata(map: &std::collections::HashMap<String, String>) -> csp::Metadata {
     map.iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()

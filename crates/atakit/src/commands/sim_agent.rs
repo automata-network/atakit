@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use automata_cvm_agent::sim::{
     ChainConfig, SimConfig, SimCvmAgent, SimServiceConfig, WorkloadRegistration,
 };
+use automata_tee_workload_compose::WorkloadVolumeMount;
 use automata_tee_workload_measurement::types::AppRef;
 use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 use clap::Args;
@@ -110,12 +111,12 @@ impl SimAgent {
             let yaml = std::fs::read_to_string(&compose_path)
                 .with_context(|| format!("Failed to read: {}", compose_path.display()))?;
 
-            let compose = workload_compose::from_yaml_str(&yaml)
+            let compose = automata_tee_workload_compose::from_yaml_str(&yaml)
                 .with_context(|| format!("Failed to parse: {}", compose_path.display()))?;
 
             for (svc_name, svc) in &compose.services {
                 for vol in &svc.volumes {
-                    if let workload_compose::WorkloadVolumeMount::Bind { host_path, .. } = vol {
+                    if let WorkloadVolumeMount::Bind { host_path, .. } = vol {
                         if host_path.ends_with(".sock") {
                             let socket_path = compose_dir.join(host_path);
                             services.push(SimServiceConfig {

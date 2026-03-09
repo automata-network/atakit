@@ -21,7 +21,7 @@ lto = "thin"
 automata-linux-release = { path = "crates/automata-linux-release" }
 csp = { path = "crates/csp" }
 automata-cvm-agent = { path = "crates/automata-cvm-agent" }
-workload-compose = { path = "crates/workload-compose" }
+automata-tee-workload-compose = { path = "crates/automata-tee-workload-compose" }
 container-engine = { path = "crates/container-engine" }
 automata-tee-workload-measurement = "0.1.1"
 

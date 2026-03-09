@@ -3,10 +3,10 @@ use super::packager;
 use std::fs;
 
 use anyhow::{Context, Result, bail};
+use automata_tee_workload_compose::{ImageKind, ServiceImage, extract_image_name_tag};
 use clap::Args;
 use container_engine::ContainerEngine;
 use tracing::info;
-use workload_compose::{ImageKind, extract_image_name_tag};
 
 use crate::{
     commands::deploy::config::{build_from_deployment, to_json},
@@ -43,8 +43,9 @@ impl BuildWorkload {
                 .with_context(|| format!("Failed to create {}", output_dir.display()))?;
 
             // Analyze the workload's docker-compose.
-            let analysis = workload_compose::analyze(&project_dir, &wl_def.docker_compose)
-                .with_context(|| format!("Failed to analyze workload {:?}", wl_def.name))?;
+            let analysis =
+                automata_tee_workload_compose::analyze(&project_dir, &wl_def.docker_compose)
+                    .with_context(|| format!("Failed to analyze workload {:?}", wl_def.name))?;
 
             info!(
                 workload = %wl_def.name,
@@ -145,10 +146,7 @@ impl BuildWorkload {
 ///
 /// Images in docker-compose may include a registry prefix (e.g., `ghcr.io/org/myapp:v1`),
 /// but the name:tag portion must match `expected` (e.g., `myapp:v1`).
-fn validate_compose_images(
-    images: &[workload_compose::ServiceImage],
-    expected: &str,
-) -> Result<()> {
+fn validate_compose_images(images: &[ServiceImage], expected: &str) -> Result<()> {
     let mut errors = Vec::new();
 
     for img in images {

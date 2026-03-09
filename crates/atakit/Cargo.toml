@@ -23,7 +23,7 @@ fscommon.workspace = true
 automata-linux-release.workspace = true
 csp.workspace = true
 automata-cvm-agent = { workspace = true, features = ["client", "sim"] }
-workload-compose.workspace = true
+automata-tee-workload-compose.workspace = true
 container-engine.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true

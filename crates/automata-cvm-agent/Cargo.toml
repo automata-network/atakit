@@ -18,7 +18,7 @@ reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
-workload-compose = { workspace = true, optional = true }
+automata-tee-workload-compose = { workspace = true, optional = true }
 automata-linux-release.workspace = true
 automata-tee-workload-measurement.workspace = true
 
@@ -35,4 +35,4 @@ sha2 = { workspace = true, optional = true }
 [features]
 default = ["client"]
 client = ["alloy", "anyhow", "hex", "k256", "p256", "rand", "reqwest", "sha2", "tokio", "tokio-util", "tracing", "hyper", "hyper-util", "http-body-util", "bytes"]
-sim = ["client", "axum", "sha2", "workload-compose", "alloy/node-bindings"]
+sim = ["client", "axum", "sha2", "automata-tee-workload-compose", "alloy/node-bindings"]

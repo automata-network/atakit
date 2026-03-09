@@ -10,7 +10,7 @@ use clap::Parser;
 use tracing::info;
 
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
-use workload_compose::measure::measure_package;
+use automata_tee_workload_compose::measure::measure_package;
 
 use crate::Env;
 use crate::types::AtakitConfig;

@@ -1,5 +1,5 @@
 [package]
-name = "workload-compose"
+name = "automata-tee-workload-compose"
 version.workspace = true
 edition.workspace = true
 

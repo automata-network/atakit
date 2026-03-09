@@ -3,6 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
+use tracing::info;
 
 /// Run a command with optional confirmation prompt.
 ///
@@ -37,6 +38,7 @@ pub async fn run_cmd(program: &str, args: &[&str], quiet: bool) -> Result<()> {
 
 /// Run a command silently without prompting. Returns `true` on success.
 pub async fn run_cmd_silent(program: &str, args: &[&str]) -> bool {
+    info!(command = program, args = ?args, "Running command silently");
     Command::new(program)
         .args(args)
         .stdout(Stdio::null())

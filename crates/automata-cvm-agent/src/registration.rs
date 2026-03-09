@@ -547,7 +547,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     }
 
     /// Attempt rotation with exponential backoff.
-    async fn rotate_with_retries(&self, shutdown: &CancellationToken) -> Result<()> {
+    pub async fn rotate_with_retries(&self, shutdown: &CancellationToken) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
 
         for attempt in 0..MAX_RETRIES {

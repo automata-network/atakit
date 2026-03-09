@@ -2,6 +2,9 @@ pub mod cmd;
 pub mod gcp;
 pub mod azure;
 pub mod qemu;
+pub mod resource;
+
+pub use resource::{CloudResource, CloudResourceConfig, CloudResourceManager, Preserve};
 
 use std::path::Path;
 
