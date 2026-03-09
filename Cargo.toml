@@ -24,6 +24,7 @@ automata-cvm-agent = { path = "crates/automata-cvm-agent" }
 workload-compose = { path = "crates/workload-compose" }
 container-engine = { path = "crates/container-engine" }
 automata-tee-workload-measurement = { git = "https://github.com/automata-network/automata-tee-workload-measurement", branch = "develop" }
+automata-tee-workload-measurement = "0.1.1"
 
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
@@ -51,6 +52,7 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
 hex = "0.4"
 alloy = { git = "https://github.com/automata-network/alloy-ext.git", package = "alloy-ext" }
+alloy = { version = "1.7.4", package = "alloy-ext" }
 alloy-chains = "0.2"
 tempfile = "3"
 chrono = "0.4"

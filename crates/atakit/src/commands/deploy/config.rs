@@ -113,6 +113,8 @@ pub struct AzureOptions {
     pub storage_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gallery_name: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -419,40 +421,62 @@ fn build_azure_options(
     if platform_name != "azure" {
         return None;
     }
+    let region = platform_config
+        .region
+        .as_deref()
+        .unwrap_or("East US");
     Some(AzureOptions {
-        region: platform_config.region.clone(),
-        storage_account: Some(sanitize_azure_storage_name(project_name)),
+        region: Some(region.to_string()),
+        resource_group: Some(format!("{}_Rg", project_name)),
+        storage_account: Some(sanitize_azure_storage_name(project_name, region)),
         container_name: Some(sanitize_bucket_name(project_name)),
+        gallery_name: Some(sanitize_azure_gallery_name(project_name)),
         ..Default::default()
     })
 }
 
-/// Sanitize a string to be a valid Azure storage account name.
-/// Azure storage names must be 3-24 chars, lowercase letters and numbers only (no hyphens).
-fn sanitize_azure_storage_name(name: &str) -> String {
+/// Sanitize a string to be a valid Azure Shared Image Gallery name.
+/// Gallery names must be alphanumeric, dots, or underscores only (no hyphens).
+fn sanitize_azure_gallery_name(name: &str) -> String {
     let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .collect();
+    if sanitized.is_empty() {
+        "atakitGallery".to_string()
+    } else {
+        format!("{}Gallery", sanitized)
+    }
+}
+
+/// Sanitize a string to be a valid Azure storage account name with region code.
+///
+/// Format: `{project}0{region_code}` (3-24 chars, lowercase + digits only).
+/// Region code is the first letter of each word: `"Southeast Asia"` → `"sa"`.
+fn sanitize_azure_storage_name(project_name: &str, region: &str) -> String {
+    let region_code: String = region
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let region_code = if region_code.is_empty() {
+        "x".to_string()
+    } else {
+        region_code
+    };
+    // {project}{0}{region_code}: reserve region_code.len() + 1 for separator.
+    let prefix_limit = 23 - region_code.len();
+    let project: String = project_name
         .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
+        .take(prefix_limit)
         .collect();
-    // Ensure it starts with a letter
-    let sanitized = if sanitized
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(true)
-    {
-        format!("ata{}", sanitized)
-    } else {
-        sanitized
-    };
-    // Ensure minimum length of 3 and max of 24
-    let sanitized = if sanitized.len() < 3 {
-        format!("{}atakit", sanitized)
-    } else {
-        sanitized
-    };
-    sanitized.chars().take(24).collect()
+    let mut name = format!("{}0{}", project, region_code);
+    while name.len() < 3 {
+        name.push('0');
+    }
+    name
 }
 
 // ── Build from deployment definition (for build-workload) ────────

@@ -221,6 +221,7 @@ impl Deploy {
         match result {
             Err(e) => {
                 // VM creation failed → cancel init task
+                tracing::error!(error = ?e, "VM creation failed");
                 cancel.cancel();
                 if let Some(h) = init_handle {
                     let _ = h.await;

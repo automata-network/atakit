@@ -29,7 +29,7 @@ pub async fn deploy(
 
     match config.provider {
         ProviderKind::Gcp => deploy_gcp(config, paths, quiet, force_upload_image, &metadata, &port_rules).await,
-        ProviderKind::Azure => deploy_azure(config, paths, quiet, force_upload_image, &metadata).await,
+        ProviderKind::Azure => deploy_azure(config, paths, quiet, force_upload_image, &metadata, &port_rules).await,
         ProviderKind::Qemu => deploy_qemu(config, paths, env, quiet, &metadata, &port_rules).await,
     }
 }
@@ -97,6 +97,7 @@ async fn deploy_azure(
     quiet: bool,
     force_upload_image: bool,
     metadata: &Metadata,
+    port_rules: &[PortRule],
 ) -> Result<InstanceInfo> {
     let azure_opts = config.azure.as_ref().cloned().unwrap_or_default();
 
@@ -107,6 +108,10 @@ async fn deploy_azure(
         resource_group: azure_opts.resource_group,
         storage_account: azure_opts.storage_account,
         container_name: azure_opts.container_name,
+        secure_boot_dir: paths.secure_boot_dir.clone(),
+        port_rules: port_rules.to_vec(),
+        data_disks: vec![],
+        gallery_name: azure_opts.gallery_name,
         quiet,
     };
 
@@ -117,6 +122,16 @@ async fn deploy_azure(
 
     info!("Uploading disk image");
     azure.upload_image(&paths.image, paths.image_ref.as_ref().map(|n| n.to_string()).as_deref(), force_upload_image).await?;
+
+    if !port_rules.is_empty() {
+        info!("Configuring network security group");
+        azure.open_ports(port_rules).await?;
+    }
+
+    for disk in &config.disks {
+        info!(disk = %disk.name, size = %disk.size, "Creating persistent disk");
+        azure.create_disk(&disk.name, &disk.size).await?;
+    }
 
     info!("Creating CVM instance");
     let instance = azure.create_instance(metadata).await?;

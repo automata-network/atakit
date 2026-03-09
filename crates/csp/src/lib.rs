@@ -85,6 +85,15 @@ pub struct InstanceInfo {
 /// - QEMU: `-fw_cfg` or SMBIOS entries
 pub type Metadata = Vec<(String, String)>;
 
+/// Configuration for a data disk to attach to an instance.
+#[derive(Clone, Debug)]
+pub struct DataDiskConfig {
+    /// Disk name (used for both disk resource name and device-name).
+    pub name: String,
+    /// Disk size (e.g., "100GB", "100").
+    pub size: String,
+}
+
 // ── Core trait ──────────────────────────────────────────────────────
 
 /// Identity and dependency checks. Every provider implements this.
