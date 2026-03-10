@@ -24,6 +24,7 @@ use crate::client::cvm_agent::{RotateKeyRequest, SignMessageRequest};
 pub(crate) async fn serve_socket(socket_path: &Path, state: Arc<ServiceState>) -> Result<()> {
     // Clean up old socket
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_dir(socket_path);
 
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)

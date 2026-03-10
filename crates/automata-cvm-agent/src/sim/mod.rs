@@ -7,8 +7,11 @@
 //! on-chain session registration and periodic rotation in the background
 //! using a [`MockDeviceProvider`](crate::mock::mock_device::MockDeviceProvider).
 
+use alloy::ext::NetworkProvider;
+use alloy::hex::FromHex;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256, U256};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
 use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
@@ -69,7 +72,7 @@ impl SimCvmAgent {
         let mut _registration_handles = Vec::new();
         if let Some(chain) = &chain {
             // Start embedded Anvil node if fork_url is configured
-            let anvil = Self::start_anvil(chain)?;
+            let anvil = self.start_anvil(chain).await?;
             if chain.can_register() {
                 match self.spawn_registrations(anvil, chain, cancel.clone()).await {
                     Ok(handles) => _registration_handles = handles,
@@ -87,7 +90,7 @@ impl SimCvmAgent {
     ///
     /// Returns the `AnvilInstance` (must be kept alive) and a patched
     /// `ChainConfig` with `rpc_url` and `relay_key` populated from Anvil.
-    fn start_anvil(chain: &ChainConfig) -> Result<AnvilInstance> {
+    async fn start_anvil(&self, chain: &ChainConfig) -> Result<AnvilInstance> {
         let host = chain.anvil_host.as_deref().unwrap_or("0.0.0.0");
         let port = chain.anvil_port.unwrap_or(14345);
 
@@ -109,6 +112,31 @@ impl SimCvmAgent {
         println!("  Endpoint:      {endpoint}");
         println!("  Fork URL:      {}", chain.rpc_url);
         println!("  Relay address: {relay_address}");
+        if let Some(mock) = chain.mock_session_registry_address {
+            println!("  MockSessionRegistry: {mock}");
+            let p = NetworkProvider::with_http(&endpoint, None, None, 100).await?;
+            let impl_slot = U256::from_be_bytes(
+                B256::from_hex(
+                    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+                )
+                .unwrap()
+                .0,
+            );
+            let proxy_impl = p
+                .get_storage_at(chain.session_registry_address, impl_slot)
+                .await?;
+            let mock_code = p.get_code_at(mock).await?;
+
+            let proxy_impl = Address::from_slice(&proxy_impl.to_be_bytes_trimmed_vec());
+            println!(
+                "  SessionRegistry implementation address: 0x{:x}",
+                proxy_impl
+            );
+            let _: serde_json::Value = p
+                .raw_request("anvil_setCode".into(), (proxy_impl, mock_code))
+                .await
+                .context("Failed to set storage at mock session registry address")?;
+        }
 
         Ok(instance)
     }

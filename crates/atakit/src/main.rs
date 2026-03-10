@@ -86,5 +86,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let env = Env::from_env();
-    cli.command.run(&env).await
+    match cli.command.run(&env).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            std::process::exit(1);
+        }
+    }
 }

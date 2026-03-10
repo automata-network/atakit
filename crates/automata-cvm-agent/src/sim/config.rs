@@ -30,6 +30,7 @@ pub struct ChainConfig {
     pub rpc_url: String,
     /// Session registry contract address.
     pub session_registry_address: Address,
+    pub mock_session_registry_address: Option<Address>,
     /// Target chain ID (queried from RPC if not set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,

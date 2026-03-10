@@ -133,14 +133,15 @@ impl SimAgent {
         let chain_id = provider.chain_id();
 
         // Resolve SessionRegistry address
-        let session_registry = if let Some(addr) = self.session_registry {
+        let (session_registry, mock_session_registry) = if let Some(addr) = self.session_registry {
             println!("SessionRegistry: {addr} (manual)");
-            Some(addr)
+            (Some(addr), None)
         } else {
             let store = env.registry_store();
+            let chain_id = chain_id.to_string();
             store.ensure_data(None).await?;
 
-            match store.resolve_contract(None, &chain_id.to_string(), "SessionRegistryMock")? {
+            let session_registry = match store.resolve_contract(None, &chain_id, "SessionRegistry")? {
                 Some(addr) => {
                     println!("SessionRegistry: {addr} (chain {chain_id})");
                     Some(addr)
@@ -149,7 +150,20 @@ impl SimAgent {
                     println!("No SessionRegistry found for chain {chain_id}");
                     None
                 }
-            }
+            };
+
+            let mock_session_registry = match store.resolve_contract(None, &chain_id, "SessionRegistryMock")? {
+                Some(addr) => {
+                    println!("SessionRegistryMock: {addr} (chain {chain_id})");
+                    Some(addr)
+                }
+                None => {
+                    println!("No SessionRegistryMock found for chain {chain_id}");
+                    None
+                }
+            };
+
+            (session_registry, mock_session_registry)
         };
 
         // Build per-workload registration entries
@@ -172,6 +186,7 @@ impl SimAgent {
         let chain = session_registry.map(|addr| ChainConfig {
             rpc_url: self.rpc_url,
             session_registry_address: addr,
+            mock_session_registry_address: mock_session_registry,
             chain_id: Some(chain_id),
             anvil_port: Some(self.anvil_port),
             anvil_host: None, // use default 0.0.0.0
