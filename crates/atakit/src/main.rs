@@ -33,6 +33,10 @@ enum AtaKit {
     /// Deploy a CVM instance to a cloud provider or local QEMU
     Deploy(commands::deploy::Deploy),
 
+    /// Cloud resource management
+    #[command(subcommand)]
+    Cloud(commands::cloud::Cloud),
+
     /// Internal development commands (requires --features internal)
     #[cfg(feature = "internal")]
     #[command(subcommand)]
@@ -59,6 +63,7 @@ impl AtaKit {
         match self {
             AtaKit::Image(cmd) => cmd.run(env).await,
             AtaKit::Deploy(cmd) => cmd.run(env).await,
+            AtaKit::Cloud(cmd) => cmd.run(env).await,
             #[cfg(feature = "internal")]
             AtaKit::Internal(cmd) => cmd.run().await,
             AtaKit::Registry(cmd) => cmd.run(env).await,
