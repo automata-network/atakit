@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use automata_cvm_agent::sim::{
     ChainConfig, SimConfig, SimCvmAgent, SimServiceConfig, WorkloadRegistration,
 };
+use automata_tee_workload_compose::WorkloadVolumeMount;
 use automata_tee_workload_measurement::types::AppRef;
 use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 use clap::Args;
@@ -42,6 +43,11 @@ pub struct SimAgent {
     /// Anvil listen port (default: 14345).
     #[arg(long, default_value_t = 14345)]
     anvil_port: u16,
+
+    /// Owner private key (hex, 32 bytes) for workload registration.
+    /// If omitted, a random key is generated per workload.
+    #[arg(long)]
+    owner_private_key: Option<B256>,
 }
 
 fn default_dev_version() -> String {
@@ -105,12 +111,12 @@ impl SimAgent {
             let yaml = std::fs::read_to_string(&compose_path)
                 .with_context(|| format!("Failed to read: {}", compose_path.display()))?;
 
-            let compose = workload_compose::from_yaml_str(&yaml)
+            let compose = automata_tee_workload_compose::from_yaml_str(&yaml)
                 .with_context(|| format!("Failed to parse: {}", compose_path.display()))?;
 
             for (svc_name, svc) in &compose.services {
                 for vol in &svc.volumes {
-                    if let workload_compose::WorkloadVolumeMount::Bind { host_path, .. } = vol {
+                    if let WorkloadVolumeMount::Bind { host_path, .. } = vol {
                         if host_path.ends_with(".sock") {
                             let socket_path = compose_dir.join(host_path);
                             services.push(SimServiceConfig {
@@ -127,14 +133,15 @@ impl SimAgent {
         let chain_id = provider.chain_id();
 
         // Resolve SessionRegistry address
-        let session_registry = if let Some(addr) = self.session_registry {
+        let (session_registry, mock_session_registry) = if let Some(addr) = self.session_registry {
             println!("SessionRegistry: {addr} (manual)");
-            Some(addr)
+            (Some(addr), None)
         } else {
             let store = env.registry_store();
+            let chain_id = chain_id.to_string();
             store.ensure_data(None).await?;
 
-            match store.resolve_contract(None, &chain_id.to_string(), "SessionRegistryMock")? {
+            let session_registry = match store.resolve_contract(None, &chain_id, "SessionRegistry")? {
                 Some(addr) => {
                     println!("SessionRegistry: {addr} (chain {chain_id})");
                     Some(addr)
@@ -143,15 +150,30 @@ impl SimAgent {
                     println!("No SessionRegistry found for chain {chain_id}");
                     None
                 }
-            }
+            };
+
+            let mock_session_registry = match store.resolve_contract(None, &chain_id, "SessionRegistryMock")? {
+                Some(addr) => {
+                    println!("SessionRegistryMock: {addr} (chain {chain_id})");
+                    Some(addr)
+                }
+                None => {
+                    println!("No SessionRegistryMock found for chain {chain_id}");
+                    None
+                }
+            };
+
+            (session_registry, mock_session_registry)
         };
 
-        // Build per-workload registration entries (each gets its own random owner key)
+        // Build per-workload registration entries
         let wl_registrations: Vec<WorkloadRegistration> = workloads
             .iter()
             .map(|wl| {
-                let sk = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-                let owner_private_key = B256::from_slice(&sk.to_bytes());
+                let owner_private_key = self.owner_private_key.unwrap_or_else(|| {
+                    let sk = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+                    B256::from_slice(&sk.to_bytes())
+                });
                 WorkloadRegistration {
                     workload_ref: AppRef::new(&wl.name, &wl.version),
                     temporary_workload_ref: AppRef::new(&wl.name, self.dev_version.clone()),
@@ -164,6 +186,7 @@ impl SimAgent {
         let chain = session_registry.map(|addr| ChainConfig {
             rpc_url: self.rpc_url,
             session_registry_address: addr,
+            mock_session_registry_address: mock_session_registry,
             chain_id: Some(chain_id),
             anvil_port: Some(self.anvil_port),
             anvil_host: None, // use default 0.0.0.0
@@ -171,11 +194,7 @@ impl SimAgent {
             workloads: wl_registrations,
         });
 
-        let sim_config = SimConfig {
-            services,
-            chain,
-            ..Default::default()
-        };
+        let sim_config = SimConfig { services, chain };
 
         SimCvmAgent::new(sim_config).run().await
     }

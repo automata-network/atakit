@@ -7,12 +7,14 @@
 //! The mock on-chain contracts skip signature verification but still parse
 //! the TPM/TDX structures, so the structural data must be genuine.
 
+use std::sync::Mutex;
+
 use alloy::primitives::Bytes;
 use alloy::sol_types::SolValue;
-use sha2::Digest;
 use automata_tee_workload_measurement::stubs::{
     AkPubCollateral, AlgoId, PublicIdentity, TeeReport, TpmReport,
 };
+use sha2::Digest;
 
 use crate::device::{DeviceProvider, PlatformInfo, TpmQuoteResult};
 use crate::mock::builder::MockDataBuilder;
@@ -58,8 +60,8 @@ pub struct MockDeviceProvider {
     data_builder: MockDataBuilder,
     /// Mock AK signing key — signs TPM2B_ATTEST structures (quote & certify).
     ak_signing_key: P256Key,
-    signing_key: P256Key,
-    tmp_signing_key: Option<P256Key>,
+    signing_key: Mutex<P256Key>,
+    tmp_signing_key: Mutex<Option<P256Key>>,
 }
 
 impl MockDeviceProvider {
@@ -67,8 +69,8 @@ impl MockDeviceProvider {
         Self {
             data_builder: builder,
             ak_signing_key: P256Key::random(),
-            signing_key: P256Key::random(),
-            tmp_signing_key: None,
+            signing_key: Mutex::new(P256Key::random()),
+            tmp_signing_key: Mutex::new(None),
         }
     }
 }
@@ -147,16 +149,23 @@ impl DeviceProvider for MockDeviceProvider {
     fn get_signing_key_public(&self) -> anyhow::Result<PublicIdentity> {
         Ok(PublicIdentity {
             type_id: AlgoId::Es256 as u8,
-            key: Bytes::from(self.signing_key.uncompressed()),
+            key: Bytes::from(self.signing_key.lock().unwrap().uncompressed()),
         })
     }
 
     async fn sign_with_signing_key(&self, digest: &[u8]) -> anyhow::Result<Bytes> {
-        Ok(Bytes::from(self.signing_key.sign_digest(digest)))
+        Ok(Bytes::from(
+            self.signing_key.lock().unwrap().sign_digest(digest),
+        ))
     }
 
     async fn certify_signing_key(&self) -> anyhow::Result<TpmReport> {
-        Ok(build_certify_report(&self.ak_signing_key, &self.signing_key, &[0u8; 32]))
+        let signing_key = self.signing_key.lock().unwrap();
+        Ok(build_certify_report(
+            &self.ak_signing_key,
+            &signing_key,
+            &[0u8; 32],
+        ))
     }
 
     async fn get_ak_pub_collateral(&self) -> anyhow::Result<AkPubCollateral> {
@@ -177,14 +186,14 @@ impl DeviceProvider for MockDeviceProvider {
         self.data_builder.platform_info.clone()
     }
 
-    async fn create_tmp_signing_key(&mut self) -> anyhow::Result<()> {
-        self.tmp_signing_key = Some(P256Key::random());
+    async fn create_tmp_signing_key(&self) -> anyhow::Result<()> {
+        *self.tmp_signing_key.lock().unwrap() = Some(P256Key::random());
         Ok(())
     }
 
     fn get_tmp_signing_key_public(&self) -> anyhow::Result<PublicIdentity> {
-        let key = self
-            .tmp_signing_key
+        let tmp_signing_key = self.tmp_signing_key.lock().unwrap();
+        let key = tmp_signing_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no temporary signing key created"))?;
         Ok(PublicIdentity {
@@ -194,27 +203,29 @@ impl DeviceProvider for MockDeviceProvider {
     }
 
     async fn sign_with_tmp_key(&self, digest: &[u8]) -> anyhow::Result<Bytes> {
-        let key = self
-            .tmp_signing_key
+        let tmp_signing_key = self.tmp_signing_key.lock().unwrap();
+        let key = tmp_signing_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no temporary signing key created"))?;
         Ok(Bytes::from(key.sign_digest(digest)))
     }
 
     async fn certify_tmp_signing_key(&self) -> anyhow::Result<TpmReport> {
-        let key = self
-            .tmp_signing_key
+        let tmp_signing_key = self.tmp_signing_key.lock().unwrap();
+        let key = tmp_signing_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no temporary signing key created"))?;
         Ok(build_certify_report(&self.ak_signing_key, key, &[0u8; 32]))
     }
 
-    async fn promote_tmp_key(&mut self) -> anyhow::Result<()> {
+    async fn promote_tmp_key(&self) -> anyhow::Result<()> {
         let key = self
             .tmp_signing_key
+            .lock()
+            .unwrap()
             .take()
             .ok_or_else(|| anyhow::anyhow!("no temporary signing key to promote"))?;
-        self.signing_key = key;
+        *self.signing_key.lock().unwrap() = key;
         Ok(())
     }
 }

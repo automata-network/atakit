@@ -6,8 +6,8 @@ use tracing::info;
 
 use crate::cmd;
 use crate::{
-    BlockStorage, CloudProvider, Compute, DiskFormat, ImageManager, InstanceInfo, Logs, Metadata,
-    Networking, PortRule, Protocol,
+    BlockStorage, CloudProvider, Compute, DataDiskConfig, DiskFormat, ImageManager, InstanceInfo,
+    Logs, Metadata, Networking, PortRule, Protocol,
 };
 
 // ── Configuration ─────────────────────────────────────────────────
@@ -28,15 +28,6 @@ pub struct GcpConfig {
     pub port_rules: Vec<PortRule>,
     /// Data disks to attach to the instance.
     pub data_disks: Vec<DataDiskConfig>,
-}
-
-/// Configuration for a data disk to attach to an instance.
-#[derive(Clone, Debug)]
-pub struct DataDiskConfig {
-    /// Disk name (used for both GCP disk name and device-name).
-    pub name: String,
-    /// Disk size (e.g., "100GB").
-    pub size: String,
 }
 
 /// Internal state for a data disk to attach during instance creation.

@@ -30,6 +30,7 @@ pub struct ChainConfig {
     pub rpc_url: String,
     /// Session registry contract address.
     pub session_registry_address: Address,
+    pub mock_session_registry_address: Option<Address>,
     /// Target chain ID (queried from RPC if not set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
@@ -73,12 +74,6 @@ impl ChainConfig {
 pub struct SimConfig {
     /// Services to simulate -- each gets its own Unix socket.
     pub services: Vec<SimServiceConfig>,
-    /// Workload ID returned in sign-message responses.
-    #[serde(default)]
-    pub workload_id: B256,
-    /// Base image ID returned in sign-message responses.
-    #[serde(default)]
-    pub base_image_id: B256,
     /// Optional chain configuration for on-chain auto-registration.
     /// If present, the sim agent will auto-register on startup and
     /// rotate the session periodically in the background.

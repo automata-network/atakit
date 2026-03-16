@@ -7,10 +7,14 @@
 //! on-chain session registration and periodic rotation in the background
 //! using a [`MockDeviceProvider`](crate::mock::mock_device::MockDeviceProvider).
 
+use alloy::ext::NetworkProvider;
+use alloy::hex::FromHex;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256, U256};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
+use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 
 use crate::device::PlatformInfo;
 pub use crate::mock;
@@ -39,34 +43,38 @@ use state::ServiceState;
 /// Simulated CVM agent that serves multiple Unix sockets.
 pub struct SimCvmAgent {
     config: SimConfig,
+    registration_managers: BTreeMap<String, Arc<RegistrationManager<MockDeviceProvider>>>,
 }
 
 impl SimCvmAgent {
     pub fn new(config: SimConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            registration_managers: BTreeMap::new(),
+        }
     }
 
     /// Start all service sockets and block until Ctrl+C.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         self.run_with_shutdown(tokio::signal::ctrl_c()).await
     }
 
     /// Start all service sockets and block until `shutdown` resolves.
-    pub async fn run_with_shutdown<F>(&self, shutdown: F) -> Result<()>
+    pub async fn run_with_shutdown<F>(&mut self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = Result<(), std::io::Error>>,
     {
         let cancel = CancellationToken::new();
 
-        let chain = self.config.chain.as_ref();
+        let chain = self.config.chain.clone();
 
         // Optionally spawn auto-registration for each workload
         let mut _registration_handles = Vec::new();
-        if let Some(chain) = chain {
+        if let Some(chain) = &chain {
             // Start embedded Anvil node if fork_url is configured
-            let anvil = Self::start_anvil(chain)?;
+            let anvil = self.start_anvil(chain).await?;
             if chain.can_register() {
-                match Self::spawn_registrations(anvil, chain, cancel.clone()).await {
+                match self.spawn_registrations(anvil, chain, cancel.clone()).await {
                     Ok(handles) => _registration_handles = handles,
                     Err(e) => {
                         tracing::error!(error = ?e, "Failed to start auto-registration (continuing without it)");
@@ -82,7 +90,7 @@ impl SimCvmAgent {
     ///
     /// Returns the `AnvilInstance` (must be kept alive) and a patched
     /// `ChainConfig` with `rpc_url` and `relay_key` populated from Anvil.
-    fn start_anvil(chain: &ChainConfig) -> Result<AnvilInstance> {
+    async fn start_anvil(&self, chain: &ChainConfig) -> Result<AnvilInstance> {
         let host = chain.anvil_host.as_deref().unwrap_or("0.0.0.0");
         let port = chain.anvil_port.unwrap_or(14345);
 
@@ -104,6 +112,31 @@ impl SimCvmAgent {
         println!("  Endpoint:      {endpoint}");
         println!("  Fork URL:      {}", chain.rpc_url);
         println!("  Relay address: {relay_address}");
+        if let Some(mock) = chain.mock_session_registry_address {
+            println!("  MockSessionRegistry: {mock}");
+            let p = NetworkProvider::with_http(&endpoint, None, None, 100).await?;
+            let impl_slot = U256::from_be_bytes(
+                B256::from_hex(
+                    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+                )
+                .unwrap()
+                .0,
+            );
+            let proxy_impl = p
+                .get_storage_at(chain.session_registry_address, impl_slot)
+                .await?;
+            let mock_code = p.get_code_at(mock).await?;
+
+            let proxy_impl = Address::from_slice(&proxy_impl.to_be_bytes_trimmed_vec());
+            println!(
+                "  SessionRegistry implementation address: 0x{:x}",
+                proxy_impl
+            );
+            let _: serde_json::Value = p
+                .raw_request("anvil_setCode".into(), (proxy_impl, mock_code))
+                .await
+                .context("Failed to set storage at mock session registry address")?;
+        }
 
         Ok(instance)
     }
@@ -130,7 +163,7 @@ impl SimCvmAgent {
         println!();
         println!("Press Ctrl+C to stop.");
 
-        let handles = self.spawn_socket_servers(&by_path).await;
+        let handles = self.spawn_socket_servers(&by_path).await?;
 
         // Block until shutdown signal
         let _ = shutdown.await;
@@ -159,38 +192,102 @@ impl SimCvmAgent {
         by_path
     }
 
+    fn resolve_registration_manager(
+        &self,
+        service_names: &[String],
+    ) -> Result<Arc<RegistrationManager<MockDeviceProvider>>> {
+        let first_name = service_names
+            .first()
+            .context("socket group has no services")?;
+
+        let workload_name = first_name
+            .split('/')
+            .next()
+            .context("service name must be in 'workload/service' format")?;
+
+        self.registration_managers
+            .get(workload_name)
+            .cloned()
+            .with_context(|| {
+                format!("No registration manager found for workload '{workload_name}'")
+            })
+    }
+
+    /// Resolve workload identity for a socket group by matching the service
+    /// name prefix (`workload_name/svc_name`) against chain workload registrations.
+    fn resolve_workload_identity(&self, service_names: &[String]) -> Result<&WorkloadRegistration> {
+        let chain = self
+            .config
+            .chain
+            .as_ref()
+            .context("chain config is required to resolve workload identity")?;
+
+        let first_name = service_names
+            .first()
+            .context("socket group has no services")?;
+
+        let workload_name = first_name
+            .split('/')
+            .next()
+            .context("service name must be in 'workload/service' format")?;
+
+        chain
+            .workloads
+            .iter()
+            .find(|w| w.workload_ref.name == workload_name)
+            .with_context(|| {
+                let registered: Vec<_> = chain
+                    .workloads
+                    .iter()
+                    .map(|w| w.workload_ref.name.as_str())
+                    .collect();
+                format!(
+                    "no workload registration found for '{workload_name}'. \
+                     Registered workloads: [{}]",
+                    registered.join(", ")
+                )
+            })
+    }
+
     /// Spawn a server task per unique socket path.
     async fn spawn_socket_servers(
         &self,
         by_path: &BTreeMap<PathBuf, Vec<String>>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
         let mut handles = Vec::new();
         for (path, names) in by_path {
             let label = names.join(", ");
             let path = path.clone();
 
-            let state = Arc::new(ServiceState::new(
-                self.config.workload_id,
-                self.config.base_image_id,
-            ));
+            let w = self.resolve_workload_identity(names)?;
+            let r = self.resolve_registration_manager(names)?;
+            let workload_id = WorkloadRegistry::get_workload_id(&w.temporary_workload_ref);
+            let base_image_id = BaseImageRegistry::get_image_id(&w.base_image_ref);
 
-            let session_public = state.session_public().await;
+            let state = Arc::new(ServiceState::new(
+                workload_id,
+                base_image_id,
+                w.owner_private_key,
+                r.clone(),
+            )?);
+
             let owner_public = state.owner_public();
+
             tracing::info!(
                 services = %label,
                 socket = %path.display(),
-                session_fingerprint = %session_public.fingerprint(),
                 owner_fingerprint = %owner_public.fingerprint(),
+                owner = ?owner_public.secp256k1_address().unwrap(),
                 "Starting sim agent"
             );
 
             handles.push(tokio::spawn(async move {
                 if let Err(e) = server::serve_socket(&path, state).await {
-                    tracing::error!(services = %label, error = %e, "Sim agent failed");
+                    tracing::error!(services = %label, error = ?e, "Sim agent failed");
                 }
             }));
         }
-        handles
+        Ok(handles)
     }
 
     /// Spawn a background registration/rotation loop per workload.
@@ -200,6 +297,7 @@ impl SimCvmAgent {
     /// 2. Applies platform invariant PCRs + variant override PCRs
     /// 3. Measures the workload package and extends PCR 23
     async fn spawn_registrations(
+        &mut self,
         anvil: AnvilInstance,
         chain: &ChainConfig,
         cancel: CancellationToken,
@@ -258,9 +356,15 @@ impl SimCvmAgent {
             };
 
             let device = MockDeviceProvider::new(mock_data);
-            let mut manager = RegistrationManager::new(device, measurement.clone(), config)?;
+            let manager = Arc::new(RegistrationManager::new(
+                device,
+                measurement.clone(),
+                config,
+            )?);
             let child_cancel = cancel.child_token();
             let label = entry.temporary_workload_ref.clone();
+            self.registration_managers
+                .insert(entry.workload_ref.name.clone(), manager.clone());
 
             handles.push(tokio::spawn({
                 let anvil = anvil.clone();

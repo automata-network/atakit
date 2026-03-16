@@ -11,6 +11,7 @@ use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use k256::ecdsa::SigningKey;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -80,12 +81,37 @@ pub struct RegistrationManager<D: DeviceProvider> {
     owner_fingerprint: B256,
     workload_id: B256,
     base_image_id: B256,
-
     // Session state (populated after register/rotate)
-    current_session_id: Option<B256>,
-    tee_report_hash: Option<B256>,
-    session_key: Option<SigningKey>,
-    session_key_public: Option<PublicIdentity>,
+    session: Mutex<Option<Session>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub session_id: B256,
+    pub tee_report_hash: B256,
+    pub session_key: SigningKey,
+    pub session_signing_key: PrivateKeySigner,
+    pub session_key_public: PublicIdentity,
+}
+
+impl Session {
+    pub fn new(session_id: B256, tee_report_hash: B256, session_key: SigningKey) -> Result<Self> {
+        let private_key: [u8; 32] = session_key.to_bytes().into();
+        let session_signing_key = PrivateKeySigner::from_bytes(&private_key.into())?;
+        let session_key_public = PublicIdentity::secp256k1(&session_signing_key);
+
+        Ok(Self {
+            session_id,
+            tee_report_hash,
+            session_key,
+            session_signing_key,
+            session_key_public,
+        })
+    }
+
+    pub fn session_key_fingerprint(&self) -> B256 {
+        self.session_key_public.fingerprint()
+    }
 }
 
 impl<D: DeviceProvider> RegistrationManager<D> {
@@ -111,21 +137,12 @@ impl<D: DeviceProvider> RegistrationManager<D> {
             owner_fingerprint,
             workload_id,
             base_image_id,
-            current_session_id: None,
-            tee_report_hash: None,
-            session_key: None,
-            session_key_public: None,
+            session: Mutex::new(None),
         })
     }
 
-    /// Return the current session ID, if registered.
-    pub fn current_session_id(&self) -> Option<B256> {
-        self.current_session_id
-    }
-
-    /// Return the current session key public identity, if registered.
-    pub fn session_key_public(&self) -> Option<&PublicIdentity> {
-        self.session_key_public.as_ref()
+    pub async fn current_session(&self) -> Option<Session> {
+        self.session.lock().await.clone()
     }
 
     // =====================================================================
@@ -136,7 +153,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     ///
     /// Follows the Go `Register()` flow step-by-step, calling into the
     /// `DeviceProvider` for all hardware operations.
-    pub async fn register(&mut self) -> Result<RegisterSessionResponse> {
+    pub async fn register(&self) -> Result<RegisterSessionResponse> {
         info!("Starting session registration...");
 
         // 1. Get chain ID
@@ -150,11 +167,6 @@ impl<D: DeviceProvider> RegistrationManager<D> {
             .context("get session nonce")?;
         let nonce = nonce_u256.to::<u64>();
         info!(nonce, "Current nonce");
-
-        // 3. Generate new session key (secp256k1)
-        let session_key = SigningKey::random(&mut rand::rngs::OsRng);
-        let session_pub = session_key_public_identity(&session_key);
-        let session_key_fingerprint = session_pub.fingerprint();
 
         // 4. Get AK public key (needed for report_data)
         // let ak_pub = self.device.get_ak_pub().context("get AK public key")?;
@@ -202,6 +214,11 @@ impl<D: DeviceProvider> RegistrationManager<D> {
         let session_id = compute_session_id(&tee_report.data, &tpm_quote.tpm_signature);
         info!(%session_id, "Computed session ID");
 
+        let session_key = SigningKey::random(&mut rand::rngs::OsRng);
+
+        let session = Session::new(session_id, tee_report_hash, session_key.clone())?;
+        let session_key_fingerprint = session.session_key_fingerprint();
+
         // 13. Compute delegation digest
         let delegation_digest = compute_delegation_digest(
             self.base_image_id,
@@ -248,7 +265,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
                 tpm_certify_report,
                 ak_pub_collateral,
                 session_key_signature,
-                session_key: session_pub.clone(),
+                session_key: session.session_key_public.clone(),
             },
             workload_id: self.workload_id,
             base_image_id: self.base_image_id,
@@ -266,17 +283,15 @@ impl<D: DeviceProvider> RegistrationManager<D> {
             .await
             .context("register session")?;
 
-        // 19. Store session state
-        self.current_session_id = Some(response.session_id);
-        self.tee_report_hash = Some(tee_report_hash);
-        self.session_key = Some(session_key);
-        self.session_key_public = Some(session_pub);
-
         info!(
-            session_id = %response.session_id,
+            session_id = %session.session_id,
             tx_hash = %response.tx_hash,
             "Session registered successfully"
         );
+
+        // 19. Store session state
+        let mut current_session = self.session.lock().await;
+        *current_session = Some(session.clone());
 
         Ok(response)
     }
@@ -288,13 +303,16 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     /// Perform a session rotation on-chain.
     ///
     /// Follows the Go `Rotate()` flow step-by-step.
-    pub async fn rotate(&mut self) -> Result<RotateSessionResponse> {
-        let old_session_id = self
-            .current_session_id
-            .ok_or_else(|| anyhow::anyhow!("no current session to rotate"))?;
-        let tee_report_hash = self
-            .tee_report_hash
-            .ok_or_else(|| anyhow::anyhow!("no TEE report hash from registration"))?;
+    pub async fn rotate(&self) -> Result<RotateSessionResponse> {
+        let old_session = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no current session to rotate"))?
+            .clone();
+        let old_session_id = old_session.session_id;
+        let tee_report_hash = old_session.tee_report_hash;
 
         info!(%old_session_id, "Starting session rotation...");
 
@@ -436,10 +454,12 @@ impl<D: DeviceProvider> RegistrationManager<D> {
             .context("promote tmp key")?;
 
         // 19. Update session state
-        self.current_session_id = Some(response.new_session_id);
-        // tee_report_hash stays the same for rotation
-        self.session_key = Some(new_session_key);
-        self.session_key_public = Some(new_session_pub);
+        let mut session = self.session.lock().await;
+        *session = Some(Session::new(
+            response.new_session_id,
+            tee_report_hash,
+            new_session_key,
+        )?);
 
         info!(
             new_session_id = %response.new_session_id,
@@ -460,7 +480,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     /// 2. Sleeps for 80% of the expire offset
     /// 3. Rotates the session
     /// 4. Repeats until `shutdown` is cancelled
-    pub async fn run(&mut self, shutdown: CancellationToken) -> Result<()> {
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
         info!("Starting registration/rotation loop...");
 
         // Initial registration with retries
@@ -481,7 +501,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
                 }
                 _ = tokio::time::sleep(rotation_interval) => {
                     info!("Time to rotate session...");
-                    if let Err(e) = self.rotate_with_retries(&shutdown).await {
+                    if let Err(e) = self.register_with_retries(&shutdown).await {
                         warn!(error = %e, "Rotation failed, will retry next interval");
                     }
                 }
@@ -490,7 +510,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     }
 
     /// Attempt registration with exponential backoff.
-    async fn register_with_retries(&mut self, shutdown: &CancellationToken) -> Result<()> {
+    async fn register_with_retries(&self, shutdown: &CancellationToken) -> Result<()> {
         const MAX_RETRIES: u32 = 5;
 
         for attempt in 0..MAX_RETRIES {
@@ -527,7 +547,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
     }
 
     /// Attempt rotation with exponential backoff.
-    async fn rotate_with_retries(&mut self, shutdown: &CancellationToken) -> Result<()> {
+    pub async fn rotate_with_retries(&self, shutdown: &CancellationToken) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
 
         for attempt in 0..MAX_RETRIES {

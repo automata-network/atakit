@@ -3,6 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
+use tracing::info;
 
 /// Run a command with optional confirmation prompt.
 ///
@@ -37,6 +38,7 @@ pub async fn run_cmd(program: &str, args: &[&str], quiet: bool) -> Result<()> {
 
 /// Run a command silently without prompting. Returns `true` on success.
 pub async fn run_cmd_silent(program: &str, args: &[&str]) -> bool {
+    info!(command = program, args = ?args, "Running command silently");
     Command::new(program)
         .args(args)
         .stdout(Stdio::null())
@@ -76,6 +78,29 @@ pub async fn try_capture(cmd: &str, args: &[&str]) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Run an external command and capture stdout.
+///
+/// Returns an error on failure or empty output (unlike [`try_capture`] which returns `Option`).
+pub async fn capture(cmd: &str, args: &[&str]) -> Result<String> {
+    let full_cmd = format!("{} {}", cmd, args.join(" "));
+    let output = Command::new(cmd)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("Failed to run {full_cmd}"))?;
+
+    if !output.status.success() {
+        bail!("{full_cmd} failed with status {}", output.status);
+    }
+
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        bail!("{full_cmd} returned empty output");
+    }
+    Ok(s)
 }
 
 /// Sanitize a name to lowercase alphanumeric characters only.

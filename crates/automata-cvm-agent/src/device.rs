@@ -148,7 +148,7 @@ pub trait DeviceProvider: Send + Sync {
     ///
     /// The old key remains active for signing the rotation message.
     /// The temporary key will be used for the new session's delegation.
-    async fn create_tmp_signing_key(&mut self) -> anyhow::Result<()>;
+    async fn create_tmp_signing_key(&self) -> anyhow::Result<()>;
 
     /// Get the temporary signing key's public identity (P-256).
     fn get_tmp_signing_key_public(&self) -> anyhow::Result<PublicIdentity>;
@@ -166,7 +166,7 @@ pub trait DeviceProvider: Send + Sync {
     /// Promote the temporary key to be the current signing key.
     ///
     /// Called after a successful rotation to finalize the key swap.
-    async fn promote_tmp_key(&mut self) -> anyhow::Result<()>;
+    async fn promote_tmp_key(&self) -> anyhow::Result<()>;
 }
 
 // =========================================================================

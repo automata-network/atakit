@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use automata_linux_release::{ImageRef, ImageStore, Platform};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use workload_compose::ComposeAnalysis;
+use automata_tee_workload_compose::ComposeAnalysis;
 
 use crate::types::{AtakitConfig, DeploymentDef, PlatformConfig, WorkloadDef};
 
@@ -113,6 +113,8 @@ pub struct AzureOptions {
     pub storage_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gallery_name: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -184,21 +186,16 @@ pub async fn resolve_deployment(
     })
 }
 
-/// Resolve a deployment by name from atakit.json.
+/// Build a DeploymentConfig from atakit.json without resolving image paths.
 ///
-/// `platform_override` selects the platform when a deployment has multiple.
-/// `image_version_override` overrides the config's image version tag.
-/// `image_dir` is the ImageStore base directory for automata-linux releases.
-/// `config_dir` is the directory containing atakit.json.
-pub async fn resolve_from_atakit_json(
+/// Use this when you only need the config (e.g., for `destroy`).
+/// For deploy, use [`resolve_from_atakit_json`] which also resolves images.
+pub fn config_from_atakit_json(
     atakit_config: &AtakitConfig,
-    image_repo: &str,
     deployment_name: &str,
     platform_override: Option<&str>,
-    image_ref_override: Option<&ImageRef>,
-    image_store: &ImageStore,
     config_dir: &Path,
-) -> Result<(DeploymentConfig, ResolvedPaths)> {
+) -> Result<DeploymentConfig> {
     let deploy_def = atakit_config
         .deployment
         .get(deployment_name)
@@ -220,21 +217,15 @@ pub async fn resolve_from_atakit_json(
         })?;
 
     let (platform_name, platform_config) = resolve_platform(deploy_def, platform_override)?;
-
-    // Find the workload definition.
     let wl_def = find_workload_def(atakit_config, &deploy_def.workload)?;
+    let analysis = automata_tee_workload_compose::analyze(config_dir, &wl_def.docker_compose)?;
 
-    // Analyze workload compose file.
-    let analysis = workload_compose::analyze(config_dir, &wl_def.docker_compose)?;
-
-    // Extract project name from config directory.
     let project_name = config_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("atakit");
 
-    // Build the config using shared logic.
-    let config = build_from_deployment(
+    build_from_deployment(
         deployment_name,
         wl_def,
         &platform_name,
@@ -242,10 +233,27 @@ pub async fn resolve_from_atakit_json(
         &analysis,
         atakit_config,
         project_name,
-    )?;
+    )
+}
 
-    // Resolve to get the actual image path (auto-downloads if needed).
-    let paths = resolve_deployment(&config, &image_store, image_repo, image_ref_override).await?;
+/// Resolve a deployment by name from atakit.json (config + image paths).
+///
+/// `platform_override` selects the platform when a deployment has multiple.
+/// `image_ref_override` overrides the config's image version tag.
+/// `config_dir` is the directory containing atakit.json.
+pub async fn resolve_from_atakit_json(
+    atakit_config: &AtakitConfig,
+    image_repo: &str,
+    deployment_name: &str,
+    platform_override: Option<&str>,
+    image_ref_override: Option<&ImageRef>,
+    image_store: &ImageStore,
+    config_dir: &Path,
+) -> Result<(DeploymentConfig, ResolvedPaths)> {
+    let config =
+        config_from_atakit_json(atakit_config, deployment_name, platform_override, config_dir)?;
+    let paths =
+        resolve_deployment(&config, image_store, image_repo, image_ref_override).await?;
     Ok((config, paths))
 }
 
@@ -419,40 +427,62 @@ fn build_azure_options(
     if platform_name != "azure" {
         return None;
     }
+    let region = platform_config
+        .region
+        .as_deref()
+        .unwrap_or("East US");
     Some(AzureOptions {
-        region: platform_config.region.clone(),
-        storage_account: Some(sanitize_azure_storage_name(project_name)),
+        region: Some(region.to_string()),
+        resource_group: Some(format!("{}_Rg", project_name)),
+        storage_account: Some(sanitize_azure_storage_name(project_name, region)),
         container_name: Some(sanitize_bucket_name(project_name)),
+        gallery_name: Some(sanitize_azure_gallery_name(project_name)),
         ..Default::default()
     })
 }
 
-/// Sanitize a string to be a valid Azure storage account name.
-/// Azure storage names must be 3-24 chars, lowercase letters and numbers only (no hyphens).
-fn sanitize_azure_storage_name(name: &str) -> String {
+/// Sanitize a string to be a valid Azure Shared Image Gallery name.
+/// Gallery names must be alphanumeric, dots, or underscores only (no hyphens).
+fn sanitize_azure_gallery_name(name: &str) -> String {
     let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .collect();
+    if sanitized.is_empty() {
+        "atakitGallery".to_string()
+    } else {
+        format!("{}Gallery", sanitized)
+    }
+}
+
+/// Sanitize a string to be a valid Azure storage account name with region code.
+///
+/// Format: `{project}0{region_code}` (3-24 chars, lowercase + digits only).
+/// Region code is the first letter of each word: `"Southeast Asia"` → `"sa"`.
+fn sanitize_azure_storage_name(project_name: &str, region: &str) -> String {
+    let region_code: String = region
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let region_code = if region_code.is_empty() {
+        "x".to_string()
+    } else {
+        region_code
+    };
+    // {project}{0}{region_code}: reserve region_code.len() + 1 for separator.
+    let prefix_limit = 23 - region_code.len();
+    let project: String = project_name
         .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
+        .take(prefix_limit)
         .collect();
-    // Ensure it starts with a letter
-    let sanitized = if sanitized
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(true)
-    {
-        format!("ata{}", sanitized)
-    } else {
-        sanitized
-    };
-    // Ensure minimum length of 3 and max of 24
-    let sanitized = if sanitized.len() < 3 {
-        format!("{}atakit", sanitized)
-    } else {
-        sanitized
-    };
-    sanitized.chars().take(24).collect()
+    let mut name = format!("{}0{}", project, region_code);
+    while name.len() < 3 {
+        name.push('0');
+    }
+    name
 }
 
 // ── Build from deployment definition (for build-workload) ────────

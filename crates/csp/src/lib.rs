@@ -2,6 +2,9 @@ pub mod cmd;
 pub mod gcp;
 pub mod azure;
 pub mod qemu;
+pub mod resource;
+
+pub use resource::{CloudResource, CloudResourceConfig, CloudResourceManager, Preserve};
 
 use std::path::Path;
 
@@ -84,6 +87,15 @@ pub struct InstanceInfo {
 /// - Azure: `--tags key=value`
 /// - QEMU: `-fw_cfg` or SMBIOS entries
 pub type Metadata = Vec<(String, String)>;
+
+/// Configuration for a data disk to attach to an instance.
+#[derive(Clone, Debug)]
+pub struct DataDiskConfig {
+    /// Disk name (used for both disk resource name and device-name).
+    pub name: String,
+    /// Disk size (e.g., "100GB", "100").
+    pub size: String,
+}
 
 // ── Core trait ──────────────────────────────────────────────────────
 

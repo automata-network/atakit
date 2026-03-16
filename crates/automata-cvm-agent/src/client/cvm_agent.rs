@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 
 /// Request for signing a message
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SignMessageRequest {
     /// Message to sign (hex with 0x prefix)
     pub message: Bytes,
@@ -21,6 +22,7 @@ pub struct SignMessageRequest {
 
 /// Response from the sign-message endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignMessageResponse {
     /// secp256k1 signature (65 bytes: r || s || v)
     pub signature: Bytes,
@@ -42,10 +44,12 @@ pub struct SignMessageResponse {
 
 /// Request for rotating the session key (empty)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RotateKeyRequest {}
 
 /// Response from the rotate-key endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RotateKeyResponse {
     /// New session ID after rotation
     pub session_id: B256,

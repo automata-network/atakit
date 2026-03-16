@@ -45,7 +45,7 @@ async fn cvm_agent_post(path: &str, body: String) -> Result<String, Box<dyn std:
         .method("POST")
         .uri(path)
         .header("Host", "localhost")
-        .header("Content-Type", "text/plain")
+        .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body)))?;
 
     let res = sender.send_request(req).await?;
