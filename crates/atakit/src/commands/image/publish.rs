@@ -34,9 +34,14 @@ pub struct Publish {
     #[arg(long, env = "ATAKIT_RPC_URL")]
     rpc_url: String,
 
-    /// Private key for signing (hex with or without 0x prefix)
-    #[arg(long, env = "ATAKIT_PRIVATE_KEY")]
-    private_key: B256,
+    /// Owner private key for signing (hex with or without 0x prefix)
+    #[arg(long, alias = "private-key", env = "ATAKIT_OWNER_PRIVATE_KEY")]
+    owner_private_key: B256,
+
+    /// Relay private key (hex with or without 0x prefix).
+    /// If omitted, defaults to the owner private key.
+    #[arg(long, env = "ATAKIT_RELAY_PRIVATE_KEY")]
+    relay_private_key: Option<B256>,
 
     /// SessionRegistry contract address.
     /// If omitted, auto-detected from the registry store.
@@ -126,7 +131,8 @@ impl Publish {
             return Ok(());
         }
 
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let signer = PrivateKeySigner::from_bytes(&self.owner_private_key)?;
+        let relay_key = self.relay_private_key.unwrap_or(self.owner_private_key);
 
         // Resolve SessionRegistry address
         let session_registry = if let Some(addr) = self.session_registry {
@@ -150,7 +156,7 @@ impl Publish {
         let wm = WorkloadMeasurement::new(WorkloadMeasurementConfig {
             rpc_url: self.rpc_url.clone(),
             session_registry_address: session_registry,
-            relay_key: Some(self.private_key),
+            relay_key: Some(relay_key),
         })
         .await?;
 
