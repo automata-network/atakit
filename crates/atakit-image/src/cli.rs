@@ -1,0 +1,60 @@
+use clap::{Args, Subcommand};
+
+use crate::types::ImageRef;
+
+/// Image subcommand.
+#[derive(Subcommand)]
+pub enum ImageCommand {
+    /// List available CVM base image releases
+    #[command(name = "ls")]
+    Ls(LsArgs),
+    /// Pull a CVM base image from a release
+    #[command(name = "pull")]
+    Pull(PullArgs),
+    /// Remove locally downloaded CVM base images
+    #[command(name = "rm")]
+    Rm(RmArgs),
+}
+
+/// Arguments for `image ls`.
+#[derive(Args)]
+pub struct LsArgs {
+    /// Maximum number of releases to show
+    #[arg(long, default_value = "10")]
+    pub limit: u32,
+
+    /// Show all releases (not just those with disk images)
+    #[arg(long)]
+    pub all: bool,
+
+    /// Show a specific release by tag
+    #[arg(long)]
+    pub tag: Option<ImageRef>,
+
+    /// Repository name
+    #[arg(long, default_value = "automata-linux")]
+    pub repo: String,
+
+    /// Query remote releases (GitHub API)
+    #[arg(long)]
+    pub remote: bool,
+}
+
+/// Arguments for `image pull`.
+#[derive(Args)]
+pub struct PullArgs {
+    /// Release tag to pull (e.g. "automata-linux:v0.5.0").
+    /// If omitted, the latest release containing disk images is used.
+    pub image: Option<ImageRef>,
+
+    /// Comma-separated list of platforms: gcp,aws,azure.
+    /// If omitted, all platforms are pulled.
+    pub csps: Option<String>,
+}
+
+/// Arguments for `image rm`.
+#[derive(Args)]
+pub struct RmArgs {
+    /// Release tag to remove (e.g. "automata-linux:v0.5.0")
+    pub tag: ImageRef,
+}

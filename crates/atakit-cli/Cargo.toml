@@ -1,0 +1,20 @@
+[package]
+name = "atakit-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "atakit"
+path = "src/main.rs"
+
+[dependencies]
+atakit-core.workspace = true
+atakit-image = { workspace = true, features = ["cli"] }
+
+clap.workspace = true
+anyhow.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+owo-colors.workspace = true
