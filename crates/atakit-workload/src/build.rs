@@ -60,6 +60,15 @@ pub async fn build_workload(
         tracing::warn!("{}", w);
     }
 
+    // Until dependencies are fully implemented, treat their presence as a hard error
+    // to avoid generating archives whose manifests reference unstaged dependency
+    // images or files.
+    if warnings.iter().any(|w| w.contains("[dependencies]")) {
+        return Err(WorkloadError::Validation(
+            "dependencies are not yet supported in workloads".to_string(),
+        ));
+    }
+
     // 3. Create staging directory
     let temp_dir = tempfile::tempdir().map_err(WorkloadError::Io)?;
     let staging = StagingDir::create(temp_dir.path(), &name)?;
