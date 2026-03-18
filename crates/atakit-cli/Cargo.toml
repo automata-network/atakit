@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 atakit-core.workspace = true
 atakit-image = { workspace = true, features = ["cli"] }
+atakit-workload = { workspace = true, features = ["cli"] }
 
 clap.workspace = true
 anyhow.workspace = true

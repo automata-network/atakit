@@ -7,7 +7,7 @@ The `image` subcommand manages CVM (Confidential Virtual Machine) base images fr
 ## CLI Interface
 
 ```
-atakit image ls [--limit N] [--all] [--tag REF] [--repo NAME] [--local]
+atakit image ls [--limit N] [--all] [--tag REF] [--repo NAME] [--remote]
 atakit image pull [IMAGE] [PLATFORMS]
 atakit image rm <IMAGE>
 ```
@@ -22,7 +22,7 @@ List available CVM base image releases.
 | `--all` | false | Show all releases (not just those with disk images) |
 | `--tag REF` | - | Show a specific release by tag (e.g. `automata-linux:v0.5.0`) |
 | `--repo NAME` | `automata-linux` | Repository name |
-| `--local` | false | Show only local images (skip remote query) |
+| `--remote` | false | Query remote releases (GitHub API). Default is local-only. |
 
 ### `image pull`
 
@@ -125,12 +125,12 @@ async fn download_asset(client: &ReleasesClient, asset: &Asset, opts: &DownloadO
 
 ## Data Flow
 
-### `image ls --local`
+### `image ls` (default, local-only)
 ```
 CLI -> ImageStore::list_local() -> scan filesystem -> format & print
 ```
 
-### `image ls`
+### `image ls --remote` / `image ls --all`
 ```
 CLI -> ImageStore::list(client, ...) -> ReleasesClient::list_image_releases() -> annotate with local status -> format & print
 ```

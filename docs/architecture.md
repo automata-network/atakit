@@ -12,6 +12,7 @@ atakit-ng/
   crates/
     atakit-core/                # shared types (Env, ProgressReporter trait)
     atakit-image/               # image subcommand library
+    atakit-workload/            # workload subcommand library
     atakit-cli/                 # main binary
 ```
 
@@ -35,18 +36,28 @@ All domain logic for image management. Core API is always available; clap struct
 - **Local store** -- `ImageStore` for local disk management (does NOT own a `ReleasesClient`)
 - **CLI arg structs** -- (behind `cli` feature) `ImageCommand`, `LsArgs`, `PullArgs`, `RmArgs`
 
+### atakit-workload
+
+All domain logic for workload management. Clap structs behind a `cli` feature flag.
+
+- **Error types** -- `WorkloadError` enum via `thiserror`
+- **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
+- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `NewArgs`
+
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `run_ls`, `run_pull`, `run_rm` bridging clap args to library API
+- **Command handlers** -- `run_ls`, `run_pull`, `run_rm`, `run_new` bridging clap args to library API
 - **Entry point** -- CLI struct, dispatch
 
 ## Dependency Graph
 
 ```
 atakit-cli ──> atakit-image (cli feature) ──> atakit-core
+    │                                              │
+    ├──> atakit-workload (cli feature)             │
     │                                              │
     └──────────────────────────────────────────────┘
 ```

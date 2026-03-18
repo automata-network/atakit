@@ -1,0 +1,15 @@
+[package]
+name = "atakit-workload"
+version.workspace = true
+edition.workspace = true
+
+[features]
+cli = ["clap"]
+
+[dependencies]
+thiserror.workspace = true
+
+clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
