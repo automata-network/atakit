@@ -54,7 +54,8 @@ impl ContainerEngine {
         cmd.arg("build").arg("-t").arg(tag);
 
         if let Some(cf) = containerfile {
-            cmd.arg("-f").arg(cf);
+            let cf_path = context.join(cf);
+            cmd.arg("-f").arg(&cf_path);
         }
 
         for (k, v) in args {
