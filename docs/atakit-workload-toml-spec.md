@@ -234,6 +234,8 @@ model-cache = "/data/cache"
 
 Built dependency images are auto-tagged as `{dependency_name}:{workload.version}`.
 
+**Note:** Dependencies are currently parsed and validated by the tooling, but `atakit workload build` does not yet support workloads that define a `[dependencies]` section. Workloads that include dependencies will fail validation during `atakit workload build`.
+
 ### `[disks.<name>]` — Persistent Storage
 
 Defines persistent disk volumes attached to the CVM. Referenced by `[workload.disks]` or `[dependencies.<name>.disks]`.
