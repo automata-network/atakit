@@ -23,6 +23,13 @@ thiserror = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 
+# Build / archive
+toml = "0.8"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

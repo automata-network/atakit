@@ -44,12 +44,15 @@ fn validate_name(name: &str) -> Result<(), WorkloadError> {
 
 fn render_template(name: &str) -> String {
     format!(
-        r#"[workload]
+        r#"format = {format}
+
+[workload]
 name = "{name}"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "{name}:latest"
-"#
+"#,
+        format = crate::FORMAT_VERSION,
     )
 }
 
@@ -66,6 +69,7 @@ mod tests {
         assert!(dir.join(CONFIG_FILENAME).is_file());
 
         let content = std::fs::read_to_string(dir.join(CONFIG_FILENAME)).unwrap();
+        assert!(content.contains("format = 1"));
         assert!(content.contains("name = \"my-app\""));
         assert!(content.contains("version = \"v0.0.1\""));
         assert!(content.contains("base-image-mode = \"blacklist\""));

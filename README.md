@@ -73,7 +73,7 @@ measured-data = ["./config/cert.pem"]
 RUST_LOG = "info"
 ```
 
-A full specification for `atakit-workload.toml` will be provided in the `docs/` directory in a future release.
+See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for the full specification.
 
 ## Project structure
 
