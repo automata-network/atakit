@@ -324,39 +324,9 @@ pub fn build_manifest(
         },
     });
 
-    // Dependencies (pass through for future use)
-    let dependencies = if config.dependencies.is_empty() {
-        None
-    } else {
-        let mut deps = BTreeMap::new();
-        for (name, dep) in &config.dependencies {
-            let dep_image = resolve_image_ref(&dep.image, name, &w.version);
-            deps.insert(
-                name.clone(),
-                ManifestDependency {
-                    image: dep_image,
-                    ports: dep.ports.clone(),
-                    restart: dep.restart.clone(),
-                    command: convert_string_or_array(&dep.command),
-                    entrypoint: convert_string_or_array(&dep.entrypoint),
-                    environment: dep.environment.clone(),
-                    depends_on: dep.depends_on.clone(),
-                    measured_data: dep
-                        .measured_data
-                        .iter()
-                        .map(|p| strip_dot_slash(p).to_string())
-                        .collect(),
-                    unmeasured_data: dep
-                        .unmeasured_data
-                        .iter()
-                        .map(|p| strip_dot_slash(p).to_string())
-                        .collect(),
-                    disks: dep.disks.clone(),
-                },
-            );
-        }
-        Some(deps)
-    };
+    // Dependencies are currently omitted from the manifest until the build
+    // pipeline supports staging their images/data and computing hashes.
+    let dependencies = None;
 
     // Disks (top-level)
     let disks: BTreeMap<String, ManifestDisk> = config
