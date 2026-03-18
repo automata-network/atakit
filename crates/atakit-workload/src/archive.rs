@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::io;
 
 use flate2::Compression;
 use flate2::GzBuilder;
@@ -208,12 +209,25 @@ fn copy_file(src: &Path, dest: &Path) -> Result<(), WorkloadError> {
 
 /// Copy a file or directory recursively. Returns the number of files copied.
 fn copy_recursive(src: &Path, dest: &Path) -> Result<usize, WorkloadError> {
-    if src.is_file() {
+    let file_type = std::fs::symlink_metadata(src)
+        .map_err(WorkloadError::Io)?
+        .file_type();
+
+    if file_type.is_symlink() {
+        // Reject symlinks to avoid traversing or copying paths outside the workload.
+        let err = io::Error::new(
+            io::ErrorKind::Other,
+            format!("symlinks are not allowed in measured data: {}", src.display()),
+        );
+        return Err(WorkloadError::Io(err));
+    }
+
+    if file_type.is_file() {
         copy_file(src, dest)?;
         return Ok(1);
     }
 
-    if src.is_dir() {
+    if file_type.is_dir() {
         std::fs::create_dir_all(dest).map_err(|e| WorkloadError::CreateDir {
             path: dest.to_path_buf(),
             source: e,
