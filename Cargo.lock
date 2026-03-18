@@ -74,6 +74,7 @@ dependencies = [
  "anyhow",
  "atakit-core",
  "atakit-image",
+ "atakit-workload",
  "clap",
  "indicatif",
  "owo-colors",
@@ -99,6 +100,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "atakit-workload"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

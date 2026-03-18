@@ -4,6 +4,7 @@ mod progress;
 use anyhow::Result;
 use atakit_core::Env;
 use atakit_image::ImageCommand;
+use atakit_workload::cli::WorkloadCommand;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -20,6 +21,9 @@ enum Command {
     /// Manage CVM base images
     #[command(subcommand)]
     Image(ImageCommand),
+    /// Manage workloads
+    #[command(subcommand)]
+    Workload(WorkloadCommand),
 }
 
 #[tokio::main]
@@ -36,6 +40,9 @@ async fn main() -> Result<()> {
             ImageCommand::Ls(args) => commands::image::run_ls(args, &env).await,
             ImageCommand::Pull(args) => commands::image::run_pull(args, &env).await,
             ImageCommand::Rm(args) => commands::image::run_rm(args, &env).await,
+        },
+        Command::Workload(cmd) => match cmd {
+            WorkloadCommand::New(args) => commands::workload::run_new(args),
         },
     }
 }
