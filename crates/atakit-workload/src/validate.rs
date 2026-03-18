@@ -130,10 +130,17 @@ pub fn validate_config(
     // ── env_file ──────────────────────────────────────────
     if let Some(ref env_files) = w.env_file {
         for ef in env_files.as_vec() {
-            let abs = workload_dir.join(&ef);
+            if !ef.starts_with("./") {
+                return Err(WorkloadError::Validation(format!(
+                    "env_file path must start with \"./\": {ef:?}"
+                )));
+            }
+            ensure_no_traversal(ef, "env_file")?;
+            let abs = workload_dir.join(ef);
             if !abs.exists() {
                 return Err(WorkloadError::EnvFileMissing(abs));
             }
+            ensure_within(&abs, workload_dir, "env_file")?;
         }
     }
 
