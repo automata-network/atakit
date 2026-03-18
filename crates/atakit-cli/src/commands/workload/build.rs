@@ -2,6 +2,8 @@ use anyhow::Result;
 use atakit_workload::cli::BuildArgs;
 use owo_colors::OwoColorize;
 
+use crate::progress::IndicatifReporter;
+
 pub async fn run(args: BuildArgs) -> Result<()> {
     let workload_dir = match args.dir {
         Some(d) => std::fs::canonicalize(d)?,
@@ -19,8 +21,8 @@ pub async fn run(args: BuildArgs) -> Result<()> {
         engine,
     };
 
-    let progress = &atakit_core::NullReporter;
-    let result = atakit_workload::build_workload(&opts, progress).await?;
+    let progress = IndicatifReporter;
+    let result = atakit_workload::build_workload(&opts, &progress).await?;
 
     println!(
         "{}",

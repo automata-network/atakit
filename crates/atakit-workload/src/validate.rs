@@ -135,8 +135,8 @@ pub fn validate_config(
                     "env_file path must start with \"./\": {ef:?}"
                 )));
             }
-            ensure_no_traversal(ef, "env_file")?;
-            let abs = workload_dir.join(ef);
+            ensure_no_traversal(&ef, "env_file")?;
+            let abs = workload_dir.join(&ef);
             if !abs.exists() {
                 return Err(WorkloadError::EnvFileMissing(abs));
             }
@@ -817,5 +817,41 @@ ports = ["3000:3000", "8080:80/tcp", "5353:5353/udp"]
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_env_file_traversal() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+env_file = "./../etc/shadow"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_env_file_without_dot_slash() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+env_file = "prod.env"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("env_file path must start with"));
     }
 }
