@@ -42,14 +42,14 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 
 - **Error types** -- `WorkloadError` enum via `thiserror`
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
-- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `NewArgs`
+- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`
 
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `run_ls`, `run_pull`, `run_rm`, `run_new` bridging clap args to library API
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules (e.g. `image::ls::run`) bridging clap args to library API
 - **Entry point** -- CLI struct, dispatch
 
 ## Dependency Graph

@@ -1,8 +1,8 @@
 use anyhow::Result;
-use atakit_workload::cli::NewArgs;
+use atakit_workload::cli::CreateArgs;
 use owo_colors::OwoColorize;
 
-pub fn run_new(args: NewArgs) -> Result<()> {
+pub fn run(args: CreateArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let dir = atakit_workload::create_workload(&cwd, &args.name)?;
 

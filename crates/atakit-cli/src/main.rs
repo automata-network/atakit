@@ -37,12 +37,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Image(cmd) => match cmd {
-            ImageCommand::Ls(args) => commands::image::run_ls(args, &env).await,
-            ImageCommand::Pull(args) => commands::image::run_pull(args, &env).await,
-            ImageCommand::Rm(args) => commands::image::run_rm(args, &env).await,
+            ImageCommand::Ls(args) => commands::image::ls::run(args, &env).await,
+            ImageCommand::Pull(args) => commands::image::pull::run(args, &env).await,
+            ImageCommand::Rm(args) => commands::image::rm::run(args, &env).await,
         },
         Command::Workload(cmd) => match cmd {
-            WorkloadCommand::New(args) => commands::workload::run_new(args),
+            WorkloadCommand::Create(args) => commands::workload::create::run(args),
+            WorkloadCommand::Build(args) => commands::workload::build::run(args).await,
         },
     }
 }
