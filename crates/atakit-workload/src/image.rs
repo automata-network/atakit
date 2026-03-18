@@ -63,7 +63,7 @@ impl ContainerEngine {
 
         cmd.arg(context);
 
-        run_command(&mut cmd, &format!("{} build", self.bin())).await
+        run_command_streaming(&mut cmd, &format!("{} build", self.bin())).await
     }
 
     /// Pull an image from a registry.
@@ -92,11 +92,14 @@ impl std::fmt::Display for ContainerEngine {
 }
 
 async fn command_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
+    use std::process::Stdio;
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .await
-        .map(|o| o.status.success())
+        .map(|s| s.success())
         .unwrap_or(false)
 }
 
@@ -107,6 +110,24 @@ async fn run_command(cmd: &mut Command, label: &str) -> Result<(), WorkloadError
         return Err(WorkloadError::ContainerCommand {
             command: label.to_string(),
             stderr,
+        });
+    }
+    Ok(())
+}
+
+/// Run a command with stdout/stderr inherited so the user sees build output in real time.
+async fn run_command_streaming(cmd: &mut Command, label: &str) -> Result<(), WorkloadError> {
+    use std::process::Stdio;
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .map_err(WorkloadError::Io)?;
+    if !status.success() {
+        return Err(WorkloadError::ContainerCommand {
+            command: label.to_string(),
+            stderr: format!("exited with {status}"),
         });
     }
     Ok(())

@@ -118,7 +118,7 @@ pub async fn build_workload(
         0
     } else {
         let handle = progress.create("Collecting measured-data...", 0);
-        let count =
+        let mut count =
             staging.stage_measured_data(&config.workload.measured_data, workload_dir)?;
 
         // Stage signing files under measured-data/signing/
@@ -127,6 +127,7 @@ pub async fn build_workload(
                 let auth = workload_dir.join(signing.auth_info.as_ref().unwrap());
                 let policy = workload_dir.join(signing.policy.as_ref().unwrap());
                 staging.stage_signing_files(&auth, &policy)?;
+                count += 2;
             }
         }
         handle.finish();

@@ -161,10 +161,12 @@ async fn build_is_deterministic() {
     .await
     .unwrap();
 
-    // Manifest content must be identical (same hash), though archive
-    // hashes may differ due to tar metadata (mtime, etc.)
     assert_eq!(r1.name, r2.name);
     assert_eq!(r1.version, r2.version);
     assert_eq!(r1.image_count, r2.image_count);
     assert_eq!(r1.measured_file_count, r2.measured_file_count);
+    assert_eq!(
+        r1.archive_hash, r2.archive_hash,
+        "archive hashes must be identical for deterministic builds"
+    );
 }

@@ -1,8 +1,44 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::config::{ImageSource, WorkloadConfig};
 use crate::WorkloadError;
+
+/// Reject paths containing `..` components (lexical check, works on non-existent paths).
+fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
+    let p = Path::new(path);
+    for component in p.components() {
+        if component == Component::ParentDir {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: path must not contain \"..\": {path:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize both paths and verify `path` is inside `base` (catches symlink escapes).
+fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), WorkloadError> {
+    let canon_path = path.canonicalize().map_err(|_| {
+        WorkloadError::Validation(format!(
+            "{context}: cannot resolve path: {}",
+            path.display()
+        ))
+    })?;
+    let canon_base = base.canonicalize().map_err(|_| {
+        WorkloadError::Validation(format!(
+            "{context}: cannot resolve base: {}",
+            base.display()
+        ))
+    })?;
+    if !canon_path.starts_with(&canon_base) {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path escapes workload directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Validate a parsed config against the spec rules.
 ///
@@ -53,6 +89,16 @@ pub fn validate_config(
         )));
     }
 
+    // ── ports ──────────────────────────────────────────────
+    for spec in &w.ports {
+        validate_port_spec(spec, "workload.ports")?;
+    }
+    for (dep_name, dep) in &config.dependencies {
+        for spec in &dep.ports {
+            validate_port_spec(spec, &format!("dependencies.{dep_name}.ports"))?;
+        }
+    }
+
     // ── image source ──────────────────────────────────────
     validate_image_source(&w.image, workload_dir)?;
 
@@ -63,10 +109,12 @@ pub fn validate_config(
                 "measured-data path must start with \"./\": {p:?}"
             )));
         }
+        ensure_no_traversal(p, "measured-data")?;
         let abs = workload_dir.join(p);
         if !abs.exists() {
             return Err(WorkloadError::MeasuredDataMissing(abs));
         }
+        ensure_within(&abs, workload_dir, "measured-data")?;
     }
 
     // ── unmeasured-data paths (format check only, files need not exist) ──
@@ -76,6 +124,7 @@ pub fn validate_config(
                 "unmeasured-data path must start with \"./\": {p:?}"
             )));
         }
+        ensure_no_traversal(p, "unmeasured-data")?;
     }
 
     // ── env_file ──────────────────────────────────────────
@@ -118,15 +167,19 @@ pub fn validate_config(
                     "signing.policy must start with \"./\"".into(),
                 ));
             }
+            ensure_no_traversal(auth, "signing.auth_info")?;
+            ensure_no_traversal(policy, "signing.policy")?;
 
             let auth_path = workload_dir.join(auth);
             if !auth_path.exists() {
                 return Err(WorkloadError::SigningFileMissing(auth_path));
             }
+            ensure_within(&auth_path, workload_dir, "signing.auth_info")?;
             let policy_path = workload_dir.join(policy);
             if !policy_path.exists() {
                 return Err(WorkloadError::SigningFileMissing(policy_path));
             }
+            ensure_within(&policy_path, workload_dir, "signing.policy")?;
         }
     }
 
@@ -255,6 +308,7 @@ fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<()
             }
         }
         ImageSource::Build { build, .. } => {
+            ensure_no_traversal(build, "image build context")?;
             let ctx = workload_dir.join(build);
             if !ctx.is_dir() {
                 return Err(WorkloadError::Validation(format!(
@@ -262,6 +316,7 @@ fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<()
                     ctx.display()
                 )));
             }
+            ensure_within(&ctx, workload_dir, "image build context")?;
         }
         ImageSource::File { file } => {
             if !file.ends_with(".tar") && !file.ends_with(".tar.gz") {
@@ -269,12 +324,49 @@ fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<()
                     "image file must end in .tar or .tar.gz: {file:?}"
                 )));
             }
+            ensure_no_traversal(file, "image file")?;
             let abs = workload_dir.join(file);
             if !abs.exists() {
                 return Err(WorkloadError::ImageFileMissing(abs));
             }
+            ensure_within(&abs, workload_dir, "image file")?;
         }
     }
+    Ok(())
+}
+
+/// Validate a port spec: `"host:container"` or `"host:container/proto"`.
+///
+/// Both host and container must be valid `u16`. Protocol, if present, must be `tcp` or `udp`.
+fn validate_port_spec(spec: &str, context: &str) -> Result<(), WorkloadError> {
+    let (ports_part, proto) = match spec.split_once('/') {
+        Some((p, proto)) => (p, Some(proto)),
+        None => (spec, None),
+    };
+
+    if let Some(proto) = proto {
+        if proto != "tcp" && proto != "udp" {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: port protocol must be \"tcp\" or \"udp\", got {proto:?} in {spec:?}"
+            )));
+        }
+    }
+
+    let parts: Vec<&str> = ports_part.split(':').collect();
+    if parts.len() != 2 {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: port spec must be \"host:container[/proto]\", got {spec:?}"
+        )));
+    }
+
+    for (label, val) in [("host", parts[0]), ("container", parts[1])] {
+        if val.parse::<u16>().is_err() {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: {label} port must be a valid u16, got {val:?} in {spec:?}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -607,5 +699,116 @@ missing-disk = "/data"
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_measured_data_traversal() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = ["./../etc/passwd"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_unmeasured_data_traversal() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-data = ["./../secrets"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_image_build_traversal() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = { build = "../other-project" }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_image_file_traversal() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = { file = "./../stolen.tar" }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_invalid_port_format() {
+        for bad in &["3000", "abc:3000", "3000:xyz", "3000:3000/sctp", "80:80:80"] {
+            let toml = format!(
+                r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+ports = ["{bad}"]
+"#
+            );
+            let cfg: crate::config::WorkloadConfig = toml::from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                validate_config(&cfg, tmp.path()).is_err(),
+                "expected error for port spec: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_port_specs() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+ports = ["3000:3000", "8080:80/tcp", "5353:5353/udp"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
     }
 }

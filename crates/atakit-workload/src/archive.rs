@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::GzBuilder;
 
 use crate::WorkloadError;
 
@@ -44,6 +44,12 @@ impl StagingDir {
         let mut count = 0;
         for p in paths {
             let rel = p.strip_prefix("./").unwrap_or(p);
+            // Defense-in-depth: reject any ".." components before joining
+            if Path::new(rel).components().any(|c| c == std::path::Component::ParentDir) {
+                return Err(WorkloadError::Validation(format!(
+                    "measured-data path must not contain \"..\": {p:?}"
+                )));
+            }
             let src = workload_dir.join(p);
             let dest = self.measured_dir.join(rel);
             count += copy_recursive(&src, &dest)?;
@@ -108,11 +114,12 @@ pub fn create_archive(
         source: e,
     })?;
 
-    let enc = GzEncoder::new(file, Compression::default());
+    let enc = GzBuilder::new()
+        .mtime(0)
+        .write(file, Compression::default());
     let mut tar = tar::Builder::new(enc);
 
-    tar.append_dir_all(workload_name, staging_root)
-        .map_err(WorkloadError::Io)?;
+    append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
 
     tar.into_inner()
         .map_err(WorkloadError::Io)?
@@ -120,6 +127,61 @@ pub fn create_archive(
         .map_err(WorkloadError::Io)?;
 
     Ok(archive_path)
+}
+
+/// Recursively append a directory tree to a tar archive with deterministic metadata.
+///
+/// Sorts entries, sets mtime=0, uid=0, gid=0, and normalises permissions
+/// (0o755 for directories, 0o644 for files).
+fn append_dir_deterministic<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    src_dir: &Path,
+    archive_prefix: &Path,
+) -> Result<(), WorkloadError> {
+    // Add the directory entry itself
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mode(0o755);
+    header.set_cksum();
+    let dir_path = format!("{}/", archive_prefix.display());
+    tar.append_data(&mut header, &dir_path, std::io::empty())
+        .map_err(WorkloadError::Io)?;
+
+    let mut entries: Vec<_> = std::fs::read_dir(src_dir)
+        .map_err(WorkloadError::Io)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(WorkloadError::Io)?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let child_src = entry.path();
+        let child_name = child_src.file_name().expect("entry has a filename");
+        let child_archive = archive_prefix.join(child_name);
+        let ft = entry.file_type().map_err(WorkloadError::Io)?;
+
+        if ft.is_dir() {
+            append_dir_deterministic(tar, &child_src, &child_archive)?;
+        } else if ft.is_file() {
+            let metadata = std::fs::metadata(&child_src).map_err(WorkloadError::Io)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(metadata.len());
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            let file = std::fs::File::open(&child_src).map_err(WorkloadError::Io)?;
+            tar.append_data(&mut header, &child_archive, file)
+                .map_err(WorkloadError::Io)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Determine the tar filename for a service's image.
