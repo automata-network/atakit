@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Component, Path};
 use std::{env, fs};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// Application configuration loaded from `config.toml`.
@@ -78,12 +78,28 @@ impl Config {
         };
 
         config.apply_env_overrides();
+        config.validate()?;
         Ok(config)
     }
 
     /// Returns the GitHub token, if set (from config file or `GITHUB_TOKEN` env var).
     pub fn github_token(&self) -> Option<&str> {
         self.github.token.as_deref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let repo = Path::new(&self.image.repository);
+        if repo.is_absolute()
+            || repo
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            bail!(
+                "invalid image.repository {:?}: must not be an absolute path or contain '..'",
+                self.image.repository,
+            );
+        }
+        Ok(())
     }
 
     fn apply_env_overrides(&mut self) {
@@ -94,12 +110,14 @@ impl Config {
         }
         if let Ok(v) = env::var("ATAKIT_DEFAULT_PLATFORMS") {
             if !v.is_empty() {
-                self.image.platforms = Some(
-                    v.split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                );
+                let parsed: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !parsed.is_empty() {
+                    self.image.platforms = Some(parsed);
+                }
             }
         }
         if let Ok(v) = env::var("ATAKIT_LIST_LIMIT") {

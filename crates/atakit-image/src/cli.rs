@@ -20,8 +20,8 @@ pub enum ImageCommand {
 #[derive(Args)]
 pub struct LsArgs {
     /// Maximum number of releases to show
-    #[arg(long, default_value = "10")]
-    pub limit: u32,
+    #[arg(long)]
+    pub limit: Option<u32>,
 
     /// Show all releases (not just those with disk images)
     #[arg(long)]
@@ -32,8 +32,8 @@ pub struct LsArgs {
     pub tag: Option<ImageRef>,
 
     /// Repository name
-    #[arg(long, default_value = "automata-linux")]
-    pub repo: String,
+    #[arg(long)]
+    pub repo: Option<String>,
 
     /// Query remote releases (GitHub API)
     #[arg(long)]
