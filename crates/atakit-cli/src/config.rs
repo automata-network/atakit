@@ -88,15 +88,18 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        let repo = Path::new(&self.image.repository);
-        if repo.is_absolute()
-            || repo
+        let repo = &self.image.repository;
+        if repo.is_empty()
+            || repo.contains('/')
+            || repo.contains('\\')
+            || Path::new(repo).is_absolute()
+            || Path::new(repo)
                 .components()
                 .any(|c| matches!(c, Component::ParentDir))
         {
             bail!(
-                "invalid image.repository {:?}: must not be an absolute path or contain '..'",
-                self.image.repository,
+                "invalid image.repository {:?}: must be a plain name without path separators",
+                repo,
             );
         }
         Ok(())
