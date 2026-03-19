@@ -84,8 +84,10 @@ dependencies = [
  "clap",
  "indicatif",
  "owo-colors",
+ "serde",
  "shell-escape",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

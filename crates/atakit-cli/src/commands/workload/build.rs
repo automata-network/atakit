@@ -2,9 +2,10 @@ use anyhow::Result;
 use atakit_workload::cli::BuildArgs;
 use owo_colors::OwoColorize;
 
+use crate::config::Config;
 use crate::progress::IndicatifReporter;
 
-pub async fn run(args: BuildArgs) -> Result<()> {
+pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
     let workload_dir = match args.dir {
         Some(d) => std::fs::canonicalize(d)?,
         None => std::env::current_dir()?,
@@ -12,6 +13,11 @@ pub async fn run(args: BuildArgs) -> Result<()> {
 
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
+        None if config.build.container_engine != "auto" => {
+            Some(atakit_workload::ContainerEngine::from_str_opt(
+                &config.build.container_engine,
+            )?)
+        }
         None => None,
     };
 
