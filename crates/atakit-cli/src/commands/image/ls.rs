@@ -8,14 +8,30 @@ use atakit_image::{
 };
 use owo_colors::OwoColorize;
 
-pub async fn run(args: LsArgs, env: &Env) -> Result<()> {
+use crate::config::Config;
+
+pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
+    let repo = if args.repo == "automata-linux" {
+        config.image.repository.clone()
+    } else {
+        args.repo
+    };
+    let limit = if args.limit == 10 {
+        config.image.list_limit
+    } else {
+        args.limit
+    };
+
     let store = ImageStore::new(&env.image_dir);
-    let client = ReleasesClient::new().with_token_from_env();
+    let client = match config.github_token() {
+        Some(token) => ReleasesClient::new().with_token(token),
+        None => ReleasesClient::new().with_token_from_env(),
+    };
 
     // --tag mode: show detailed view for a single release.
     if let Some(tag) = &args.tag {
         let release = client.get_release(tag).await?;
-        print_release_detail(&args.repo, &release, &store);
+        print_release_detail(&repo, &release, &store);
         return Ok(());
     }
 
@@ -40,24 +56,24 @@ pub async fn run(args: LsArgs, env: &Env) -> Result<()> {
         let remote_tags: HashSet<ImageRef>;
 
         if args.all {
-            let releases = client.list_releases(&args.repo, args.limit).await?;
+            let releases = client.list_releases(&repo, limit).await?;
             remote_tags = releases
                 .iter()
-                .map(|r| ImageRef::new(&args.repo, &r.tag_name))
+                .map(|r| ImageRef::new(&repo, &r.tag_name))
                 .collect();
             let rows: Vec<_> = releases
                 .iter()
-                .map(|r| row_from_release(r, &store, &args.repo))
+                .map(|r| row_from_release(r, &store, &repo))
                 .collect();
-            groups.entry(args.repo.clone()).or_default().extend(rows);
+            groups.entry(repo.clone()).or_default().extend(rows);
         } else {
-            let statuses = store.list(&client, &args.repo, args.limit).await?;
+            let statuses = store.list(&client, &repo, limit).await?;
             remote_tags = statuses
                 .iter()
-                .map(|s| ImageRef::new(&args.repo, &s.release.tag_name))
+                .map(|s| ImageRef::new(&repo, &s.release.tag_name))
                 .collect();
             let rows: Vec<_> = statuses.iter().map(row_from_status).collect();
-            groups.entry(args.repo.clone()).or_default().extend(rows);
+            groups.entry(repo.clone()).or_default().extend(rows);
         }
 
         // Append local-only images (not present in remote).

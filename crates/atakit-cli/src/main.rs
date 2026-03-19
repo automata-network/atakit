@@ -1,8 +1,10 @@
 mod commands;
+mod config;
 mod progress;
 
 use anyhow::Result;
 use atakit_core::Env;
+use config::Config;
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
 use clap::{Parser, Subcommand};
@@ -34,6 +36,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let env = Env::from_env();
+    let config = Config::load(&env.config_dir)?;
     if let Some(legacy) = env.check_legacy_dir() {
         // Sanity check: refuse to suggest rm on suspiciously short paths.
         let safe = |p: &std::path::Path| p.components().count() >= 3;
@@ -77,13 +80,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Image(cmd) => match cmd {
-            ImageCommand::Ls(args) => commands::image::ls::run(args, &env).await,
-            ImageCommand::Pull(args) => commands::image::pull::run(args, &env).await,
+            ImageCommand::Ls(args) => commands::image::ls::run(args, &env, &config).await,
+            ImageCommand::Pull(args) => commands::image::pull::run(args, &env, &config).await,
             ImageCommand::Rm(args) => commands::image::rm::run(args, &env).await,
         },
         Command::Workload(cmd) => match cmd {
             WorkloadCommand::Create(args) => commands::workload::create::run(args),
-            WorkloadCommand::Build(args) => commands::workload::build::run(args).await,
+            WorkloadCommand::Build(args) => commands::workload::build::run(args, &config).await,
         },
     }
 }
