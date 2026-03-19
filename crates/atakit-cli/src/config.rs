@@ -105,6 +105,15 @@ impl Config {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn load_from_str(toml_content: &str) -> Result<Self> {
+        let mut config: Config =
+            toml::from_str(toml_content).context("failed to parse config")?;
+        config.apply_env_overrides();
+        config.validate()?;
+        Ok(config)
+    }
+
     fn apply_env_overrides(&mut self) {
         if let Ok(v) = env::var("ATAKIT_DEFAULT_REPO") {
             if !v.is_empty() {
@@ -138,5 +147,155 @@ impl Config {
                 self.build.container_engine = v;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn missing_file_returns_defaults() {
+        let dir = TempDir::new().unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.list_limit, 10);
+        assert!(config.image.platforms.is_none());
+        assert!(config.github.token.is_none());
+        assert_eq!(config.build.container_engine, "auto");
+    }
+
+    #[test]
+    fn parses_full_config() {
+        let config = Config::load_from_str(
+            r#"
+            [image]
+            repository = "my-images"
+            platforms = ["gcp", "aws"]
+            list_limit = 25
+
+            [github]
+            token = "ghp_test123"
+
+            [build]
+            container_engine = "podman"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.image.repository, "my-images");
+        assert_eq!(
+            config.image.platforms.as_deref(),
+            Some(&["gcp".to_string(), "aws".to_string()][..])
+        );
+        assert_eq!(config.image.list_limit, 25);
+        assert_eq!(config.github_token(), Some("ghp_test123"));
+        assert_eq!(config.build.container_engine, "podman");
+    }
+
+    #[test]
+    fn partial_config_fills_defaults() {
+        let config = Config::load_from_str(
+            r#"
+            [image]
+            list_limit = 5
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.list_limit, 5);
+        assert!(config.image.platforms.is_none());
+        assert_eq!(config.build.container_engine, "auto");
+    }
+
+    #[test]
+    fn empty_config_returns_defaults() {
+        let config = Config::load_from_str("").unwrap();
+        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.list_limit, 10);
+    }
+
+    #[test]
+    fn rejects_slash_in_repository() {
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repository = "owner/repo"
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("owner/repo"), "error: {msg}");
+        assert!(msg.contains("plain name"), "error: {msg}");
+    }
+
+    #[test]
+    fn rejects_backslash_in_repository() {
+        // Use a TOML literal string (single quotes) to avoid TOML escape processing.
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repository = 'owner\repo'
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("plain name"));
+    }
+
+    #[test]
+    fn rejects_dotdot_in_repository() {
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repository = ".."
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("plain name"));
+    }
+
+    #[test]
+    fn rejects_empty_repository() {
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repository = ""
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("plain name"));
+    }
+
+    #[test]
+    fn malformed_toml_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = fs::File::create(&path).unwrap();
+        write!(f, "not valid [[ toml").unwrap();
+
+        let err = Config::load(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn load_from_real_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [image]
+            repository = "custom-images"
+            list_limit = 3
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.image.repository, "custom-images");
+        assert_eq!(config.image.list_limit, 3);
     }
 }
