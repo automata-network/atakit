@@ -86,6 +86,7 @@ dependencies = [
  "owo-colors",
  "serde",
  "shell-escape",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

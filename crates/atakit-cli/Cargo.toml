@@ -22,3 +22,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 owo-colors.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
