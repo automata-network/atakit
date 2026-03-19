@@ -22,7 +22,7 @@ atakit-ng/
 
 Minimal shared crate with no heavy dependencies. Provides:
 
-- **`Env`** -- runtime context holding `~/.atakit` paths (`atakit_dir`, `image_dir`). Only global state, no project-scoped config.
+- **`Env`** -- runtime context holding XDG-compliant paths (`data_dir`, `config_dir`, `cache_dir`, `image_dir`). Only global state, no project-scoped config. Resolution: `ATAKIT_*_DIR` > `XDG_*_HOME/atakit` > `$HOME/<default>/atakit`.
 - **`ProgressReporter` + `ProgressHandle`** -- traits for pluggable progress reporting. Includes `NullReporter` no-op impl. This is the key abstraction that lets CLI use indicatif while TUI can use ratatui gauges.
 
 ### atakit-image

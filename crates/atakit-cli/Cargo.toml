@@ -15,6 +15,7 @@ atakit-workload = { workspace = true, features = ["cli"] }
 clap.workspace = true
 anyhow.workspace = true
 indicatif.workspace = true
+shell-escape.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

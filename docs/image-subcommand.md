@@ -148,7 +148,7 @@ CLI -> ImageStore::delete() -> remove_dir_all -> print confirmation
 ## Local Storage Layout
 
 ```
-~/.atakit/images/
+~/.local/share/atakit/images/        # default ($XDG_DATA_HOME/atakit/images)
   <repository>/
     <tag>/
       gcp_disk.tar.gz
@@ -160,3 +160,5 @@ CLI -> ImageStore::delete() -> remove_dir_all -> print confirmation
         db.crt
         kernel.crt
 ```
+
+Override with `ATAKIT_DATA_DIR` or `XDG_DATA_HOME`.
