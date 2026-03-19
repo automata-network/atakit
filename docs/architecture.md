@@ -41,15 +41,22 @@ All domain logic for image management. Core API is always available; clap struct
 All domain logic for workload management. Clap structs behind a `cli` feature flag.
 
 - **Error types** -- `WorkloadError` enum via `thiserror`
+- **Config parsing** -- `WorkloadConfig`, `ImageSource` deserialization of `atakit-workload.toml`
+- **Validation** -- cross-field validation (paths, names, disk refs, signing prefixes, disk sizes, mount constraints, firewall ports)
+- **Container images** -- `ContainerEngine` enum (`Docker`, `Podman`) with detect/build/pull/save via CLI shelling
+- **Hashing** -- SHA-256 hashing of files and directories for integrity verification
+- **Manifest generation** -- `Manifest`, `ManifestMeta` serialization types for deterministic `manifest.toml`
+- **Archive creation** -- `StagingDir` assembly + tar.gz `.atawl` archive output
+- **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
-- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `NewArgs`
+- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`
 
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `run_ls`, `run_pull`, `run_rm`, `run_new` bridging clap args to library API
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules (e.g. `image::ls::run`) bridging clap args to library API
 - **Entry point** -- CLI struct, dispatch
 
 ## Dependency Graph
@@ -63,7 +70,7 @@ atakit-cli ──> atakit-image (cli feature) ──> atakit-core
 ```
 
 ### Library dependencies
-- reqwest, serde, tokio, futures-util, tracing, thiserror
+- reqwest, serde, tokio, futures-util, tracing, thiserror, toml, sha2, tar, flate2
 
 ### CLI-only dependencies
 - clap, anyhow, indicatif, tracing-subscriber

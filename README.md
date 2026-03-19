@@ -38,10 +38,10 @@ atakit image ls
 atakit image ls --remote
 
 # Pull an image for a specific platform
-atakit image pull automata-linux:v0.1.6 --platform gcp
+atakit image pull automata-linux:v0.1.6 gcp
 
 # Remove a local image
-atakit image rm automata-linux:v0.1.6 --platform gcp
+atakit image rm automata-linux:v0.1.6
 ```
 
 ### Workload management
