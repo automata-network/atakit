@@ -11,16 +11,8 @@ use owo_colors::OwoColorize;
 use crate::config::Config;
 
 pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
-    let repo = if args.repo == "automata-linux" {
-        config.image.repository.clone()
-    } else {
-        args.repo
-    };
-    let limit = if args.limit == 10 {
-        config.image.list_limit
-    } else {
-        args.limit
-    };
+    let repo = args.repo.unwrap_or_else(|| config.image.repository.clone());
+    let limit = args.limit.unwrap_or(config.image.list_limit);
 
     let store = ImageStore::new(&env.image_dir);
     let client = match config.github_token() {
@@ -31,7 +23,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     // --tag mode: show detailed view for a single release.
     if let Some(tag) = &args.tag {
         let release = client.get_release(tag).await?;
-        print_release_detail(&repo, &release, &store);
+        print_release_detail(&tag.repository, &release, &store);
         return Ok(());
     }
 
