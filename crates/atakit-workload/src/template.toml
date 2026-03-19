@@ -1,0 +1,95 @@
+format = 1
+
+[workload]
+name = "{{name}}"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+# base-image = []
+
+# ── image source (pick one) ──────────────────────────────
+# Pull from registry:
+image = "{{name}}:latest"
+# Build from source:
+# image = { build = ".", containerfile = "Containerfile" }
+# Build with args:
+# image = { build = ".", containerfile = "Containerfile", args = { KEY = "value" } }
+# Load from local tar:
+# image = { file = "./images/{{name}}.tar" }
+
+# ── container configuration ──────────────────────────────
+# ports = ["3000:3000", "8080:8080/udp"]
+# restart = "unless-stopped"          # "no" (default), "always", "on-failure", "unless-stopped"
+# command = "echo hello"              # string (shell form) or array (exec form)
+# entrypoint = ["/app/entrypoint.sh"]
+# cvm_agent = true                    # enable CVM agent socket mount
+# env_file = ".env"                   # string or array of paths
+
+# ── environment variables ────────────────────────────────
+# [workload.environment]
+# RUST_LOG = "info"
+# LISTEN_ADDR = "0.0.0.0:3000"
+
+# ── data mounts ──────────────────────────────────────────
+# Integrity-verified files (PCR23), mounted read-only at /app/measured-data/
+# measured-data = ["./config/cert.pem", "./config/settings.json"]
+#
+# Operator-provided files (not verified), mounted read-only at /app/unmeasured-data/
+# unmeasured-data = ["./runtime-data/key.pem"]
+
+# ── persistent disk mounts ───────────────────────────────
+# Maps disk names (defined in [disks.*]) to container mount paths.
+# [workload.disks]
+# my-disk = "/data"
+
+# ── dependencies ─────────────────────────────────────────
+# [dependencies.redis]
+# image = "redis:7"
+# ports = ["6379:6379"]
+# restart = "unless-stopped"
+# depends_on = []
+# [dependencies.redis.environment]
+# REDIS_PASSWORD = "secret"
+# [dependencies.redis.disks]
+# redis-data = "/data"
+
+# ── firewall ─────────────────────────────────────────────
+# By default, host ports from `ports` get TCP allow rules automatically.
+# Use [firewall] only to add extra rules or deny auto-derived ones.
+# [firewall]
+# allow = [{ port = 4000, protocol = "tcp" }, { port = 5000, protocol = "udp" }]
+# deny = [9091]
+
+# ── baby containers ──────────────────────────────────────
+# Ephemeral sidecar containers via the agent's /baby-container/* API.
+# [baby-container]
+# allow = true
+# max_count = 2                       # default: 1
+
+# ── image signing ────────────────────────────────────────
+# Cosign-based image signature verification. Both files are included in
+# measured-data/signing/ and are part of PCR23.
+# [signing]
+# enable = true
+# auth_info = "./secrets/auth_info.json"
+# policy = "./config/cosign_policy.json"
+
+# ── persistent disks ─────────────────────────────────────
+# Each disk must be mounted by exactly one container (workload or dependency).
+# [disks.my-disk]
+# size = "10GB"
+# bind_fs = true                      # UID translation via bindfs (default: false)
+# encryption = { enable = true }
+# encryption = { enable = true, key_security = "strong" }  # "standard" (default) or "strong"
+
+# ── deployment targets ───────────────────────────────────
+# Optional. Required to use `atakit deploy`.
+# Providers: gcp, azure, qemu. All three fields required per platform.
+# [deployments.prod.platforms.gcp]
+# vmtype = "c3-standard-4"
+# region = "us-central1-a"
+# project = "my-gcp-project"
+#
+# [deployments.prod.platforms.azure]
+# vmtype = "Standard_DC4as_v5"
+# region = "eastus"
+# project = "my-azure-subscription"

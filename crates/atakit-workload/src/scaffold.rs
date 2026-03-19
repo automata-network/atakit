@@ -43,17 +43,7 @@ fn validate_name(name: &str) -> Result<(), WorkloadError> {
 }
 
 fn render_template(name: &str) -> String {
-    format!(
-        r#"format = {format}
-
-[workload]
-name = "{name}"
-version = "v0.0.1"
-base-image-mode = "blacklist"
-image = "{name}:latest"
-"#,
-        format = crate::FORMAT_VERSION,
-    )
+    include_str!("template.toml").replace("{{name}}", name)
 }
 
 #[cfg(test)]
