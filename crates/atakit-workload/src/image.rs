@@ -49,6 +49,7 @@ impl ContainerEngine {
         containerfile: Option<&str>,
         tag: &str,
         args: &BTreeMap<String, String>,
+        verbose: bool,
     ) -> Result<(), WorkloadError> {
         let mut cmd = Command::new(self.bin());
         cmd.arg("build").arg("-t").arg(tag);
@@ -64,7 +65,7 @@ impl ContainerEngine {
 
         cmd.arg(context);
 
-        run_command_streaming(&mut cmd, &format!("{} build", self.bin())).await
+        run_command_streaming(&mut cmd, &format!("{} build", self.bin()), verbose).await
     }
 
     /// Pull an image from a registry.
@@ -116,20 +117,44 @@ async fn run_command(cmd: &mut Command, label: &str) -> Result<(), WorkloadError
     Ok(())
 }
 
-/// Run a command with stdout/stderr inherited so the user sees build output in real time.
-async fn run_command_streaming(cmd: &mut Command, label: &str) -> Result<(), WorkloadError> {
+/// Run a command, optionally streaming stdout/stderr to the terminal.
+///
+/// When `verbose` is false, output is captured and discarded on success. On
+/// failure the captured stderr is included in the error.
+async fn run_command_streaming(
+    cmd: &mut Command,
+    label: &str,
+    verbose: bool,
+) -> Result<(), WorkloadError> {
     use std::process::Stdio;
-    let status = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .map_err(WorkloadError::Io)?;
-    if !status.success() {
-        return Err(WorkloadError::ContainerCommand {
-            command: label.to_string(),
-            stderr: format!("exited with {status}"),
-        });
+
+    if verbose {
+        let status = cmd
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .map_err(WorkloadError::Io)?;
+        if !status.success() {
+            return Err(WorkloadError::ContainerCommand {
+                command: label.to_string(),
+                stderr: format!("exited with {status}"),
+            });
+        }
+    } else {
+        let output = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(WorkloadError::Io)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(WorkloadError::ContainerCommand {
+                command: label.to_string(),
+                stderr,
+            });
+        }
     }
     Ok(())
 }

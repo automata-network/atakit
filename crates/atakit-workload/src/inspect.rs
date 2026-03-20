@@ -15,6 +15,8 @@ pub struct InspectOptions {
     pub workload_dir: Option<PathBuf>,
     /// Container engine override (for dir mode).
     pub engine: Option<ContainerEngine>,
+    /// Show verbose output from container commands.
+    pub verbose: bool,
 }
 
 /// Result of inspecting a workload.
@@ -36,7 +38,7 @@ pub async fn inspect_workload(
     if let Some(ref archive_path) = opts.archive {
         inspect_archive(archive_path)
     } else if let Some(ref workload_dir) = opts.workload_dir {
-        inspect_dir(workload_dir, opts.engine).await
+        inspect_dir(workload_dir, opts.engine, opts.verbose).await
     } else {
         Err(WorkloadError::Validation(
             "either --archive or --dir must be specified".into(),
@@ -76,6 +78,7 @@ fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, Work
 async fn inspect_dir(
     workload_dir: &std::path::Path,
     engine_override: Option<ContainerEngine>,
+    verbose: bool,
 ) -> Result<InspectResult, WorkloadError> {
     let workload_dir = if workload_dir.is_absolute() {
         workload_dir.to_path_buf()
@@ -139,7 +142,7 @@ async fn inspect_dir(
             };
             let context = workload_dir.join(build);
             engine
-                .build_image(&context, containerfile.as_deref(), &resolved_image, args)
+                .build_image(&context, containerfile.as_deref(), &resolved_image, args, verbose)
                 .await?;
             engine
                 .save_image(&resolved_image, &staging.image_tar_path(&tar_name))

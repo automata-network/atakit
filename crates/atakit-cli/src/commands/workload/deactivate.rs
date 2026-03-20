@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
-use atakit_workload::cli::PublishArgs;
+use atakit_workload::cli::DeactivateArgs;
 use owo_colors::OwoColorize;
 
 use crate::config::Config;
 
-pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()> {
+pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result<()> {
     // Resolve RPC URL and session registry from args, config, or env
     let rpc_url = args
         .rpc_url
@@ -23,7 +23,7 @@ pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()
     let session_registry_address: alloy_ext::core::primitives::Address =
         session_registry_str.parse().context("invalid session registry address")?;
 
-    // Resolve private key: CLI arg > key file from config
+    // Resolve owner private key: CLI arg > key file from config
     let private_key_raw = match args.owner_key {
         Some(k) => k,
         None => match config.publish.owner_key_file {
@@ -39,7 +39,7 @@ pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()
     let signer_address = signer.address();
     println!("Signer: {}", format!("{signer_address}").dimmed());
 
-    // Inspect workload to get PCR23 and manifest
+    // Inspect workload to get name+version
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
         None if config.build.container_engine != "auto" => {
@@ -75,52 +75,10 @@ pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()
         manifest.meta.name.green().bold(),
         manifest.meta.version,
     );
-    println!("PCR23: {}", result.pcr23.dimmed());
 
-    // Parse PCR23 into bytes32
-    let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
-    let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
-        .context("invalid PCR23 hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
-
-    // Parse base image IDs
-    let mut base_image_ids = Vec::new();
-    for id_str in &args.base_image_id {
-        let hex_str = id_str.strip_prefix("0x").unwrap_or(id_str);
-        let bytes: [u8; 32] = hex::decode(hex_str)
-            .context(format!("invalid base image ID hex: {id_str}"))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("base image ID must be 32 bytes: {id_str}"))?;
-        base_image_ids.push(alloy_ext::core::primitives::B256::from(bytes));
-    }
-
-    // Map base-image-mode string to AccessMode enum value
-    // Solidity: ANY=0, BLACKLIST=1, WHITELIST=2
-    let base_image_mode = match manifest.config.base_image_mode.as_str() {
-        "any" => 0u8,
-        "blacklist" => 1u8,
-        "whitelist" => 2u8,
-        other => bail!("unknown base-image-mode: {other}"),
-    };
-
-    // Build WorkloadSpec using the contract's generated types
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
-
-    let spec = WorkloadSpec {
-        name: manifest.meta.name.clone(),
-        version: manifest.meta.version.clone(),
-        ttl: args.ttl,
-        baseImageMode: base_image_mode,
-        baseImageIds: base_image_ids,
-        requirements: vec![],
-        pcrs: vec![PcrSpec {
-            pcrIndex: 23,
-            verifyType: 0, // STATIC
-            matchData: vec![pcr23_b256],
-        }],
-    };
+    let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
+    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    println!("Workload ID: {}", workload_id_hex.dimmed());
 
     // Resolve relay key: CLI arg > key file from config
     let relay_key_raw = match args.relay_key {
@@ -154,36 +112,32 @@ pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()
 
     let registry = measurement.workload_registry();
 
-    // Check if workload is already registered
-    let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
-
-    if let Ok(existing) = registry.get_workload_spec(workload_id).await {
+    // Check if workload is already revoked
+    if let Ok(true) = registry.is_workload_revoked(workload_id).await {
         println!();
         println!(
             "{}",
-            "Workload already registered.".yellow().bold()
+            "Workload is already deactivated.".yellow().bold()
         );
         println!("  {:<18}{}", "Workload ID:", workload_id_hex);
-        println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
         return Ok(());
     }
 
-    println!("Submitting registerWorkload transaction...");
-    let result_id = registry
-        .register_workload(&signer, spec, args.expire_offset)
+    println!("Submitting deactivateWorkload transaction...");
+    let tx_hash = registry
+        .deactivate_workload(&signer, workload_id, args.expire_offset)
         .await
-        .context("registerWorkload failed")?;
+        .context("deactivateWorkload failed")?;
 
     println!();
     println!(
         "{}",
-        "Workload published successfully.".green().bold()
+        "Workload deactivated successfully.".green().bold()
     );
     println!(
         "  {:<18}0x{}",
-        "Workload ID:",
-        hex::encode(result_id),
+        "Tx hash:",
+        hex::encode(tx_hash),
     );
 
     Ok(())

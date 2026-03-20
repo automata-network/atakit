@@ -6,7 +6,7 @@ use owo_colors::OwoColorize;
 use super::find_archive;
 use crate::config::Config;
 
-pub async fn run(args: InfoArgs, config: &Config) -> Result<()> {
+pub async fn run(args: InfoArgs, config: &Config, verbose: bool) -> Result<()> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
         None if config.build.container_engine != "auto" => {
@@ -22,6 +22,7 @@ pub async fn run(args: InfoArgs, config: &Config) -> Result<()> {
             archive: Some(archive),
             workload_dir: None,
             engine,
+            verbose,
         }
     } else {
         // Dir mode: explicit --dir or default to cwd
@@ -36,12 +37,14 @@ pub async fn run(args: InfoArgs, config: &Config) -> Result<()> {
                 archive,
                 workload_dir: None,
                 engine,
+                verbose,
             }
         } else {
             atakit_workload::InspectOptions {
                 archive: None,
                 workload_dir: Some(dir),
                 engine,
+                verbose,
             }
         }
     };

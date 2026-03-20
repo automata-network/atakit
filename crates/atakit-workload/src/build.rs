@@ -18,6 +18,8 @@ pub struct BuildOptions {
     pub output_dir: Option<PathBuf>,
     /// Explicit container engine override.
     pub engine: Option<ContainerEngine>,
+    /// Show verbose output from container commands.
+    pub verbose: bool,
 }
 
 /// Result of a successful build.
@@ -103,6 +105,7 @@ pub async fn build_workload(
                     containerfile.as_deref(),
                     &resolved_image,
                     args,
+                    opts.verbose,
                 )
                 .await?;
             engine
@@ -167,13 +170,13 @@ pub async fn build_workload(
     // 9. Create archive
     let handle = progress.create(
         &format!(
-            "Writing {name}.atawl ({image_count} image{}, {measured_file_count} measured file{})...",
+            "Writing {name}-{version}.atawl ({image_count} image{}, {measured_file_count} measured file{})...",
             if image_count != 1 { "s" } else { "" },
             if measured_file_count != 1 { "s" } else { "" },
         ),
         0,
     );
-    let archive_path = archive::create_archive(&staging.root, &name, output_dir)?;
+    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir)?;
     handle.finish();
 
     // 10. Hash archive

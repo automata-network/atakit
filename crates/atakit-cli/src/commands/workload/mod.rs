@@ -1,7 +1,9 @@
 pub mod build;
 pub mod create;
+pub mod deactivate;
 pub mod info;
 pub mod publish;
+pub mod spec;
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +25,24 @@ pub fn find_archive(dir: &Path) -> Option<PathBuf> {
         }
     }
     found
+}
+
+/// Read `atakit-workload.toml` from `dir` and look for the matching
+/// `{name}-{version}.atawl` archive. Returns an error if the config
+/// exists but the versioned archive does not.
+pub fn find_versioned_archive(dir: &Path) -> anyhow::Result<PathBuf> {
+    let config = atakit_workload::config::WorkloadConfig::from_dir(dir)?;
+    let name = &config.workload.name;
+    let version = &config.workload.version;
+    let archive = dir.join(format!("{name}-{version}.atawl"));
+    if archive.exists() {
+        Ok(archive)
+    } else {
+        anyhow::bail!(
+            "archive not found: {}\nRun `atakit workload build` first.",
+            archive.display()
+        )
+    }
 }
 
 /// Compute the on-chain workload ID: `keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))`
