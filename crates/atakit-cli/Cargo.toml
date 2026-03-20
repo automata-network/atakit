@@ -25,6 +25,7 @@ owo-colors.workspace = true
 alloy-ext.workspace = true
 automata-tee-workload-measurement.workspace = true
 hex.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

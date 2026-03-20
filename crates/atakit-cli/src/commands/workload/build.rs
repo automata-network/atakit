@@ -5,7 +5,7 @@ use owo_colors::OwoColorize;
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
 
-pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
+pub async fn run(args: BuildArgs, config: &Config, verbose: bool) -> Result<()> {
     let workload_dir = match args.dir {
         Some(d) => std::fs::canonicalize(d)?,
         None => std::env::current_dir()?,
@@ -25,6 +25,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         workload_dir,
         output_dir: args.output,
         engine,
+        verbose,
     };
 
     let progress = IndicatifReporter;

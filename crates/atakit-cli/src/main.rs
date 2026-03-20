@@ -14,6 +14,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "atakit", version, about)]
 struct Cli {
+    /// Show verbose output (e.g. container build logs)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -87,9 +91,21 @@ async fn main() -> Result<()> {
         },
         Command::Workload(cmd) => match cmd {
             WorkloadCommand::Create(args) => commands::workload::create::run(args),
-            WorkloadCommand::Build(args) => commands::workload::build::run(args, &config).await,
-            WorkloadCommand::Info(args) => commands::workload::info::run(args, &config).await,
-            WorkloadCommand::Publish(args) => commands::workload::publish::run(args, &config).await,
+            WorkloadCommand::Build(args) => {
+                commands::workload::build::run(args, &config, cli.verbose).await
+            }
+            WorkloadCommand::Info(args) => {
+                commands::workload::info::run(args, &config, cli.verbose).await
+            }
+            WorkloadCommand::Publish(args) => {
+                commands::workload::publish::run(args, &config, cli.verbose).await
+            }
+            WorkloadCommand::Deactivate(args) => {
+                commands::workload::deactivate::run(args, &config, cli.verbose).await
+            }
+            WorkloadCommand::Spec(args) => {
+                commands::workload::spec::run(args, &config).await
+            }
         },
     }
 }

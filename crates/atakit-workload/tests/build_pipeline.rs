@@ -46,6 +46,7 @@ async fn build_produces_valid_archive() {
             workload_dir: wl_dir,
             output_dir: Some(out_dir.clone()),
             engine: None,
+            verbose: false,
         },
         &NullReporter,
     )
@@ -57,7 +58,7 @@ async fn build_produces_valid_archive() {
     assert_eq!(result.image_count, 1);
     assert_eq!(result.measured_file_count, 1);
     assert!(result.archive_path.exists());
-    assert!(result.archive_path.to_string_lossy().ends_with(".atawl"));
+    assert!(result.archive_path.to_string_lossy().ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
 
     // Verify archive contents
@@ -120,6 +121,7 @@ async fn build_defaults_output_to_workload_dir() {
             workload_dir: wl_dir.clone(),
             output_dir: None,
             engine: None,
+            verbose: false,
         },
         &NullReporter,
     )
@@ -144,6 +146,7 @@ async fn build_is_deterministic() {
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
             engine: None,
+            verbose: false,
         },
         &NullReporter,
     )
@@ -155,6 +158,7 @@ async fn build_is_deterministic() {
             workload_dir: wl_dir,
             output_dir: Some(out2),
             engine: None,
+            verbose: false,
         },
         &NullReporter,
     )

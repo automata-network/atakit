@@ -107,9 +107,10 @@ impl StagingDir {
 pub fn create_archive(
     staging_root: &Path,
     workload_name: &str,
+    workload_version: &str,
     output_dir: &Path,
 ) -> Result<PathBuf, WorkloadError> {
-    let archive_path = output_dir.join(format!("{workload_name}.atawl"));
+    let archive_path = output_dir.join(format!("{workload_name}-{workload_version}.atawl"));
     let file = std::fs::File::create(&archive_path).map_err(|e| WorkloadError::WriteFile {
         path: archive_path.clone(),
         source: e,
@@ -297,9 +298,9 @@ mod tests {
         std::fs::write(staging.images_dir.join("test-app.tar"), "fake tar").unwrap();
 
         let out_dir = tempfile::tempdir().unwrap();
-        let archive = create_archive(&staging.root, "test-app", out_dir.path()).unwrap();
+        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path()).unwrap();
         assert!(archive.exists());
-        assert!(archive.to_string_lossy().ends_with(".atawl"));
+        assert!(archive.to_string_lossy().ends_with("test-app-0.1.0.atawl"));
     }
 
     #[test]
