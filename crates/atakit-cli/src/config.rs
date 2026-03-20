@@ -67,6 +67,10 @@ pub struct PublishConfig {
     pub rpc_url: Option<String>,
     /// Default session registry contract address.
     pub session_registry: Option<String>,
+    /// Path to file containing the owner private key (hex).
+    pub owner_key_file: Option<String>,
+    /// Path to file containing the relay private key (hex).
+    pub relay_key_file: Option<String>,
 }
 
 impl Config {
@@ -168,6 +172,19 @@ impl Config {
             }
         }
     }
+}
+
+/// Read a hex key from a file, trimming whitespace and optional `0x` prefix.
+pub fn read_key_file(path: &str) -> Result<String> {
+    let expanded = if path.starts_with("~/") {
+        let home = env::var("HOME").context("HOME not set")?;
+        format!("{}{}", home, &path[1..])
+    } else {
+        path.to_string()
+    };
+    let content = fs::read_to_string(&expanded)
+        .with_context(|| format!("failed to read key file {}", expanded))?;
+    Ok(content.trim().to_string())
 }
 
 /// Write a template `config.toml` if one doesn't exist yet.

@@ -24,8 +24,15 @@ pub async fn run(args: PublishArgs, config: &Config) -> Result<()> {
     let session_registry_address: alloy_ext::core::primitives::Address =
         session_registry_str.parse().context("invalid session registry address")?;
 
-    // Parse private key
-    let private_key_hex = args.private_key.strip_prefix("0x").unwrap_or(&args.private_key);
+    // Resolve private key: CLI arg > key file from config
+    let private_key_raw = match args.owner_key {
+        Some(k) => k,
+        None => match config.publish.owner_key_file {
+            Some(ref path) => crate::config::read_key_file(path)?,
+            None => bail!("owner key required: use --owner-key or set publish.owner_key_file in config"),
+        },
+    };
+    let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
     let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
         .parse()
         .context("invalid private key")?;
@@ -126,13 +133,20 @@ pub async fn run(args: PublishArgs, config: &Config) -> Result<()> {
         }],
     };
 
-    // Connect to the registry
+    // Resolve relay key: CLI arg > key file from config
+    let relay_key_raw = match args.relay_key {
+        Some(k) => k,
+        None => match config.publish.relay_key_file {
+            Some(ref path) => crate::config::read_key_file(path)?,
+            None => bail!("relay key required: use --relay-key or set publish.relay_key_file in config"),
+        },
+    };
+    let relay_key_hex = relay_key_raw.strip_prefix("0x").unwrap_or(&relay_key_raw);
     let relay_key = {
-        let key_hex = private_key_hex;
-        let bytes: [u8; 32] = hex::decode(key_hex)
-            .context("invalid private key hex for relay_key")?
+        let bytes: [u8; 32] = hex::decode(relay_key_hex)
+            .context("invalid relay key hex")?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?;
+            .map_err(|_| anyhow::anyhow!("relay key must be 32 bytes"))?;
         alloy_ext::core::primitives::B256::from(bytes)
     };
 

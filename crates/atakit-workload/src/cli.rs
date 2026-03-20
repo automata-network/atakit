@@ -63,9 +63,12 @@ pub struct PublishArgs {
     /// Session registry contract address
     #[arg(long)]
     pub session_registry: Option<String>,
-    /// Private key hex for signing transactions
+    /// Owner private key hex for signing transactions
     #[arg(long)]
-    pub private_key: String,
+    pub owner_key: Option<String>,
+    /// Relay private key hex for submitting transactions
+    #[arg(long)]
+    pub relay_key: Option<String>,
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
