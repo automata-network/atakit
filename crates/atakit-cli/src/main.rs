@@ -34,8 +34,9 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
     let env = Env::from_env();
+    config::ensure_template(&env.config_dir);
+    let cli = Cli::parse();
     let config = Config::load(&env.config_dir)?;
     if let Some(legacy) = env.check_legacy_dir() {
         // Sanity check: refuse to suggest rm on suspiciously short paths.
@@ -87,6 +88,8 @@ async fn main() -> Result<()> {
         Command::Workload(cmd) => match cmd {
             WorkloadCommand::Create(args) => commands::workload::create::run(args),
             WorkloadCommand::Build(args) => commands::workload::build::run(args, &config).await,
+            WorkloadCommand::Info(args) => commands::workload::info::run(args, &config).await,
+            WorkloadCommand::Publish(args) => commands::workload::publish::run(args, &config).await,
         },
     }
 }

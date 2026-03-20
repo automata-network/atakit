@@ -156,7 +156,13 @@ fn append_dir_deterministic<W: std::io::Write>(
         .map_err(WorkloadError::Io)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(WorkloadError::Io)?;
-    entries.sort_by_key(|e| e.file_name());
+    // Sort files before directories (so manifest.toml precedes images/),
+    // then alphabetically within each group.
+    entries.sort_by(|a, b| {
+        let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let b_is_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        a_is_dir.cmp(&b_is_dir).then_with(|| a.file_name().cmp(&b.file_name()))
+    });
 
     for entry in entries {
         let child_src = entry.path();

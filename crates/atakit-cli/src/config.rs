@@ -14,6 +14,7 @@ pub struct Config {
     pub image: ImageConfig,
     pub github: GithubConfig,
     pub build: BuildConfig,
+    pub publish: PublishConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +58,15 @@ impl Default for BuildConfig {
             container_engine: "auto".to_string(),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PublishConfig {
+    /// Default RPC URL for publish commands.
+    pub rpc_url: Option<String>,
+    /// Default session registry contract address.
+    pub session_registry: Option<String>,
 }
 
 impl Config {
@@ -147,6 +157,24 @@ impl Config {
                 self.build.container_engine = v;
             }
         }
+        if let Ok(v) = env::var("ATAKIT_RPC_URL") {
+            if !v.is_empty() {
+                self.publish.rpc_url = Some(v);
+            }
+        }
+        if let Ok(v) = env::var("ATAKIT_SESSION_REGISTRY") {
+            if !v.is_empty() {
+                self.publish.session_registry = Some(v);
+            }
+        }
+    }
+}
+
+/// Write a template `config.toml` if one doesn't exist yet.
+pub fn ensure_template(config_dir: &Path) {
+    let path = config_dir.join("config.toml");
+    if !path.exists() {
+        let _ = fs::write(&path, include_str!("config_template.toml"));
     }
 }
 

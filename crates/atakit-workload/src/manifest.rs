@@ -1,61 +1,64 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{ImageSource, StringOrArray, WorkloadConfig};
 use crate::WorkloadError;
 
 /// Top-level manifest written to `manifest.toml` inside the archive.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub meta: ManifestMeta,
     pub config: ManifestConfig,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub disks: BTreeMap<String, ManifestDisk>,
     pub hashes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestMeta {
     pub format: u32,
     pub name: String,
     pub version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestConfig {
     pub image: String,
     #[serde(rename = "base-image-mode")]
     pub base_image_mode: String,
     #[serde(
+        default,
         rename = "base-image",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub base_image: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<String>,
-    #[serde(skip_serializing_if = "is_default_restart")]
+    #[serde(default = "default_restart", skip_serializing_if = "is_default_restart")]
     pub restart: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<StringOrArrayOut>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<StringOrArrayOut>,
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub cvm_agent: bool,
     #[serde(
+        default,
         rename = "measured-data",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub measured_data: Vec<String>,
     #[serde(
+        default,
         rename = "unmeasured-data",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub unmeasured_data: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub disks: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
@@ -68,6 +71,10 @@ pub struct ManifestConfig {
     pub baby_container: Option<ManifestBabyContainer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing: Option<ManifestSigning>,
+}
+
+fn default_restart() -> String {
+    "no".to_string()
 }
 
 fn is_default_restart(s: &str) -> bool {
@@ -97,78 +104,102 @@ impl Serialize for StringOrArrayOut {
     }
 }
 
-#[derive(Debug, Serialize)]
+impl<'de> Deserialize<'de> for StringOrArrayOut {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Single(String),
+            Array(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Single(s) => Ok(StringOrArrayOut::Single(s)),
+            Raw::Array(v) => Ok(StringOrArrayOut::Array(v)),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDependency {
     pub image: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<String>,
-    #[serde(skip_serializing_if = "is_default_restart")]
+    #[serde(default = "default_restart", skip_serializing_if = "is_default_restart")]
     pub restart: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<StringOrArrayOut>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<StringOrArrayOut>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(
+        default,
         rename = "measured-data",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub measured_data: Vec<String>,
     #[serde(
+        default,
         rename = "unmeasured-data",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub unmeasured_data: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub disks: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestFirewall {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<ManifestFirewallAllow>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<u16>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestFirewallAllow {
     pub port: u16,
     pub protocol: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestBabyContainer {
     pub allow: bool,
     pub max_count: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestSigning {
     pub enable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_info: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDisk {
     pub size: String,
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub bind_fs: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<ManifestDiskEncryption>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDiskEncryption {
     pub enable: bool,
-    #[serde(skip_serializing_if = "is_default_key_security")]
+    #[serde(default = "default_key_security", skip_serializing_if = "is_default_key_security")]
     pub key_security: String,
+}
+
+fn default_key_security() -> String {
+    "standard".to_string()
 }
 
 fn is_default_key_security(s: &str) -> bool {
