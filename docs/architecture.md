@@ -49,14 +49,15 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Archive creation** -- `StagingDir` assembly + tar.gz `.atawl` archive output
 - **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
-- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`
+- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`, `InfoArgs`, `PublishArgs`, `DeactivateArgs`, `SpecArgs`
 
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules (e.g. `image::ls::run`) bridging clap args to library API
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`.
+- **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
 
 ## Dependency Graph
@@ -73,7 +74,7 @@ atakit-cli ──> atakit-image (cli feature) ──> atakit-core
 - reqwest, serde, tokio, futures-util, tracing, thiserror, toml, sha2, tar, flate2
 
 ### CLI-only dependencies
-- clap, anyhow, indicatif, tracing-subscriber
+- clap, anyhow, indicatif, tracing-subscriber, owo-colors, shell-escape, reqwest, serde_json, alloy-ext, automata-tee-workload-measurement, hex, sha2
 
 ## Key Design Decisions
 
@@ -86,3 +87,5 @@ atakit-cli ──> atakit-image (cli feature) ──> atakit-core
 4. **Clean library/CLI split** -- run/presentation logic lives in the CLI binary, not in library crates. Library crates are pure logic that can be consumed by any frontend.
 
 5. **Feature-gated CLI types** -- clap arg structs in `atakit-image` are behind a `cli` feature so the library can be used without pulling in clap.
+
+6. **On-chain integration** -- workload publish/deactivate use signature-based ownership (owner key signs, relay key pays gas). The `automata-tee-workload-measurement` crate provides alloy-based contract bindings for `WorkloadRegistry`. The CLI handles key loading, signature construction, and transaction submission; library crates remain chain-unaware.
