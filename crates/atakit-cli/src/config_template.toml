@@ -1,0 +1,24 @@
+# atakit configuration
+# Precedence: CLI args > env vars > this file > defaults
+
+[image]
+# Default repository for image commands.
+# repository = "automata-linux"
+# Default platforms for `image pull` (comma-separated: gcp, aws, azure).
+# platforms = ["gcp"]
+# Default limit for `image ls`.
+# list_limit = 10
+
+[github]
+# GitHub API token (or set GITHUB_TOKEN env var).
+# token = "ghp_..."
+
+[build]
+# Container engine: "auto", "docker", or "podman".
+# container_engine = "auto"
+
+[publish]
+# Ethereum RPC URL for workload publish (or set ATAKIT_RPC_URL).
+# rpc_url = "https://..."
+# Session registry contract address (or set ATAKIT_SESSION_REGISTRY).
+# session_registry = "0x..."

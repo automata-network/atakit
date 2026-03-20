@@ -9,6 +9,10 @@ pub enum WorkloadCommand {
     Create(CreateArgs),
     /// Build an .atawl archive from atakit-workload.toml
     Build(BuildArgs),
+    /// Show workload details and PCR23 measurement
+    Info(InfoArgs),
+    /// Publish a workload spec to the on-chain WorkloadRegistry
+    Publish(PublishArgs),
 }
 
 /// Arguments for `workload create`.
@@ -30,4 +34,48 @@ pub struct BuildArgs {
     /// Container engine override (docker or podman)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
+}
+
+/// Arguments for `workload info`.
+#[derive(Args)]
+pub struct InfoArgs {
+    /// Path to .atawl archive
+    pub archive: Option<PathBuf>,
+    /// Workload directory (alternative to archive)
+    #[arg(short, long, conflicts_with = "archive")]
+    pub dir: Option<PathBuf>,
+    /// Container engine override (for --dir mode)
+    #[arg(long, value_parser = ["docker", "podman"])]
+    pub engine: Option<String>,
+}
+
+/// Arguments for `workload publish`.
+#[derive(Args)]
+pub struct PublishArgs {
+    /// Path to .atawl archive
+    pub archive: Option<PathBuf>,
+    /// Workload directory (alternative to archive)
+    #[arg(short, long, conflicts_with = "archive")]
+    pub dir: Option<PathBuf>,
+    /// Ethereum RPC URL
+    #[arg(long)]
+    pub rpc_url: Option<String>,
+    /// Session registry contract address
+    #[arg(long)]
+    pub session_registry: Option<String>,
+    /// Private key hex for signing transactions
+    #[arg(long)]
+    pub private_key: String,
+    /// Signature expiration offset in seconds
+    #[arg(long, default_value = "300")]
+    pub expire_offset: u64,
+    /// Session TTL in seconds (0 = contract default of 30 days)
+    #[arg(long, default_value = "0")]
+    pub ttl: u64,
+    /// Container engine override (for --dir mode)
+    #[arg(long, value_parser = ["docker", "podman"])]
+    pub engine: Option<String>,
+    /// Base image IDs for whitelist/blacklist (hex bytes32)
+    #[arg(long)]
+    pub base_image_id: Vec<String>,
 }

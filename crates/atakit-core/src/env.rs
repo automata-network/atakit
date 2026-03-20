@@ -80,11 +80,20 @@ impl Env {
         );
         let image_dir = data_dir.join("images");
 
-        Self {
+        let env = Self {
             data_dir,
             config_dir,
             cache_dir,
             image_dir,
+        };
+        env.ensure_dirs();
+        env
+    }
+
+    /// Create data, config, cache, and image directories if they don't exist.
+    fn ensure_dirs(&self) {
+        for dir in [&self.data_dir, &self.config_dir, &self.cache_dir, &self.image_dir] {
+            let _ = std::fs::create_dir_all(dir);
         }
     }
 

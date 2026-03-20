@@ -22,6 +22,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 owo-colors.workspace = true
+alloy-ext.workspace = true
+automata-tee-workload-measurement.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,6 +30,11 @@ tar = "0.4"
 flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Blockchain
+alloy-ext = "1.7.4"
+automata-tee-workload-measurement = "0.1.1"
+hex = "0.4"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -42,3 +47,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 atakit-core = { path = "crates/atakit-core" }
 atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
+
+# Optimize compression and crypto in dev builds -- gzip decompression
+# of large .atawl archives is unusably slow without this.
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3
