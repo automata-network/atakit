@@ -65,17 +65,17 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     println!("PCR23: {}", result.pcr23.dimmed());
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
-    // Read archive bytes
-    let data = std::fs::read(&archive_path)
-        .with_context(|| format!("failed to read {}", archive_path.display()))?;
-
-    // Resolve registry and upload
+    // Resolve registry and stream upload from file
     let registry_url = config.registry.resolve_url(args.registry.as_deref())?;
     let client = RegistryClient::new(&registry_url);
 
+    let file = tokio::fs::File::open(&archive_path)
+        .await
+        .with_context(|| format!("failed to open {}", archive_path.display()))?;
+
     println!("Uploading to {}...", registry_url.dimmed());
     let meta = client
-        .upload(&workload_id_hex, data)
+        .upload(&workload_id_hex, file)
         .await
         .context("upload failed")?;
 

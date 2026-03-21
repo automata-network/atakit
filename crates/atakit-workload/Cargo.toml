@@ -18,6 +18,7 @@ flate2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+futures-util.workspace = true
 
 tempfile = "3"
 
