@@ -80,16 +80,3 @@ image = "{{name}}:latest"
 # bind_fs = true                      # UID translation via bindfs (default: false)
 # encryption = { enable = true }
 # encryption = { enable = true, key_security = "strong" }  # "standard" (default) or "strong"
-
-# ── deployment targets ───────────────────────────────────
-# Optional. Required to use `atakit deploy`.
-# Providers: gcp, azure, qemu. All three fields required per platform.
-# [deployments.prod.platforms.gcp]
-# vmtype = "c3-standard-4"
-# region = "us-central1-a"
-# project = "my-gcp-project"
-#
-# [deployments.prod.platforms.azure]
-# vmtype = "Standard_DC4as_v5"
-# region = "eastus"
-# project = "my-azure-subscription"

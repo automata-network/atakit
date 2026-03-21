@@ -22,8 +22,6 @@ pub struct WorkloadConfig {
     pub signing: Option<SigningSection>,
     #[serde(default)]
     pub disks: BTreeMap<String, DiskSection>,
-    #[serde(default)]
-    pub deployments: BTreeMap<String, DeploymentSection>,
 }
 
 impl WorkloadConfig {
@@ -255,19 +253,6 @@ fn default_key_security() -> String {
     "standard".to_string()
 }
 
-/// Deployment target.
-#[derive(Debug, Deserialize)]
-pub struct DeploymentSection {
-    #[serde(default)]
-    pub platforms: BTreeMap<String, PlatformSection>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PlatformSection {
-    pub vmtype: String,
-    pub region: String,
-    pub project: String,
-}
 
 #[cfg(test)]
 mod tests {
@@ -373,10 +358,6 @@ size = "10GB"
 bind_fs = true
 encryption = { enable = true }
 
-[deployments.prod.platforms.gcp]
-vmtype = "c3-standard-4"
-region = "us-central1"
-project = "my-project"
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.workload.name, "secure-signer");
@@ -388,7 +369,6 @@ project = "my-project"
         assert!(cfg.baby_container.is_some());
         assert!(cfg.signing.is_some());
         assert!(cfg.disks.contains_key("data"));
-        assert!(cfg.deployments.contains_key("prod"));
     }
 
     #[test]

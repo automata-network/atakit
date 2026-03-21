@@ -75,17 +75,6 @@ size = "11GB"
 bind_fs = true
 encryption = { enable = true }
 
-# ── deployment targets ─────────────────────────────────
-
-[deployments.secure-signer-tdx.platforms.gcp]
-vmtype = "c3-standard-4"
-region = "asia-southeast1-b"
-project = "my-gcp-project"
-
-[deployments.secure-signer-tdx.platforms.azure]
-vmtype = "Standard_DC4as_v5"
-region = "eastus"
-project = "my-azure-subscription"
 ```
 
 ---
@@ -102,7 +91,7 @@ base-image-mode = "blacklist"
 image = "my-app:latest"
 ```
 
-Five required fields. Everything else defaults: no ports, no mounts, no dependencies, no firewall overrides, no baby containers, no signing, no deployments. With `base-image-mode = "blacklist"` and `base-image` defaulting to `[]`, this workload can deploy on any CVM image.
+Five required fields. Everything else defaults: no ports, no mounts, no dependencies, no firewall overrides, no baby containers, no signing. With `base-image-mode = "blacklist"` and `base-image` defaulting to `[]`, this workload can deploy on any CVM image.
 
 ---
 
@@ -310,24 +299,6 @@ policy = "./config/cosign_policy.json"
 
 Both files are included in the package under `measured-data/signing/` and shipped to the CVM. They **are** part of the PCR23 measurement.
 
-### `[deployments.<name>]` — Deployment Targets
-
-Each deployment targets one or more cloud platforms.
-
-#### `[deployments.<name>.platforms.<provider>]`
-
-Provider is one of: `gcp`, `azure`, `qemu`.
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `vmtype` | string | yes | VM instance type (e.g. `"c3-standard-4"`). |
-| `region` | string | yes | Cloud region. |
-| `project` | string | yes | Cloud project/subscription ID. |
-
-The `[deployments]` section is optional — but required to use `atakit deploy`. When a platform is defined, all three fields must be present.
-
-Provider-specific fields (bucket names, resource groups, etc.) are auto-generated from the workload name during build, as they are today.
-
 ---
 
 ## Explicitly Unsupported (Security Boundary)
@@ -403,13 +374,6 @@ These compose features are intentionally excluded. The CVM runtime controls thes
 - All `measured-data` and `unmeasured-data` entries must start with `./` (relative to `atakit-workload.toml`)
 - All `measured-data` entries must exist at build time (files or directories)
 - `unmeasured-data` entries are listed in the manifest but not required to exist at build time
-
-### Deployments
-
-- The `[deployments]` section is optional, but required to use `atakit deploy`
-- Each deployment's implicit workload is the one defined in this file (no cross-references needed)
-- Platform provider must be one of: `gcp`, `azure`, `qemu`
-- When a platform is defined, `vmtype`, `region`, and `project` are all required
 
 ---
 
