@@ -17,9 +17,11 @@ pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
     }
 
     let src = store.blob_path(&name, &version)?;
-    let output_dir = args
-        .output
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let output_dir = match args.output {
+        Some(path) => path,
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to determine current directory: {e}"))?,
+    };
     let dest = output_dir.join(format!("{name}-{version}.atawl"));
 
     std::fs::copy(&src, &dest)?;
