@@ -29,8 +29,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         }
     };
 
-    // Check if already in store
-    if store.exists(&name, &version) && !args.force {
+    // Check if blob already in store (metadata-only entries from `add` should still pull)
+    if store.has_blob(&name, &version) && !args.force {
         println!(
             "Workload {}:{} already in store (use --force to overwrite).",
             name, version

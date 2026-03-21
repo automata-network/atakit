@@ -23,8 +23,8 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
     let name = &result.manifest.meta.name;
     let version = &result.manifest.meta.version;
 
-    // Check if already exists
-    if store.exists(name, version) && !args.force {
+    // Check if blob already exists (metadata-only entries from `add` should still import)
+    if store.has_blob(name, version) && !args.force {
         println!(
             "Workload {name}:{version} already in store (use --force to overwrite)."
         );

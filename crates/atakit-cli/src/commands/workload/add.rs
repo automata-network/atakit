@@ -72,7 +72,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Import archive blob if provided
     if let Some(ref path) = archive_path {
-        if store.exists(&name, &version) && !args.force {
+        if store.has_blob(&name, &version) && !args.force {
             // Still continue to merge on-chain data, but skip blob import
             println!("Archive already in store (use --force to overwrite blob).");
         } else {
