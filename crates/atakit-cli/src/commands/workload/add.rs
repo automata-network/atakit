@@ -185,6 +185,11 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         if let Some(size) = archive_size {
             m.archive_size = Some(size);
         }
+        // Refresh identity and timestamp for consistency with other merge paths
+        m.workload_id = workload_id_hex.clone();
+        m.name = name.clone();
+        m.version = version.clone();
+        m.added_at = now.clone();
         m
     } else {
         WorkloadMeta {
