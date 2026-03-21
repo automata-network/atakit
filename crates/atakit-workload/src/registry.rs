@@ -60,7 +60,7 @@ impl RegistryClient {
         workload_id: &str,
         data: Vec<u8>,
     ) -> Result<RegistryMeta, WorkloadError> {
-        let url = format!("{}/v1/workloads/{}/archive", self.base_url, workload_id);
+        let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
         let resp = self
             .client
             .put(&url)
@@ -96,7 +96,7 @@ impl RegistryClient {
         &self,
         workload_id: &str,
     ) -> Result<(Vec<u8>, String), WorkloadError> {
-        let url = format!("{}/v1/workloads/{}/archive", self.base_url, workload_id);
+        let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
         let resp = self
             .client
             .get(&url)
@@ -143,7 +143,7 @@ impl RegistryClient {
         &self,
         workload_id: &str,
     ) -> Result<RegistryMeta, WorkloadError> {
-        let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
+        let url = format!("{}/v1/workloads/{}/meta", self.base_url, workload_id);
         let resp = self
             .client
             .get(&url)
@@ -176,31 +176,28 @@ impl RegistryClient {
         &self,
         filters: &RegistryFilters,
     ) -> Result<RegistryListResponse, WorkloadError> {
-        let mut url = format!("{}/v1/workloads", self.base_url);
-        let mut params = Vec::new();
+        let url = format!("{}/v1/workloads", self.base_url);
+        let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(ref owner) = filters.owner {
-            params.push(format!("owner={owner}"));
+            query.push(("owner", owner.clone()));
         }
         if let Some(ref name) = filters.name {
-            params.push(format!("name={name}"));
+            query.push(("name", name.clone()));
         }
         if let Some(ref prefix) = filters.name_prefix {
-            params.push(format!("namePrefix={prefix}"));
+            query.push(("name_prefix", prefix.clone()));
         }
         if let Some(limit) = filters.limit {
-            params.push(format!("limit={limit}"));
+            query.push(("limit", limit.to_string()));
         }
         if let Some(offset) = filters.offset {
-            params.push(format!("offset={offset}"));
-        }
-        if !params.is_empty() {
-            url.push('?');
-            url.push_str(&params.join("&"));
+            query.push(("offset", offset.to_string()));
         }
 
         let resp = self
             .client
             .get(&url)
+            .query(&query)
             .send()
             .await
             .map_err(|e| WorkloadError::RegistryRequest {
@@ -227,7 +224,7 @@ impl RegistryClient {
 
     /// Health check the registry.
     pub async fn health(&self) -> Result<(), WorkloadError> {
-        let url = format!("{}/health", self.base_url);
+        let url = format!("{}/v1/health", self.base_url);
         let resp = self
             .client
             .get(&url)

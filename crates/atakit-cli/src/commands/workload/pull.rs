@@ -56,21 +56,33 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         verify_pcr23(&workload_id_hex, &pcr23, config).await?;
     }
 
-    // Save blob and metadata
+    // Save blob and metadata (merge into existing meta to preserve chain data)
     store.save_blob(&name, &version, &data)?;
 
     let now = chrono::Local::now().to_rfc3339();
-    let meta = WorkloadMeta {
-        workload_id: workload_id_hex.clone(),
-        name: name.clone(),
-        version: version.clone(),
-        pcr23: Some(pcr23.clone()),
-        owner: None,
-        archive_size: Some(archive_size),
-        on_chain_spec: None,
-        revoked: false,
-        registries: vec![registry_url],
-        added_at: now,
+    let meta = match store.load_meta(&name, &version)? {
+        Some(mut existing) => {
+            existing.workload_id = workload_id_hex.clone();
+            existing.pcr23 = Some(pcr23.clone());
+            existing.archive_size = Some(archive_size);
+            if !existing.registries.contains(&registry_url) {
+                existing.registries.push(registry_url.clone());
+            }
+            existing.added_at = now;
+            existing
+        }
+        None => WorkloadMeta {
+            workload_id: workload_id_hex.clone(),
+            name: name.clone(),
+            version: version.clone(),
+            pcr23: Some(pcr23.clone()),
+            owner: None,
+            archive_size: Some(archive_size),
+            on_chain_spec: None,
+            revoked: false,
+            registries: vec![registry_url.clone()],
+            added_at: now,
+        },
     };
     store.save_meta(&meta)?;
 

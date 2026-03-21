@@ -16,7 +16,7 @@ pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
         anyhow::bail!("no archive blob for {name}:{version} in store");
     }
 
-    let src = store.blob_path(&name, &version);
+    let src = store.blob_path(&name, &version)?;
     let output_dir = args
         .output
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());

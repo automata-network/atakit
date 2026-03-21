@@ -28,7 +28,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 .split_once(':')
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .unwrap();
-            let blob = store.blob_path(&name, &version);
+            let blob = store.blob_path(&name, &version)?;
             if !blob.exists() {
                 anyhow::bail!("no archive blob for {name}:{version} in store");
             }

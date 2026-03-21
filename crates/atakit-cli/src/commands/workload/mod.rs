@@ -70,12 +70,34 @@ pub enum WorkloadRef {
 /// Parse a workload reference string.
 ///
 /// Accepts `name:version` or `0x<64-hex-chars>` (workload ID).
+/// Name must be alphanumeric + hyphens, no leading hyphen.
+/// Version must start with `v` and contain no path separators.
 pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
     if s.starts_with("0x") && s.len() == 66 {
         Ok(WorkloadRef::Id(s.to_string()))
     } else if let Some((name, version)) = s.split_once(':') {
         if name.is_empty() || version.is_empty() {
             anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'");
+        }
+        // Validate name: alphanumeric + hyphens, no leading hyphen
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            || name.starts_with('-')
+        {
+            anyhow::bail!(
+                "invalid workload name in reference: must be alphanumeric + hyphens, got '{name}'"
+            );
+        }
+        // Validate version: starts with 'v', no path separators or '..'
+        if !version.starts_with('v')
+            || version.contains('/')
+            || version.contains('\\')
+            || version.contains("..")
+        {
+            anyhow::bail!(
+                "invalid workload version in reference: must start with 'v' and contain no path separators, got '{version}'"
+            );
         }
         Ok(WorkloadRef::NameVersion {
             name: name.to_string(),
