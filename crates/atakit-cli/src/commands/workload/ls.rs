@@ -255,7 +255,7 @@ fn print_table(entries: &[DisplayEntry]) {
     }
 
     // Legend
-    let legend_parts = vec![
+    let legend_parts = [
         "\u{25c9} local+tracked",
         "\u{25d4} local",
         "\u{25cc} tracked",

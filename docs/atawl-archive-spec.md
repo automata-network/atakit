@@ -299,7 +299,7 @@ Every file in the archive (except `manifest.toml` itself) gets an entry:
 |---|---|
 | `[workload] image` build/file metadata (`build`, `containerfile`, `args`, `file`) | Build-time metadata stripped. Resolved `name:tag` kept in `[config] image`. |
 | `[workload] env_file` | Inlined into `[config.environment]` at build time. |
-| `[deployments]` | Consumed by `atakit deploy`, not by the CVM agent. |
+| (deployment targets) | Deployment targets live in operator config (`config.toml`), not in the workload definition. |
 
 ---
 
@@ -352,7 +352,7 @@ Changing any of the following changes PCR23:
 ### What Is NOT Measured
 
 - `unmeasured-data/` — not in the archive; operator-provided at deploy time
-- `[deployments]` — not in the manifest; consumed by `atakit deploy`
+- Deployment targets -- not in the manifest; live in operator config
 
 ### Why Hash the Manifest, Not the Raw TOML
 
@@ -480,4 +480,4 @@ The relationship is analogous to source code and a compiled binary. The source i
 | `[baby-container]` | `[config.baby-container]` |
 | `[signing]` | `[config.signing]` (paths rewritten) |
 | `[disks.<name>]` | `[disks.<name>]` |
-| `[deployments]` | *(not in manifest)* |
+| (deployment targets) | *(not in workload config or manifest; lives in operator config.toml)* |
