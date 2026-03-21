@@ -91,23 +91,49 @@ impl WorkloadStore {
     fn entry_dir(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
         validate_path_component(name, "name")?;
         validate_path_component(version, "version")?;
-        let path = self.base_dir.join(name).join(version);
-        // If the path already exists, do a real canonicalize check
-        if path.exists() {
-            let canon = path.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
-                path: path.clone(),
-                reason: e.to_string(),
-            })?;
-            let canon_base = self.base_dir.canonicalize().map_err(|e| {
+
+        // Canonicalize base_dir for containment checks (must exist).
+        let canon_base = if self.base_dir.exists() {
+            Some(self.base_dir.canonicalize().map_err(|e| {
                 WorkloadError::ReadStoreDir {
                     path: self.base_dir.clone(),
                     reason: e.to_string(),
                 }
-            })?;
-            if !canon.starts_with(&canon_base) {
-                return Err(WorkloadError::StorePathTraversal { path });
+            })?)
+        } else {
+            None
+        };
+
+        // Check the parent <base>/<name> if it exists. A symlink here could
+        // redirect writes outside base_dir when <version> doesn't exist yet.
+        let parent = self.base_dir.join(name);
+        if let Some(ref canon_base) = canon_base {
+            if parent.exists() {
+                let canon_parent =
+                    parent.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
+                        path: parent.clone(),
+                        reason: e.to_string(),
+                    })?;
+                if !canon_parent.starts_with(canon_base) {
+                    return Err(WorkloadError::StorePathTraversal { path: parent });
+                }
             }
         }
+
+        // Check the full path if it exists.
+        let path = parent.join(version);
+        if let Some(ref canon_base) = canon_base {
+            if path.exists() {
+                let canon = path.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                })?;
+                if !canon.starts_with(canon_base) {
+                    return Err(WorkloadError::StorePathTraversal { path });
+                }
+            }
+        }
+
         Ok(path)
     }
 
@@ -345,5 +371,194 @@ impl WorkloadStore {
             path: path.to_path_buf(),
             reason: e.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_meta(name: &str, version: &str) -> WorkloadMeta {
+        WorkloadMeta {
+            workload_id: "0xtest".to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            pcr23: None,
+            owner: None,
+            archive_size: None,
+            on_chain_spec: None,
+            revoked: false,
+            registries: Vec::new(),
+            added_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn rejects_dotdot_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir("..", "v0.0.1"),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_dotdot_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir("app", ".."),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_slash_in_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir("foo/bar", "v0.0.1"),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_slash_in_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir("app", "v0/../etc"),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir("", "v0.0.1"),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_dot_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(matches!(
+            store.entry_dir(".", "v0.0.1"),
+            Err(WorkloadError::StorePathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_valid_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let dir = store.entry_dir("my-app", "v0.0.1").unwrap();
+        assert_eq!(dir, tmp.path().join("my-app").join("v0.0.1"));
+    }
+
+    #[test]
+    fn save_and_load_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let meta = test_meta("my-app", "v0.0.1");
+        store.save_meta(&meta).unwrap();
+
+        let loaded = store.load_meta("my-app", "v0.0.1").unwrap().unwrap();
+        assert_eq!(loaded.workload_id, "0xtest");
+        assert_eq!(loaded.name, "my-app");
+        assert_eq!(loaded.version, "v0.0.1");
+    }
+
+    #[test]
+    fn load_meta_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        assert!(store.load_meta("no-such", "v0.0.1").unwrap().is_none());
+    }
+
+    #[test]
+    fn exists_and_has_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+
+        assert!(!store.exists("app", "v1"));
+
+        store.save_meta(&test_meta("app", "v1")).unwrap();
+        assert!(store.exists("app", "v1"));
+        assert!(!store.has_blob("app", "v1"));
+
+        store.save_blob("app", "v1", b"fake archive").unwrap();
+        assert!(store.has_blob("app", "v1"));
+    }
+
+    #[test]
+    fn remove_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+
+        store.save_meta(&test_meta("app", "v1")).unwrap();
+        store.save_blob("app", "v1", b"data").unwrap();
+        assert!(store.exists("app", "v1"));
+
+        store.remove("app", "v1").unwrap();
+        assert!(!store.exists("app", "v1"));
+        // Parent name dir should be cleaned up too
+        assert!(!tmp.path().join("app").exists());
+    }
+
+    #[test]
+    fn remove_blob_keeps_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+
+        store.save_meta(&test_meta("app", "v1")).unwrap();
+        store.save_blob("app", "v1", b"data").unwrap();
+        assert!(store.has_blob("app", "v1"));
+
+        store.remove_blob("app", "v1").unwrap();
+        assert!(!store.has_blob("app", "v1"));
+        assert!(store.exists("app", "v1"));
+    }
+
+    #[test]
+    fn list_returns_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+
+        store.save_meta(&test_meta("bravo", "v0.0.1")).unwrap();
+        store.save_meta(&test_meta("alpha", "v0.0.2")).unwrap();
+        store.save_meta(&test_meta("alpha", "v0.0.1")).unwrap();
+
+        let entries = store.list().unwrap();
+        let keys: Vec<_> = entries
+            .iter()
+            .map(|e| format!("{}:{}", e.meta.name, e.meta.version))
+            .collect();
+        assert_eq!(keys, vec!["alpha:v0.0.1", "alpha:v0.0.2", "bravo:v0.0.1"]);
+    }
+
+    #[test]
+    fn symlink_parent_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        fs::create_dir(&store_dir).unwrap();
+        let store = WorkloadStore::new(&store_dir);
+
+        // Create a symlink <store>/evil -> /tmp (outside store)
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, store_dir.join("evil")).unwrap();
+
+        // Trying to write via the symlink should fail containment check
+        let result = store.entry_dir("evil", "v1");
+        assert!(
+            matches!(result, Err(WorkloadError::StorePathTraversal { .. })),
+            "expected StorePathTraversal, got {result:?}"
+        );
     }
 }

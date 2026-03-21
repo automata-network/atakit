@@ -47,13 +47,28 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     let archive_size = data.len() as u64;
 
-    // Inspect downloaded archive to extract PCR23
-    let pcr23 = inspect_bytes(&data)?;
+    // Inspect downloaded archive to extract PCR23 and verify identity
+    let inspection = inspect_bytes(&data)?;
+    let pcr23 = &inspection.pcr23;
+
+    // Verify the archive's manifest matches the requested identity
+    let expected_id = compute_workload_id(&inspection.name, &inspection.version);
+    let expected_id_hex = format!("0x{}", hex::encode(expected_id));
+    if expected_id_hex != workload_id_hex {
+        anyhow::bail!(
+            "archive identity mismatch: requested {name}:{version} ({}), \
+             but archive contains {}:{} ({})",
+            &workload_id_hex[..10],
+            inspection.name,
+            inspection.version,
+            &expected_id_hex[..10],
+        );
+    }
 
     // Optionally verify against on-chain spec
     if args.verify {
         println!("Verifying PCR23 against on-chain spec...");
-        verify_pcr23(&workload_id_hex, &pcr23, config).await?;
+        verify_pcr23(&workload_id_hex, pcr23, config).await?;
     }
 
     // Save blob and metadata (merge into existing meta to preserve chain data)
@@ -95,8 +110,14 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Inspect archive bytes in-memory to extract PCR23.
-fn inspect_bytes(data: &[u8]) -> Result<String> {
+struct ArchiveInspection {
+    name: String,
+    version: String,
+    pcr23: String,
+}
+
+/// Inspect archive bytes in-memory to extract name, version, and PCR23.
+fn inspect_bytes(data: &[u8]) -> Result<ArchiveInspection> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
@@ -113,7 +134,30 @@ fn inspect_bytes(data: &[u8]) -> Result<String> {
             let mut hasher = Sha256::new();
             hasher.update(content.as_bytes());
             let digest = hasher.finalize();
-            return Ok(format!("0x{:x}", digest));
+            let pcr23 = format!("0x{:x}", digest);
+
+            // Parse manifest to extract name and version
+            let manifest: toml::Value = toml::from_str(&content)
+                .context("failed to parse manifest.toml from archive")?;
+            let meta = manifest
+                .get("meta")
+                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing [meta] section"))?;
+            let name = meta
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing meta.name"))?
+                .to_string();
+            let version = meta
+                .get("version")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing meta.version"))?
+                .to_string();
+
+            return Ok(ArchiveInspection {
+                name,
+                version,
+                pcr23,
+            });
         }
     }
 
