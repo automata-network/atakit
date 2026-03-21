@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use std::{env, fs};
 
@@ -15,6 +16,7 @@ pub struct Config {
     pub github: GithubConfig,
     pub build: BuildConfig,
     pub publish: PublishConfig,
+    pub registry: RegistryConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +73,53 @@ pub struct PublishConfig {
     pub owner_key_file: Option<String>,
     /// Path to file containing the relay private key (hex).
     pub relay_key_file: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RegistryConfig {
+    /// Default registry remote name.
+    pub default: Option<String>,
+    /// Named registry remotes.
+    #[serde(default)]
+    pub remotes: BTreeMap<String, RemoteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteConfig {
+    pub url: String,
+}
+
+impl RegistryConfig {
+    /// Resolve registry URL from CLI arg, default remote, or error.
+    ///
+    /// `cli_arg` accepts either a remote name or a raw URL (starts with http).
+    pub fn resolve_url(&self, cli_arg: Option<&str>) -> Result<String> {
+        if let Some(arg) = cli_arg {
+            // If it looks like a URL, use it directly
+            if arg.starts_with("http://") || arg.starts_with("https://") {
+                return Ok(arg.to_string());
+            }
+            // Otherwise look up as a remote name
+            if let Some(remote) = self.remotes.get(arg) {
+                return Ok(remote.url.clone());
+            }
+            bail!("unknown registry remote: {arg}");
+        }
+
+        // Fall back to default remote
+        if let Some(ref default_name) = self.default {
+            if let Some(remote) = self.remotes.get(default_name) {
+                return Ok(remote.url.clone());
+            }
+            bail!(
+                "default registry remote '{}' not found in config",
+                default_name
+            );
+        }
+
+        bail!("no registry configured: use --registry or set [registry] in config")
+    }
 }
 
 impl Config {
@@ -169,6 +218,23 @@ impl Config {
         if let Ok(v) = env::var("ATAKIT_SESSION_REGISTRY") {
             if !v.is_empty() {
                 self.publish.session_registry = Some(v);
+            }
+        }
+        if let Ok(v) = env::var("ATAKIT_REGISTRY_URL") {
+            if !v.is_empty() {
+                // If a default remote is configured, update its URL.
+                // Otherwise create a "default" remote and set it as default.
+                let remote_name = self
+                    .registry
+                    .default
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                self.registry
+                    .remotes
+                    .insert(remote_name.clone(), RemoteConfig { url: v });
+                if self.registry.default.is_none() {
+                    self.registry.default = Some(remote_name);
+                }
             }
         }
     }

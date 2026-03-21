@@ -1,20 +1,25 @@
+use std::io::{self, Write};
+
 use anyhow::{Context, Result, bail};
+use atakit_core::Env;
 use atakit_workload::cli::DeactivateArgs;
+use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
+use super::{compute_workload_id, looks_like_store_ref};
 use crate::config::Config;
 
-pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result<()> {
+pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     // Resolve RPC URL and session registry from args, config, or env
     let rpc_url = args
-        .rpc_url
+        .rpc_url.clone()
         .or_else(|| config.publish.rpc_url.clone())
         .ok_or_else(|| anyhow::anyhow!(
             "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
         ))?;
 
     let session_registry_str = args
-        .session_registry
+        .session_registry.clone()
         .or_else(|| config.publish.session_registry.clone())
         .ok_or_else(|| anyhow::anyhow!(
             "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
@@ -24,7 +29,7 @@ pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result
         session_registry_str.parse().context("invalid session registry address")?;
 
     // Resolve owner private key: CLI arg > key file from config
-    let private_key_raw = match args.owner_key {
+    let private_key_raw = match args.owner_key.clone() {
         Some(k) => k,
         None => match config.publish.owner_key_file {
             Some(ref path) => crate::config::read_key_file(path)?,
@@ -39,49 +44,22 @@ pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result
     let signer_address = signer.address();
     println!("Signer: {}", format!("{signer_address}").dimmed());
 
-    // Inspect workload to get name+version
-    let engine = match args.engine {
-        Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
-        None => None,
-    };
+    // Resolve workload identity: name+version or workload ID
+    let (name, version, workload_id) = resolve_workload_identity(
+        &args, env, config, verbose,
+    ).await?;
 
-    let dir = match args.dir {
-        Some(d) => std::fs::canonicalize(d)?,
-        None => std::env::current_dir()?,
-    };
-
-    let archive = match args.archive {
-        Some(a) => a,
-        None => super::find_versioned_archive(&dir)?,
-    };
-
-    let opts = atakit_workload::InspectOptions {
-        archive: Some(archive),
-        workload_dir: None,
-        engine,
-        verbose,
-    };
-
-    let result = atakit_workload::inspect_workload(&opts).await?;
-    let manifest = &result.manifest;
+    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
 
     println!(
         "Workload: {} {}",
-        manifest.meta.name.green().bold(),
-        manifest.meta.version,
+        name.green().bold(),
+        version,
     );
-
-    let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
     // Resolve relay key: CLI arg > key file from config
-    let relay_key_raw = match args.relay_key {
+    let relay_key_raw = match args.relay_key.clone() {
         Some(k) => k,
         None => match config.publish.relay_key_file {
             Some(ref path) => crate::config::read_key_file(path)?,
@@ -114,6 +92,15 @@ pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result
 
     // Check if workload is already revoked
     if let Ok(true) = registry.is_workload_revoked(workload_id).await {
+        // Update store to reflect revoked state
+        let store = WorkloadStore::new(&env.workload_dir);
+        if let Ok(Some(entry)) = store.get(&name, &version) {
+            if !entry.meta.revoked {
+                let mut meta = entry.meta;
+                meta.revoked = true;
+                let _ = store.save_meta(&meta);
+            }
+        }
         println!();
         println!(
             "{}",
@@ -121,6 +108,25 @@ pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result
         );
         println!("  {:<18}{}", "Workload ID:", workload_id_hex);
         return Ok(());
+    }
+
+    // Confirmation prompt
+    if !args.yes {
+        println!();
+        print!(
+            "Deactivate {} {}? This cannot be undone. [y/N] ",
+            name.bold(),
+            version,
+        );
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
     }
 
     println!("Submitting deactivateWorkload transaction...");
@@ -140,5 +146,96 @@ pub async fn run(args: DeactivateArgs, config: &Config, verbose: bool) -> Result
         hex::encode(tx_hash),
     );
 
+    // Mark as revoked in the local store if entry exists
+    let store = WorkloadStore::new(&env.workload_dir);
+    if let Ok(Some(entry)) = store.get(&name, &version) {
+        let mut meta = entry.meta;
+        meta.revoked = true;
+        let _ = store.save_meta(&meta);
+    }
+
     Ok(())
+}
+
+/// Resolve the workload identity from the positional arg.
+/// Accepts: name:version, 0x<workload_id>, path to .atawl, or auto-detect from dir.
+async fn resolve_workload_identity(
+    args: &DeactivateArgs,
+    env: &Env,
+    config: &Config,
+    verbose: bool,
+) -> Result<(String, String, alloy_ext::core::primitives::B256)> {
+    if let Some(ref archive_arg) = args.archive {
+        let s = archive_arg.to_string_lossy();
+
+        // 0x<workload_id> (66 chars)
+        if s.starts_with("0x") && s.len() == 66 {
+            let id_hex = s.strip_prefix("0x").unwrap();
+            let bytes: [u8; 32] = hex::decode(id_hex)
+                .context("invalid workload ID hex")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("workload ID must be 32 bytes"))?;
+            let workload_id = alloy_ext::core::primitives::B256::from(bytes);
+            // Try store lookup for name+version, fall back to "unknown"
+            let store = WorkloadStore::new(&env.workload_dir);
+            if let Some(entry) = store.get_by_id(&s)? {
+                return Ok((entry.meta.name, entry.meta.version, workload_id));
+            }
+            // Can't resolve name+version without chain query here,
+            // but we need them for display. Use placeholders - the chain
+            // will verify the ID.
+            return Ok(("(unknown)".to_string(), "".to_string(), workload_id));
+        }
+
+        // name:version store ref
+        if looks_like_store_ref(&s) {
+            let (name, version) = s
+                .split_once(':')
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .unwrap();
+            let workload_id = compute_workload_id(&name, &version);
+            return Ok((name, version, workload_id));
+        }
+
+        // File path - inspect archive
+        return resolve_from_archive(archive_arg, args, config, verbose).await;
+    }
+
+    // No positional arg - auto-detect from dir
+    let dir = match args.dir {
+        Some(ref d) => std::fs::canonicalize(d)?,
+        None => std::env::current_dir()?,
+    };
+    let archive = super::find_versioned_archive(&dir)?;
+    resolve_from_archive(&archive, args, config, verbose).await
+}
+
+async fn resolve_from_archive(
+    archive: &std::path::Path,
+    args: &DeactivateArgs,
+    config: &Config,
+    verbose: bool,
+) -> Result<(String, String, alloy_ext::core::primitives::B256)> {
+    let engine = match args.engine {
+        Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
+        None if config.build.container_engine != "auto" => {
+            Some(atakit_workload::ContainerEngine::from_str_opt(
+                &config.build.container_engine,
+            )?)
+        }
+        None => None,
+    };
+
+    let opts = atakit_workload::InspectOptions {
+        archive: Some(archive.to_path_buf()),
+        workload_dir: None,
+        engine,
+        verbose,
+    };
+
+    let result = atakit_workload::inspect_workload(&opts).await?;
+    let name = result.manifest.meta.name.clone();
+    let version = result.manifest.meta.version.clone();
+    let workload_id = compute_workload_id(&name, &version);
+    Ok((name, version, workload_id))
 }

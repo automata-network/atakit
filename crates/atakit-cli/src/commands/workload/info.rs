@@ -1,12 +1,14 @@
 use anyhow::Result;
+use atakit_core::Env;
 use atakit_workload::cli::InfoArgs;
 use atakit_workload::manifest::{Manifest, ManifestFirewallAllow};
+use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
-use super::find_archive;
+use super::{find_archive, looks_like_store_ref};
 use crate::config::Config;
 
-pub async fn run(args: InfoArgs, config: &Config, verbose: bool) -> Result<()> {
+pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
         None if config.build.container_engine != "auto" => {
@@ -17,12 +19,32 @@ pub async fn run(args: InfoArgs, config: &Config, verbose: bool) -> Result<()> {
         None => None,
     };
 
-    let opts = if let Some(archive) = args.archive {
-        atakit_workload::InspectOptions {
-            archive: Some(archive),
-            workload_dir: None,
-            engine,
-            verbose,
+    let opts = if let Some(ref archive_arg) = args.archive {
+        // Check if it looks like a store reference (name:version)
+        let archive_str = archive_arg.to_string_lossy();
+        if looks_like_store_ref(&archive_str) {
+            let store = WorkloadStore::new(&env.workload_dir);
+            let (name, version) = archive_str
+                .split_once(':')
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .unwrap();
+            let blob = store.blob_path(&name, &version);
+            if !blob.exists() {
+                anyhow::bail!("no archive blob for {name}:{version} in store");
+            }
+            atakit_workload::InspectOptions {
+                archive: Some(blob),
+                workload_dir: None,
+                engine,
+                verbose,
+            }
+        } else {
+            atakit_workload::InspectOptions {
+                archive: Some(archive_arg.clone()),
+                workload_dir: None,
+                engine,
+                verbose,
+            }
         }
     } else {
         // Dir mode: explicit --dir or default to cwd
@@ -50,8 +72,70 @@ pub async fn run(args: InfoArgs, config: &Config, verbose: bool) -> Result<()> {
     };
 
     let result = atakit_workload::inspect_workload(&opts).await?;
-    print_info(&result.manifest, &result.pcr23);
+    let name = &result.manifest.meta.name;
+    let version = &result.manifest.meta.version;
+
+    // Check on-chain status if RPC is configured
+    let on_chain_status = refresh_chain_status(name, version, env, config).await;
+
+    print_info(&result.manifest, &result.pcr23, on_chain_status.as_deref());
     Ok(())
+}
+
+/// Query on-chain revocation status. Updates the store if status changed.
+/// Returns None if RPC is not configured or query fails.
+async fn refresh_chain_status(
+    name: &str,
+    version: &str,
+    env: &Env,
+    config: &Config,
+) -> Option<String> {
+    let rpc_url = config.publish.rpc_url.as_deref()?;
+    let session_registry_str = config.publish.session_registry.as_deref()?;
+    let session_registry_address: alloy_ext::core::primitives::Address =
+        session_registry_str.parse().ok()?;
+
+    let workload_id = super::compute_workload_id(name, version);
+
+    let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
+        rpc_url: rpc_url.to_string(),
+        relay_key: None,
+        session_registry_address,
+    };
+
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .ok()?;
+    let registry = measurement.workload_registry();
+
+    // Check if registered
+    let spec = registry.get_workload_spec(workload_id).await.ok();
+    if spec.is_none() {
+        return Some("not registered".to_string());
+    }
+
+    // Check revocation
+    let revoked = registry
+        .is_workload_revoked(workload_id)
+        .await
+        .unwrap_or(false);
+
+    // Update store
+    let store = WorkloadStore::new(&env.workload_dir);
+    if let Ok(Some(entry)) = store.get(name, version) {
+        if entry.meta.revoked != revoked {
+            let mut meta = entry.meta;
+            meta.revoked = revoked;
+            let _ = store.save_meta(&meta);
+        }
+    }
+
+    if revoked {
+        Some("revoked".to_string())
+    } else {
+        Some("active".to_string())
+    }
 }
 
 fn section_header(name: &str) {
@@ -64,7 +148,7 @@ fn section_header(name: &str) {
     println!("{}", format!("{prefix}{pad}").cyan().bold());
 }
 
-fn print_info(m: &Manifest, pcr23: &str) {
+fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
     // Title
     println!(
         "{}",
@@ -193,6 +277,12 @@ fn print_info(m: &Manifest, pcr23: &str) {
     // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
     let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
     println!("  {:<18}{}", "Workload ID:", format!("0x{}", hex::encode(workload_id)).dimmed());
+    match chain_status {
+        Some("active") => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
+        Some("revoked") => println!("  {:<18}{}", "On-chain:", "revoked".red().bold()),
+        Some(s) => println!("  {:<18}{}", "On-chain:", s.dimmed()),
+        None => println!("  {:<18}{}", "On-chain:", "-".dimmed()),
+    }
 }
 
 fn print_multi(label: &str, items: &[String]) {

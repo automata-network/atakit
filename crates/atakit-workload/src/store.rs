@@ -1,0 +1,302 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::WorkloadError;
+
+/// Cached on-chain workload spec data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedChainSpec {
+    pub ttl: u64,
+    pub base_image_mode: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_image_ids: Vec<String>,
+    pub pcrs: Vec<CachedPcrSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPcrSpec {
+    pub pcr_index: u8,
+    pub verify_type: u8,
+    pub match_data: Vec<String>,
+}
+
+/// Per-workload metadata stored as `meta.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkloadMeta {
+    pub workload_id: String,
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr23: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_chain_spec: Option<CachedChainSpec>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<String>,
+    pub added_at: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// A workload entry with computed local state.
+pub struct WorkloadEntry {
+    pub meta: WorkloadMeta,
+    pub has_blob: bool,
+}
+
+/// Local workload store at `~/.local/share/atakit/workloads/`.
+///
+/// Layout: `base_dir/<name>/<version>/meta.json` + `archive.atawl`
+pub struct WorkloadStore {
+    base_dir: PathBuf,
+}
+
+impl WorkloadStore {
+    pub fn new(base_dir: &Path) -> Self {
+        Self {
+            base_dir: base_dir.to_path_buf(),
+        }
+    }
+
+    // ── Paths ──────────────────────────────────────────
+
+    fn entry_dir(&self, name: &str, version: &str) -> PathBuf {
+        self.base_dir.join(name).join(version)
+    }
+
+    pub fn meta_path(&self, name: &str, version: &str) -> PathBuf {
+        self.entry_dir(name, version).join("meta.json")
+    }
+
+    pub fn blob_path(&self, name: &str, version: &str) -> PathBuf {
+        self.entry_dir(name, version).join("archive.atawl")
+    }
+
+    // ── Read ───────────────────────────────────────────
+
+    /// List all workload entries in the store.
+    /// Returns empty vec if the base directory doesn't exist.
+    pub fn list(&self) -> Result<Vec<WorkloadEntry>, WorkloadError> {
+        if !self.base_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        let name_dirs = fs::read_dir(&self.base_dir).map_err(|e| WorkloadError::ReadStoreDir {
+            path: self.base_dir.clone(),
+            reason: e.to_string(),
+        })?;
+
+        for name_entry in name_dirs {
+            let name_entry = name_entry.map_err(|e| WorkloadError::ReadStoreDir {
+                path: self.base_dir.clone(),
+                reason: e.to_string(),
+            })?;
+            if !name_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let name_path = name_entry.path();
+            let version_dirs =
+                fs::read_dir(&name_path).map_err(|e| WorkloadError::ReadStoreDir {
+                    path: name_path.clone(),
+                    reason: e.to_string(),
+                })?;
+
+            for version_entry in version_dirs {
+                let version_entry = version_entry.map_err(|e| WorkloadError::ReadStoreDir {
+                    path: name_path.clone(),
+                    reason: e.to_string(),
+                })?;
+                if !version_entry
+                    .file_type()
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                let version_path = version_entry.path();
+                let meta_path = version_path.join("meta.json");
+                if !meta_path.exists() {
+                    continue;
+                }
+
+                let meta = self.read_meta(&meta_path)?;
+                let has_blob = version_path.join("archive.atawl").exists();
+                entries.push(WorkloadEntry { meta, has_blob });
+            }
+        }
+
+        // Sort by name, then version
+        entries.sort_by(|a, b| {
+            a.meta
+                .name
+                .cmp(&b.meta.name)
+                .then_with(|| a.meta.version.cmp(&b.meta.version))
+        });
+
+        Ok(entries)
+    }
+
+    /// Get a specific workload entry by name and version.
+    pub fn get(&self, name: &str, version: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
+        let meta_path = self.meta_path(name, version);
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+        let meta = self.read_meta(&meta_path)?;
+        let has_blob = self.blob_path(name, version).exists();
+        Ok(Some(WorkloadEntry { meta, has_blob }))
+    }
+
+    /// Find a workload entry by workload ID (hex string).
+    pub fn get_by_id(&self, workload_id: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
+        let entries = self.list()?;
+        Ok(entries
+            .into_iter()
+            .find(|e| e.meta.workload_id == workload_id))
+    }
+
+    // ── Write ──────────────────────────────────────────
+
+    /// Save metadata for a workload. Creates directories as needed.
+    pub fn save_meta(&self, meta: &WorkloadMeta) -> Result<(), WorkloadError> {
+        let dir = self.entry_dir(&meta.name, &meta.version);
+        fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
+            path: dir.clone(),
+            source: e,
+        })?;
+
+        let json = serde_json::to_string_pretty(meta).map_err(|e| WorkloadError::Json(e.to_string()))?;
+        let meta_path = dir.join("meta.json");
+        fs::write(&meta_path, json).map_err(|e| WorkloadError::WriteFile {
+            path: meta_path,
+            source: e,
+        })?;
+
+        Ok(())
+    }
+
+    /// Copy an archive file into the store. Returns the file size.
+    pub fn import_blob(
+        &self,
+        name: &str,
+        version: &str,
+        src: &Path,
+    ) -> Result<u64, WorkloadError> {
+        let dir = self.entry_dir(name, version);
+        fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
+            path: dir.clone(),
+            source: e,
+        })?;
+
+        let dest = dir.join("archive.atawl");
+        fs::copy(src, &dest).map_err(|e| WorkloadError::CopyFile {
+            from: src.to_path_buf(),
+            to: dest.clone(),
+            source: e,
+        })
+    }
+
+    /// Write raw bytes as an archive blob (for pull).
+    pub fn save_blob(
+        &self,
+        name: &str,
+        version: &str,
+        data: &[u8],
+    ) -> Result<(), WorkloadError> {
+        let dir = self.entry_dir(name, version);
+        fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
+            path: dir.clone(),
+            source: e,
+        })?;
+
+        let dest = dir.join("archive.atawl");
+        fs::write(&dest, data).map_err(|e| WorkloadError::WriteFile {
+            path: dest,
+            source: e,
+        })?;
+
+        Ok(())
+    }
+
+    // ── Delete ─────────────────────────────────────────
+
+    /// Remove an entire workload entry (metadata + blob).
+    /// Cleans up the name directory if empty afterward.
+    pub fn remove(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
+        let dir = self.entry_dir(name, version);
+        if !dir.exists() {
+            return Err(WorkloadError::StoreNotFound {
+                name: name.to_string(),
+                version: version.to_string(),
+            });
+        }
+
+        fs::remove_dir_all(&dir).map_err(|e| WorkloadError::ReadStoreDir {
+            path: dir,
+            reason: e.to_string(),
+        })?;
+
+        // Clean up parent name dir if empty
+        let name_dir = self.base_dir.join(name);
+        if name_dir.exists() {
+            if let Ok(mut entries) = fs::read_dir(&name_dir) {
+                if entries.next().is_none() {
+                    let _ = fs::remove_dir(&name_dir);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove only the archive blob, keeping metadata.
+    pub fn remove_blob(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
+        let blob = self.blob_path(name, version);
+        if !blob.exists() {
+            return Err(WorkloadError::NoBlobInStore {
+                name: name.to_string(),
+                version: version.to_string(),
+            });
+        }
+        fs::remove_file(&blob).map_err(|e| WorkloadError::ReadStoreDir {
+            path: blob,
+            reason: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    // ── Query ──────────────────────────────────────────
+
+    pub fn has_blob(&self, name: &str, version: &str) -> bool {
+        self.blob_path(name, version).exists()
+    }
+
+    pub fn exists(&self, name: &str, version: &str) -> bool {
+        self.meta_path(name, version).exists()
+    }
+
+    // ── Internal ───────────────────────────────────────
+
+    fn read_meta(&self, path: &Path) -> Result<WorkloadMeta, WorkloadError> {
+        let content = fs::read_to_string(path).map_err(|e| WorkloadError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        serde_json::from_str(&content).map_err(|e| WorkloadError::ParseMeta {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })
+    }
+}

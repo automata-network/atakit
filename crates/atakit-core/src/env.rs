@@ -26,6 +26,8 @@ pub struct Env {
     pub cache_dir: PathBuf,
     /// Local directory for storing downloaded CVM base images (`data_dir/images`).
     pub image_dir: PathBuf,
+    /// Local directory for storing workload archives and metadata (`data_dir/workloads`).
+    pub workload_dir: PathBuf,
 }
 
 /// Resolve a directory path using 3-tier priority:
@@ -79,12 +81,14 @@ impl Env {
             ".cache",
         );
         let image_dir = data_dir.join("images");
+        let workload_dir = data_dir.join("workloads");
 
         let env = Self {
             data_dir,
             config_dir,
             cache_dir,
             image_dir,
+            workload_dir,
         };
         env.ensure_dirs();
         env
@@ -94,7 +98,7 @@ impl Env {
     /// Returns a list of (path, error) pairs for any directories that could not be created.
     pub fn ensure_dirs(&self) -> Vec<(std::path::PathBuf, std::io::Error)> {
         let mut failures = Vec::new();
-        for dir in [&self.data_dir, &self.config_dir, &self.cache_dir, &self.image_dir] {
+        for dir in [&self.data_dir, &self.config_dir, &self.cache_dir, &self.image_dir, &self.workload_dir] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 failures.push((dir.clone(), e));
             }

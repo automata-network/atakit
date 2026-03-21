@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
+use atakit_core::Env;
 use atakit_workload::cli::PublishArgs;
+use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
+use super::looks_like_store_ref;
 use crate::config::Config;
 
-pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()> {
+pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     // Resolve RPC URL and session registry from args, config, or env
     let rpc_url = args
         .rpc_url
@@ -50,14 +53,28 @@ pub async fn run(args: PublishArgs, config: &Config, verbose: bool) -> Result<()
         None => None,
     };
 
-    let dir = match args.dir {
-        Some(d) => std::fs::canonicalize(d)?,
-        None => std::env::current_dir()?,
-    };
-
-    let archive = match args.archive {
-        Some(a) => a,
-        None => super::find_versioned_archive(&dir)?,
+    let archive = if let Some(ref archive_arg) = args.archive {
+        let archive_str = archive_arg.to_string_lossy();
+        if looks_like_store_ref(&archive_str) {
+            let store = WorkloadStore::new(&env.workload_dir);
+            let (name, version) = archive_str
+                .split_once(':')
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .unwrap();
+            let blob = store.blob_path(&name, &version);
+            if !blob.exists() {
+                bail!("no archive blob for {name}:{version} in store");
+            }
+            blob
+        } else {
+            archive_arg.clone()
+        }
+    } else {
+        let dir = match args.dir {
+            Some(d) => std::fs::canonicalize(d)?,
+            None => std::env::current_dir()?,
+        };
+        super::find_versioned_archive(&dir)?
     };
 
     let opts = atakit_workload::InspectOptions {

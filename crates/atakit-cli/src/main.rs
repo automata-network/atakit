@@ -95,19 +95,40 @@ async fn main() -> Result<()> {
         Command::Workload(cmd) => match cmd {
             WorkloadCommand::Create(args) => commands::workload::create::run(args),
             WorkloadCommand::Build(args) => {
-                commands::workload::build::run(args, &config, cli.verbose).await
+                commands::workload::build::run(args, &env, &config, cli.verbose).await
             }
             WorkloadCommand::Info(args) => {
-                commands::workload::info::run(args, &config, cli.verbose).await
+                commands::workload::info::run(args, &env, &config, cli.verbose).await
             }
             WorkloadCommand::Publish(args) => {
-                commands::workload::publish::run(args, &config, cli.verbose).await
+                commands::workload::publish::run(args, &env, &config, cli.verbose).await
             }
             WorkloadCommand::Deactivate(args) => {
-                commands::workload::deactivate::run(args, &config, cli.verbose).await
+                commands::workload::deactivate::run(args, &env, &config, cli.verbose).await
             }
             WorkloadCommand::Spec(args) => {
                 commands::workload::spec::run(args, &config).await
+            }
+            WorkloadCommand::Ls(args) => {
+                commands::workload::ls::run(args, &env, &config).await
+            }
+            WorkloadCommand::Pull(args) => {
+                commands::workload::pull::run(args, &env, &config).await
+            }
+            WorkloadCommand::Push(args) => {
+                commands::workload::push::run(args, &env, &config, cli.verbose).await
+            }
+            WorkloadCommand::Import(args) => {
+                commands::workload::import::run(args, &env).await
+            }
+            WorkloadCommand::Export(args) => {
+                commands::workload::export::run(args, &env)
+            }
+            WorkloadCommand::Add(args) => {
+                commands::workload::add::run(args, &env, &config).await
+            }
+            WorkloadCommand::Rm(args) => {
+                commands::workload::rm::run(args, &env)
             }
         },
     }
