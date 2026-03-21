@@ -22,7 +22,7 @@ atakit-ng/
 
 Minimal shared crate with no heavy dependencies. Provides:
 
-- **`Env`** -- runtime context holding XDG-compliant paths (`data_dir`, `config_dir`, `cache_dir`, `image_dir`). Only global state, no project-scoped config. Resolution: `ATAKIT_*_DIR` > `XDG_*_HOME/atakit` > `$HOME/<default>/atakit`.
+- **`Env`** -- runtime context holding XDG-compliant paths (`data_dir`, `config_dir`, `cache_dir`, `image_dir`, `workload_dir`). Only global state, no project-scoped config. Resolution: `ATAKIT_*_DIR` > `XDG_*_HOME/atakit` > `$HOME/<default>/atakit`.
 - **`ProgressReporter` + `ProgressHandle`** -- traits for pluggable progress reporting. Includes `NullReporter` no-op impl. This is the key abstraction that lets CLI use indicatif while TUI can use ratatui gauges.
 
 ### atakit-image
@@ -49,14 +49,16 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Archive creation** -- `StagingDir` assembly + tar.gz `.atawl` archive output
 - **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
-- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`, `InfoArgs`, `PublishArgs`, `DeactivateArgs`, `SpecArgs`
+- **Local store** -- `WorkloadStore` for local workload archive and metadata management (`workload_dir/<name>/<version>/meta.json` + `archive.atawl`)
+- **Registry client** -- `RegistryClient` for HTTP workload registry API (upload, download, list, metadata)
+- **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`, `InfoArgs`, `PublishArgs`, `DeactivateArgs`, `SpecArgs`, `LsArgs`, `PullArgs`, `PushArgs`, `ImportArgs`, `ExportArgs`, `AddArgs`, `RmArgs`
 
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_measurements`, `generate_platform_profile`, `platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`.
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_measurements`, `generate_platform_profile`, `platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`.
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
 

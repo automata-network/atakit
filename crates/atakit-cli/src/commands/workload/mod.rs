@@ -1,14 +1,22 @@
+pub mod add;
 pub mod build;
 pub mod create;
 pub mod deactivate;
+pub mod export;
+pub mod import;
 pub mod info;
+pub mod ls;
 pub mod publish;
+pub mod pull;
+pub mod push;
+pub mod rm;
 pub mod spec;
 
 use std::path::{Path, PathBuf};
 
 use alloy_ext::core::primitives::{B256, keccak256};
 use alloy_ext::core::sol_types::SolValue;
+use atakit_workload::WorkloadStore;
 
 /// Look for a single `.atawl` file in the directory.
 /// Returns `None` if zero or multiple archives are found.
@@ -51,4 +59,51 @@ pub fn compute_workload_id(name: &str, version: &str) -> B256 {
     let domain = keccak256("CVM_WORKLOAD_V1");
     let encoded = (domain, name.to_string(), version.to_string()).abi_encode_params();
     keccak256(&encoded)
+}
+
+/// Parsed workload reference: either `name:version` or a hex workload ID.
+pub enum WorkloadRef {
+    NameVersion { name: String, version: String },
+    Id(String),
+}
+
+/// Parse a workload reference string.
+///
+/// Accepts `name:version` or `0x<64-hex-chars>` (workload ID).
+pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
+    if s.starts_with("0x") && s.len() == 66 {
+        Ok(WorkloadRef::Id(s.to_string()))
+    } else if let Some((name, version)) = s.split_once(':') {
+        if name.is_empty() || version.is_empty() {
+            anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'");
+        }
+        Ok(WorkloadRef::NameVersion {
+            name: name.to_string(),
+            version: version.to_string(),
+        })
+    } else {
+        anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'")
+    }
+}
+
+/// Resolve a WorkloadRef to (name, version), using the store for ID lookups.
+pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(String, String)> {
+    match r {
+        WorkloadRef::NameVersion { name, version } => Ok((name.clone(), version.clone())),
+        WorkloadRef::Id(id) => {
+            let entry = store
+                .get_by_id(id)?
+                .ok_or_else(|| anyhow::anyhow!("workload ID not found in store: {id}"))?;
+            Ok((entry.meta.name, entry.meta.version))
+        }
+    }
+}
+
+/// Check if a string looks like a `name:version` store reference (not a file path).
+pub fn looks_like_store_ref(s: &str) -> bool {
+    // Contains a colon and doesn't look like a file path
+    s.contains(':')
+        && !s.starts_with('/')
+        && !s.starts_with('.')
+        && !s.ends_with(".atawl")
 }

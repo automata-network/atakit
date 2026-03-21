@@ -26,3 +26,10 @@
 # owner_key_file = "~/.config/atakit/owner_key"
 # Path to file containing the relay private key (hex). chmod 600 recommended.
 # relay_key_file = "~/.config/atakit/relay_key"
+
+[registry]
+# Default registry remote name (or set ATAKIT_REGISTRY_URL).
+# default = "main"
+# Named registry remotes.
+# [registry.remotes.main]
+# url = "https://registry.example.com"

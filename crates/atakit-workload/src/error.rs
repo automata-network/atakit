@@ -77,4 +77,30 @@ pub enum WorkloadError {
 
     #[error("failed to serialize manifest: {0}")]
     SerializeManifest(#[from] toml::ser::Error),
+
+    // ── store ────────────────────────────────────────────
+    #[error("workload not found in store: {name}:{version}")]
+    StoreNotFound { name: String, version: String },
+
+    #[error("workload already exists in store: {name}:{version}")]
+    StoreExists { name: String, version: String },
+
+    #[error("no archive blob for workload: {name}:{version}")]
+    NoBlobInStore { name: String, version: String },
+
+    #[error("failed to read store directory {path}: {reason}")]
+    ReadStoreDir { path: PathBuf, reason: String },
+
+    #[error("failed to parse metadata {path}: {reason}")]
+    ParseMeta { path: PathBuf, reason: String },
+
+    // ── registry ─────────────────────────────────────────
+    #[error("registry error: {message}")]
+    Registry { message: String },
+
+    #[error("registry request failed: {reason}")]
+    RegistryRequest { reason: String },
+
+    #[error("JSON serialization error: {0}")]
+    Json(String),
 }
