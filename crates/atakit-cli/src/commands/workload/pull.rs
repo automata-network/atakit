@@ -47,20 +47,30 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         .await
         .context("failed to download archive")?;
 
-    // Inspect downloaded archive to extract PCR23 and verify identity
-    let inspection = inspect_file(&tmp_path)?;
+    // Inspect downloaded archive using the shared library inspector
+    let inspect_opts = atakit_workload::InspectOptions {
+        archive: Some(tmp_path.clone()),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    };
+    let inspection = atakit_workload::inspect_workload(&inspect_opts)
+        .await
+        .context("failed to inspect downloaded archive")?;
     let pcr23 = &inspection.pcr23;
+    let archive_name = &inspection.manifest.meta.name;
+    let archive_version = &inspection.manifest.meta.version;
 
     // Verify the archive's manifest matches the requested identity
-    let expected_id = compute_workload_id(&inspection.name, &inspection.version);
+    let expected_id = compute_workload_id(archive_name, archive_version);
     let expected_id_hex = format!("0x{}", hex::encode(expected_id));
     if expected_id_hex != workload_id_hex {
         anyhow::bail!(
             "archive identity mismatch: requested {name}:{version} ({}), \
              but archive contains {}:{} ({})",
             &workload_id_hex[..10],
-            inspection.name,
-            inspection.version,
+            archive_name,
+            archive_version,
             &expected_id_hex[..10],
         );
     }
@@ -108,62 +118,6 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     println!("  {:<18}{}", "PCR23:", pcr23.dimmed());
 
     Ok(())
-}
-
-struct ArchiveInspection {
-    name: String,
-    version: String,
-    pcr23: String,
-}
-
-/// Inspect an archive file on disk to extract name, version, and PCR23.
-fn inspect_file(path: &std::path::Path) -> Result<ArchiveInspection> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?;
-        if entry_path.file_name().is_some_and(|f| f == "manifest.toml") {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            let digest = hasher.finalize();
-            let pcr23 = format!("0x{:x}", digest);
-
-            // Parse manifest to extract name and version
-            let manifest: toml::Value = toml::from_str(&content)
-                .context("failed to parse manifest.toml from archive")?;
-            let meta = manifest
-                .get("meta")
-                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing [meta] section"))?;
-            let name = meta
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing meta.name"))?
-                .to_string();
-            let version = meta
-                .get("version")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("manifest.toml missing meta.version"))?
-                .to_string();
-
-            return Ok(ArchiveInspection {
-                name,
-                version,
-                pcr23,
-            });
-        }
-    }
-
-    anyhow::bail!("manifest.toml not found in downloaded archive")
 }
 
 async fn verify_pcr23(workload_id_hex: &str, pcr23: &str, config: &Config) -> Result<()> {

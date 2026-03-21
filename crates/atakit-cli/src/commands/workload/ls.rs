@@ -75,14 +75,14 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 let filters = RegistryFilters {
                     owner: args.owner.clone(),
                     name: None,
-                    name_prefix: args.name.clone(),
+                    name_prefix: None,
                     limit: args.limit,
                     offset: None,
                 };
                 match client.list(&filters).await {
                     Ok(resp) => {
                         for rm in resp.workloads {
-                            // Client-side substring filter (prefix query is broader)
+                            // Client-side substring filter (registry has no substring query)
                             if let Some(ref name_filter) = args.name {
                                 if !rm.name.contains(name_filter.as_str()) {
                                     continue;

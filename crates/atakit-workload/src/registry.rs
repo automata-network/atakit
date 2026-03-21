@@ -149,7 +149,7 @@ impl RegistryClient {
         dest: &std::path::Path,
     ) -> Result<u64, WorkloadError> {
         use futures_util::StreamExt;
-        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
 
         let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
         let resp = self
@@ -175,10 +175,12 @@ impl RegistryClient {
         }
 
         let mut file =
-            std::fs::File::create(dest).map_err(|e| WorkloadError::WriteFile {
-                path: dest.to_path_buf(),
-                source: e,
-            })?;
+            tokio::fs::File::create(dest)
+                .await
+                .map_err(|e| WorkloadError::WriteFile {
+                    path: dest.to_path_buf(),
+                    source: e,
+                })?;
 
         let mut size: u64 = 0;
         let mut stream = resp.bytes_stream();
@@ -186,7 +188,7 @@ impl RegistryClient {
             let chunk = chunk.map_err(|e| WorkloadError::RegistryRequest {
                 reason: format!("failed to read download stream: {e}"),
             })?;
-            file.write_all(&chunk).map_err(|e| WorkloadError::WriteFile {
+            file.write_all(&chunk).await.map_err(|e| WorkloadError::WriteFile {
                 path: dest.to_path_buf(),
                 source: e,
             })?;
