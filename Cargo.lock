@@ -1005,6 +1005,7 @@ dependencies = [
  "atakit-core",
  "clap",
  "flate2",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

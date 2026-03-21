@@ -89,14 +89,18 @@ pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
                 "invalid workload name in reference: must be alphanumeric + hyphens, got '{name}'"
             );
         }
-        // Validate version: starts with 'v', no path separators or '..'
-        if !version.starts_with('v')
-            || version.contains('/')
-            || version.contains('\\')
-            || version.contains("..")
+        // Validate version: starts with 'v', at least 2 chars, only [A-Za-z0-9._-] after 'v'
+        if version.len() < 2 || !version.starts_with('v') {
+            anyhow::bail!(
+                "invalid workload version in reference: must start with 'v' and be at least 2 characters, got '{version}'"
+            );
+        }
+        if !version[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
             anyhow::bail!(
-                "invalid workload version in reference: must start with 'v' and contain no path separators, got '{version}'"
+                "invalid workload version in reference: only alphanumeric, '.', '-', '_' allowed after 'v', got '{version}'"
             );
         }
         Ok(WorkloadRef::NameVersion {

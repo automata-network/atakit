@@ -55,17 +55,20 @@ impl RegistryClient {
     }
 
     /// Upload a workload archive to the registry.
+    ///
+    /// Accepts any body type convertible to `reqwest::Body`, including `Vec<u8>`,
+    /// `tokio::fs::File`, or a streaming body for large archives.
     pub async fn upload(
         &self,
         workload_id: &str,
-        data: Vec<u8>,
+        body: impl Into<reqwest::Body>,
     ) -> Result<RegistryMeta, WorkloadError> {
         let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
         let resp = self
             .client
             .put(&url)
             .header("content-type", "application/octet-stream")
-            .body(data)
+            .body(body)
             .send()
             .await
             .map_err(|e| WorkloadError::RegistryRequest {
@@ -136,6 +139,61 @@ impl RegistryClient {
         })?;
 
         Ok((bytes.to_vec(), filename))
+    }
+
+    /// Download a workload archive from the registry, streaming to a file.
+    /// Returns the file size.
+    pub async fn download_to_file(
+        &self,
+        workload_id: &str,
+        dest: &std::path::Path,
+    ) -> Result<u64, WorkloadError> {
+        use futures_util::StreamExt;
+        use std::io::Write;
+
+        let url = format!("{}/v1/workloads/{}", self.base_url, workload_id);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| WorkloadError::RegistryRequest {
+                reason: e.to_string(),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(api_err) = serde_json::from_str::<RegistryApiError>(&body) {
+                return Err(WorkloadError::Registry {
+                    message: format!("{}: {}", api_err.error, api_err.message),
+                });
+            }
+            return Err(WorkloadError::Registry {
+                message: format!("HTTP {status}: {body}"),
+            });
+        }
+
+        let mut file =
+            std::fs::File::create(dest).map_err(|e| WorkloadError::WriteFile {
+                path: dest.to_path_buf(),
+                source: e,
+            })?;
+
+        let mut size: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| WorkloadError::RegistryRequest {
+                reason: format!("failed to read download stream: {e}"),
+            })?;
+            file.write_all(&chunk).map_err(|e| WorkloadError::WriteFile {
+                path: dest.to_path_buf(),
+                source: e,
+            })?;
+            size += chunk.len() as u64;
+        }
+
+        Ok(size)
     }
 
     /// Get metadata for a workload from the registry.

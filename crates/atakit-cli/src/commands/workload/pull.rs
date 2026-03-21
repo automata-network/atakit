@@ -38,17 +38,17 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Download archive
+    // Download archive to temp file (streaming, bounded memory)
     println!("Downloading {}:{}...", name.green().bold(), version);
-    let (data, _filename) = client
-        .download(&workload_id_hex)
+    let tmp_dir = tempfile::tempdir().context("failed to create temp directory")?;
+    let tmp_path = tmp_dir.path().join("download.atawl");
+    let archive_size = client
+        .download_to_file(&workload_id_hex, &tmp_path)
         .await
         .context("failed to download archive")?;
 
-    let archive_size = data.len() as u64;
-
     // Inspect downloaded archive to extract PCR23 and verify identity
-    let inspection = inspect_bytes(&data)?;
+    let inspection = inspect_file(&tmp_path)?;
     let pcr23 = &inspection.pcr23;
 
     // Verify the archive's manifest matches the requested identity
@@ -71,8 +71,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         verify_pcr23(&workload_id_hex, pcr23, config).await?;
     }
 
-    // Save blob and metadata (merge into existing meta to preserve chain data)
-    store.save_blob(&name, &version, &data)?;
+    // Import blob from temp file into store
+    store.import_blob(&name, &version, &tmp_path)?;
 
     let now = chrono::Local::now().to_rfc3339();
     let meta = match store.load_meta(&name, &version)? {
@@ -116,18 +116,20 @@ struct ArchiveInspection {
     pcr23: String,
 }
 
-/// Inspect archive bytes in-memory to extract name, version, and PCR23.
-fn inspect_bytes(data: &[u8]) -> Result<ArchiveInspection> {
+/// Inspect an archive file on disk to extract name, version, and PCR23.
+fn inspect_file(path: &std::path::Path) -> Result<ArchiveInspection> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    let decoder = flate2::read::GzDecoder::new(data);
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
-        if path.file_name().is_some_and(|f| f == "manifest.toml") {
+        let entry_path = entry.path()?;
+        if entry_path.file_name().is_some_and(|f| f == "manifest.toml") {
             let mut content = String::new();
             entry.read_to_string(&mut content)?;
 

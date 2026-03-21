@@ -243,6 +243,7 @@ impl WorkloadStore {
     // ── Write ──────────────────────────────────────────
 
     /// Save metadata for a workload. Creates directories as needed.
+    /// Uses temp-file + atomic rename to prevent corruption and symlink following.
     pub fn save_meta(&self, meta: &WorkloadMeta) -> Result<(), WorkloadError> {
         let dir = self.entry_dir(&meta.name, &meta.version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
@@ -252,7 +253,12 @@ impl WorkloadStore {
 
         let json = serde_json::to_string_pretty(meta).map_err(|e| WorkloadError::Json(e.to_string()))?;
         let meta_path = dir.join("meta.json");
-        fs::write(&meta_path, json).map_err(|e| WorkloadError::WriteFile {
+        let tmp_path = dir.join("meta.json.tmp");
+        fs::write(&tmp_path, json).map_err(|e| WorkloadError::WriteFile {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        fs::rename(&tmp_path, &meta_path).map_err(|e| WorkloadError::WriteFile {
             path: meta_path,
             source: e,
         })?;
@@ -261,6 +267,7 @@ impl WorkloadStore {
     }
 
     /// Copy an archive file into the store. Returns the file size.
+    /// Uses temp-file + atomic rename to prevent corruption and symlink following.
     pub fn import_blob(
         &self,
         name: &str,
@@ -273,15 +280,22 @@ impl WorkloadStore {
             source: e,
         })?;
 
+        let tmp = dir.join("archive.atawl.tmp");
         let dest = dir.join("archive.atawl");
-        fs::copy(src, &dest).map_err(|e| WorkloadError::CopyFile {
+        let size = fs::copy(src, &tmp).map_err(|e| WorkloadError::CopyFile {
             from: src.to_path_buf(),
-            to: dest.clone(),
+            to: tmp.clone(),
             source: e,
-        })
+        })?;
+        fs::rename(&tmp, &dest).map_err(|e| WorkloadError::WriteFile {
+            path: dest,
+            source: e,
+        })?;
+        Ok(size)
     }
 
     /// Write raw bytes as an archive blob (for pull).
+    /// Uses temp-file + atomic rename to prevent corruption and symlink following.
     pub fn save_blob(
         &self,
         name: &str,
@@ -294,8 +308,13 @@ impl WorkloadStore {
             source: e,
         })?;
 
+        let tmp = dir.join("archive.atawl.tmp");
         let dest = dir.join("archive.atawl");
-        fs::write(&dest, data).map_err(|e| WorkloadError::WriteFile {
+        fs::write(&tmp, data).map_err(|e| WorkloadError::WriteFile {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        fs::rename(&tmp, &dest).map_err(|e| WorkloadError::WriteFile {
             path: dest,
             source: e,
         })?;
@@ -316,10 +335,7 @@ impl WorkloadStore {
             });
         }
 
-        fs::remove_dir_all(&dir).map_err(|e| WorkloadError::ReadStoreDir {
-            path: dir,
-            reason: e.to_string(),
-        })?;
+        fs::remove_dir_all(&dir).map_err(WorkloadError::from)?;
 
         // Clean up parent name dir if empty
         let name_dir = self.base_dir.join(name);
@@ -343,10 +359,7 @@ impl WorkloadStore {
                 version: version.to_string(),
             });
         }
-        fs::remove_file(&blob).map_err(|e| WorkloadError::ReadStoreDir {
-            path: blob,
-            reason: e.to_string(),
-        })?;
+        fs::remove_file(&blob).map_err(WorkloadError::from)?;
         Ok(())
     }
 
