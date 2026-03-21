@@ -74,14 +74,20 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 let client = RegistryClient::new(&url);
                 let filters = RegistryFilters {
                     owner: args.owner.clone(),
-                    name: args.name.clone(),
-                    name_prefix: None,
+                    name: None,
+                    name_prefix: args.name.clone(),
                     limit: args.limit,
                     offset: None,
                 };
                 match client.list(&filters).await {
                     Ok(resp) => {
                         for rm in resp.workloads {
+                            // Client-side substring filter (prefix query is broader)
+                            if let Some(ref name_filter) = args.name {
+                                if !rm.name.contains(name_filter.as_str()) {
+                                    continue;
+                                }
+                            }
                             // Skip if we already have this entry from local
                             if entries.iter().any(|e| {
                                 e.name == rm.name && e.version == rm.version
