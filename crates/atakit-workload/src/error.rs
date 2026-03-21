@@ -88,6 +88,9 @@ pub enum WorkloadError {
     #[error("no archive blob for workload: {name}:{version}")]
     NoBlobInStore { name: String, version: String },
 
+    #[error("store path escapes base directory: {path}")]
+    StorePathTraversal { path: PathBuf },
+
     #[error("failed to read store directory {path}: {reason}")]
     ReadStoreDir { path: PathBuf, reason: String },
 

@@ -1,9 +1,28 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::WorkloadError;
+
+/// Validate that a name or version component is safe for use as a path segment.
+/// Rejects empty strings, path separators, `..`, and `.`.
+fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains('/')
+        || s.contains('\\')
+        || Path::new(s)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(WorkloadError::StorePathTraversal {
+            path: PathBuf::from(format!("{label}: {s}")),
+        });
+    }
+    Ok(())
+}
 
 /// Cached on-chain workload spec data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,16 +88,35 @@ impl WorkloadStore {
 
     // ── Paths ──────────────────────────────────────────
 
-    fn entry_dir(&self, name: &str, version: &str) -> PathBuf {
-        self.base_dir.join(name).join(version)
+    fn entry_dir(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
+        validate_path_component(name, "name")?;
+        validate_path_component(version, "version")?;
+        let path = self.base_dir.join(name).join(version);
+        // If the path already exists, do a real canonicalize check
+        if path.exists() {
+            let canon = path.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
+                path: path.clone(),
+                reason: e.to_string(),
+            })?;
+            let canon_base = self.base_dir.canonicalize().map_err(|e| {
+                WorkloadError::ReadStoreDir {
+                    path: self.base_dir.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            if !canon.starts_with(&canon_base) {
+                return Err(WorkloadError::StorePathTraversal { path });
+            }
+        }
+        Ok(path)
     }
 
-    pub fn meta_path(&self, name: &str, version: &str) -> PathBuf {
-        self.entry_dir(name, version).join("meta.json")
+    pub fn meta_path(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(name, version)?.join("meta.json"))
     }
 
-    pub fn blob_path(&self, name: &str, version: &str) -> PathBuf {
-        self.entry_dir(name, version).join("archive.atawl")
+    pub fn blob_path(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(name, version)?.join("archive.atawl"))
     }
 
     // ── Read ───────────────────────────────────────────
@@ -150,12 +188,12 @@ impl WorkloadStore {
 
     /// Get a specific workload entry by name and version.
     pub fn get(&self, name: &str, version: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
-        let meta_path = self.meta_path(name, version);
+        let meta_path = self.meta_path(name, version)?;
         if !meta_path.exists() {
             return Ok(None);
         }
         let meta = self.read_meta(&meta_path)?;
-        let has_blob = self.blob_path(name, version).exists();
+        let has_blob = self.blob_path(name, version)?.exists();
         Ok(Some(WorkloadEntry { meta, has_blob }))
     }
 
@@ -167,11 +205,20 @@ impl WorkloadStore {
             .find(|e| e.meta.workload_id == workload_id))
     }
 
+    /// Load metadata for a workload, if it exists.
+    pub fn load_meta(&self, name: &str, version: &str) -> Result<Option<WorkloadMeta>, WorkloadError> {
+        let path = self.meta_path(name, version)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_meta(&path).map(Some)
+    }
+
     // ── Write ──────────────────────────────────────────
 
     /// Save metadata for a workload. Creates directories as needed.
     pub fn save_meta(&self, meta: &WorkloadMeta) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(&meta.name, &meta.version);
+        let dir = self.entry_dir(&meta.name, &meta.version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -194,7 +241,7 @@ impl WorkloadStore {
         version: &str,
         src: &Path,
     ) -> Result<u64, WorkloadError> {
-        let dir = self.entry_dir(name, version);
+        let dir = self.entry_dir(name, version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -215,7 +262,7 @@ impl WorkloadStore {
         version: &str,
         data: &[u8],
     ) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(name, version);
+        let dir = self.entry_dir(name, version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -235,7 +282,7 @@ impl WorkloadStore {
     /// Remove an entire workload entry (metadata + blob).
     /// Cleans up the name directory if empty afterward.
     pub fn remove(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(name, version);
+        let dir = self.entry_dir(name, version)?;
         if !dir.exists() {
             return Err(WorkloadError::StoreNotFound {
                 name: name.to_string(),
@@ -263,7 +310,7 @@ impl WorkloadStore {
 
     /// Remove only the archive blob, keeping metadata.
     pub fn remove_blob(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
-        let blob = self.blob_path(name, version);
+        let blob = self.blob_path(name, version)?;
         if !blob.exists() {
             return Err(WorkloadError::NoBlobInStore {
                 name: name.to_string(),
@@ -280,11 +327,11 @@ impl WorkloadStore {
     // ── Query ──────────────────────────────────────────
 
     pub fn has_blob(&self, name: &str, version: &str) -> bool {
-        self.blob_path(name, version).exists()
+        self.blob_path(name, version).map(|p| p.exists()).unwrap_or(false)
     }
 
     pub fn exists(&self, name: &str, version: &str) -> bool {
-        self.meta_path(name, version).exists()
+        self.meta_path(name, version).map(|p| p.exists()).unwrap_or(false)
     }
 
     // ── Internal ───────────────────────────────────────

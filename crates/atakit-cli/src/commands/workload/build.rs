@@ -64,19 +64,29 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
 
         let size = store.import_blob(name, version, &result.archive_path)?;
 
+        // Merge into existing meta to preserve chain data from `workload add`
         let workload_id = super::compute_workload_id(name, version);
         let now = chrono::Local::now().to_rfc3339();
-        let meta = WorkloadMeta {
-            workload_id: format!("0x{}", hex::encode(workload_id)),
-            name: name.clone(),
-            version: version.clone(),
-            pcr23: Some(inspect.pcr23),
-            owner: None,
-            archive_size: Some(size),
-            on_chain_spec: None,
-            revoked: false,
-            registries: Vec::new(),
-            added_at: now,
+        let meta = match store.load_meta(name, version)? {
+            Some(mut existing) => {
+                existing.workload_id = format!("0x{}", hex::encode(workload_id));
+                existing.pcr23 = Some(inspect.pcr23);
+                existing.archive_size = Some(size);
+                existing.added_at = now;
+                existing
+            }
+            None => WorkloadMeta {
+                workload_id: format!("0x{}", hex::encode(workload_id)),
+                name: name.clone(),
+                version: version.clone(),
+                pcr23: Some(inspect.pcr23),
+                owner: None,
+                archive_size: Some(size),
+                on_chain_spec: None,
+                revoked: false,
+                registries: Vec::new(),
+                added_at: now,
+            },
         };
         store.save_meta(&meta)?;
         println!("{}", "Added to local store.".green());

@@ -18,7 +18,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
                 .split_once(':')
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .unwrap();
-            let path = store.blob_path(&name, &version);
+            let path = store.blob_path(&name, &version)?;
             if !path.exists() {
                 anyhow::bail!(
                     "no archive blob for {name}:{version} in store. Run `atakit workload pull` first."

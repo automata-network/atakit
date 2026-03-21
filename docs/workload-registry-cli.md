@@ -41,9 +41,11 @@ workloads/
 
 ### Status symbols
 
-- `●` cached - has both metadata and archive blob
-- `◐` tracked - has metadata only (from `workload add`)
-- `○` remote - only exists on a remote registry
+- `◉` local+tracked - present in the local store (metadata and archive) and tracked in a registry
+- `◔` local - present in the local store only (metadata and archive), not tracked in a registry
+- `◌` tracked - tracked in a registry with local metadata only (e.g. from `workload add`)
+- `◊` remote - only exists on a remote registry, not present in the local store
+- `✗` revoked - present locally or remotely but marked as revoked
 
 ## Workload Reference Format
 
