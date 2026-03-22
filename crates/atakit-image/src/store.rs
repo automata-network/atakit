@@ -17,10 +17,11 @@ use crate::types::{ImageRef, Platform, Release};
 /// base_dir/
 ///   automata-linux/
 ///     v0.5.0/
-///       gcp_disk.tar.gz
-///       aws_disk.vmdk
-///       azure_disk.vhd
-///       secure_boot/
+///       disk_images/
+///         gcp_disk.tar.gz
+///         aws_disk.vmdk
+///         azure_disk.vhd
+///       secure_boot_certs/
 ///         PK.crt
 ///         KEK.crt
 ///         db.crt
@@ -39,7 +40,7 @@ pub struct ReleaseStatus {
     pub release: Release,
     /// Platforms whose disk images exist locally.
     pub local_platforms: Vec<Platform>,
-    /// Whether the `secure_boot/` directory exists locally.
+    /// Whether the `secure_boot_certs/` directory exists locally.
     pub local_certs: bool,
 }
 
@@ -88,14 +89,19 @@ impl ImageStore {
             .join(&image_ref.tag)
     }
 
-    /// Expected path of a disk image file (after decompression).
-    pub fn image_path(&self, image_ref: &ImageRef, platform: Platform) -> PathBuf {
-        self.tag_dir(image_ref).join(disk_filename(platform))
+    /// Directory containing disk image files for a tag.
+    pub fn disk_images_dir(&self, image_ref: &ImageRef) -> PathBuf {
+        self.tag_dir(image_ref).join("disk_images")
     }
 
-    /// Expected path of the `secure_boot/` directory for a tag.
+    /// Expected path of a disk image file (after decompression).
+    pub fn image_path(&self, image_ref: &ImageRef, platform: Platform) -> PathBuf {
+        self.disk_images_dir(image_ref).join(disk_filename(platform))
+    }
+
+    /// Directory containing secure-boot certificates for a tag.
     pub fn certs_dir(&self, image_ref: &ImageRef) -> PathBuf {
-        self.tag_dir(image_ref).join("secure_boot")
+        self.tag_dir(image_ref).join("secure_boot_certs")
     }
 
     // ── list ───────────────────────────────────────────────────────
@@ -176,9 +182,9 @@ impl ImageStore {
         progress: &dyn ProgressReporter,
     ) -> Result<Vec<PathBuf>> {
         let release = client.get_release(image_ref).await?;
-        let dir = self.tag_dir(image_ref);
+        let disk_dir = self.disk_images_dir(image_ref);
         let opts = DownloadOptions::default()
-            .dest_dir(&dir)
+            .dest_dir(&disk_dir)
             .skip_existing(true);
 
         let mut paths = Vec::new();
@@ -196,7 +202,7 @@ impl ImageStore {
             paths.push(path);
         }
 
-        // Download secure-boot certs once into a secure_boot/ subdirectory.
+        // Download secure-boot certs into secure_boot_certs/ subdirectory.
         if let Some(certs) = release.secure_boot_certs() {
             let certs_dir = self.certs_dir(image_ref);
             let certs_opts = DownloadOptions::default()
