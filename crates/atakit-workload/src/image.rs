@@ -149,7 +149,15 @@ async fn run_command_streaming(
             .await
             .map_err(WorkloadError::Io)?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            // Cap stderr to avoid unbounded memory usage from verbose container tools
+            const MAX_STDERR: usize = 8192;
+            let raw = &output.stderr;
+            let stderr = if raw.len() > MAX_STDERR {
+                let truncated = String::from_utf8_lossy(&raw[raw.len() - MAX_STDERR..]);
+                format!("... ({} bytes truncated)\n{truncated}", raw.len() - MAX_STDERR)
+            } else {
+                String::from_utf8_lossy(raw).to_string()
+            };
             return Err(WorkloadError::ContainerCommand {
                 command: label.to_string(),
                 stderr,

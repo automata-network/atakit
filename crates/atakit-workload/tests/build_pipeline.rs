@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use atakit_core::NullReporter;
-use atakit_workload::{build_workload, BuildOptions};
+use atakit_workload::{build_workload, inspect_workload, BuildOptions, InspectOptions};
 use flate2::read::GzDecoder;
 
 /// Set up a minimal workload directory using `image = { file = "..." }` so the
@@ -173,4 +173,82 @@ async fn build_is_deterministic() {
         r1.archive_hash, r2.archive_hash,
         "archive hashes must be identical for deterministic builds"
     );
+}
+
+#[tokio::test]
+async fn inspect_archive_matches_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wl_dir = setup_workload_dir(tmp.path());
+    let out_dir = tmp.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let build_result = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir,
+            output_dir: Some(out_dir),
+            engine: None,
+            verbose: false,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let inspect_result = inspect_workload(&InspectOptions {
+        archive: Some(build_result.archive_path),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(inspect_result.manifest.meta.name, "my-workload");
+    assert_eq!(inspect_result.manifest.meta.version, "v0.1.0");
+    assert!(!inspect_result.pcr23.is_empty());
+    assert!(inspect_result.pcr23.starts_with("0x"));
+    assert!(!inspect_result.manifest_hash.is_empty());
+    assert!(inspect_result.manifest_hash.starts_with("sha256:"));
+    assert!(inspect_result.manifest_raw.contains("name = \"my-workload\""));
+}
+
+#[tokio::test]
+async fn inspect_dir_matches_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wl_dir = setup_workload_dir(tmp.path());
+    let out_dir = tmp.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let build_result = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir.clone(),
+            output_dir: Some(out_dir),
+            engine: None,
+            verbose: false,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let archive_result = inspect_workload(&InspectOptions {
+        archive: Some(build_result.archive_path),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    })
+    .await
+    .unwrap();
+
+    let dir_result = inspect_workload(&InspectOptions {
+        archive: None,
+        workload_dir: Some(wl_dir),
+        engine: None,
+        verbose: false,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(archive_result.pcr23, dir_result.pcr23);
+    assert_eq!(archive_result.manifest_hash, dir_result.manifest_hash);
 }

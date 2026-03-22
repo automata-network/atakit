@@ -174,7 +174,7 @@ impl Config {
     }
 }
 
-/// Read a hex key from a file, trimming whitespace and optional `0x` prefix.
+/// Read a hex key from a file, trimming whitespace.
 pub fn read_key_file(path: &str) -> Result<String> {
     let expanded = if path.starts_with("~/") {
         let home = env::var("HOME").context("HOME not set")?;

@@ -74,9 +74,14 @@ pub fn validate_config(
     }
 
     // ── version ───────────────────────────────────────────
-    if !w.version.starts_with('v') {
+    if !w.version.starts_with('v')
+        || w.version.len() < 2
+        || !w.version[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
         return Err(WorkloadError::Validation(format!(
-            "version must start with 'v', got {:?}",
+            "version must start with 'v' followed by alphanumeric/.-_ chars, got {:?}",
             w.version
         )));
     }

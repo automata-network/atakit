@@ -222,8 +222,7 @@ fn copy_recursive(src: &Path, dest: &Path) -> Result<usize, WorkloadError> {
 
     if file_type.is_symlink() {
         // Reject symlinks to avoid traversing or copying paths outside the workload.
-        let err = io::Error::new(
-            io::ErrorKind::Other,
+        let err = io::Error::other(
             format!("symlinks are not allowed in measured data: {}", src.display()),
         );
         return Err(WorkloadError::Io(err));

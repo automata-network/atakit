@@ -53,8 +53,16 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
     // Query workload spec
     let spec = match registry.get_workload_spec(workload_id).await {
         Ok(s) => s,
-        Err(_) => {
-            println!("Workload not found: 0x{}", hex::encode(workload_id));
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("revert") || err_str.contains("execution reverted") {
+                println!("Workload not found: 0x{}", hex::encode(workload_id));
+            } else {
+                println!(
+                    "Failed to query workload 0x{}: {e}",
+                    hex::encode(workload_id)
+                );
+            }
             return Ok(());
         }
     };
@@ -123,18 +131,28 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
                 verify_type.dimmed(),
                 pcr.verifyType,
             );
-            // matchData contains events, not the final PCR value.
-            // PCR = extend(0x00..00, event1, event2, ...)
-            // where extend(pcr, event) = SHA-256(pcr || event)
-            let mut pcr_value = [0u8; 32];
-            for data in &pcr.matchData {
-                let mut hasher = Sha256::new();
-                hasher.update(pcr_value);
-                hasher.update(data.as_slice());
-                pcr_value = hasher.finalize().into();
-                println!("      event  {}", format!("0x{}", hex::encode(data)).dimmed());
+            match pcr.verifyType {
+                // STATIC: matchData[0] is the expected final PCR value.
+                0 => {
+                    if let Some(expected) = pcr.matchData.first() {
+                        println!("      value  {}", format!("0x{}", hex::encode(expected)).green());
+                    }
+                }
+                // DYNAMIC: matchData contains event hashes.
+                // PCR = extend(0x00..00, event1, event2, ...)
+                // where extend(pcr, event) = SHA-256(pcr || event)
+                _ => {
+                    let mut pcr_value = [0u8; 32];
+                    for data in &pcr.matchData {
+                        let mut hasher = Sha256::new();
+                        hasher.update(pcr_value);
+                        hasher.update(data.as_slice());
+                        pcr_value = hasher.finalize().into();
+                        println!("      event  {}", format!("0x{}", hex::encode(data)).dimmed());
+                    }
+                    println!("      value  {}", format!("0x{}", hex::encode(pcr_value)).green());
+                }
             }
-            println!("      value  {}", format!("0x{}", hex::encode(pcr_value)).green());
         }
     }
     println!();

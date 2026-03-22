@@ -92,6 +92,13 @@ async fn inspect_dir(
         tracing::warn!("{}", w);
     }
 
+    // Mirror build_workload's hard error on unsupported dependencies
+    if warnings.iter().any(|w| w.contains("[dependencies]")) {
+        return Err(WorkloadError::Validation(
+            "dependencies are not yet supported in workloads".to_string(),
+        ));
+    }
+
     let name = &config.workload.name;
     let version = &config.workload.version;
     let resolved_image =
