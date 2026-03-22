@@ -30,6 +30,8 @@ enum Command {
     /// Manage workloads
     #[command(subcommand)]
     Workload(WorkloadCommand),
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[tokio::main]
@@ -131,5 +133,20 @@ async fn main() -> Result<()> {
                 commands::workload::rm::run(args, &env)
             }
         },
+        Command::External(args) => {
+            let subcmd = &args[0];
+            let bin = format!("atakit-{subcmd}");
+            let status = std::process::Command::new(&bin)
+                .args(&args[1..])
+                .status();
+            match status {
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("unknown command '{subcmd}' (no '{bin}' found on PATH)");
+                    std::process::exit(2);
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
     }
 }

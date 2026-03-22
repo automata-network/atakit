@@ -27,7 +27,7 @@ Minimal shared crate with no heavy dependencies. Provides:
 
 ### atakit-image
 
-All domain logic for image management. Core API is always available; clap structs are behind a `cli` feature flag.
+Domain logic for public image management (ls, pull, rm). Core API is always available; clap structs are behind a `cli` feature flag. Internal image-build tooling (scaffolding, config parsing, platform profiles) lives in the separate `atakit-imgbuild` crate.
 
 - **Error types** -- `ImageError` enum via `thiserror`
 - **Domain types** -- `ImageRef`, `Platform`, `AssetKind`, `Release`, `Asset`, `VersionSelector`
@@ -58,7 +58,8 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_measurements`, `generate_platform_profile`, `platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`.
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`.
+- **External subcommand delegation** -- unknown subcommands are delegated to `atakit-<name>` binaries on PATH (e.g. `atakit imgbuild` runs `atakit-imgbuild`).
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
 
