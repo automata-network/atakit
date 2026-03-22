@@ -56,7 +56,7 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`.
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `fetch_platform_measurements`, `generate_platform_profile`, `platform_profile`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`.
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
 

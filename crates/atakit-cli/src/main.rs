@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
         .init();
 
     let env = Env::from_env();
+    for (path, err) in env.ensure_dirs() {
+        eprintln!("warning: failed to create directory '{}': {err}", path.display());
+    }
     config::ensure_template(&env.config_dir);
     let cli = Cli::parse();
     let config = Config::load(&env.config_dir)?;

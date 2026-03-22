@@ -91,10 +91,15 @@ impl Env {
     }
 
     /// Create data, config, cache, and image directories if they don't exist.
-    fn ensure_dirs(&self) {
+    /// Returns a list of (path, error) pairs for any directories that could not be created.
+    pub fn ensure_dirs(&self) -> Vec<(std::path::PathBuf, std::io::Error)> {
+        let mut failures = Vec::new();
         for dir in [&self.data_dir, &self.config_dir, &self.cache_dir, &self.image_dir] {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                failures.push((dir.clone(), e));
+            }
         }
+        failures
     }
 
     /// Check if the legacy `~/.atakit/images/` directory exists and differs from
