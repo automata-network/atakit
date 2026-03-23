@@ -1,3 +1,4 @@
+use crate::config::CcType;
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 
@@ -49,7 +50,7 @@ pub async fn upload_image(
     bucket: &str,
     source_path: &str,
     runner: &dyn CommandRunner,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<String, CloudError> {
     let filename = std::path::Path::new(source_path)
         .file_name()
@@ -57,6 +58,7 @@ pub async fn upload_image(
         .unwrap_or("image.raw.tar.gz");
     let gcs_uri = format!("gs://{bucket}/{filename}");
 
+    // Always stream stderr so gsutil's native transfer progress is visible.
     runner
         .run_stream(
             "gsutil",
@@ -67,7 +69,7 @@ pub async fn upload_image(
                 source_path,
                 &gcs_uri,
             ],
-            verbose,
+            true,
         )
         .await
         .map_err(|e| CloudError::ImageUploadFailed {
@@ -82,6 +84,7 @@ pub async fn register_image(
     project: &str,
     image_name: &str,
     gcs_uri: &str,
+    cc_type: CcType,
     runner: &dyn CommandRunner,
 ) -> Result<(), CloudError> {
     runner
@@ -96,7 +99,7 @@ pub async fn register_image(
                 project,
                 "--source-uri",
                 gcs_uri,
-                "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC",
+                cc_type.guest_os_features(),
                 "--format=json",
             ],
         )

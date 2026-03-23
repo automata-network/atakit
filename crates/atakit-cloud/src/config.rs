@@ -19,6 +19,42 @@ impl std::fmt::Display for PlatformKind {
     }
 }
 
+/// Confidential computing type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CcType {
+    #[default]
+    SevSnp,
+    Tdx,
+}
+
+impl std::fmt::Display for CcType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CcType::SevSnp => write!(f, "SEV_SNP"),
+            CcType::Tdx => write!(f, "TDX"),
+        }
+    }
+}
+
+impl CcType {
+    /// GCE guest OS features for image registration.
+    pub fn guest_os_features(&self) -> &str {
+        match self {
+            CcType::SevSnp => "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC",
+            CcType::Tdx => "--guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC",
+        }
+    }
+
+    /// Minimum CPU platform for instance creation, if required.
+    pub fn min_cpu_platform(&self) -> Option<&str> {
+        match self {
+            CcType::SevSnp => Some("AMD Milan"),
+            CcType::Tdx => None,
+        }
+    }
+}
+
 /// Top-level `[cloud]` configuration section.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -43,6 +79,9 @@ pub struct CloudConfig {
 pub struct CloudTarget {
     /// Cloud platform.
     pub platform: PlatformKind,
+    /// Confidential computing type (SEV_SNP or TDX). Default: SEV_SNP.
+    #[serde(default)]
+    pub cc_type: CcType,
     /// GCP project ID.
     pub project: Option<String>,
     /// Azure subscription ID (future).

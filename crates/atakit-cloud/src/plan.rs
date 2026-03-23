@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::CcType;
+
 /// A deployment execution plan.
 pub struct DeployPlan {
     pub steps: Vec<DeployStep>,
@@ -14,7 +16,12 @@ pub enum DeployStep {
     UploadImage {
         bucket: String,
         image_name: String,
-        source_path: String,
+        /// Local file to upload. `None` means the image is assumed to already
+        /// exist in GCE -- the step verifies existence but skips upload.
+        source_path: Option<String>,
+        cc_type: CcType,
+        /// Delete and re-register the image even if it already exists.
+        force: bool,
     },
     OpenPorts {
         firewall_rule: String,
@@ -28,6 +35,7 @@ pub enum DeployStep {
         machine_type: String,
         zone: String,
         image: String,
+        cc_type: CcType,
     },
     WaitForAgent {
         timeout_secs: u64,
@@ -80,8 +88,16 @@ impl fmt::Display for DeployStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DeployStep::CheckDeps => write!(f, "Check cloud CLI dependencies"),
-            DeployStep::UploadImage { image_name, .. } => {
-                write!(f, "Upload base image '{image_name}'")
+            DeployStep::UploadImage {
+                image_name,
+                source_path,
+                ..
+            } => {
+                if source_path.is_some() {
+                    write!(f, "Upload base image '{image_name}'")
+                } else {
+                    write!(f, "Verify base image '{image_name}'")
+                }
             }
             DeployStep::OpenPorts {
                 firewall_rule,

@@ -12,6 +12,9 @@ pub struct DeployOptions {
     pub target_name: String,
     pub target: CloudTarget,
     pub image_ref: String,
+    /// Local disk image file path for upload. `None` means the image is assumed
+    /// to already exist in GCE (e.g. a bare GCE image name was passed).
+    pub source_image_path: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub workload_name: String,
@@ -26,7 +29,7 @@ pub struct DeployOptions {
 pub struct DestroyOptions {
     /// Resources to preserve: "image", "disks", "firewall".
     pub preserve: Vec<String>,
-    /// Also delete the GCE image (normally shared).
+    /// Also delete the GCE image. Default: true.
     pub delete_image: bool,
 }
 
