@@ -239,6 +239,11 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	} else {
 		eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
 	}
+	if !metadata.is_empty() {
+		for (k, v) in &metadata {
+			eprintln!("  {:<15}{}={}", "Metadata:".dimmed(), k, v);
+		}
+	}
 	eprintln!();
 
 	// 12. Confirm.
