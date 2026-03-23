@@ -214,6 +214,27 @@ impl ImageStore {
         Ok(paths)
     }
 
+    // ── query ──────────────────────────────────────────────────
+
+    /// List which platform disk images exist locally for a given ref.
+    pub fn local_platforms(&self, image_ref: &ImageRef) -> Vec<Platform> {
+        Platform::ALL
+            .iter()
+            .copied()
+            .filter(|&p| self.image_path(image_ref, p).exists())
+            .collect()
+    }
+
+    /// Whether secure_boot_certs/ directory exists for a given ref.
+    pub fn has_certs(&self, image_ref: &ImageRef) -> bool {
+        self.certs_dir(image_ref).exists()
+    }
+
+    /// Whether any content (disk images or certs) exists for a given ref.
+    pub fn exists(&self, image_ref: &ImageRef) -> bool {
+        !self.local_platforms(image_ref).is_empty() || self.has_certs(image_ref)
+    }
+
     // ── delete ─────────────────────────────────────────────────────
 
     /// Delete all locally downloaded files for a release tag.

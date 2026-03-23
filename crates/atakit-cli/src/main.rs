@@ -97,6 +97,8 @@ async fn main() -> Result<()> {
             ImageCommand::Ls(args) => commands::image::ls::run(args, &env, &config).await,
             ImageCommand::Pull(args) => commands::image::pull::run(args, &env, &config).await,
             ImageCommand::Rm(args) => commands::image::rm::run(args, &env).await,
+            ImageCommand::Export(args) => commands::image::export::run(args, &env),
+            ImageCommand::Import(args) => commands::image::import_::run(args, &env),
         },
         Command::Workload(cmd) => match cmd {
             WorkloadCommand::Create(args) => commands::workload::create::run(args),

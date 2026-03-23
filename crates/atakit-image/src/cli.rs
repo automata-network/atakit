@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
 
 use crate::types::ImageRef;
@@ -14,6 +16,12 @@ pub enum ImageCommand {
     /// Remove locally downloaded CVM base images
     #[command(name = "rm")]
     Rm(RmArgs),
+    /// Export an image from the store as a portable .atabi archive
+    #[command(name = "export")]
+    Export(ExportArgs),
+    /// Import a .atabi archive into the image store
+    #[command(name = "import")]
+    Import(ImportArgs),
 }
 
 /// Arguments for `image ls`.
@@ -57,4 +65,26 @@ pub struct PullArgs {
 pub struct RmArgs {
     /// Release tag to remove (e.g. "automata-linux:v0.5.0")
     pub tag: ImageRef,
+}
+
+/// Arguments for `image export`.
+#[derive(Args)]
+pub struct ExportArgs {
+    /// Image reference to export (e.g. "automata-linux:v0.1.6")
+    pub image: ImageRef,
+
+    /// Output directory (default: current directory)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments for `image import`.
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Path to .atabi archive file
+    pub archive: PathBuf,
+
+    /// Overwrite existing files in the store
+    #[arg(long)]
+    pub force: bool,
 }
