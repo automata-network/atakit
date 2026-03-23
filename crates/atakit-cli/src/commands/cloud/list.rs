@@ -39,17 +39,29 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
 		.max(6);
 	let w_workload = states
 		.iter()
-		.map(|s| s.workload_name.len() + 1 + s.workload_version.len())
+		.map(|s| {
+			if s.workload_name.is_empty() {
+				1
+			} else {
+				s.workload_name.len() + 1 + s.workload_version.len()
+			}
+		})
 		.max()
 		.unwrap_or(8)
 		.max(8);
+	let w_image = states
+		.iter()
+		.map(|s| s.image_ref.len())
+		.max()
+		.unwrap_or(5)
+		.max(5);
 
 	// Header.
 	eprintln!(
 		"{}",
 		format!(
-			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<18}  {}",
-			"Instance", "Target", "Workload", "Status", "IP",
+			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {:<18}  {}",
+			"Instance", "Target", "Workload", "Image", "Status", "IP",
 		)
 		.dimmed()
 	);
@@ -95,10 +107,11 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
 		};
 
 		eprintln!(
-			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {}  {}",
+			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {}  {}",
 			s.instance_name.bold(),
 			s.target_name,
 			workload,
+			s.image_ref,
 			status_col,
 			ip,
 		);
