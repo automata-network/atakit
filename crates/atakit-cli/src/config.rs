@@ -3,6 +3,7 @@ use std::path::{Component, Path};
 use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
+use atakit_cloud::CloudConfig;
 use serde::Deserialize;
 
 /// Application configuration loaded from `config.toml`.
@@ -17,6 +18,7 @@ pub struct Config {
     pub build: BuildConfig,
     pub publish: PublishConfig,
     pub registry: RegistryConfig,
+    pub cloud: CloudConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +236,17 @@ impl Config {
                     .insert(remote_name.clone(), RemoteConfig { url: v });
                 if self.registry.default.is_none() {
                     self.registry.default = Some(remote_name);
+                }
+            }
+        }
+        if let Ok(v) = env::var("ATAKIT_GCP_PROJECT") {
+            if !v.is_empty() {
+                for target in self.cloud.targets.values_mut() {
+                    if matches!(target.platform, atakit_cloud::PlatformKind::Gcp)
+                        && target.project.is_none()
+                    {
+                        target.project = Some(v.clone());
+                    }
                 }
             }
         }

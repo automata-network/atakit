@@ -33,3 +33,23 @@
 # Named registry remotes.
 # [registry.remotes.main]
 # url = "https://registry.example.com"
+
+[cloud]
+# Default expire offset for CVM agent sessions (seconds).
+# expire_offset = 3600
+# RPC URL (falls back to [publish] rpc_url if not set here).
+# rpc_url = "https://..."
+# Session registry (falls back to [publish] session_registry).
+# session_registry = "0x..."
+# Default key files (falls back to [publish] equivalents).
+# owner_key_file = "~/.config/atakit/owner_key"
+# relay_key_file = "~/.config/atakit/relay_key"
+
+# Cloud deployment targets.
+# [cloud.targets.my-gcp]
+# platform = "gcp"
+# project = "my-gcp-project"
+# region = "us-central1-a"
+# vmtype = "c3-standard-4"
+# Per-target key overrides:
+# owner_key_file = "~/.config/atakit/my_owner_key"

@@ -11,6 +11,7 @@ path = "src/main.rs"
 atakit-core.workspace = true
 atakit-image = { workspace = true, features = ["cli"] }
 atakit-workload = { workspace = true, features = ["cli"] }
+atakit-cloud = { workspace = true, features = ["cli"] }
 
 chrono.workspace = true
 clap.workspace = true
