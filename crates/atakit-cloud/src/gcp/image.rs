@@ -80,14 +80,16 @@ pub async fn upload_image(
 }
 
 /// Register a GCS object as a GCE image.
+///
+/// Returns `Ok(false)` if the image already exists (idempotent).
 pub async fn register_image(
     project: &str,
     image_name: &str,
     gcs_uri: &str,
     cc_type: CcType,
     runner: &dyn CommandRunner,
-) -> Result<(), CloudError> {
-    runner
+) -> Result<bool, CloudError> {
+    match runner
         .run_capture(
             "gcloud",
             &[
@@ -104,11 +106,18 @@ pub async fn register_image(
             ],
         )
         .await
-        .map_err(|e| CloudError::ImageUploadFailed {
+    {
+        Ok(_) => Ok(true),
+        Err(CloudError::CommandFailed { stderr, .. })
+            if stderr.contains("already exists") =>
+        {
+            tracing::info!("image '{image_name}' already exists, skipping registration");
+            Ok(false)
+        }
+        Err(e) => Err(CloudError::ImageUploadFailed {
             message: format!("failed to register image: {e}"),
-        })?;
-
-    Ok(())
+        }),
+    }
 }
 
 /// Check if a GCE image already exists.
