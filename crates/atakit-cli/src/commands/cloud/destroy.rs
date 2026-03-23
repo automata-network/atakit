@@ -33,30 +33,62 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		.plan_destroy(&state, &destroy_opts)
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
+	// Display deployment details.
+	let gcp = state.resources.gcp.as_ref();
+	eprintln!("{}", "Deployment:".dimmed());
+	eprintln!("  {:<15}{}", "Instance:".dimmed(), instance_name.bold());
+	eprintln!("  {:<15}{}", "Target:".dimmed(), target_name);
+	eprintln!("  {:<15}{}", "Platform:".dimmed(), state.platform);
+	if let Some(g) = gcp {
+		eprintln!("  {:<15}{}", "Project:".dimmed(), g.project);
+		eprintln!("  {:<15}{}", "Zone:".dimmed(), g.zone);
+		if let Some(ref name) = g.instance {
+			eprintln!("  {:<15}{}", "VM:".dimmed(), name);
+		}
+		if let Some(ref ip) = g.external_ip {
+			eprintln!("  {:<15}{}", "IP:".dimmed(), ip);
+		}
+		if let Some(ref name) = g.image {
+			eprintln!("  {:<15}{}", "Image:".dimmed(), name);
+		}
+		if let Some(ref name) = g.bucket {
+			eprintln!("  {:<15}{}", "Bucket:".dimmed(), name);
+		}
+		if let Some(ref name) = g.firewall_rule {
+			eprintln!("  {:<15}{}", "Firewall:".dimmed(), name);
+		}
+		if !g.disks.is_empty() {
+			eprintln!("  {:<15}{}", "Disks:".dimmed(), g.disks.join(", "));
+		}
+	}
+	if !state.workload_name.is_empty() {
+		eprintln!("  {:<15}{}:{}", "Workload:".dimmed(), state.workload_name, state.workload_version);
+	}
+	eprintln!();
+
 	if plan.steps.is_empty() {
 		DeployState::delete(&env.data_dir, &target_name, &instance_name)
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		eprintln!("No resources to destroy for {target_name}/{instance_name}.");
-		eprintln!(
-			"  {} Cleaned up {}/{}",
-			"o".dimmed(),
-			target_name,
-			instance_name.bold(),
-		);
+		eprintln!("No resources to destroy. Cleaned up state file.");
 		return Ok(());
 	}
 
 	// Display plan.
-	eprintln!("{}", "Destroy plan:".dimmed());
+	eprintln!("{}", "Plan:".dimmed());
 	for (i, step) in plan.steps.iter().enumerate() {
 		eprintln!("  {}. {step}", i + 1);
 	}
 	eprintln!();
 
+	if !args.preserve.is_empty() {
+		eprintln!("  {:<15}{}", "Preserving:".dimmed(), args.preserve.join(", "));
+		eprintln!();
+	}
+
 	// Confirm.
 	if !args.yes {
 		eprint!(
-			"Destroy deployment {}? [y/N] ",
+			"Destroy {}? [y/N] ",
 			format!("{target_name}/{instance_name}").bold()
 		);
 		let mut input = String::new();
