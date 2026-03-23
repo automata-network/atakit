@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 #[derive(Subcommand)]
 pub enum CloudCommand {
     /// Deploy a workload to a cloud CVM
+    #[command(arg_required_else_help = true)]
     Deploy(DeployArgs),
     /// Destroy a cloud deployment
     Destroy(DestroyArgs),
@@ -34,7 +35,7 @@ pub struct DeployArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Base image reference (repository:tag) or path to image file
+    /// Base image: repository:tag (from image store), path to .atabi file, or existing GCE image name
     #[arg(long)]
     pub image: Option<String>,
 
@@ -77,6 +78,10 @@ pub struct DeployArgs {
     /// Skip CVM agent initialization (steps 6-7)
     #[arg(long)]
     pub skip_init: bool,
+
+    /// Deploy only the base image VM without a workload (for measurements)
+    #[arg(long)]
+    pub image_only: bool,
 }
 
 /// Arguments for `cloud destroy`.
@@ -93,8 +98,8 @@ pub struct DestroyArgs {
     #[arg(long, value_delimiter = ',')]
     pub preserve: Vec<String>,
 
-    /// Also delete the shared GCE image
-    #[arg(long)]
+    /// Also delete the GCE image (default: true)
+    #[arg(long, default_value_t = true)]
     pub delete_image: bool,
 
     /// Skip confirmation prompt

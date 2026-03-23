@@ -9,6 +9,7 @@ use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{GcpResources, PlatformKind, ProcessRunner};
 use atakit_core::Env;
+use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
@@ -67,6 +68,12 @@ fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env) -
 
     // Dir mode: read atakit-workload.toml, find versioned archive.
     let workload_dir = dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
+    if !workload_dir.join("atakit-workload.toml").exists() {
+        bail!(
+            "no workload source specified and no atakit-workload.toml found in {}",
+            workload_dir.display(),
+        );
+    }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
     let wl_config = atakit_workload::config::WorkloadConfig::from_dir(&workload_dir)?;
     Ok(ResolvedWorkload {
@@ -77,11 +84,25 @@ fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env) -
 }
 
 pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
-	// 1. Resolve workload source (store ref, .atawl file, or dir).
-	let resolved = resolve_workload(&args.source, &args.dir, env)?;
-	let archive_path = resolved.archive_path;
-	let workload_name = resolved.name;
-	let workload_version = resolved.version;
+	let image_only = args.image_only;
+
+	// 1. Resolve workload source (unless --image-only).
+	let (archive_path, workload_name, workload_version, archive_hash);
+	if image_only {
+		archive_path = String::new();
+		workload_name = String::new();
+		workload_version = String::new();
+		archive_hash = String::new();
+	} else {
+		let resolved = resolve_workload(&args.source, &args.dir, env)?;
+		workload_name = resolved.name;
+		workload_version = resolved.version;
+		let ap = resolved.archive_path;
+		let bytes = std::fs::read(&ap)
+			.with_context(|| format!("failed to read archive: {}", ap.display()))?;
+		archive_hash = format!("{:x}", Sha256::digest(&bytes));
+		archive_path = ap.display().to_string();
+	}
 
 	// 2. Resolve target.
 	let target_name = args.target.as_deref().ok_or_else(|| {
@@ -107,10 +128,11 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	}
 
 	// 4. Instance name.
-	let instance_name = args
-		.name
-		.clone()
-		.unwrap_or_else(|| format!("{workload_name}-{target_name}"));
+	let instance_name = match args.name.clone() {
+		Some(name) => name,
+		None if image_only => bail!("--name is required with --image-only"),
+		None => format!("{workload_name}-{target_name}"),
+	};
 
 	// 5. Check for existing deployment.
 	if atakit_cloud::state::find_instance(&env.data_dir, &instance_name, Some(target_name))
@@ -134,23 +156,21 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	};
 	let agent_env = agent_env_builder.build();
 
-	// 7. Compute archive hash.
-	let archive_bytes = std::fs::read(&archive_path)
-		.with_context(|| format!("failed to read archive: {}", archive_path.display()))?;
-	let archive_hash = format!("{:x}", Sha256::digest(&archive_bytes));
-
-	// 8. Parse metadata.
+	// 7. Parse metadata.
 	let mut metadata = parse_metadata(&args.metadata)?;
 	for (k, v) in &target.metadata {
 		metadata.entry(k.clone()).or_insert_with(|| v.clone());
 	}
 
-	// 9. Resolve image reference.
-	let image_ref = args.image.as_deref().ok_or_else(|| {
-		anyhow::anyhow!("--image is required (base CVM image reference or path)")
+	// 8. Resolve image reference.
+	let image_arg = args.image.as_deref().ok_or_else(|| {
+		anyhow::anyhow!("--image is required (repository:tag, .atabi file, or GCE image name)")
 	})?;
 
-	// 10. Create provider.
+	let resolved_image = resolve_image(image_arg, &target.platform, env)?;
+	let image_ref = &resolved_image.display_name;
+
+	// 9. Create provider.
 	let provider: Box<dyn CloudProvider> = match target.platform {
 		PlatformKind::Gcp => Box::new(GcpProvider::new(
 			target.project.clone().unwrap(),
@@ -159,39 +179,69 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		PlatformKind::Azure => bail!("Azure support is not yet implemented"),
 	};
 
-	// 11. Generate plan.
+	// 10. Generate plan.
 	let deploy_opts = DeployOptions {
 		instance_name: instance_name.clone(),
 		target_name: target_name.to_string(),
 		target: target.clone(),
 		image_ref: image_ref.to_string(),
-		archive_path: archive_path.display().to_string(),
+		source_image_path: resolved_image.source_path.clone(),
+		archive_path: archive_path.clone(),
 		archive_hash: archive_hash.clone(),
 		workload_name: workload_name.clone(),
 		workload_version: workload_version.clone(),
 		agent_env: agent_env.clone(),
 		metadata: metadata.clone(),
 		force_image: args.force_image,
-		skip_init: args.skip_init,
+		skip_init: image_only || args.skip_init,
 	};
 	let plan = provider.plan_deploy(&deploy_opts).await?;
 
-	// 12. Display plan.
-	eprintln!("{}", "Deploy plan:".dimmed());
+	// 11. Display plan and configuration.
+	let names = atakit_cloud::naming::ResourceNames::for_gcp(&instance_name, image_ref);
+	let ports: Vec<String> = {
+		let mut p = vec!["1024".to_string()];
+		if let Some(extra) = metadata.get("ports") {
+			for port in extra.split(',') {
+				let pt = port.trim().to_string();
+				if !pt.is_empty() && !p.contains(&pt) {
+					p.push(pt);
+				}
+			}
+		}
+		p
+	};
+
+	eprintln!("{}", "Plan:".dimmed());
 	for (i, step) in plan.steps.iter().enumerate() {
 		eprintln!("  {}. {step}", i + 1);
 	}
 	eprintln!();
-	eprintln!(
-		"  Instance:  {}",
-		format!("{target_name}/{instance_name}").bold()
-	);
-	eprintln!("  Workload:  {workload_name}:{workload_version}");
-	eprintln!("  Image:     {image_ref}");
-	eprintln!("  Platform:  {}", target.platform);
+	eprintln!("{}", "Configuration:".dimmed());
+	eprintln!("  {:<15}{}", "Instance:".dimmed(), format!("{target_name}/{instance_name}").bold());
+	if let Some(ref project) = target.project {
+		eprintln!("  {:<15}{}", "Project:".dimmed(), project);
+	}
+	eprintln!("  {:<15}{}", "Zone:".dimmed(), target.region);
+	eprintln!("  {:<15}{}", "Machine type:".dimmed(), target.vmtype);
+	eprintln!("  {:<15}{}", "CC type:".dimmed(), target.cc_type);
+	eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+	eprintln!("  {:<15}{}", "GCE name:".dimmed(), names.image);
+	if resolved_image.source_path.is_some() {
+		eprintln!("  {:<15}{}", "Bucket:".dimmed(), names.bucket);
+	}
+	eprintln!("  {:<15}{} (tcp:{})", "Firewall:".dimmed(), names.firewall, ports.join(","));
+	if let Some(ref src) = resolved_image.source_path {
+		eprintln!("  {:<15}{}", "Disk image:".dimmed(), src);
+	}
+	if !image_only {
+		eprintln!("  {:<15}{}:{}", "Workload:".dimmed(), workload_name, workload_version);
+	} else {
+		eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
+	}
 	eprintln!();
 
-	// 13. Confirm.
+	// 12. Confirm.
 	if !args.yes {
 		eprint!("Proceed? [y/N] ");
 		let mut input = String::new();
@@ -202,7 +252,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		}
 	}
 
-	// 14. Create initial state.
+	// 13. Create initial state.
 	let mut state = DeployState::new(atakit_cloud::NewDeployParams {
 		instance_name: instance_name.clone(),
 		workload_name: workload_name.clone(),
@@ -210,7 +260,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		target_name: target_name.to_string(),
 		platform: target.platform,
 		image_ref: image_ref.to_string(),
-		archive_path: archive_path.display().to_string(),
+		archive_path,
 		archive_hash,
 		agent_env: agent_env.clone(),
 	});
@@ -230,7 +280,14 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	for (i, step) in plan.steps.iter().enumerate() {
 		let step_num = (i + 1) as u32;
 		state.advance_step(step_num, &env.data_dir)?;
-		eprint!("  [{step_num}/{total}] {step}... ");
+
+		// Upload streams gsutil progress to stderr, so use newline not "...".
+		let streams_output = matches!(step, DeployStep::UploadImage { source_path: Some(_), .. });
+		if streams_output {
+			eprintln!("  [{step_num}/{total}] {step}");
+		} else {
+			eprint!("  [{step_num}/{total}] {step}... ");
+		}
 
 		match step {
 			DeployStep::WaitForAgent { timeout_secs } => {
@@ -329,9 +386,16 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			Ok(result) => {
 				state.apply_resource_updates(&result.resource_updates);
 				state.save(&env.data_dir)?;
-				eprintln!("{}", "done".green());
+				if streams_output {
+					eprintln!("  [{step_num}/{total}] {}", "done".green());
+				} else {
+					eprintln!("{}", "done".green());
+				}
 			}
 			Err(e) => {
+				if streams_output {
+					eprint!("  [{step_num}/{total}] ");
+				}
 				eprintln!("{}", "failed".red());
 				if !args.keep_going {
 					state.set_status(
@@ -357,14 +421,119 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		.unwrap_or_default();
 	state.set_status(DeployStatus::Deployed { ip: ip.clone() }, &env.data_dir)?;
 
+	let project = target.project.as_deref().unwrap_or("-");
+	let zone = &target.region;
+
 	eprintln!();
-	eprintln!(
-		"  {} Deployed {}/{} at {}",
-		"*".green(),
-		target_name,
-		instance_name.bold(),
-		if ip.is_empty() { "-" } else { &ip },
-	);
+	eprintln!("{}", "==> Deployment complete!".green().bold());
+	eprintln!();
+	eprintln!("    {:<12}{}", "VM:".dimmed(), instance_name.bold());
+	eprintln!("    {:<12}{}", "IP:".dimmed(), if ip.is_empty() { "-" } else { &ip });
+	eprintln!("    {:<12}{}", "Zone:".dimmed(), zone);
+	eprintln!("    {:<12}{}", "Project:".dimmed(), project);
+	eprintln!("    {:<12}{}", "Image:".dimmed(), names.image);
+	eprintln!("    {:<12}{}", "CC type:".dimmed(), target.cc_type);
+	eprintln!();
+	eprintln!("    {}:", "Serial console".dimmed());
+	eprintln!("      gcloud compute connect-to-serial-port {instance_name} --zone={zone} --project={project}");
+	eprintln!();
+	eprintln!("    {}:", "SSH".dimmed());
+	eprintln!("      gcloud compute ssh {instance_name} --zone={zone} --project={project}");
+	eprintln!();
+	eprintln!("    {}:", "Cleanup".dimmed());
+	eprintln!("      atakit cloud destroy {instance_name}");
+	eprintln!();
 
 	Ok(())
+}
+
+/// Resolved base image: display name for the plan + optional local file path.
+struct ResolvedImage {
+    /// Human-readable name (image ref or GCE image name).
+    display_name: String,
+    /// Local disk image file path for upload. `None` means the image is
+    /// assumed to already exist in GCE.
+    source_path: Option<String>,
+}
+
+/// Resolve the `--image` argument into a display name and optional source path.
+///
+/// Three cases:
+/// 1. Ends with `.atabi` - import into store, then resolve from store.
+/// 2. Contains `:` (ImageRef) - look up in ImageStore for the target
+///    platform's disk image. If found locally, use as source_path.
+///    If not found, treat as existing GCE image name.
+/// 3. Otherwise - bare GCE image name, no upload needed.
+fn resolve_image(
+    image_arg: &str,
+    platform: &PlatformKind,
+    env: &Env,
+) -> Result<ResolvedImage> {
+    let store = ImageStore::new(&env.image_dir);
+
+    if image_arg.ends_with(".atabi") {
+        // Import .atabi archive, then resolve from store.
+        let archive_path = PathBuf::from(image_arg);
+        if !archive_path.exists() {
+            bail!("archive not found: {image_arg}");
+        }
+        let image_ref = import_image_archive(&archive_path, store.base_dir())
+            .with_context(|| format!("failed to import {image_arg}"))?;
+        eprintln!("  Imported {} from .atabi archive", image_ref);
+        return resolve_store_image(&store, &image_ref, platform);
+    }
+
+    if image_arg.contains(':') {
+        // Parse as ImageRef (repository:tag).
+        let image_ref: ImageRef = image_arg.parse()
+            .with_context(|| format!("invalid image reference: {image_arg}"))?;
+        if store.exists(&image_ref) {
+            return resolve_store_image(&store, &image_ref, platform);
+        }
+        bail!(
+            "image {} not found in store (run 'atakit image pull {}' first, \
+             or 'atakit image ls --remote' to check available releases)",
+            image_ref,
+            image_ref,
+        );
+    }
+
+    // Bare name - existing GCE image.
+    Ok(ResolvedImage {
+        display_name: image_arg.to_string(),
+        source_path: None,
+    })
+}
+
+/// Look up a disk image file in the store for the target platform.
+fn resolve_store_image(
+    store: &ImageStore,
+    image_ref: &ImageRef,
+    platform: &PlatformKind,
+) -> Result<ResolvedImage> {
+    let image_platform = match platform {
+        PlatformKind::Gcp => ImagePlatform::Gcp,
+        PlatformKind::Azure => ImagePlatform::Azure,
+    };
+
+    let disk_path = store.image_path(image_ref, image_platform);
+    if !disk_path.exists() {
+        let available = store.local_platforms(image_ref);
+        let names: Vec<_> = available.iter().map(|p| p.to_string()).collect();
+        bail!(
+            "no {} disk image for {} in store (available: {})",
+            image_platform,
+            image_ref,
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            },
+        );
+    }
+
+    Ok(ResolvedImage {
+        display_name: image_ref.to_string(),
+        source_path: Some(disk_path.display().to_string()),
+    })
 }
