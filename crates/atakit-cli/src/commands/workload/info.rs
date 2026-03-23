@@ -4,6 +4,7 @@ use atakit_workload::cli::InfoArgs;
 use atakit_workload::manifest::{Manifest, ManifestFirewallAllow};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
+use sha2::Digest;
 
 use super::{find_archive, looks_like_store_ref};
 use crate::config::Config;
@@ -271,7 +272,19 @@ fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
 
     // --- Measurement ---
     section_header("Measurement");
-    println!("  {:<18}{}", "PCR23:", pcr23.green());
+    println!("  {:<18}{}", "SHA256:", pcr23);
+
+    // Compute final PCR register value: SHA-256(zeros_32 || event_hash).
+    let event_hex = pcr23.strip_prefix("0x").unwrap_or(pcr23);
+    if let Ok(event_bytes) = hex::decode(event_hex) {
+        if event_bytes.len() == 32 {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update([0u8; 32]);
+            hasher.update(&event_bytes);
+            let final_pcr = format!("0x{:x}", hasher.finalize());
+            println!("  {:<18}{}", "PCR23:", final_pcr.green());
+        }
+    }
 
     // Compute workload ID: keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))
     // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
