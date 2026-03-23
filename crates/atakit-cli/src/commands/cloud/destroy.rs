@@ -34,7 +34,15 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
 	if plan.steps.is_empty() {
+		DeployState::delete(&env.data_dir, &target_name, &instance_name)
+			.map_err(|e| anyhow::anyhow!("{e}"))?;
 		eprintln!("No resources to destroy for {target_name}/{instance_name}.");
+		eprintln!(
+			"  {} Cleaned up {}/{}",
+			"o".dimmed(),
+			target_name,
+			instance_name.bold(),
+		);
 		return Ok(());
 	}
 
@@ -77,8 +85,7 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 	}
 
-	state
-		.set_status(DeployStatus::Destroyed, &env.data_dir)
+	DeployState::delete(&env.data_dir, &target_name, &instance_name)
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
 	eprintln!();
