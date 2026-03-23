@@ -263,7 +263,7 @@ allow = [{ port = 4000, protocol = "tcp" }]
 deny = [9091]
 ```
 
-If no `[firewall]` section exists, the workload gets exactly the auto-derived rules from `ports`. Port 8000 (agent external API) is always allowed by the CVM runtime regardless of this config.
+If no `[firewall]` section exists, the workload gets exactly the auto-derived rules from `ports`. Port 1024 (CVM agent API) is always allowed by the CVM runtime regardless of this config.
 
 ### `[baby-container]` — Sidecar Container Runtime
 

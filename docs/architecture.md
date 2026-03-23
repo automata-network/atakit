@@ -13,6 +13,7 @@ atakit-ng/
     atakit-core/                # shared types (Env, ProgressReporter trait)
     atakit-image/               # image subcommand library
     atakit-workload/            # workload subcommand library
+    atakit-cloud/               # cloud deployment library
     atakit-cli/                 # main binary
 ```
 
@@ -53,12 +54,27 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Registry client** -- `RegistryClient` for HTTP workload registry API (upload, download, list, metadata)
 - **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`, `InfoArgs`, `PublishArgs`, `DeactivateArgs`, `SpecArgs`, `LsArgs`, `PullArgs`, `PushArgs`, `ImportArgs`, `ExportArgs`, `AddArgs`, `RmArgs`
 
+### atakit-cloud
+
+Cloud deployment logic. Clap structs behind a `cli` feature flag.
+
+- **Error types** -- `CloudError` enum via `thiserror`
+- **Config types** -- `PlatformKind` (Gcp, Azure), `CcType` (SevSnp, Tdx), `CloudConfig`, `CloudTarget`
+- **Provider trait** -- `CloudProvider` async trait with `plan_deploy`, `execute_step`, `plan_destroy`, `execute_destroy_step`, `get_instance_ip`, `get_serial_output`, `ssh_command`, `serial_command`
+- **GCP provider** -- `GcpProvider` implementing `CloudProvider`. Modules: `deps`, `image` (bucket + GCE image), `firewall`, `disk`, `instance`
+- **Plan types** -- `DeployStep` (CheckDeps, UploadImage, OpenPorts, CreateDisks, CreateInstance, WaitForAgent, InitializeWorkload), `DestroyStep`, `DeployPlan`, `StepResult`, `ResourceUpdates`
+- **State management** -- `DeployState` persisted as JSON at `<data_dir>/deployments/<target>/<instance>.state.json`. Lifecycle: Deploying, Deployed, Failed, Destroying, Destroyed. State file deleted on destroy completion.
+- **Resource naming** -- `ResourceNames::for_gcp(instance, image_ref)` derives bucket, GCE image, firewall rule names. All deterministic.
+- **Command execution** -- `CommandRunner` trait + `ProcessRunner` for real subprocess execution via tokio
+- **CVM agent client** -- `wait_for_agent` (polling with backoff), `post_init` (multipart POST with archive + agent config)
+- **CLI arg structs** -- (behind `cli` feature) `CloudCommand`, `DeployArgs`, `DestroyArgs`, `StatusArgs`, `ListArgs`, `SshArgs`, `SerialArgs`
+
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`.
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `export`, `import`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`. Cloud: `deploy`, `destroy`, `status`, `list`, `ssh`, `serial`.
 - **External subcommand delegation** -- unknown subcommands are delegated to `atakit-<name>` binaries on PATH (e.g. `atakit imgbuild` runs `atakit-imgbuild`).
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
@@ -67,14 +83,17 @@ Binary crate. Owns all presentation: output formatting, progress bars, error dis
 
 ```
 atakit-cli ──> atakit-image (cli feature) ──> atakit-core
-    │                                              │
+    │                                              ^
     ├──> atakit-workload (cli feature)             │
     │                                              │
+    ├──> atakit-cloud (cli feature) ───────────────┘
+    │
     └──────────────────────────────────────────────┘
 ```
 
 ### Library dependencies
 - reqwest, serde, tokio, futures-util, tracing, thiserror, toml, sha2, tar, flate2
+- atakit-cloud additionally: serde_json, chrono, async-trait
 
 ### CLI-only dependencies
 - clap, anyhow, indicatif, tracing-subscriber, owo-colors, shell-escape, reqwest, serde_json, alloy-ext, automata-tee-workload-measurement, hex, sha2
