@@ -67,14 +67,14 @@ Cloud deployment logic. Clap structs behind a `cli` feature flag.
 - **Resource naming** -- `ResourceNames::for_gcp(instance, image_ref)` derives bucket, GCE image, firewall rule names. All deterministic.
 - **Command execution** -- `CommandRunner` trait + `ProcessRunner` for real subprocess execution via tokio
 - **CVM agent client** -- `wait_for_agent` (polling with backoff), `post_init` (multipart POST with archive + agent config)
-- **CLI arg structs** -- (behind `cli` feature) `CloudCommand`, `DeployArgs`, `DestroyArgs`, `StatusArgs`, `ListArgs`, `SshArgs`, `SerialArgs`
+- **CLI arg structs** -- (behind `cli` feature) `CloudCommand`, `DeployArgs`, `DestroyArgs`, `StatusArgs`, `ListArgs`, `SshArgs`, `SerialArgs`, `UploadImageArgs`, `InitArgs`
 
 ### atakit-cli
 
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `export`, `import`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`. Cloud: `deploy`, `destroy`, `status`, `list`, `ssh`, `serial`.
+- **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `export`, `import`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`. Cloud: `deploy`, `destroy`, `status`, `list`, `ssh`, `serial`, `upload_image`, `init`.
 - **External subcommand delegation** -- unknown subcommands are delegated to `atakit-<name>` binaries on PATH (e.g. `atakit imgbuild` runs `atakit-imgbuild`).
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
 - **Entry point** -- CLI struct, dispatch
