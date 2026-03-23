@@ -3,6 +3,7 @@ use atakit_core::Env;
 use atakit_workload::cli::PublishArgs;
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
+use sha2::Digest;
 
 use super::looks_like_store_ref;
 use crate::config::Config;
@@ -94,13 +95,18 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     );
     println!("PCR23: {}", result.pcr23.dimmed());
 
-    // Parse PCR23 into bytes32
+    // Compute final PCR23 register value: SHA-256(zeros_32 || event_hash).
+    // The event hash is SHA-256(manifest.toml). The TPM extends from all zeros.
     let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
-    let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
+    let event_hash: [u8; 32] = hex::decode(pcr23_hex)
         .context("invalid PCR23 hex")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
+    let mut extend_hasher = sha2::Sha256::new();
+    extend_hasher.update([0u8; 32]); // PCR starts at all zeros
+    extend_hasher.update(event_hash);
+    let pcr23_final: [u8; 32] = extend_hasher.finalize().into();
+    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_final);
 
     // Parse base image IDs
     let mut base_image_ids = Vec::new();
