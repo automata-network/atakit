@@ -81,13 +81,15 @@ pub async fn post_init(
         }
     })?;
 
-    // Build agent env JSON.
-    let agent_env = serde_json::json!({
-        "relay_private_key": agent_config.relay_private_key,
-        "rpc_url": agent_config.rpc_url,
-        "session_registry": agent_config.session_registry,
-        "owner_private_key": agent_config.owner_private_key,
-        "expire_offset": agent_config.expire_offset,
+    // Build agent env JSON (nested under "agent_env" key as the CVM agent expects).
+    let config_json = serde_json::json!({
+        "agent_env": {
+            "rpc_url": agent_config.rpc_url,
+            "session_registry": agent_config.session_registry,
+            "owner_private_key": agent_config.owner_private_key,
+            "relay_private_key": agent_config.relay_private_key,
+            "expire_offset": agent_config.expire_offset,
+        }
     });
 
     // Build multipart form.
@@ -101,7 +103,15 @@ pub async fn post_init(
                     message: e.to_string(),
                 })?,
         )
-        .text("config", agent_env.to_string());
+        .part(
+            "config",
+            reqwest::multipart::Part::bytes(config_json.to_string().into_bytes())
+                .file_name("config.json")
+                .mime_str("application/json")
+                .map_err(|e| CloudError::Http {
+                    message: e.to_string(),
+                })?,
+        );
 
     if let Some(unmeasured) = unmeasured_tar {
         form = form.part(
