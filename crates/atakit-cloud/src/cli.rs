@@ -19,6 +19,12 @@ pub enum CloudCommand {
     Ssh(SshArgs),
     /// View serial console output
     Serial(SerialArgs),
+    /// Upload a base CVM image to the cloud (without deploying)
+    #[command(name = "upload-image", arg_required_else_help = true)]
+    UploadImage(UploadImageArgs),
+    /// Initialize a deployed instance with a workload
+    #[command(arg_required_else_help = true)]
+    Init(InitArgs),
 }
 
 /// Arguments for `cloud deploy`.
@@ -135,6 +141,67 @@ pub struct SshArgs {
     /// Target name (for disambiguation)
     #[arg(long)]
     pub target: Option<String>,
+}
+
+/// Arguments for `cloud upload-image`.
+#[derive(Args)]
+pub struct UploadImageArgs {
+    /// Base image: repository:tag (from image store) or path to .atabi file
+    pub image: String,
+
+    /// Target name from [cloud.targets.<name>]
+    #[arg(long)]
+    pub target: String,
+
+    /// Delete and re-upload if the image already exists
+    #[arg(long)]
+    pub force: bool,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+/// Arguments for `cloud init`.
+#[derive(Args)]
+pub struct InitArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Workload source: name:version (store ref) or path to .atawl file
+    pub source: Option<String>,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Workload directory (default: current directory)
+    #[arg(short, long, conflicts_with = "source")]
+    pub dir: Option<PathBuf>,
+
+    /// RPC URL override
+    #[arg(long)]
+    pub rpc_url: Option<String>,
+
+    /// Session registry address override
+    #[arg(long)]
+    pub session_registry: Option<String>,
+
+    /// Owner key file path override
+    #[arg(long)]
+    pub owner_key: Option<String>,
+
+    /// Relay key file path override
+    #[arg(long)]
+    pub relay_key: Option<String>,
+
+    /// Agent wait timeout in seconds
+    #[arg(long, default_value = "300")]
+    pub timeout: u64,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 /// Arguments for `cloud serial`.

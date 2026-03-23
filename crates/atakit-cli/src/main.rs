@@ -154,6 +154,12 @@ async fn main() -> Result<()> {
             CloudCommand::Serial(args) => {
                 commands::cloud::serial::run(args, &env, &config).await
             }
+            CloudCommand::UploadImage(args) => {
+                commands::cloud::upload_image::run(args, &env, &config, cli.verbose).await
+            }
+            CloudCommand::Init(args) => {
+                commands::cloud::init::run(args, &env, &config).await
+            }
         },
         Command::External(args) => {
             let subcmd = &args[0];
