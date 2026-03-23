@@ -14,8 +14,9 @@ pub struct AgentConfig {
 
 /// Poll the CVM agent health endpoint with exponential backoff.
 pub async fn wait_for_agent(ip: &str, timeout_secs: u64) -> Result<(), CloudError> {
-    let url = format!("http://{ip}:1024/health");
+    let url = format!("https://{ip}:1024/platform-measurements");
     let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| CloudError::Http {
