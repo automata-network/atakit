@@ -29,8 +29,6 @@ pub struct DeployOptions {
 pub struct DestroyOptions {
     /// Resources to preserve: "image", "disks", "firewall".
     pub preserve: Vec<String>,
-    /// Also delete the GCE image. Default: true.
-    pub delete_image: bool,
 }
 
 /// Abstraction over cloud providers (GCP, Azure).

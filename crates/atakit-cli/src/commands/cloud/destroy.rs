@@ -26,7 +26,6 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 
 	let destroy_opts = atakit_cloud::provider::DestroyOptions {
 		preserve: args.preserve.clone(),
-		delete_image: args.delete_image,
 	};
 
 	let plan = provider
