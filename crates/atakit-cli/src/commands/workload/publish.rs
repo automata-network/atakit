@@ -88,13 +88,6 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let result = atakit_workload::inspect_workload(&opts).await?;
     let manifest = &result.manifest;
 
-    println!(
-        "Workload: {} {}",
-        manifest.meta.name.green().bold(),
-        manifest.meta.version,
-    );
-    println!("PCR23: {}", result.pcr23.dimmed());
-
     // Compute final PCR23 register value: SHA-256(zeros_32 || event_hash).
     // The event hash is SHA-256(manifest.toml). The TPM extends from all zeros.
     let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
@@ -177,9 +170,35 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     let registry = measurement.workload_registry();
 
-    // Check if workload is already registered
+    // Compute workload ID and display summary before publishing.
     let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
     let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    let pcr23_final_hex = format!("0x{}", hex::encode(pcr23_final));
+    let base_image_mode_str = &manifest.config.base_image_mode;
+
+    println!(
+        "{} {}",
+        manifest.meta.name.green().bold(),
+        manifest.meta.version,
+    );
+    println!();
+    println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
+    println!("  {:<20}{}", "SHA256:".dimmed(), result.pcr23);
+    println!("  {:<20}{}", "PCR23:".dimmed(), pcr23_final_hex);
+    println!("  {:<20}{} ({})", "Base Image Mode:".dimmed(), base_image_mode_str, base_image_mode);
+    if !args.base_image_id.is_empty() {
+        for (i, id) in args.base_image_id.iter().enumerate() {
+            if i == 0 {
+                println!("  {:<20}{}", "Base Image IDs:".dimmed(), id);
+            } else {
+                println!("  {:<20}{}", "", id);
+            }
+        }
+    } else {
+        println!("  {:<20}{}", "Base Image IDs:".dimmed(), "none".dimmed());
+    }
+    println!("  {:<20}{}", "TTL:".dimmed(), if args.ttl == 0 { "default (30 days)".to_string() } else { format!("{} days", args.ttl / 86400) });
+    println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {
         println!();
