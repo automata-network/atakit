@@ -55,19 +55,39 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
 	);
 
 	for s in &states {
-		let workload = format!("{}:{}", s.workload_name, s.workload_version);
-		let (status_symbol, status_text) = match &s.status {
-			DeployStatus::Deployed { .. } => ("*".green().to_string(), "deployed".to_string()),
-			DeployStatus::Deploying { step, total } => {
-				("~".yellow().to_string(), format!("deploying {step}/{total}"))
-			}
-			DeployStatus::Failed { step, .. } => {
-				("x".red().to_string(), format!("failed {step}"))
-			}
-			DeployStatus::Destroying => ("~".yellow().to_string(), "destroying".to_string()),
-			DeployStatus::Destroyed => ("o".dimmed().to_string(), "destroyed".to_string()),
+		let workload = if s.workload_name.is_empty() {
+			"-".to_string()
+		} else {
+			format!("{}:{}", s.workload_name, s.workload_version)
 		};
-		let status_col = format!("{status_symbol} {status_text}");
+
+		let (status_symbol, status_plain) = match &s.status {
+			DeployStatus::Deployed { .. } => ("*", "deployed".to_string()),
+			DeployStatus::Deploying { step, total } => ("~", format!("deploying {step}/{total}")),
+			DeployStatus::Failed { step, .. } => ("x", format!("failed {step}")),
+			DeployStatus::Destroying => ("~", "destroying".to_string()),
+			DeployStatus::Destroyed => ("o", "destroyed".to_string()),
+		};
+		// Pad the plain text first, then colorize, to avoid ANSI escape byte counting.
+		let status_padded = format!("{status_symbol} {status_plain}");
+		let status_col = format!("{:<18}", status_padded);
+		let status_col = match &s.status {
+			DeployStatus::Deployed { .. } => {
+				let sym = "*".green().to_string();
+				format!("{sym} {:<16}", status_plain)
+			}
+			DeployStatus::Deploying { .. } | DeployStatus::Destroying => {
+				let sym = "~".yellow().to_string();
+				format!("{sym} {:<16}", status_plain)
+			}
+			DeployStatus::Failed { .. } => {
+				let sym = "x".red().to_string();
+				format!("{sym} {:<16}", status_plain)
+			}
+			DeployStatus::Destroyed => {
+				format!("{}", status_col.dimmed())
+			}
+		};
 
 		let ip = match &s.status {
 			DeployStatus::Deployed { ip } if !ip.is_empty() => ip.clone(),
@@ -75,7 +95,7 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
 		};
 
 		eprintln!(
-			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<18}  {}",
+			"{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {}  {}",
 			s.instance_name.bold(),
 			s.target_name,
 			workload,
