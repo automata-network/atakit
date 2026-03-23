@@ -93,7 +93,7 @@ pub async fn post_init(
     // Build multipart form.
     let mut form = reqwest::multipart::Form::new()
         .part(
-            "archive",
+            "atawl",
             reqwest::multipart::Part::bytes(archive_bytes)
                 .file_name("archive.atawl")
                 .mime_str("application/octet-stream")
