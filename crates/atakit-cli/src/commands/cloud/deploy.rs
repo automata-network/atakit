@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
@@ -9,79 +7,11 @@ use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{GcpResources, PlatformKind, ProcessRunner};
 use atakit_core::Env;
-use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
-use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config};
-use super::{AgentEnvBuilder, parse_metadata};
-
-/// Resolved workload source: archive path + name/version.
-struct ResolvedWorkload {
-    archive_path: PathBuf,
-    name: String,
-    version: String,
-}
-
-/// Resolve workload from source arg, falling back to dir mode.
-fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env) -> Result<ResolvedWorkload> {
-    if let Some(ref src) = source {
-        // Store reference: name:version
-        if crate::commands::workload::looks_like_store_ref(src) {
-            let (name, version) = src
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let store = WorkloadStore::new(&env.workload_dir);
-            let blob = store.blob_path(&name, &version)?;
-            if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
-            }
-            return Ok(ResolvedWorkload {
-                archive_path: blob,
-                name,
-                version,
-            });
-        }
-
-        // File path: something.atawl
-        let path = PathBuf::from(src);
-        if !path.exists() {
-            bail!("archive not found: {src}");
-        }
-        let opts = atakit_workload::InspectOptions {
-            archive: Some(path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-        };
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
-        }).context("failed to inspect archive")?;
-        return Ok(ResolvedWorkload {
-            archive_path: path,
-            name: result.manifest.meta.name,
-            version: result.manifest.meta.version,
-        });
-    }
-
-    // Dir mode: read atakit-workload.toml, find versioned archive.
-    let workload_dir = dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
-    if !workload_dir.join("atakit-workload.toml").exists() {
-        bail!(
-            "no workload source specified and no atakit-workload.toml found in {}",
-            workload_dir.display(),
-        );
-    }
-    let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
-    let wl_config = atakit_workload::config::WorkloadConfig::from_dir(&workload_dir)?;
-    Ok(ResolvedWorkload {
-        archive_path,
-        name: wl_config.workload.name,
-        version: wl_config.workload.version,
-    })
-}
+use super::{AgentEnvBuilder, parse_metadata, resolve_image, resolve_workload};
 
 pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
 	let image_only = args.image_only;
@@ -467,93 +397,3 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	Ok(())
 }
 
-/// Resolved base image: display name for the plan + optional local file path.
-struct ResolvedImage {
-    /// Human-readable name (image ref or GCE image name).
-    display_name: String,
-    /// Local disk image file path for upload. `None` means the image is
-    /// assumed to already exist in GCE.
-    source_path: Option<String>,
-}
-
-/// Resolve the `--image` argument into a display name and optional source path.
-///
-/// Three cases:
-/// 1. Ends with `.atabi` - import into store, then resolve from store.
-/// 2. Contains `:` (ImageRef) - look up in ImageStore for the target
-///    platform's disk image. If found locally, use as source_path.
-///    If not found, treat as existing GCE image name.
-/// 3. Otherwise - bare GCE image name, no upload needed.
-fn resolve_image(
-    image_arg: &str,
-    platform: &PlatformKind,
-    env: &Env,
-) -> Result<ResolvedImage> {
-    let store = ImageStore::new(&env.image_dir);
-
-    if image_arg.ends_with(".atabi") {
-        // Import .atabi archive, then resolve from store.
-        let archive_path = PathBuf::from(image_arg);
-        if !archive_path.exists() {
-            bail!("archive not found: {image_arg}");
-        }
-        let image_ref = import_image_archive(&archive_path, store.base_dir())
-            .with_context(|| format!("failed to import {image_arg}"))?;
-        eprintln!("  Imported {} from .atabi archive", image_ref);
-        return resolve_store_image(&store, &image_ref, platform);
-    }
-
-    if image_arg.contains(':') {
-        // Parse as ImageRef (repository:tag).
-        let image_ref: ImageRef = image_arg.parse()
-            .with_context(|| format!("invalid image reference: {image_arg}"))?;
-        if store.exists(&image_ref) {
-            return resolve_store_image(&store, &image_ref, platform);
-        }
-        bail!(
-            "image {} not found in store (run 'atakit image pull {}' first, \
-             or 'atakit image ls --remote' to check available releases)",
-            image_ref,
-            image_ref,
-        );
-    }
-
-    // Bare name - existing GCE image.
-    Ok(ResolvedImage {
-        display_name: image_arg.to_string(),
-        source_path: None,
-    })
-}
-
-/// Look up a disk image file in the store for the target platform.
-fn resolve_store_image(
-    store: &ImageStore,
-    image_ref: &ImageRef,
-    platform: &PlatformKind,
-) -> Result<ResolvedImage> {
-    let image_platform = match platform {
-        PlatformKind::Gcp => ImagePlatform::Gcp,
-        PlatformKind::Azure => ImagePlatform::Azure,
-    };
-
-    let disk_path = store.image_path(image_ref, image_platform);
-    if !disk_path.exists() {
-        let available = store.local_platforms(image_ref);
-        let names: Vec<_> = available.iter().map(|p| p.to_string()).collect();
-        bail!(
-            "no {} disk image for {} in store (available: {})",
-            image_platform,
-            image_ref,
-            if names.is_empty() {
-                "none".to_string()
-            } else {
-                names.join(", ")
-            },
-        );
-    }
-
-    Ok(ResolvedImage {
-        display_name: image_ref.to_string(),
-        source_path: Some(disk_path.display().to_string()),
-    })
-}
