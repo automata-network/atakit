@@ -261,8 +261,8 @@ impl CloudProvider for GcpProvider {
             }
         }
 
-        // Delete image (unless preserved or --no-delete-image).
-        if opts.delete_image && !opts.preserve.contains(&"image".to_string()) {
+        // Delete image (unless preserved).
+        if !opts.preserve.contains(&"image".to_string()) {
             if let Some(ref name) = gcp.image {
                 steps.push(DestroyStep::DeleteImage { name: name.clone() });
             }

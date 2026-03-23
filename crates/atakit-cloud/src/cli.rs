@@ -98,10 +98,6 @@ pub struct DestroyArgs {
     #[arg(long, value_delimiter = ',')]
     pub preserve: Vec<String>,
 
-    /// Also delete the GCE image (default: true)
-    #[arg(long, default_value_t = true)]
-    pub delete_image: bool,
-
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
