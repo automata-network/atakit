@@ -21,9 +21,11 @@ pub async fn create_instance(
     let cpu_flag = cc_type
         .min_cpu_platform()
         .map(|p| format!("--min-cpu-platform={p}"));
+    // Use ^;^ as the delimiter so commas in values (e.g. "ports=1024,8000")
+    // are not misinterpreted as key-value separators by gcloud.
     let metadata_flag = if !metadata.is_empty() {
         let pairs: Vec<String> = metadata.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        Some(format!("--metadata={}", pairs.join(",")))
+        Some(format!("--metadata=^;^{}", pairs.join(";")))
     } else {
         None
     };
