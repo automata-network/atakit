@@ -1,3 +1,4 @@
+use crate::config::CcType;
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 
@@ -9,32 +10,42 @@ pub async fn create_instance(
     name: &str,
     machine_type: &str,
     image: &str,
+    cc_type: CcType,
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
+    let cc_flag = format!("--confidential-compute-type={cc_type}");
+    let machine_flag = format!("--machine-type={machine_type}");
+    let image_flag = format!("--image={image}");
+    let tags_flag = format!("--tags={name}-ingress");
+    let cpu_flag = cc_type
+        .min_cpu_platform()
+        .map(|p| format!("--min-cpu-platform={p}"));
+
+    let mut args = vec![
+        "compute",
+        "instances",
+        "create",
+        name,
+        "--project",
+        project,
+        "--zone",
+        zone,
+        &machine_flag,
+        &image_flag,
+        "--image-project",
+        project,
+        "--network-interface=network-tier=PREMIUM,nic-type=GVNIC",
+        &cc_flag,
+        "--maintenance-policy=TERMINATE",
+    ];
+    if let Some(ref flag) = cpu_flag {
+        args.push(flag);
+    }
+    args.push(&tags_flag);
+    args.push("--format=json");
+
     let output = runner
-        .run_capture(
-            "gcloud",
-            &[
-                "compute",
-                "instances",
-                "create",
-                name,
-                "--project",
-                project,
-                "--zone",
-                zone,
-                &format!("--machine-type={machine_type}"),
-                &format!("--image={image}"),
-                "--image-project",
-                project,
-                "--network-interface=network-tier=PREMIUM,nic-type=GVNIC",
-                "--confidential-compute-type=SEV_SNP",
-                "--maintenance-policy=TERMINATE",
-                "--min-cpu-platform=AMD Milan",
-                &format!("--tags={name}-ingress"),
-                "--format=json",
-            ],
-        )
+        .run_capture("gcloud", &args)
         .await
         .map_err(|e| CloudError::InstanceError {
             message: format!("failed to create instance: {e}"),

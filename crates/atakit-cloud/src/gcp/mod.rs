@@ -49,17 +49,17 @@ impl CloudProvider for GcpProvider {
         let names = ResourceNames::for_gcp(&opts.instance_name, &opts.image_ref);
         let mut steps = vec![DeployStep::CheckDeps];
 
-        // Image upload.
+        // Image upload/verify.
         let image_source = opts
-            .target
-            .metadata
-            .get("image_path")
-            .cloned()
-            .unwrap_or_else(|| opts.image_ref.clone());
+            .source_image_path
+            .clone()
+            .or_else(|| opts.target.metadata.get("image_path").cloned());
         steps.push(DeployStep::UploadImage {
             bucket: names.bucket.clone(),
             image_name: names.image.clone(),
             source_path: image_source,
+            cc_type: opts.target.cc_type,
+            force: opts.force_image,
         });
 
         // Firewall - always open agent port 1024.
@@ -105,6 +105,7 @@ impl CloudProvider for GcpProvider {
             machine_type: opts.target.vmtype.clone(),
             zone: self.zone.clone(),
             image: names.image.clone(),
+            cc_type: opts.target.cc_type,
         });
 
         if !opts.skip_init {
@@ -136,16 +137,31 @@ impl CloudProvider for GcpProvider {
                 bucket,
                 image_name,
                 source_path,
+                cc_type,
+                force,
             } => {
-                // Check if image already exists.
-                if image::check_image_exists(&self.project, image_name, runner).await? {
+                let exists = image::check_image_exists(&self.project, image_name, runner).await?;
+                if exists && *force {
+                    tracing::info!("force: deleting existing image '{image_name}'");
+                    image::delete_image(&self.project, image_name, runner).await?;
+                    image::delete_bucket(bucket, runner).await.ok();
+                } else if exists {
                     tracing::info!("image '{image_name}' already exists, skipping upload");
-                } else {
-                    image::ensure_bucket(&self.project, bucket, &self.zone, runner).await?;
-                    let gcs_uri =
-                        image::upload_image(bucket, source_path, runner, verbose).await?;
-                    image::register_image(&self.project, image_name, &gcs_uri, runner).await?;
-                    updates.bucket = Some(bucket.clone());
+                }
+                if !exists || *force {
+                    if let Some(src) = source_path {
+                        image::ensure_bucket(&self.project, bucket, &self.zone, runner).await?;
+                        let gcs_uri =
+                            image::upload_image(bucket, src, runner, verbose).await?;
+                        image::register_image(&self.project, image_name, &gcs_uri, *cc_type, runner).await?;
+                        updates.bucket = Some(bucket.clone());
+                    } else {
+                        return Err(CloudError::ImageUploadFailed {
+                            message: format!(
+                                "GCE image '{image_name}' does not exist and no source file was provided"
+                            ),
+                        });
+                    }
                 }
                 updates.image = Some(image_name.clone());
             }
@@ -180,6 +196,7 @@ impl CloudProvider for GcpProvider {
                 machine_type,
                 zone,
                 image,
+                cc_type,
             } => {
                 let ip = instance::create_instance(
                     &self.project,
@@ -187,6 +204,7 @@ impl CloudProvider for GcpProvider {
                     instance_name,
                     machine_type,
                     image,
+                    *cc_type,
                     runner,
                 )
                 .await?;
@@ -243,8 +261,8 @@ impl CloudProvider for GcpProvider {
             }
         }
 
-        // Delete image (only if explicitly requested).
-        if opts.delete_image {
+        // Delete image (unless preserved or --no-delete-image).
+        if opts.delete_image && !opts.preserve.contains(&"image".to_string()) {
             if let Some(ref name) = gcp.image {
                 steps.push(DestroyStep::DeleteImage { name: name.clone() });
             }
