@@ -4,6 +4,7 @@ members = [
     "crates/atakit-core",
     "crates/atakit-image",
     "crates/atakit-workload",
+    "crates/atakit-cloud",
     "crates/atakit-cli",
 ]
 
@@ -20,7 +21,7 @@ tracing = "0.1"
 thiserror = "2"
 
 # Network
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = "0.3"
 
 # Build / archive
@@ -28,12 +29,15 @@ toml = "0.8"
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Blockchain
 alloy-ext = "1.7.4"
 automata-tee-workload-measurement = "0.1.2"
 hex = "0.4"
+
+# Async
+async-trait = "0.1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -47,6 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 atakit-core = { path = "crates/atakit-core" }
 atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
+atakit-cloud = { path = "crates/atakit-cloud" }
 
 # Optimize compression and crypto in dev builds -- gzip decompression
 # of large .atawl archives is unusably slow without this.

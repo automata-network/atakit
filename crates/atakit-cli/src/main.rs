@@ -5,6 +5,7 @@ mod progress;
 use anyhow::Result;
 use atakit_core::Env;
 use config::Config;
+use atakit_cloud::cli::CloudCommand;
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
 use clap::{Parser, Subcommand};
@@ -30,6 +31,9 @@ enum Command {
     /// Manage workloads
     #[command(subcommand)]
     Workload(WorkloadCommand),
+    /// Manage cloud deployments
+    #[command(subcommand)]
+    Cloud(CloudCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -131,6 +135,22 @@ async fn main() -> Result<()> {
             }
             WorkloadCommand::Rm(args) => {
                 commands::workload::rm::run(args, &env)
+            }
+        },
+        Command::Cloud(cmd) => match cmd {
+            CloudCommand::Deploy(args) => {
+                commands::cloud::deploy::run(args, &env, &config, cli.verbose).await
+            }
+            CloudCommand::Destroy(args) => {
+                commands::cloud::destroy::run(args, &env, &config).await
+            }
+            CloudCommand::Status(args) => {
+                commands::cloud::status::run(args, &env, &config).await
+            }
+            CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
+            CloudCommand::Ssh(args) => commands::cloud::ssh::run(args, &env, &config),
+            CloudCommand::Serial(args) => {
+                commands::cloud::serial::run(args, &env, &config).await
             }
         },
         Command::External(args) => {
