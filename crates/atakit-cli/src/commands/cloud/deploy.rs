@@ -396,6 +396,21 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				} else {
 					eprintln!("{}", "done".green());
 				}
+				// After instance creation, show VM details.
+				if matches!(step, DeployStep::CreateInstance { .. }) {
+					if let Some(ref gcp) = state.resources.gcp {
+						let ip = gcp.external_ip.as_deref().unwrap_or("-");
+						let inst = gcp.instance.as_deref().unwrap_or(&instance_name);
+						let project = gcp.project.as_str();
+						let zone = gcp.zone.as_str();
+						eprintln!();
+						eprintln!("  {:<12}{}", "VM:".dimmed(), inst.bold());
+						eprintln!("  {:<12}{}", "IP:".dimmed(), ip);
+						eprintln!("  {:<12}{}", "Zone:".dimmed(), zone);
+						eprintln!("  {:<12}{}", "Project:".dimmed(), project);
+						eprintln!();
+					}
+				}
 			}
 			Err(e) => {
 				if streams_output {
