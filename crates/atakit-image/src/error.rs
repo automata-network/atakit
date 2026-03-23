@@ -66,6 +66,27 @@ pub enum ImageError {
     #[error("decompression failed: {0}")]
     Decompress(String),
 
+    #[error("failed to read archive {path}: {source}")]
+    ArchiveRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("archive {path} is missing manifest.toml")]
+    ArchiveMissingManifest { path: PathBuf },
+
+    #[error("invalid archive {path}: {message}")]
+    ArchiveInvalid { path: PathBuf, message: String },
+
+    #[error("failed to parse manifest in {path}: {reason}")]
+    ParseManifest { path: PathBuf, reason: String },
+
+    #[error("failed to read file {path}: {source}")]
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
