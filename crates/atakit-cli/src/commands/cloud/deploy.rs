@@ -364,7 +364,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					expire_offset: agent_env.expire_offset.unwrap_or(3600),
 				};
 
-				match init::post_init(&ip, ap, None, &agent_config, true).await {
+				match init::post_init(&ip, ap, None, &agent_config).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());

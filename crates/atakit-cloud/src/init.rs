@@ -54,18 +54,19 @@ pub async fn wait_for_agent(ip: &str, timeout_secs: u64) -> Result<(), CloudErro
 }
 
 /// POST /init to the CVM agent with workload archive and configuration.
+///
+/// Always uses HTTPS. The CVM agent serves a self-signed certificate,
+/// so we always accept invalid certs for the init request.
 pub async fn post_init(
     ip: &str,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
     agent_config: &AgentConfig,
-    insecure: bool,
 ) -> Result<(), CloudError> {
-    let scheme = if insecure { "http" } else { "https" };
-    let url = format!("{scheme}://{ip}:1024/init");
+    let url = format!("https://{ip}:1024/init");
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(insecure)
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| CloudError::Http {
