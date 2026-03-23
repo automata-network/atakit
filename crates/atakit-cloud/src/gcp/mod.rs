@@ -106,6 +106,7 @@ impl CloudProvider for GcpProvider {
             zone: self.zone.clone(),
             image: names.image.clone(),
             cc_type: opts.target.cc_type,
+            metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         });
 
         if !opts.skip_init {
@@ -197,6 +198,7 @@ impl CloudProvider for GcpProvider {
                 zone,
                 image,
                 cc_type,
+                metadata,
             } => {
                 let ip = instance::create_instance(
                     &self.project,
@@ -205,6 +207,7 @@ impl CloudProvider for GcpProvider {
                     machine_type,
                     image,
                     *cc_type,
+                    metadata,
                     runner,
                 )
                 .await?;

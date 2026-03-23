@@ -36,6 +36,7 @@ pub enum DeployStep {
         zone: String,
         image: String,
         cc_type: CcType,
+        metadata: Vec<(String, String)>,
     },
     WaitForAgent {
         timeout_secs: u64,
