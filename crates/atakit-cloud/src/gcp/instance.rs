@@ -11,6 +11,7 @@ pub async fn create_instance(
     machine_type: &str,
     image: &str,
     cc_type: CcType,
+    metadata: &[(String, String)],
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
     let cc_flag = format!("--confidential-compute-type={cc_type}");
@@ -20,6 +21,12 @@ pub async fn create_instance(
     let cpu_flag = cc_type
         .min_cpu_platform()
         .map(|p| format!("--min-cpu-platform={p}"));
+    let metadata_flag = if !metadata.is_empty() {
+        let pairs: Vec<String> = metadata.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        Some(format!("--metadata={}", pairs.join(",")))
+    } else {
+        None
+    };
 
     let mut args = vec![
         "compute",
@@ -39,6 +46,9 @@ pub async fn create_instance(
         "--maintenance-policy=TERMINATE",
     ];
     if let Some(ref flag) = cpu_flag {
+        args.push(flag);
+    }
+    if let Some(ref flag) = metadata_flag {
         args.push(flag);
     }
     args.push(&tags_flag);
