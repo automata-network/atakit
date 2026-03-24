@@ -168,15 +168,16 @@ pub async fn build_workload(
     handle.finish();
 
     // 9. Create archive
+    let total_bytes = archive::dir_size(&staging.root);
     let handle = progress.create(
         &format!(
             "Writing {name}-{version}.atawl ({image_count} image{}, {measured_file_count} measured file{})...",
             if image_count != 1 { "s" } else { "" },
             if measured_file_count != 1 { "s" } else { "" },
         ),
-        0,
+        total_bytes,
     );
-    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir)?;
+    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir, handle.as_ref())?;
     handle.finish();
 
     // 10. Hash archive

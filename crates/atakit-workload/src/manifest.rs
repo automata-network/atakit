@@ -42,6 +42,8 @@ pub struct ManifestConfig {
     pub command: Option<StringOrArrayOut>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<StringOrArrayOut>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ttl: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub cvm_agent: bool,
     #[serde(
@@ -79,6 +81,10 @@ fn default_restart() -> String {
 
 fn is_default_restart(s: &str) -> bool {
     s == "no"
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 fn is_false(b: &bool) -> bool {
@@ -393,6 +399,7 @@ pub fn build_manifest(
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
             entrypoint: convert_string_or_array(&w.entrypoint),
+            ttl: w.ttl,
             cvm_agent: w.cvm_agent,
             measured_data,
             unmeasured_data,
