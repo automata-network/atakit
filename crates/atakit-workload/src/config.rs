@@ -57,6 +57,8 @@ pub struct WorkloadSection {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub env_file: Option<StringOrArray>,
+    #[serde(default = "default_ttl")]
+    pub ttl: u64,
     #[serde(default)]
     pub cvm_agent: bool,
     #[serde(default, rename = "measured-data")]
@@ -65,6 +67,12 @@ pub struct WorkloadSection {
     pub unmeasured_data: Vec<String>,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+}
+
+/// Default TTL: ~100 years in seconds. The contract computes
+/// `block.timestamp + ttl` as uint64, so u64::MAX would overflow.
+fn default_ttl() -> u64 {
+    100 * 365 * 86400
 }
 
 fn default_restart() -> String {

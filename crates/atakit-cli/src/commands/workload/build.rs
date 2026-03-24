@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::Result;
 use atakit_core::Env;
 use atakit_workload::cli::BuildArgs;
@@ -47,8 +49,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
     );
     println!("SHA-256: {}", result.archive_hash.dimmed());
 
-    // Import into store if --store flag is set
-    if args.store {
+    // Import into store unless --no-store flag is set
+    if !args.no_store {
         let store = WorkloadStore::new(&env.workload_dir);
 
         // Inspect the built archive to get name, version, PCR23
@@ -62,12 +64,45 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         let name = &inspect.manifest.meta.name;
         let version = &inspect.manifest.meta.version;
 
+        // Check if an existing entry has a different PCR23 and confirm before overwriting
+        let existing_meta = store.load_meta(name, version)?;
+        if let Some(ref existing) = existing_meta {
+            if let Some(ref old_pcr23) = existing.pcr23 {
+                if *old_pcr23 != inspect.pcr23 {
+                    println!();
+                    println!(
+                        "{}",
+                        format!("Store already has {name}:{version} with a different measurement.").yellow().bold()
+                    );
+                    println!("  {:<12}{}", "Old PCR23:".dimmed(), old_pcr23);
+                    println!("  {:<12}{}", "New PCR23:".dimmed(), inspect.pcr23);
+                    if let Some(ref spec) = existing.on_chain_spec {
+                        println!(
+                            "  {:<12}{}",
+                            "On-chain:".dimmed(),
+                            "yes (will be stale after overwrite)".yellow()
+                        );
+                        let _ = spec; // suppress unused warning
+                    }
+                    println!();
+                    eprint!("Overwrite? [y/N] ");
+                    std::io::stderr().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Skipped store import.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let size = store.import_blob(name, version, &result.archive_path)?;
 
         // Merge into existing meta to preserve chain data from `workload add`
         let workload_id = super::compute_workload_id(name, version);
         let now = chrono::Local::now().to_rfc3339();
-        let meta = match store.load_meta(name, version)? {
+        let meta = match existing_meta {
             Some(mut existing) => {
                 existing.workload_id = format!("0x{}", hex::encode(workload_id));
                 existing.pcr23 = Some(inspect.pcr23);

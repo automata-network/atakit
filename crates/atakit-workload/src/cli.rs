@@ -52,9 +52,9 @@ pub struct BuildArgs {
     /// Container engine override (docker or podman)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
-    /// Import built archive into the local workload store
+    /// Skip importing the built archive into the local workload store
     #[arg(long)]
-    pub store: bool,
+    pub no_store: bool,
 }
 
 /// Arguments for `workload info`.
@@ -124,15 +124,18 @@ pub struct PublishArgs {
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
-    /// Session TTL in seconds (0 = contract default of 30 days)
-    #[arg(long, default_value = "0")]
-    pub ttl: u64,
+    /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
+    #[arg(long)]
+    pub ttl: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
     /// Base image IDs for whitelist/blacklist (hex bytes32)
     #[arg(long)]
     pub base_image_id: Vec<String>,
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 /// Arguments for `workload spec`.

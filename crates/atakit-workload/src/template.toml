@@ -1,47 +1,122 @@
+# atakit-workload.toml -- workload definition for CVM deployments.
+#
+# This file defines a single workload: its container image, runtime config,
+# data mounts, on-chain parameters, and optional sidecars. Running
+# `atakit workload build` compiles it into a deterministic .atawl archive
+# containing manifest.toml + images + measured-data.
+
+# Schema version. Must be 1.
 format = 1
 
 [workload]
+# Workload identity. The on-chain workload ID is derived from name + version
+# via keccak256, so changing either produces a new workload.
+#
+# name: alphanumeric + hyphens, must not start with a hyphen.
+# version: must start with "v", followed by alphanumeric/.-_ chars.
 name = "{{name}}"
 version = "v0.0.1"
-base-image-mode = "blacklist"
-# base-image = []
 
-# ── image source (pick one) ──────────────────────────────
-# Pull from registry:
+# ── on-chain parameters ──────────────────────────────────────────
+#
+# base-image-mode: controls which base OS images this workload trusts.
+#   "blacklist" -- allow all base images except those in base-image list.
+#   "whitelist" -- only allow base images in the base-image list.
+# On-chain AccessMode enum: ANY=0, BLACKLIST=1, WHITELIST=2.
+# (ANY is not exposed here; use "blacklist" with an empty list for the same effect.)
+base-image-mode = "blacklist"
+
+# base-image: list of base image IDs (hex bytes32) for the whitelist/blacklist.
+# These are matched against BaseImageRegistry entries on-chain.
+# base-image = ["0xabc123..."]
+
+# ttl: session TTL in seconds. Determines how long a CVM session remains
+# valid after attestation. Default: ~100 years (3153600000s). Set to 0 for
+# the contract default (30 days). Can be overridden per-publish with `--ttl`.
+# The contract computes `block.timestamp + ttl` as uint64, so the value
+# must not cause overflow.
+# ttl = 3153600000
+
+# ── image source (pick exactly one form) ─────────────────────────
+#
+# Form 1 -- Pull from a container registry:
 image = "{{name}}:latest"
-# Build from source:
-# image = { build = ".", containerfile = "Containerfile" }
-# Build with args:
+#
+# Form 2 -- Build from a local Dockerfile/Containerfile:
+#   build: path to build context directory (relative to this file, no ".." allowed).
+#   containerfile: optional, defaults to "Dockerfile" in the build context.
+#   args: optional build-time arguments passed to docker/podman build.
 # image = { build = ".", containerfile = "Containerfile", args = { KEY = "value" } }
-# Load from local tar:
+#
+# Form 3 -- Load from a pre-built local tar archive (.tar or .tar.gz):
 # image = { file = "./images/{{name}}.tar" }
 
-# ── container configuration ──────────────────────────────
+# ── container runtime ────────────────────────────────────────────
+#
+# ports: host:container port mappings. Optional /tcp or /udp suffix (default: tcp).
+# Host ports from this list automatically get firewall allow rules.
 # ports = ["3000:3000", "8080:8080/udp"]
-# restart = "unless-stopped"          # "no" (default), "always", "on-failure", "unless-stopped"
-# command = "echo hello"              # string (shell form) or array (exec form)
+#
+# restart: container restart policy.
+# Values: "no" (default), "always", "on-failure", "unless-stopped".
+# restart = "unless-stopped"
+#
+# command: override the container CMD. String (shell form) or array (exec form).
+# command = "echo hello"
+# command = ["echo", "hello"]
+#
+# entrypoint: override the container ENTRYPOINT. String or array.
 # entrypoint = ["/app/entrypoint.sh"]
-# cvm_agent = true                    # enable CVM agent socket mount
-# env_file = ".env"                   # string or array of paths
+#
+# cvm_agent: mount the CVM agent Unix socket into the container.
+# Required for workloads that communicate with the host agent.
+# cvm_agent = true
 
-# ── environment variables ────────────────────────────────
+# ── environment variables ────────────────────────────────────────
+#
+# Inline key-value pairs merged into the container environment.
 # [workload.environment]
 # RUST_LOG = "info"
 # LISTEN_ADDR = "0.0.0.0:3000"
+#
+# env_file: load variables from a dotenv file. Path must start with "./"
+# and must not contain "..". Can be a string or array of strings.
+# env_file = "./.env"
+# env_file = ["./.env", "./.env.production"]
+#
+# Resolution order when a key appears in both: env_file values are loaded
+# first, then [workload.environment] overrides them.
 
-# ── data mounts ──────────────────────────────────────────
-# Integrity-verified files (PCR23), mounted read-only at /app/measured-data/
+# ── data mounts ──────────────────────────────────────────────────
+#
+# measured-data: files included in the archive and verified via PCR23.
+# Paths must start with "./" and must not contain "..". Files must exist
+# at build time. Mounted read-only at /app/measured-data/ in the container.
+# Changing these files changes PCR23, which changes the on-chain measurement.
 # measured-data = ["./config/cert.pem", "./config/settings.json"]
 #
-# Operator-provided files (not verified), mounted read-only at /app/unmeasured-data/
-# unmeasured-data = ["./runtime-data/key.pem"]
+# unmeasured-data: operator-provided files NOT included in the archive.
+# Not verified by PCR23 -- the operator supplies them at deploy time.
+# Mounted read-only at /app/unmeasured-data/ in the container.
+# unmeasured-data = ["./runtime-data/signing-key.pem"]
 
-# ── persistent disk mounts ───────────────────────────────
-# Maps disk names (defined in [disks.*]) to container mount paths.
+# ── persistent disk mounts ───────────────────────────────────────
+#
+# Maps disk names (defined in [disks.*] below) to container mount paths.
+# Each disk can only be mounted by one container (workload or dependency).
 # [workload.disks]
 # my-disk = "/data"
 
-# ── dependencies ─────────────────────────────────────────
+# ── dependencies (not yet implemented) ───────────────────────────
+#
+# Sidecar containers that run alongside the main workload. Each dependency
+# has the same container config options as [workload] (image, ports, restart,
+# command, entrypoint, environment, env_file, measured-data, unmeasured-data,
+# disks) plus depends_on for startup ordering.
+#
+# WARNING: dependencies are parsed but NOT built. The build will warn and
+# only include the main workload.
+#
 # [dependencies.redis]
 # image = "redis:7"
 # ports = ["6379:6379"]
@@ -50,33 +125,61 @@ image = "{{name}}:latest"
 # [dependencies.redis.environment]
 # REDIS_PASSWORD = "secret"
 # [dependencies.redis.disks]
-# redis-data = "/data"
+# redis-data = "/cache"
 
-# ── firewall ─────────────────────────────────────────────
-# By default, host ports from `ports` get TCP allow rules automatically.
-# Use [firewall] only to add extra rules or deny auto-derived ones.
+# ── firewall ─────────────────────────────────────────────────────
+#
+# By default, every host port in `ports` gets a TCP allow rule on the VM
+# firewall. Use [firewall] to add extra rules or deny auto-derived ones.
+#
+# allow: additional firewall rules. Port must be >= 1025.
+#        Protocol must be "tcp" or "udp".
+# deny:  suppress auto-derived rules for specific ports.
+#        Only useful for ports that appear in `ports` above.
+#
 # [firewall]
 # allow = [{ port = 4000, protocol = "tcp" }, { port = 5000, protocol = "udp" }]
 # deny = [9091]
 
-# ── baby containers ──────────────────────────────────────
-# Ephemeral sidecar containers via the agent's /baby-container/* API.
+# ── baby containers ──────────────────────────────────────────────
+#
+# Allow ephemeral sidecar containers spawned at runtime via the CVM agent's
+# /baby-container/* API. These are not defined in the workload config --
+# they are created dynamically by the main workload container.
+#
 # [baby-container]
 # allow = true
-# max_count = 2                       # default: 1
+# max_count = 2                         # max concurrent baby containers (default: 1)
 
-# ── image signing ────────────────────────────────────────
-# Cosign-based image signature verification. Both files are included in
-# measured-data/signing/ and are part of PCR23.
+# ── image signing ────────────────────────────────────────────────
+#
+# Cosign-based container image signature verification. When enabled, the
+# CVM agent verifies the workload image signature before running it.
+#
+# Both auth_info and policy files must start with "./" and are copied into
+# measured-data/signing/ in the archive -- they ARE part of PCR23.
+#
+# auth_info: JSON file with registry credentials for signature verification.
+# policy: cosign verification policy file.
+#
 # [signing]
 # enable = true
 # auth_info = "./secrets/auth_info.json"
 # policy = "./config/cosign_policy.json"
 
-# ── persistent disks ─────────────────────────────────────
-# Each disk must be mounted by exactly one container (workload or dependency).
+# ── persistent disks ─────────────────────────────────────────────
+#
+# Define persistent disks that survive container restarts. Each disk must
+# be mounted by exactly one container via [workload.disks] or
+# [dependencies.<name>.disks].
+#
+# size: disk size with unit suffix. Valid units: MB, GB, TB.
+# bind_fs: use bindfs for UID translation (default: false).
+# encryption.enable: encrypt the disk at rest (default: false).
+# encryption.key_security: "standard" (default) or "strong".
+#
 # [disks.my-disk]
 # size = "10GB"
-# bind_fs = true                      # UID translation via bindfs (default: false)
+# bind_fs = true
 # encryption = { enable = true }
-# encryption = { enable = true, key_security = "strong" }  # "standard" (default) or "strong"
+# encryption = { enable = true, key_security = "strong" }

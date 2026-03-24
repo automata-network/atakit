@@ -4,6 +4,8 @@ use std::io;
 use flate2::Compression;
 use flate2::GzBuilder;
 
+use atakit_core::ProgressHandle;
+
 use crate::WorkloadError;
 
 /// Staging directory layout for a workload archive.
@@ -109,6 +111,7 @@ pub fn create_archive(
     workload_name: &str,
     workload_version: &str,
     output_dir: &Path,
+    progress: &dyn ProgressHandle,
 ) -> Result<PathBuf, WorkloadError> {
     let archive_path = output_dir.join(format!("{workload_name}-{workload_version}.atawl"));
     let file = std::fs::File::create(&archive_path).map_err(|e| WorkloadError::WriteFile {
@@ -119,16 +122,58 @@ pub fn create_archive(
     let enc = GzBuilder::new()
         .mtime(0)
         .write(file, Compression::default());
-    let mut tar = tar::Builder::new(enc);
+    let counting = ProgressWriter { inner: enc, progress };
+    let mut tar = tar::Builder::new(counting);
 
     append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
 
     tar.into_inner()
         .map_err(WorkloadError::Io)?
+        .inner
         .finish()
         .map_err(WorkloadError::Io)?;
 
     Ok(archive_path)
+}
+
+/// Recursively sum file sizes in a directory. Returns 0 if it doesn't exist.
+pub fn dir_size(path: &Path) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() {
+                total += meta.len();
+            } else if meta.is_dir() {
+                total += walk(&entry.path());
+            }
+        }
+        total
+    }
+    walk(path)
+}
+
+/// Writer wrapper that reports bytes written to a progress handle.
+struct ProgressWriter<'a, W> {
+    inner: W,
+    progress: &'a dyn ProgressHandle,
+}
+
+impl<W: io::Write> io::Write for ProgressWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.progress.inc(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Recursively append a directory tree to a tar archive with deterministic metadata.
@@ -262,6 +307,8 @@ fn copy_recursive(src: &Path, dest: &Path) -> Result<usize, WorkloadError> {
 
 #[cfg(test)]
 mod tests {
+    use atakit_core::ProgressReporter;
+
     use super::*;
 
     #[test]
@@ -297,7 +344,9 @@ mod tests {
         std::fs::write(staging.images_dir.join("test-app.tar"), "fake tar").unwrap();
 
         let out_dir = tempfile::tempdir().unwrap();
-        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path()).unwrap();
+        let null = atakit_core::NullReporter;
+        let handle = null.create("test", 0);
+        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path(), handle.as_ref()).unwrap();
         assert!(archive.exists());
         assert!(archive.to_string_lossy().ends_with("test-app-0.1.0.atawl"));
     }
