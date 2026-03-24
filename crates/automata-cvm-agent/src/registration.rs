@@ -81,6 +81,7 @@ pub struct RegistrationManager<D: DeviceProvider> {
     owner_fingerprint: B256,
     workload_id: B256,
     base_image_id: B256,
+    session_ttl: u64,
     // Session state (populated after register/rotate)
     session: Mutex<Option<Session>>,
 }
@@ -116,7 +117,7 @@ impl Session {
 
 impl<D: DeviceProvider> RegistrationManager<D> {
     /// Create a new registration manager.
-    pub fn new(
+    pub async fn new(
         device: D,
         measurement: Arc<WorkloadMeasurement>,
         config: RegistrationConfig,
@@ -127,6 +128,15 @@ impl<D: DeviceProvider> RegistrationManager<D> {
         let owner_fingerprint = owner_identity.fingerprint();
         let workload_id = WorkloadRegistry::get_workload_id(&config.workload_ref);
         let base_image_id = BaseImageRegistry::get_image_id(&config.base_image_ref);
+        let session_ttl = measurement
+            .session_ttl(workload_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to get session TTL for workload ID: {:?}",
+                    workload_id
+                )
+            })?;
 
         Ok(Self {
             device,
@@ -137,6 +147,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
             owner_fingerprint,
             workload_id,
             base_image_id,
+            session_ttl,
             session: Mutex::new(None),
         })
     }
@@ -487,11 +498,10 @@ impl<D: DeviceProvider> RegistrationManager<D> {
         self.register_with_retries(&shutdown).await?;
 
         // Compute rotation interval (80% of expire offset, minimum 60 seconds)
-        let expire_secs = self.config.expire_offset();
-        let rotation_secs = ((expire_secs as f64) * 0.8) as u64;
-        let rotation_secs = rotation_secs.max(60);
-        let rotation_interval = std::time::Duration::from_secs(rotation_secs);
-        info!(?rotation_interval, "Rotation interval");
+        let registration_interval = ((self.session_ttl as f64) * 0.8) as u64;
+        let registration_interval = registration_interval.max(60);
+        let registration_interval = std::time::Duration::from_secs(registration_interval);
+        info!(?registration_interval, "Registration interval");
 
         loop {
             tokio::select! {
@@ -499,7 +509,7 @@ impl<D: DeviceProvider> RegistrationManager<D> {
                     info!("Registration loop stopped by shutdown signal");
                     return Ok(());
                 }
-                _ = tokio::time::sleep(rotation_interval) => {
+                _ = tokio::time::sleep(registration_interval) => {
                     info!("Time to rotate session...");
                     if let Err(e) = self.register_with_retries(&shutdown).await {
                         warn!(error = %e, "Rotation failed, will retry next interval");

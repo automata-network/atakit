@@ -360,7 +360,7 @@ impl SimCvmAgent {
                 device,
                 measurement.clone(),
                 config,
-            )?);
+            ).await?);
             let child_cancel = cancel.child_token();
             let label = entry.temporary_workload_ref.clone();
             self.registration_managers
