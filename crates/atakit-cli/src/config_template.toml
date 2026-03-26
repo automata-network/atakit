@@ -54,3 +54,10 @@
 # cc_type = "SEV_SNP"  # or "TDX"
 # Per-target key overrides:
 # owner_key_file = "~/.config/atakit/my_owner_key"
+
+# [cloud.targets.my-azure]
+# platform = "azure"
+# subscription = "your-subscription-id"
+# region = "eastus"
+# vmtype = "Standard_DC4as_v5"
+# cc_type = "SEV_SNP"  # or "TDX"

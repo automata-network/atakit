@@ -62,14 +62,28 @@ impl CloudProvider for GcpProvider {
             force: opts.force_image,
         });
 
-        // Firewall - always open agent port 1024.
-        let mut ports = vec!["1024".to_string()];
-        // Add any ports from workload metadata.
-        if let Some(extra) = opts.metadata.get("ports") {
-            for port in extra.split(',') {
-                let p = port.trim().to_string();
-                if !p.is_empty() && !ports.contains(&p) {
-                    ports.push(p);
+        // Firewall - always open agent port 1024 (tcp), plus workload ports.
+        // Port format: "port/proto" (e.g. "1024/tcp", "5353/udp").
+        // No protocol suffix in the workload config means both tcp and udp.
+        let mut ports = vec!["1024/tcp".to_string()];
+        for mapping in &opts.workload_ports {
+            // Parse "host:container[/proto]" -> host port + optional proto.
+            let (ports_part, proto) = match mapping.split_once('/') {
+                Some((p, proto)) => (p, Some(proto)),
+                None => (mapping.as_str(), None),
+            };
+            let host_port = ports_part.split(':').next().unwrap_or("").trim();
+            if host_port.is_empty() {
+                continue;
+            }
+            let protos: &[&str] = match proto {
+                Some(p) => &[p],
+                None => &["tcp", "udp"],
+            };
+            for p in protos {
+                let entry = format!("{host_port}/{p}");
+                if !ports.contains(&entry) {
+                    ports.push(entry);
                 }
             }
         }
@@ -78,25 +92,18 @@ impl CloudProvider for GcpProvider {
             ports,
         });
 
-        // Disks (from metadata, if any).
+        // Disks from the workload manifest.
         let mut disks = Vec::new();
-        if let Some(disk_spec) = opts.metadata.get("disks") {
-            for spec in disk_spec.split(';') {
-                let parts: Vec<&str> = spec.split(':').collect();
-                if parts.len() >= 2 {
-                    let name = format!("{}-{}", names.instance, parts[0].trim());
-                    let size_gb: u64 = parts[1].trim().parse().unwrap_or(10);
-                    let disk_type = parts.get(2).unwrap_or(&"pd-balanced").trim().to_string();
-                    disks.push(DiskSpec {
-                        name,
-                        size_gb,
-                        disk_type,
-                    });
-                }
-            }
+        for (disk_name, size_gb) in &opts.workload_disks {
+            disks.push(DiskSpec {
+                name: format!("{}-{disk_name}", names.instance),
+                device_name: disk_name.clone(),
+                size_gb: *size_gb,
+                disk_type: "pd-balanced".to_string(),
+            });
         }
         if !disks.is_empty() {
-            steps.push(DeployStep::CreateDisks { disks });
+            steps.push(DeployStep::CreateDisks { disks: disks.clone() });
         }
 
         // Create instance.
@@ -107,6 +114,7 @@ impl CloudProvider for GcpProvider {
             image: names.image.clone(),
             cc_type: opts.target.cc_type,
             metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            disks,
         });
 
         if !opts.skip_init {
@@ -199,6 +207,7 @@ impl CloudProvider for GcpProvider {
                 image,
                 cc_type,
                 metadata,
+                disks,
             } => {
                 let ip = instance::create_instance(
                     &self.project,
@@ -208,6 +217,7 @@ impl CloudProvider for GcpProvider {
                     image,
                     *cc_type,
                     metadata,
+                    disks,
                     runner,
                 )
                 .await?;
@@ -222,6 +232,15 @@ impl CloudProvider for GcpProvider {
 
             DeployStep::InitializeWorkload { .. } => {
                 // Handled by the CLI layer (calls init::post_init).
+            }
+
+            // Azure steps - should not be executed by GCP provider.
+            DeployStep::CreateResourceGroup { .. }
+            | DeployStep::UploadImageAzure { .. }
+            | DeployStep::CreateInstanceAzure { .. } => {
+                return Err(CloudError::State {
+                    message: "Azure step executed by GCP provider".to_string(),
+                });
             }
         }
 
@@ -304,6 +323,14 @@ impl CloudProvider for GcpProvider {
                 image::delete_image(&self.project, name, runner).await
             }
             DestroyStep::DeleteBucket { name } => image::delete_bucket(name, runner).await,
+
+            // Azure steps.
+            DestroyStep::DeleteResourceGroup { .. }
+            | DestroyStep::DeleteImageVersion { .. } => {
+                Err(CloudError::State {
+                    message: "Azure destroy step executed by GCP provider".to_string(),
+                })
+            }
         }
     }
 

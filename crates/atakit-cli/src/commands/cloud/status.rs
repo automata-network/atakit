@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::StatusArgs;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::provider::CloudProvider;
@@ -19,7 +20,15 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
 
 	let mut live_ip: Option<String> = None;
 	if args.live {
-		if let Ok(provider) = GcpProvider::from_state(&state) {
+		let provider: Option<Box<dyn CloudProvider>> = match state.platform {
+			atakit_cloud::PlatformKind::Gcp => {
+				GcpProvider::from_state(&state).ok().map(|p| Box::new(p) as _)
+			}
+			atakit_cloud::PlatformKind::Azure => {
+				AzureProvider::from_state(&state).ok().map(|p| Box::new(p) as _)
+			}
+		};
+		if let Some(provider) = provider {
 			let runner = ProcessRunner;
 			live_ip = provider
 				.get_instance_ip(&state, &runner)
@@ -94,6 +103,31 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		if !gcp.disks.is_empty() {
 			eprintln!("    Disks:     {}", gcp.disks.join(", "));
+		}
+	}
+	if let Some(ref az) = state.resources.azure {
+		eprintln!();
+		eprintln!("  {}", "Resources:".dimmed());
+		if let Some(ref i) = az.instance {
+			eprintln!("    Instance:  {i}");
+		}
+		if let Some(ref rg) = az.resource_group {
+			eprintln!("    RG:        {rg}");
+		}
+		if let Some(ref nsg) = az.nsg {
+			eprintln!("    NSG:       {nsg}");
+		}
+		if let Some(ref g) = az.gallery {
+			eprintln!("    Gallery:   {g}");
+		}
+		if let Some(ref def) = az.image_definition {
+			eprintln!("    Image def: {def}");
+		}
+		if let Some(ref sa) = az.storage_account {
+			eprintln!("    Storage:   {sa}");
+		}
+		if !az.disks.is_empty() {
+			eprintln!("    Disks:     {}", az.disks.join(", "));
 		}
 	}
 
