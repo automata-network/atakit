@@ -115,10 +115,12 @@ pub enum DeployStep {
 /// Persistent disk specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskSpec {
-    /// GCE disk resource name (e.g. `{instance}-{disk_name}`).
+    /// Cloud disk resource name (e.g. `{instance}-{disk_name}`).
     pub name: String,
     /// Manifest disk name, used as device-name/serial for CVM agent discovery.
     pub device_name: String,
+    /// LUN / device index for cloud attachment.
+    pub index: u32,
     pub size_gb: u64,
     pub disk_type: String,
 }

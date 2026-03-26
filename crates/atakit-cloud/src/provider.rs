@@ -23,6 +23,10 @@ pub struct DeployOptions {
     pub metadata: BTreeMap<String, String>,
     pub force_image: bool,
     pub skip_init: bool,
+    /// Host ports from the workload manifest (format: "host:container" or "port").
+    pub workload_ports: Vec<String>,
+    /// Disks from the workload manifest: (disk_name, index, size_gb).
+    pub workload_disks: Vec<(String, u32, u64)>,
 }
 
 /// Options for a destroy operation.

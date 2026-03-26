@@ -32,10 +32,10 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		workload_version = resolved.version;
 		workload_ports = resolved.ports;
 		workload_disks = resolved.disks.iter()
-			.map(|(name, size)| {
+			.map(|(name, (index, size))| {
 				let gb = parse_size_gb(size)
 					.ok_or_else(|| anyhow::anyhow!("invalid disk size '{size}' for disk '{name}'"))?;
-				Ok((name.clone(), gb))
+				Ok((name.clone(), *index, gb))
 			})
 			.collect::<Result<Vec<_>>>()?;
 		let ap = resolved.archive_path;
@@ -200,13 +200,13 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			PlatformKind::Gcp => "pd-balanced",
 			PlatformKind::Azure => "Premium_LRS",
 		};
-		for (i, (name, gb)) in workload_disks.iter().enumerate() {
+		for (i, (name, index, gb)) in workload_disks.iter().enumerate() {
 			let label = if i == 0 {
 				format!("{:<15}", "Disks:").dimmed().to_string()
 			} else {
 				format!("{:<15}", "")
 			};
-			eprintln!("  {label}- {name} ({gb}GB, {disk_type})");
+			eprintln!("  {label}- {name} ({gb}GB, {disk_type}, LUN {index})");
 		}
 	}
 	if let Some(ref src) = resolved_image.source_path {

@@ -34,6 +34,35 @@ impl WorkloadConfig {
         })?;
         toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })
     }
+
+    /// Resolve disk indices: auto-assign starting from 10 for disks without
+    /// an explicit `index`, filling gaps around explicitly assigned indices.
+    /// Returns a map of disk name -> resolved index.
+    pub fn resolved_disk_indices(&self) -> BTreeMap<String, u32> {
+        let mut result = BTreeMap::new();
+        // Collect explicitly assigned indices.
+        let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (name, disk) in &self.disks {
+            if let Some(idx) = disk.index {
+                result.insert(name.clone(), idx);
+                used.insert(idx);
+            }
+        }
+        // Auto-assign for disks without index (BTreeMap iterates alphabetically).
+        let mut next = 10u32;
+        for name in self.disks.keys() {
+            if result.contains_key(name) {
+                continue;
+            }
+            while used.contains(&next) {
+                next += 1;
+            }
+            result.insert(name.clone(), next);
+            used.insert(next);
+            next += 1;
+        }
+        result
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,19 +231,122 @@ pub struct DependencySection {
     pub disks: BTreeMap<String, String>,
 }
 
+/// Parsed port specification: `host[:container][/protocol]`.
+#[derive(Debug, Clone)]
+pub struct ParsedPort {
+    pub host: u16,
+    pub container: Option<u16>,
+    /// `None` means both tcp and udp.
+    pub protocol: Option<String>,
+}
+
+/// Parse a port specification string.
+///
+/// Format: `host[:container][/protocol]`
+/// - `host` is required (u16)
+/// - `container` is optional (u16)
+/// - `protocol` is optional ("tcp" or "udp"; absent means both)
+///
+/// Examples: `"3000"`, `"3000/tcp"`, `"3000:3000"`, `"8080:80/tcp"`
+pub fn parse_port_spec(s: &str) -> Result<ParsedPort, String> {
+    let (ports_part, protocol) = match s.split_once('/') {
+        Some((p, proto)) => {
+            if proto != "tcp" && proto != "udp" {
+                return Err(format!(
+                    "protocol must be \"tcp\" or \"udp\", got {proto:?}"
+                ));
+            }
+            (p, Some(proto.to_string()))
+        }
+        None => (s, None),
+    };
+
+    let parts: Vec<&str> = ports_part.split(':').collect();
+    match parts.len() {
+        1 => {
+            let host = parts[0]
+                .parse::<u16>()
+                .map_err(|_| format!("port must be a valid u16, got {:?}", parts[0]))?;
+            Ok(ParsedPort {
+                host,
+                container: None,
+                protocol,
+            })
+        }
+        2 => {
+            let host = parts[0]
+                .parse::<u16>()
+                .map_err(|_| format!("host port must be a valid u16, got {:?}", parts[0]))?;
+            let container = parts[1]
+                .parse::<u16>()
+                .map_err(|_| format!("container port must be a valid u16, got {:?}", parts[1]))?;
+            Ok(ParsedPort {
+                host,
+                container: Some(container),
+                protocol,
+            })
+        }
+        _ => Err(format!("invalid port spec: {s:?}")),
+    }
+}
+
 /// VM firewall overrides.
 #[derive(Debug, Deserialize)]
 pub struct FirewallSection {
     #[serde(default)]
-    pub allow: Vec<FirewallAllow>,
+    pub allow: Vec<FirewallEntry>,
     #[serde(default)]
-    pub deny: Vec<u16>,
+    pub deny: Vec<FirewallEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct FirewallAllow {
+/// A firewall entry: port + optional protocol.
+///
+/// Accepts three TOML forms:
+/// - Integer: `3000` (both tcp+udp)
+/// - String: `"3000"`, `"3000/tcp"`, `"3000/udp"`
+/// - Object: `{ port = 3000, protocol = "tcp" }`
+#[derive(Debug)]
+pub struct FirewallEntry {
     pub port: u16,
-    pub protocol: String,
+    /// `None` means both tcp and udp.
+    pub protocol: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for FirewallEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Port(u16),
+            Spec(String),
+            Full { port: u16, protocol: String },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Port(port) => Ok(FirewallEntry {
+                port,
+                protocol: None,
+            }),
+            Raw::Spec(s) => {
+                let parsed = parse_port_spec(&s).map_err(de::Error::custom)?;
+                if parsed.container.is_some() {
+                    return Err(de::Error::custom(
+                        "firewall entry must not include a container port",
+                    ));
+                }
+                Ok(FirewallEntry {
+                    port: parsed.host,
+                    protocol: parsed.protocol,
+                })
+            }
+            Raw::Full { port, protocol } => Ok(FirewallEntry {
+                port,
+                protocol: Some(protocol),
+            }),
+        }
+    }
 }
 
 /// Baby (sidecar) container runtime settings.
@@ -242,6 +374,9 @@ pub struct SigningSection {
 /// Persistent disk definition.
 #[derive(Debug, Deserialize)]
 pub struct DiskSection {
+    /// LUN / device index. Must be >= 10 and unique across all disks.
+    /// If omitted, auto-assigned starting from 10 in alphabetical disk name order.
+    pub index: Option<u32>,
     pub size: String,
     #[serde(default)]
     pub bind_fs: bool,
@@ -362,6 +497,7 @@ auth_info = "./secrets/auth_info.json"
 policy = "./config/cosign_policy.json"
 
 [disks.data]
+index = 10
 size = "10GB"
 bind_fs = true
 encryption = { enable = true }
@@ -377,6 +513,7 @@ encryption = { enable = true }
         assert!(cfg.baby_container.is_some());
         assert!(cfg.signing.is_some());
         assert!(cfg.disks.contains_key("data"));
+        assert_eq!(cfg.disks["data"].index, Some(10));
     }
 
     #[test]

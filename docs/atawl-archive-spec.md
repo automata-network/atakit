@@ -82,10 +82,19 @@ image = "redis:7"
 image = "model-server:v0.0.1"
 ports = ["8080:8080"]
 
-# ── firewall ──────────────────────────────────────────
+# ── firewall ports (resolved: auto-derived + allow - deny) ──
 
-[config.firewall]
-allow = [{ port = 4000, protocol = "tcp" }]
+[[config.firewall-ports]]
+port = 3000
+protocol = "tcp"
+
+[[config.firewall-ports]]
+port = 3000
+protocol = "udp"
+
+[[config.firewall-ports]]
+port = 4000
+protocol = "tcp"
 
 # ── baby containers ───────────────────────────────────
 
@@ -103,9 +112,11 @@ policy = "signing/cosign_policy.json"
 # ── persistent disks ──────────────────────────────────
 
 [disks.secure-signer-data]
+index = 10
 size = "10GB"
 
 [disks.secure-signer-data2]
+index = 11
 size = "11GB"
 bind_fs = true
 encryption = { enable = true }
@@ -237,14 +248,16 @@ image = "model-server:v0.0.1"
 ports = ["8080:8080"]
 ```
 
-### `[config.firewall]` — VM Firewall Overrides
+### `[config.firewall-ports]` — Resolved Firewall Ports
 
-| Field | Type | Default | Source in TOML |
-|---|---|---|---|
-| `allow` | array of tables | `[]` | `[firewall] allow` |
-| `deny` | array of integers | `[]` | `[firewall] deny` |
+A flat list of port/protocol pairs to open. This is the compiled result of: auto-derived ports from `ports` fields + `[firewall] allow` entries - `[firewall] deny` entries. Sorted by port number, then protocol, for deterministic output.
 
-Each `allow` entry has `port` (integer) and `protocol` (string: `"tcp"` or `"udp"`).
+| Field | Type | Description |
+|---|---|---|
+| `port` | integer | Port number. |
+| `protocol` | string | `"tcp"` or `"udp"`. |
+
+Each entry represents a single port/protocol rule to open. Ports without a protocol suffix in the source config are expanded to two entries (tcp + udp).
 
 ### `[config.baby-container]` — Sidecar Container Runtime
 
@@ -269,6 +282,7 @@ Top-level section (not under `[config]`). Defines persistent disk volumes attach
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `index` | integer | yes | LUN / device index for cloud disk attachment. Always present in manifest (resolved from source config). |
 | `size` | string | yes | Disk size (e.g. `"10GB"`). |
 | `bind_fs` | bool | no | Enable UID translation via bindfs. Default: `false`. |
 | `encryption.enable` | bool | no | Enable disk encryption. Default: `false`. |
@@ -476,7 +490,7 @@ The relationship is analogous to source code and a compiled binary. The source i
 | `[workload.environment]` + `env_file` | `[config.environment]` (merged, inlined) |
 | `[workload.disks]` | `[config.disks]` |
 | `[dependencies.<name>]` | `[config.dependencies.<name>]` *(not yet implemented)* |
-| `[firewall]` | `[config.firewall]` |
+| `[firewall]` + `ports` | `[config.firewall-ports]` (resolved flat list) |
 | `[baby-container]` | `[config.baby-container]` |
 | `[signing]` | `[config.signing]` (paths rewritten) |
 | `[disks.<name>]` | `[disks.<name>]` |

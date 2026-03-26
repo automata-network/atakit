@@ -8,7 +8,7 @@ All-in-one CLI for creation, provisioning, and management of Confidential Virtua
 - **Workload lifecycle** -- scaffold, build, publish, and manage workload archives (`.atawl`) with deterministic integrity verification (PCR23)
 - **Workload registry** -- push/pull workload archives to/from an HTTP registry
 - **On-chain integration** -- publish and deactivate workload specs on the on-chain WorkloadRegistry; query specs by workload ID
-- **Cloud deployment** -- deploy workloads to CVM instances on GCP (Azure planned), with full orchestration of images, firewall rules, disks, and instances
+- **Cloud deployment** -- deploy workloads to CVM instances on GCP and Azure, with full orchestration of images, firewall rules, disks, and instances
 - **Deployment management** -- status, SSH, serial console, destroy with selective resource preservation
 
 ## Install
@@ -117,10 +117,17 @@ session_registry = "0x..."
 
 [cloud.targets.my-gcp]
 platform = "gcp"
-cc_type = "sev-snp"
+cc_type = "SEV_SNP"
 project = "my-project"
-region = "us-central1"
-vmtype = "n2d-standard-2"
+region = "us-central1-a"
+vmtype = "c3-standard-4"
+
+[cloud.targets.my-azure]
+platform = "azure"
+cc_type = "SEV_SNP"
+subscription = "your-subscription-id"
+region = "eastus"
+vmtype = "Standard_DC4as_v5"
 ```
 
 ### Workload config (`atakit-workload.toml`)
@@ -151,7 +158,7 @@ crates/
   atakit-core/       # Shared types (Env, ProgressReporter trait)
   atakit-image/      # Image domain logic (GitHub Releases, local store)
   atakit-workload/   # Workload domain logic (build, registry, on-chain)
-  atakit-cloud/      # Cloud deployment logic (GCP provider, state management)
+  atakit-cloud/      # Cloud deployment logic (GCP + Azure providers, state management)
   atakit-cli/        # Binary crate (presentation, progress bars, error display)
 ```
 
