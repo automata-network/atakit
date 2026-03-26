@@ -1,3 +1,4 @@
+pub mod azure;
 pub mod config;
 pub mod error;
 pub mod exec;
@@ -15,11 +16,12 @@ pub use config::{CcType, CloudConfig, CloudTarget, PlatformKind};
 pub use error::CloudError;
 pub use exec::{CommandOutput, CommandRunner, ProcessRunner};
 pub use init::AgentConfig;
-pub use naming::ResourceNames;
+pub use naming::{AzureResourceNames, ResourceNames};
 pub use plan::{
     DeployPlan, DeployStep, DestroyPlan, DestroyStep, DiskSpec, ResourceUpdates, StepResult,
 };
 pub use provider::{CloudProvider, DeployOptions, DestroyOptions};
 pub use state::{
-    DeployState, DeployStatus, GcpResources, NewDeployParams, PersistedAgentEnv, ResourceSet,
+    AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams, PersistedAgentEnv,
+    ResourceSet,
 };

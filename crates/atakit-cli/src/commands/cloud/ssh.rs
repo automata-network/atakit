@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::SshArgs;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::provider::CloudProvider;
@@ -15,12 +16,12 @@ pub fn run(args: SshArgs, env: &Env, _config: &Config) -> Result<()> {
 	let state = DeployState::load(&env.data_dir, &target_name, &instance_name)
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-	let provider = match state.platform {
+	let provider: Box<dyn CloudProvider> = match state.platform {
 		atakit_cloud::PlatformKind::Gcp => {
-			GcpProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?
+			Box::new(GcpProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
 		atakit_cloud::PlatformKind::Azure => {
-			anyhow::bail!("Azure SSH is not yet implemented")
+			Box::new(AzureProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
 	};
 

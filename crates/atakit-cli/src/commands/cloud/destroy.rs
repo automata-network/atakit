@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
+use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DestroyArgs;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::provider::CloudProvider;
@@ -21,7 +22,9 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		atakit_cloud::PlatformKind::Gcp => {
 			Box::new(GcpProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
-		atakit_cloud::PlatformKind::Azure => bail!("Azure support is not yet implemented"),
+		atakit_cloud::PlatformKind::Azure => {
+			Box::new(AzureProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+		}
 	};
 
 	let destroy_opts = atakit_cloud::provider::DestroyOptions {
@@ -33,12 +36,11 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
 	// Display deployment details.
-	let gcp = state.resources.gcp.as_ref();
 	eprintln!("{}", "Deployment:".dimmed());
 	eprintln!("  {:<15}{}", "Instance:".dimmed(), instance_name.bold());
 	eprintln!("  {:<15}{}", "Target:".dimmed(), target_name);
 	eprintln!("  {:<15}{}", "Platform:".dimmed(), state.platform);
-	if let Some(g) = gcp {
+	if let Some(ref g) = state.resources.gcp {
 		eprintln!("  {:<15}{}", "Project:".dimmed(), g.project);
 		eprintln!("  {:<15}{}", "Zone:".dimmed(), g.zone);
 		if let Some(ref name) = g.instance {
@@ -58,6 +60,28 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		if !g.disks.is_empty() {
 			eprintln!("  {:<15}{}", "Disks:".dimmed(), g.disks.join(", "));
+		}
+	}
+	if let Some(ref az) = state.resources.azure {
+		eprintln!("  {:<15}{}", "Subscription:".dimmed(), az.subscription);
+		eprintln!("  {:<15}{}", "Region:".dimmed(), az.region);
+		if let Some(ref name) = az.instance {
+			eprintln!("  {:<15}{}", "VM:".dimmed(), name);
+		}
+		if let Some(ref ip) = az.external_ip {
+			eprintln!("  {:<15}{}", "IP:".dimmed(), ip);
+		}
+		if let Some(ref name) = az.resource_group {
+			eprintln!("  {:<15}{}", "RG:".dimmed(), name);
+		}
+		if let Some(ref name) = az.nsg {
+			eprintln!("  {:<15}{}", "NSG:".dimmed(), name);
+		}
+		if let Some(ref name) = az.gallery {
+			eprintln!("  {:<15}{}", "Gallery:".dimmed(), name);
+		}
+		if !az.disks.is_empty() {
+			eprintln!("  {:<15}{}", "Disks:".dimmed(), az.disks.join(", "));
 		}
 	}
 	if !state.workload_name.is_empty() {

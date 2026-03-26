@@ -54,6 +54,8 @@ pub struct PersistedAgentEnv {
 pub struct ResourceSet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcpResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureResources>,
 }
 
 /// GCP-specific resource tracking.
@@ -67,6 +69,33 @@ pub struct GcpResources {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firewall_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_ip: Option<String>,
+}
+
+/// Azure-specific resource tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AzureResources {
+    pub subscription: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gallery_rg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gallery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_definition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsg: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +230,15 @@ impl DeployState {
 
     /// Apply resource updates from a completed step.
     pub fn apply_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        // Route to the correct platform resource set.
+        if self.resources.azure.is_some() {
+            self.apply_azure_resource_updates(updates);
+        } else {
+            self.apply_gcp_resource_updates(updates);
+        }
+    }
+
+    fn apply_gcp_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
         let gcp = self
             .resources
             .gcp
@@ -222,6 +260,46 @@ impl DeployState {
         }
         if let Some(ref ip) = updates.external_ip {
             gcp.external_ip = Some(ip.clone());
+        }
+    }
+
+    fn apply_azure_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let az = self
+            .resources
+            .azure
+            .get_or_insert_with(AzureResources::default);
+        if let Some(ref rg) = updates.resource_group {
+            az.resource_group = Some(rg.clone());
+        }
+        if let Some(ref sa) = updates.storage_account {
+            az.storage_account = Some(sa.clone());
+        }
+        if let Some(ref grg) = updates.gallery_rg {
+            az.gallery_rg = Some(grg.clone());
+        }
+        if let Some(ref g) = updates.gallery {
+            az.gallery = Some(g.clone());
+        }
+        if let Some(ref def) = updates.image_definition {
+            az.image_definition = Some(def.clone());
+        }
+        if let Some(ref ver) = updates.image_version {
+            az.image_version = Some(ver.clone());
+        }
+        if let Some(ref n) = updates.nsg {
+            az.nsg = Some(n.clone());
+        }
+        if let Some(ref f) = updates.firewall_rule {
+            az.nsg = Some(f.clone());
+        }
+        if !updates.disks.is_empty() {
+            az.disks.extend(updates.disks.iter().cloned());
+        }
+        if let Some(ref i) = updates.instance {
+            az.instance = Some(i.clone());
+        }
+        if let Some(ref ip) = updates.external_ip {
+            az.external_ip = Some(ip.clone());
         }
     }
 }

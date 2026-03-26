@@ -22,6 +22,85 @@ impl ResourceNames {
     }
 }
 
+/// Azure resource names for cloud deployments.
+pub struct AzureResourceNames {
+    /// Resource group: `{instance}-rg`.
+    pub resource_group: String,
+    /// Storage account: `atakit{alphanum}` (max 24, lowercase alphanum only).
+    pub storage_account: String,
+    /// Gallery resource group: `atakit-images-{region}` (shared across deployments).
+    pub gallery_rg: String,
+    /// Compute Gallery: `atakit_{alphanum}_gallery` (alphanum + underscores).
+    pub gallery: String,
+    /// Image definition: sanitized image ref.
+    pub image_definition: String,
+    /// Image version: always "1.0.0".
+    pub image_version: String,
+    /// Network security group: `{instance}-nsg`.
+    pub nsg: String,
+    /// VM instance name.
+    pub instance: String,
+}
+
+impl AzureResourceNames {
+    /// Derive Azure resource names from instance name, image reference, and region.
+    pub fn for_azure(instance_name: &str, image_ref: &str, region: &str) -> Self {
+        let inst = sanitize(instance_name, 64);
+        Self {
+            resource_group: format!("{}-rg", sanitize(instance_name, 87)),
+            storage_account: sanitize_azure_storage(&format!("atakit{instance_name}"), 24),
+            gallery_rg: format!("atakit-images-{}", sanitize(region, 73)),
+            gallery: format!(
+                "atakit_{}_gallery",
+                sanitize_azure_gallery(instance_name, 55)
+            ),
+            image_definition: sanitize(image_ref, 80),
+            image_version: "1.0.0".to_string(),
+            nsg: format!("{}-nsg", sanitize(instance_name, 76)),
+            instance: inst,
+        }
+    }
+}
+
+/// Sanitize for Azure storage account: lowercase alphanum only, no hyphens.
+fn sanitize_azure_storage(s: &str, max_len: usize) -> String {
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch.to_ascii_lowercase());
+        }
+    }
+    if result.len() > max_len {
+        result.truncate(max_len);
+    }
+    result
+}
+
+/// Sanitize for Azure gallery name: alphanum + underscores.
+fn sanitize_azure_gallery(s: &str, max_len: usize) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut last_was_underscore = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            result.push('_');
+            last_was_underscore = true;
+        }
+    }
+    while result.ends_with('_') {
+        result.pop();
+    }
+    if result.len() > max_len {
+        result.truncate(max_len);
+        while result.ends_with('_') {
+            result.pop();
+        }
+    }
+    result
+}
+
 /// Standard labels applied to all GCP resources.
 pub fn resource_labels(
     instance: &str,
@@ -101,6 +180,35 @@ mod tests {
         assert_eq!(names.bucket, "atakit-my-instance");
         assert_eq!(names.image, "automata-linux-v0-1-6");
         assert_eq!(names.firewall, "my-instance-ingress");
+        assert_eq!(names.instance, "my-instance");
+    }
+
+    #[test]
+    fn azure_storage_account_sanitize() {
+        assert_eq!(sanitize_azure_storage("atakit-my-instance", 24), "atakitmyinstance");
+        // Max 24 chars.
+        assert_eq!(
+            sanitize_azure_storage("atakitaverylonginstancename", 24),
+            "atakitaverylonginstancen"
+        );
+    }
+
+    #[test]
+    fn azure_gallery_sanitize() {
+        assert_eq!(sanitize_azure_gallery("my-instance", 55), "my_instance");
+        assert_eq!(sanitize_azure_gallery("--leading--", 55), "leading");
+    }
+
+    #[test]
+    fn azure_resource_names() {
+        let names = AzureResourceNames::for_azure("my-instance", "automata-linux:v0.1.6", "eastus");
+        assert_eq!(names.resource_group, "my-instance-rg");
+        assert_eq!(names.storage_account, "atakitmyinstance");
+        assert_eq!(names.gallery_rg, "atakit-images-eastus");
+        assert_eq!(names.gallery, "atakit_my_instance_gallery");
+        assert_eq!(names.image_definition, "automata-linux-v0-1-6");
+        assert_eq!(names.image_version, "1.0.0");
+        assert_eq!(names.nsg, "my-instance-nsg");
         assert_eq!(names.instance, "my-instance");
     }
 }
