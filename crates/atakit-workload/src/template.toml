@@ -53,9 +53,10 @@ image = "{{name}}:latest"
 
 # ── container runtime ────────────────────────────────────────────
 #
-# ports: host:container port mappings. Optional /tcp or /udp suffix (default: tcp).
+# ports: host:container port mappings. Optional /tcp or /udp suffix.
+# No suffix opens both TCP and UDP. Use /tcp or /udp to restrict to one protocol.
 # Host ports from this list automatically get firewall allow rules.
-# ports = ["3000:3000", "8080:8080/udp"]
+# ports = ["3000:3000", "8080:8080/tcp", "5353:5353/udp"]
 #
 # restart: container restart policy.
 # Values: "no" (default), "always", "on-failure", "unless-stopped".
@@ -129,17 +130,20 @@ image = "{{name}}:latest"
 
 # ── firewall ─────────────────────────────────────────────────────
 #
-# By default, every host port in `ports` gets a TCP allow rule on the VM
-# firewall. Use [firewall] to add extra rules or deny auto-derived ones.
+# By default, every host port in `ports` gets firewall allow rules (both TCP
+# and UDP unless a protocol suffix restricts it). Use [firewall] to add extra
+# rules or deny auto-derived ones.
 #
-# allow: additional firewall rules. Port must be >= 1025.
-#        Protocol must be "tcp" or "udp".
-# deny:  suppress auto-derived rules for specific ports.
-#        Only useful for ports that appear in `ports` above.
+# Format: same as ports -- "host-port[/protocol]" (no container port).
+# A bare port number (integer or string without /protocol) means both tcp+udp.
+# Port must be >= 1025. Also accepts { port, protocol } object form.
+#
+# allow: additional firewall rules beyond auto-derived ones.
+# deny:  suppress auto-derived rules. Only useful for ports in `ports` above.
 #
 # [firewall]
-# allow = [{ port = 4000, protocol = "tcp" }, { port = 5000, protocol = "udp" }]
-# deny = [9091]
+# allow = ["4000/tcp", "5000/udp"]
+# deny = [3000, "8080/udp"]
 
 # ── baby containers ──────────────────────────────────────────────
 #
@@ -173,12 +177,15 @@ image = "{{name}}:latest"
 # be mounted by exactly one container via [workload.disks] or
 # [dependencies.<name>.disks].
 #
+# index: device LUN / index. Must be >= 10, unique across all disks.
+#        Auto-assigned from 10 in alphabetical order if omitted.
 # size: disk size with unit suffix. Valid units: MB, GB, TB.
 # bind_fs: use bindfs for UID translation (default: false).
 # encryption.enable: encrypt the disk at rest (default: false).
 # encryption.key_security: "standard" (default) or "strong".
 #
 # [disks.my-disk]
+# index = 10
 # size = "10GB"
 # bind_fs = true
 # encryption = { enable = true }

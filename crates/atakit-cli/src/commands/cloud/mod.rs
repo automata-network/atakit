@@ -7,6 +7,7 @@ pub mod ssh;
 pub mod status;
 pub mod upload_image;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -188,11 +189,14 @@ fn resolve_store_image(
     })
 }
 
-/// Resolved workload source: archive path + name/version.
+/// Resolved workload source: archive path + name/version + declared ports + disks.
 pub(super) struct ResolvedWorkload {
     pub archive_path: PathBuf,
     pub name: String,
     pub version: String,
+    pub ports: Vec<String>,
+    /// Disk name -> (index, size string e.g. "10GB").
+    pub disks: BTreeMap<String, (u32, String)>,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -209,10 +213,24 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             if !blob.exists() {
                 bail!("no archive blob for {name}:{version} in store");
             }
+            let inspect_opts = atakit_workload::InspectOptions {
+                archive: Some(blob.clone()),
+                workload_dir: None,
+                engine: None,
+                verbose: false,
+            };
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
+            }).context("failed to inspect store archive")?;
+            let disks = result.manifest.disks.iter()
+                .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+                .collect();
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 name,
                 version,
+                ports: result.manifest.config.ports,
+                disks,
             });
         }
 
@@ -230,10 +248,15 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
         }).context("failed to inspect archive")?;
+        let disks = result.manifest.disks.iter()
+            .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+            .collect();
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
+            ports: result.manifest.config.ports,
+            disks,
         });
     }
 
@@ -247,10 +270,19 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
     let wl_config = atakit_workload::config::WorkloadConfig::from_dir(&workload_dir)?;
+    let resolved_indices = wl_config.resolved_disk_indices();
+    let disks = wl_config.disks.iter()
+        .map(|(k, v)| {
+            let index = resolved_indices.get(k).copied().unwrap_or(10);
+            (k.clone(), (index, v.size.clone()))
+        })
+        .collect();
     Ok(ResolvedWorkload {
         archive_path,
         name: wl_config.workload.name,
         version: wl_config.workload.version,
+        ports: wl_config.workload.ports,
+        disks,
     })
 }
 

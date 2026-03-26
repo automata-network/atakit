@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -64,8 +64,13 @@ pub struct ManifestConfig {
     pub disks: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub firewall: Option<ManifestFirewall>,
+    /// Resolved firewall ports to open (auto-derived + allow - deny).
+    #[serde(
+        default,
+        rename = "firewall-ports",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub firewall_ports: Vec<ManifestFirewallPort>,
     #[serde(
         rename = "baby-container",
         skip_serializing_if = "Option::is_none"
@@ -159,16 +164,9 @@ pub struct ManifestDependency {
     pub disks: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ManifestFirewall {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<ManifestFirewallAllow>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<u16>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ManifestFirewallAllow {
+/// A resolved firewall port to open: port number + protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ManifestFirewallPort {
     pub port: u16,
     pub protocol: String,
 }
@@ -190,6 +188,8 @@ pub struct ManifestSigning {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDisk {
+    /// LUN / device index for cloud disk attachment.
+    pub index: u32,
     pub size: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub bind_fs: bool,
@@ -324,18 +324,40 @@ pub fn build_manifest(
         .map(|p| strip_dot_slash(p).to_string())
         .collect();
 
-    // Firewall
-    let firewall = config.firewall.as_ref().map(|fw| ManifestFirewall {
-        allow: fw
-            .allow
+    // Firewall: resolve auto-derived ports + allow - deny into a flat list.
+    // Firewall: resolve auto-derived ports + allow - deny into a flat list.
+    let firewall_ports = {
+        let mut open: HashSet<(u16, String)> = HashSet::new();
+
+        // Auto-derive from ports (workload + dependencies).
+        let all_port_specs = w
+            .ports
             .iter()
-            .map(|a| ManifestFirewallAllow {
-                port: a.port,
-                protocol: a.protocol.clone(),
-            })
-            .collect(),
-        deny: fw.deny.clone(),
-    });
+            .chain(config.dependencies.values().flat_map(|d| d.ports.iter()));
+        for spec in all_port_specs {
+            if let Ok(parsed) = crate::config::parse_port_spec(spec) {
+                insert_port_protos(&mut open, parsed.host, &parsed.protocol);
+            }
+        }
+
+        // Apply firewall overrides.
+        if let Some(ref fw) = config.firewall {
+            for entry in &fw.allow {
+                insert_port_protos(&mut open, entry.port, &entry.protocol);
+            }
+            for entry in &fw.deny {
+                remove_port_protos(&mut open, entry.port, &entry.protocol);
+            }
+        }
+
+        // Sort for deterministic output.
+        let mut ports: Vec<ManifestFirewallPort> = open
+            .into_iter()
+            .map(|(port, protocol)| ManifestFirewallPort { port, protocol })
+            .collect();
+        ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+        ports
+    };
 
     // Baby container
     let baby_container = config
@@ -365,7 +387,8 @@ pub fn build_manifest(
     // pipeline supports staging their images/data and computing hashes.
     let dependencies = None;
 
-    // Disks (top-level)
+    // Disks (top-level) - resolve auto-assigned indices.
+    let resolved_indices = config.resolved_disk_indices();
     let disks: BTreeMap<String, ManifestDisk> = config
         .disks
         .iter()
@@ -374,9 +397,11 @@ pub fn build_manifest(
                 enable: e.enable,
                 key_security: e.key_security.clone(),
             });
+            let index = resolved_indices.get(name).copied().unwrap_or(10);
             (
                 name.clone(),
                 ManifestDisk {
+                    index,
                     size: d.size.clone(),
                     bind_fs: d.bind_fs,
                     encryption: enc,
@@ -406,12 +431,34 @@ pub fn build_manifest(
             environment,
             disks: w.disks.clone(),
             dependencies,
-            firewall,
+            firewall_ports,
             baby_container,
             signing,
         },
         disks,
         hashes,
+    }
+}
+
+/// Insert port with protocol(s) into the open set. `None` means both tcp+udp.
+fn insert_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &Option<String>) {
+    match protocol {
+        Some(p) => { open.insert((port, p.clone())); }
+        None => {
+            open.insert((port, "tcp".to_string()));
+            open.insert((port, "udp".to_string()));
+        }
+    }
+}
+
+/// Remove port with protocol(s) from the open set. `None` means both tcp+udp.
+fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &Option<String>) {
+    match protocol {
+        Some(p) => { open.remove(&(port, p.clone())); }
+        None => {
+            open.remove(&(port, "tcp".to_string()));
+            open.remove(&(port, "udp".to_string()));
+        }
     }
 }
 

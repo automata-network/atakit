@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
-use crate::config::{ImageSource, WorkloadConfig};
+use crate::config::{self, ImageSource, WorkloadConfig};
 use crate::WorkloadError;
 
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
@@ -96,11 +96,11 @@ pub fn validate_config(
 
     // ── ports ──────────────────────────────────────────────
     for spec in &w.ports {
-        validate_port_spec(spec, "workload.ports")?;
+        validate_container_port(spec, "workload.ports")?;
     }
     for (dep_name, dep) in &config.dependencies {
         for spec in &dep.ports {
-            validate_port_spec(spec, &format!("dependencies.{dep_name}.ports"))?;
+            validate_container_port(spec, &format!("dependencies.{dep_name}.ports"))?;
         }
     }
 
@@ -206,25 +206,21 @@ pub fn validate_config(
 
     // ── firewall ──────────────────────────────────────────
     if let Some(ref fw) = config.firewall {
-        for rule in &fw.allow {
-            if rule.port < 1025 {
-                return Err(WorkloadError::Validation(format!(
-                    "firewall allow port must be >= 1025, got {}",
-                    rule.port
-                )));
-            }
-            if rule.protocol != "tcp" && rule.protocol != "udp" {
-                return Err(WorkloadError::Validation(format!(
-                    "firewall protocol must be \"tcp\" or \"udp\", got {:?}",
-                    rule.protocol
-                )));
-            }
-        }
-        for &port in &fw.deny {
-            if port < 1025 {
-                return Err(WorkloadError::Validation(format!(
-                    "firewall deny port must be >= 1025, got {port}"
-                )));
+        for (label, entries) in [("allow", &fw.allow), ("deny", &fw.deny)] {
+            for entry in entries {
+                if entry.port < 1025 {
+                    return Err(WorkloadError::Validation(format!(
+                        "firewall {label} port must be >= 1025, got {}",
+                        entry.port
+                    )));
+                }
+                if let Some(ref proto) = entry.protocol {
+                    if proto != "tcp" && proto != "udp" {
+                        return Err(WorkloadError::Validation(format!(
+                            "firewall protocol must be \"tcp\" or \"udp\", got {proto:?}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -238,19 +234,34 @@ pub fn validate_config(
         }
     }
 
-    // ── disk size format + encryption ────────────────────
-    for (name, disk) in &config.disks {
-        if !is_valid_size(&disk.size) {
-            return Err(WorkloadError::Validation(format!(
-                "disk {name:?} size must be a valid size string (e.g. \"10GB\", \"500MB\"), got {:?}",
-                disk.size
-            )));
-        }
-        if let Some(ref enc) = disk.encryption {
-            if enc.enable && enc.key_security != "standard" && enc.key_security != "strong" {
+    // ── disk index + size format + encryption ─────────────
+    {
+        let resolved = config.resolved_disk_indices();
+        let mut seen_indices: HashSet<u32> = HashSet::new();
+        for (name, disk) in &config.disks {
+            let index = resolved.get(name.as_str()).copied().unwrap_or(10);
+            if index < 10 {
                 return Err(WorkloadError::Validation(format!(
-                    "disk {name:?} encryption.key_security must be \"standard\" or \"strong\""
+                    "disk {name:?} index must be >= 10, got {index}"
                 )));
+            }
+            if !seen_indices.insert(index) {
+                return Err(WorkloadError::Validation(format!(
+                    "disk {name:?} has duplicate index {index}"
+                )));
+            }
+            if !is_valid_size(&disk.size) {
+                return Err(WorkloadError::Validation(format!(
+                    "disk {name:?} size must be a valid size string (e.g. \"10GB\", \"500MB\"), got {:?}",
+                    disk.size
+                )));
+            }
+            if let Some(ref enc) = disk.encryption {
+                if enc.enable && enc.key_security != "standard" && enc.key_security != "strong" {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?} encryption.key_security must be \"standard\" or \"strong\""
+                    )));
+                }
             }
         }
     }
@@ -281,18 +292,21 @@ pub fn validate_config(
     if let Some(ref fw) = config.firewall {
         let auto_ports = collect_auto_derived_ports(config);
 
-        for rule in &fw.allow {
-            if rule.protocol == "tcp" && auto_ports.contains(&rule.port) {
+        for entry in &fw.allow {
+            let redundant = entry_matches_auto(&auto_ports, entry);
+            if redundant {
                 warnings.push(format!(
-                    "firewall allow port {} is redundant (already auto-derived from ports)",
-                    rule.port
+                    "firewall allow {} is redundant (already auto-derived from ports)",
+                    format_entry(entry)
                 ));
             }
         }
-        for &port in &fw.deny {
-            if !auto_ports.contains(&port) {
+        for entry in &fw.deny {
+            let matched = entry_matches_auto(&auto_ports, entry);
+            if !matched {
                 warnings.push(format!(
-                    "firewall deny port {port} does not match any auto-derived port (no-op)"
+                    "firewall deny {} does not match any auto-derived port (no-op)",
+                    format_entry(entry)
                 ));
             }
         }
@@ -347,38 +361,18 @@ fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<()
     Ok(())
 }
 
-/// Validate a port spec: `"host:container"` or `"host:container/proto"`.
+/// Validate a container port spec: `"host:container[/proto]"`.
 ///
-/// Both host and container must be valid `u16`. Protocol, if present, must be `tcp` or `udp`.
-fn validate_port_spec(spec: &str, context: &str) -> Result<(), WorkloadError> {
-    let (ports_part, proto) = match spec.split_once('/') {
-        Some((p, proto)) => (p, Some(proto)),
-        None => (spec, None),
-    };
-
-    if let Some(proto) = proto {
-        if proto != "tcp" && proto != "udp" {
-            return Err(WorkloadError::Validation(format!(
-                "{context}: port protocol must be \"tcp\" or \"udp\", got {proto:?} in {spec:?}"
-            )));
-        }
-    }
-
-    let parts: Vec<&str> = ports_part.split(':').collect();
-    if parts.len() != 2 {
+/// Uses the shared `parse_port_spec` and enforces that `container` is present.
+fn validate_container_port(spec: &str, context: &str) -> Result<(), WorkloadError> {
+    let parsed = config::parse_port_spec(spec).map_err(|e| {
+        WorkloadError::Validation(format!("{context}: {e} in {spec:?}"))
+    })?;
+    if parsed.container.is_none() {
         return Err(WorkloadError::Validation(format!(
-            "{context}: port spec must be \"host:container[/proto]\", got {spec:?}"
+            "{context}: container port is required, got {spec:?}"
         )));
     }
-
-    for (label, val) in [("host", parts[0]), ("container", parts[1])] {
-        if val.parse::<u16>().is_err() {
-            return Err(WorkloadError::Validation(format!(
-                "{context}: {label} port must be a valid u16, got {val:?} in {spec:?}"
-            )));
-        }
-    }
-
     Ok(())
 }
 
@@ -393,33 +387,53 @@ fn is_valid_size(s: &str) -> bool {
     false
 }
 
-/// Collect all host ports auto-derived from `ports` fields across workload and dependencies.
+/// Collect all auto-derived `(port, protocol)` pairs from `ports` fields.
 ///
-/// Port format: `"host:container"` or `"host:container/udp"`. Auto-derived firewall rules
-/// use the host port with TCP.
-fn collect_auto_derived_ports(config: &WorkloadConfig) -> HashSet<u16> {
+/// No protocol suffix means both tcp and udp.
+fn collect_auto_derived_ports(config: &WorkloadConfig) -> HashSet<(u16, &'static str)> {
     let mut ports = HashSet::new();
-    for spec in &config.workload.ports {
-        if let Some(host_port) = parse_host_port(spec) {
-            ports.insert(host_port);
-        }
-    }
-    for dep in config.dependencies.values() {
-        for spec in &dep.ports {
-            if let Some(host_port) = parse_host_port(spec) {
-                ports.insert(host_port);
+    let all_specs = config
+        .workload
+        .ports
+        .iter()
+        .chain(config.dependencies.values().flat_map(|d| d.ports.iter()));
+    for spec in all_specs {
+        if let Ok(parsed) = config::parse_port_spec(spec) {
+            match parsed.protocol.as_deref() {
+                Some("tcp") => { ports.insert((parsed.host, "tcp")); }
+                Some("udp") => { ports.insert((parsed.host, "udp")); }
+                _ => {
+                    ports.insert((parsed.host, "tcp"));
+                    ports.insert((parsed.host, "udp"));
+                }
             }
         }
     }
     ports
 }
 
-/// Extract the host port number from a port spec like `"3000:3000"` or `"8080:80/udp"`.
-fn parse_host_port(spec: &str) -> Option<u16> {
-    // Strip optional protocol suffix
-    let without_proto = spec.split('/').next()?;
-    let host_part = without_proto.split(':').next()?;
-    host_part.parse().ok()
+/// Check whether a `FirewallEntry` matches any auto-derived port.
+///
+/// An entry with no protocol matches if either tcp or udp is auto-derived.
+fn entry_matches_auto(
+    auto_ports: &HashSet<(u16, &str)>,
+    entry: &config::FirewallEntry,
+) -> bool {
+    match &entry.protocol {
+        Some(proto) => auto_ports.contains(&(entry.port, proto.as_str())),
+        None => {
+            auto_ports.contains(&(entry.port, "tcp"))
+                || auto_ports.contains(&(entry.port, "udp"))
+        }
+    }
+}
+
+/// Format a `FirewallEntry` for display in warnings.
+fn format_entry(entry: &config::FirewallEntry) -> String {
+    match &entry.protocol {
+        Some(proto) => format!("{}/{proto}", entry.port),
+        None => entry.port.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +583,7 @@ base-image-mode = "blacklist"
 image = "x:latest"
 
 [disks.data]
+index = 10
 size = "big"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
@@ -589,17 +604,66 @@ base-image-mode = "blacklist"
 image = "x:latest"
 
 [disks.a]
+index = 10
 size = "10GB"
 
 [disks.b]
+index = 11
 size = "500MB"
 
 [disks.c]
+index = 12
 size = "1TB"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_disk_index_below_10() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 5
+size = "10GB"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("index must be >= 10"));
+    }
+
+    #[test]
+    fn rejects_duplicate_disk_index() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.a]
+index = 10
+size = "10GB"
+
+[disks.b]
+index = 10
+size = "5GB"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate index"));
     }
 
     #[test]
@@ -623,6 +687,7 @@ image = "redis:7"
 shared = "/cache"
 
 [disks.shared]
+index = 10
 size = "10GB"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();

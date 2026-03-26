@@ -1,9 +1,11 @@
 use crate::config::CcType;
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
-use crate::plan::DiskSpec;
 
 /// Create an Azure CVM instance. Returns the external IP address.
+///
+/// Disks are attached separately via `attach_disk()` with explicit LUN
+/// assignments, so they are not passed here.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_instance(
     rg: &str,
@@ -13,7 +15,6 @@ pub async fn create_instance(
     _cc_type: CcType,
     nsg: &str,
     metadata: &[(String, String)],
-    disks: &[DiskSpec],
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
     let mut args = vec![
@@ -54,15 +55,6 @@ pub async fn create_instance(
         args.push(&tags_flag);
     }
 
-    // Attach pre-created managed disks.
-    let disk_ids: Vec<String> = disks.iter().map(|d| d.name.clone()).collect();
-    if !disk_ids.is_empty() {
-        args.push("--data-disks");
-        for id in &disk_ids {
-            args.push(id);
-        }
-    }
-
     args.push("--output");
     args.push("json");
 
@@ -79,6 +71,38 @@ pub async fn create_instance(
         tracing::warn!("could not determine public IP from instance creation output");
     }
     Ok(ip)
+}
+
+/// Attach a managed disk to an instance with a specific LUN.
+pub async fn attach_disk(
+    rg: &str,
+    vm_name: &str,
+    disk_name: &str,
+    lun: u32,
+    runner: &dyn CommandRunner,
+) -> Result<(), CloudError> {
+    runner
+        .run_capture(
+            "az",
+            &[
+                "vm",
+                "disk",
+                "attach",
+                "--resource-group",
+                rg,
+                "--vm-name",
+                vm_name,
+                "--name",
+                disk_name,
+                "--lun",
+                &lun.to_string(),
+            ],
+        )
+        .await
+        .map_err(|e| CloudError::DiskError {
+            message: format!("failed to attach disk '{disk_name}' at LUN {lun}: {e}"),
+        })?;
+    Ok(())
 }
 
 /// Get the public IP of a running instance.

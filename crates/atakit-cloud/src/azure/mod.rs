@@ -100,10 +100,11 @@ impl CloudProvider for AzureProvider {
 
         // Disks from the workload manifest.
         let mut disks = Vec::new();
-        for (disk_name, size_gb) in &opts.workload_disks {
+        for (disk_name, index, size_gb) in &opts.workload_disks {
             disks.push(DiskSpec {
                 name: format!("{}-{disk_name}", names.instance),
                 device_name: disk_name.clone(),
+                index: *index,
                 size_gb: *size_gb,
                 disk_type: "Premium_LRS".to_string(),
             });
@@ -368,10 +369,22 @@ impl CloudProvider for AzureProvider {
                     *cc_type,
                     nsg,
                     metadata,
-                    disks,
                     runner,
                 )
                 .await?;
+
+                // Attach disks with explicit LUN assignments after VM creation.
+                for disk in disks {
+                    instance::attach_disk(
+                        resource_group,
+                        instance_name,
+                        &disk.name,
+                        disk.index,
+                        runner,
+                    )
+                    .await?;
+                }
+
                 updates.instance = Some(instance_name.clone());
                 updates.external_ip = Some(ip);
             }

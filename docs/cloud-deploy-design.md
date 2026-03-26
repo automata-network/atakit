@@ -24,7 +24,7 @@ See the old atakit analysis in `~/work/atakit/cloud-deploy-details.md` (pipeline
 - No rollback on failure (state enables resume/cleanup)
 - Random bucket names (fully deterministic)
 - Per-command y/N prompts (show full plan upfront, confirm once)
-- Hardcoded port 8000 (single port 1024 for CVM agent)
+- Hardcoded port 8000 (port 1024 for CVM agent, workload ports auto-derived from manifest)
 - `[deployments]` in workload config (moved to operator config)
 
 ---
@@ -163,7 +163,7 @@ staging      azure      deploy-failed   (step 5: instance)    -
 Thin wrappers. The `CloudProvider` trait provides `ssh_command()` and `serial_command()` methods that return the full command args. The CLI execs the command directly.
 
 - GCP: `gcloud compute ssh {instance} --project {project} --zone {zone}` / `gcloud compute connect-to-serial-port {instance} --project {project} --zone {zone}`
-- Azure: not yet implemented
+- Azure: `az ssh vm --name {instance} --resource-group {rg}` / `az serial-console connect --name {instance} --resource-group {rg}`
 
 ---
 
@@ -481,9 +481,9 @@ crates/atakit-cloud/
     error.rs            -- CloudError (thiserror)
     cli.rs              -- clap arg structs (behind `cli` feature)
     config.rs           -- PlatformKind, CcType, CloudConfig, CloudTarget
-    state.rs            -- DeployState, DeployStatus, ResourceSet, GcpResources, PersistedAgentEnv
+    state.rs            -- DeployState, DeployStatus, ResourceSet, GcpResources, AzureResources, PersistedAgentEnv
     plan.rs             -- DeployPlan, DeployStep, DestroyPlan, DestroyStep, StepResult, ResourceUpdates
-    naming.rs           -- ResourceNames, resource_labels(), sanitize()
+    naming.rs           -- ResourceNames (GCP), AzureResourceNames (Azure), resource_labels(), sanitize()
     exec.rs             -- CommandRunner trait + ProcessRunner impl
     provider.rs         -- CloudProvider trait, DeployOptions, DestroyOptions
     init.rs             -- AgentConfig, wait_for_agent, post_init
@@ -496,7 +496,19 @@ crates/atakit-cloud/
       instance.rs       -- create/delete_instance, get_instance_ip, get_serial_output
 ```
 
-Azure modules are not yet implemented. The `CloudProvider` trait supports it; `GcpProvider` is the only implementation.
+```
+crates/atakit-cloud/
+  src/
+    azure/
+      mod.rs            -- AzureProvider (plan_deploy, execute_step, plan_destroy, execute_destroy_step, ssh/serial)
+      deps.rs           -- check_az
+      image.rs          -- ensure_resource_group, ensure_storage_account, ensure_gallery, ensure_image_definition, create/check/delete_image_version, upload_vhd
+      firewall.rs       -- create_nsg, add_nsg_rules, check/delete_nsg
+      disk.rs           -- create/check/delete_disk
+      instance.rs       -- create/delete_instance, get_instance_ip, get_boot_log, delete_resource_group
+```
+
+Both `GcpProvider` and `AzureProvider` implement the `CloudProvider` trait.
 
 ### Dependencies
 
@@ -580,6 +592,9 @@ pub struct DeployOptions {
     pub metadata: BTreeMap<String, String>,
     pub force_image: bool,
     pub skip_init: bool,
+    /// Host ports from the workload manifest (format: "host:container[/proto]").
+    /// Used to derive firewall rules. No protocol = both tcp+udp.
+    pub workload_ports: Vec<String>,
 }
 
 pub struct DestroyOptions {
@@ -669,6 +684,7 @@ pub struct PersistedAgentEnv {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ResourceSet {
     pub gcp: Option<GcpResources>,
+    pub azure: Option<AzureResources>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -678,6 +694,22 @@ pub struct GcpResources {
     pub bucket: Option<String>,
     pub image: Option<String>,
     pub firewall_rule: Option<String>,
+    pub disks: Vec<String>,
+    pub instance: Option<String>,
+    pub external_ip: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AzureResources {
+    pub subscription: String,
+    pub region: String,
+    pub resource_group: Option<String>,
+    pub storage_account: Option<String>,
+    pub gallery_rg: Option<String>,
+    pub gallery: Option<String>,
+    pub image_definition: Option<String>,
+    pub image_version: Option<String>,
+    pub nsg: Option<String>,
     pub disks: Vec<String>,
     pub instance: Option<String>,
     pub external_ip: Option<String>,
@@ -722,14 +754,19 @@ Resource names are derived from `instance_name` (which defaults to `{workload}-{
 
 ### Azure
 
+Resource names are derived from `instance_name` via `AzureResourceNames::for_azure(instance, image_ref, region)`:
+
 | Resource | Pattern | Example |
 |---|---|---|
-| Resource Group | `{workload}-{deployment}-rg` | `secure-signer-prod-rg` |
-| Storage Account | `atakit{sanitized}{regioncode}` (max 24) | `atakitsecuresignerpeu` |
-| Gallery | `atakit{Sanitized}Gallery` | `atakitSecureSignerProdGallery` |
+| Resource Group | `{instance}-rg` | `secure-signer-prod-rg` |
+| Storage Account | `atakit{alphanum}` (max 24, lowercase alphanum only) | `atakitsecuresignerprod` |
+| Gallery RG | `atakit-images-{region}` (shared, survives destroy) | `atakit-images-eastus` |
+| Gallery | `atakit_{alphanum}_gallery` (alphanum + underscores) | `atakit_secure_signer_prod_gallery` |
 | Image Definition | `{sanitized-image-ref}` | `automata-linux-v0-1-6` |
-| NSG | `{workload}-{deployment}-nsg` | `secure-signer-prod-nsg` |
-| VM Instance | `--name` or `{workload}-{deployment}` | `secure-signer-prod` |
+| Image Version | `1.0.0` (fixed) | `1.0.0` |
+| NSG | `{instance}-nsg` | `secure-signer-prod-nsg` |
+| Managed Disk | `{instance}-{disk-name}` | `secure-signer-prod-data` |
+| VM Instance | `{instance}` (sanitized, max 64) | `secure-signer-prod` |
 
 ### Resource Tags/Labels
 
@@ -749,16 +786,24 @@ GCP: `--labels`. Azure: `--tags`.
 
 ## Firewall Rule Derivation
 
+Port format: `host:container[/protocol]`. No protocol suffix = both TCP and UDP.
+Firewall entries use the same format without the container port: `port[/protocol]`.
+
 ```
 1. Auto-derive from workload ports:
-   "3000:3000"     -> tcp:3000
-   "8080:8080/udp" -> udp:8080
+   "3000:3000"      -> tcp:3000, udp:3000   (no proto = both)
+   "8080:8080/tcp"  -> tcp:8080             (tcp only)
+   "5353:5353/udp"  -> udp:5353             (udp only)
 2. Auto-derive from dependency ports (same logic)
 3. Apply [firewall] overrides:
-   allow[] adds rules
-   deny[] removes auto-derived rules
+   allow[] adds rules    -- "4000/tcp", "5000", 6000, { port = 7000, protocol = "udp" }
+   deny[] removes rules  -- "3000/udp", 8080, { port = 9000, protocol = "tcp" }
+   (bare int or string without /proto = both tcp+udp)
 4. Always include: tcp:1024 (CVM agent - init + platform-measurements)
 ```
+
+The manifest stores the resolved flat list as `firewall-ports` (auto-derived + allow - deny),
+not the raw allow/deny config. Sorted by port then protocol for determinism.
 
 ---
 
@@ -980,7 +1025,7 @@ The `CloudProvider` trait supports it. When added:
 8. **CLI integration:** `cloud deploy`, `cloud destroy`, `cloud status`, `cloud list`
 9. **Resource tagging** (labels/tags on all resources)
 10. **`cloud ssh` / `cloud serial`** (thin wrappers)
-11. **Azure provider** (same sequence as GCP)
+11. **Azure provider** (same sequence as GCP) -- done
 12. **Image validation** (check --image against workload's base-image allow/deny list)
 13. **`cloud verify`** (fetch measurements, compare against profile + PCR23)
 14. **`cloud plan`** (dry run)

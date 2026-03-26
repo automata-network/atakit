@@ -94,10 +94,11 @@ impl CloudProvider for GcpProvider {
 
         // Disks from the workload manifest.
         let mut disks = Vec::new();
-        for (disk_name, size_gb) in &opts.workload_disks {
+        for (disk_name, index, size_gb) in &opts.workload_disks {
             disks.push(DiskSpec {
                 name: format!("{}-{disk_name}", names.instance),
                 device_name: disk_name.clone(),
+                index: *index,
                 size_gb: *size_gb,
                 disk_type: "pd-balanced".to_string(),
             });
