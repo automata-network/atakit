@@ -26,7 +26,7 @@ pub async fn run(args: SerialArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 	};
 
-	let runner = ProcessRunner;
+	let runner = ProcessRunner::default();
 	let output = provider
 		.get_serial_output(&state, &runner)
 		.await

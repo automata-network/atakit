@@ -77,6 +77,7 @@ pub enum DeployStep {
         cc_type: CcType,
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
+        boot_disk_size_gb: Option<u64>,
     },
     WaitForAgent {
         timeout_secs: u64,
@@ -109,6 +110,7 @@ pub enum DeployStep {
         nsg: String,
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
+        boot_disk_size_gb: Option<u64>,
     },
 }
 

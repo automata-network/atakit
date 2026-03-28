@@ -196,6 +196,7 @@ The resolved, canonicalized runtime config extracted from `atakit-workload.toml`
 | `cvm_agent` | bool | `false` | `[workload] cvm_agent` |
 | `measured-data` | array of strings | `[]` | `[workload] measured-data` (paths rewritten, see below) |
 | `unmeasured-data` | array of strings | `[]` | `[workload] unmeasured-data` (paths rewritten, see below) |
+| `boot-disk-size` | string | — | `[workload] boot-disk-size` |
 
 **Path rewriting:** Source paths are relative to `atakit-workload.toml` (e.g. `"./config/hello"`). Manifest paths are archive-relative with the `./` prefix stripped (e.g. `"config/hello"`). The actual files live under `measured-data/` in the archive.
 
@@ -487,6 +488,7 @@ The relationship is analogous to source code and a compiled binary. The source i
 | `[workload] cvm_agent` | `[config] cvm_agent` |
 | `[workload] measured-data` | `[config] measured-data` (paths rewritten) |
 | `[workload] unmeasured-data` | `[config] unmeasured-data` (paths rewritten) |
+| `[workload] boot-disk-size` | `[config] boot-disk-size` |
 | `[workload.environment]` + `env_file` | `[config.environment]` (merged, inlined) |
 | `[workload.disks]` | `[config.disks]` |
 | `[dependencies.<name>]` | `[config.dependencies.<name>]` *(not yet implemented)* |

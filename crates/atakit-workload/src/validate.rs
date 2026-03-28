@@ -195,6 +195,15 @@ pub fn validate_config(
         }
     }
 
+    // ── boot-disk-size ─────────────────────────────────────
+    if let Some(ref bds) = w.boot_disk_size {
+        if !is_valid_size(bds) {
+            return Err(WorkloadError::Validation(format!(
+                "boot-disk-size must be a valid size string (e.g. \"50GB\", \"1TB\"), got {bds:?}"
+            )));
+        }
+    }
+
     // ── disk references ───────────────────────────────────
     for disk_name in w.disks.keys() {
         if !config.disks.contains_key(disk_name) {

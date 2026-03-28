@@ -18,7 +18,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	let image_only = args.image_only;
 
 	// 1. Resolve workload source (unless --image-only).
-	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks);
+	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb);
 	if image_only {
 		archive_path = String::new();
 		workload_name = String::new();
@@ -26,6 +26,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		archive_hash = String::new();
 		workload_ports = Vec::new();
 		workload_disks = Vec::new();
+		boot_disk_size_gb = None;
 	} else {
 		let resolved = resolve_workload(&args.source, &args.dir, env)?;
 		workload_name = resolved.name;
@@ -38,6 +39,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				Ok((name.clone(), *index, gb))
 			})
 			.collect::<Result<Vec<_>>>()?;
+		boot_disk_size_gb = resolved.boot_disk_size.as_deref().and_then(parse_size_gb);
 		let ap = resolved.archive_path;
 		let bytes = std::fs::read(&ap)
 			.with_context(|| format!("failed to read archive: {}", ap.display()))?;
@@ -142,6 +144,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		skip_init: image_only || args.skip_init,
 		workload_ports: workload_ports.clone(),
 		workload_disks: workload_disks.clone(),
+		boot_disk_size_gb,
 	};
 	let plan = provider.plan_deploy(&deploy_opts).await?;
 
@@ -190,6 +193,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("  {:<15}{}/{}", "Gallery:".dimmed(), names.gallery_rg, names.gallery);
 			eprintln!("  {:<15}{}", "NSG:".dimmed(), names.nsg);
 		}
+	}
+	if let Some(gb) = boot_disk_size_gb {
+		eprintln!("  {:<15}{}GB", "Boot disk:".dimmed(), gb);
 	}
 	let port_lines = atakit_cloud::plan::format_ports_list(&ports);
 	for line in &port_lines {
@@ -266,7 +272,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	state.save(&env.data_dir)?;
 
 	// 15. Execute steps.
-	let runner = ProcessRunner;
+	let runner = ProcessRunner::new(verbose);
 	let total = plan.steps.len() as u32;
 
 	for (i, step) in plan.steps.iter().enumerate() {

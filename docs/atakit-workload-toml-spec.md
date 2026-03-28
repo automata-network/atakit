@@ -27,6 +27,7 @@ image = { build = ".", containerfile = "Containerfile" }
 ports = ["3000:3000"]
 restart = "unless-stopped"
 cvm_agent = true
+boot-disk-size = "50GB"
 measured-data = ["./config/hello", "./config/cert.pem"]
 unmeasured-data = ["./additional-data/signer_key"]
 
@@ -157,6 +158,7 @@ Built images are auto-tagged as `{workload.name}:{workload.version}`.
 | `cvm_agent` | bool | `false` | Enable CVM agent socket for this service. |
 | `measured-data` | array of strings | `[]` | Files/directories included in the package and integrity-verified (PCR23). See below. |
 | `unmeasured-data` | array of strings | `[]` | Files/directories provided by operators at deploy time. Not integrity-verified. See below. |
+| `boot-disk-size` | string | — | Minimum boot/OS disk size (e.g. `"50GB"`). Cloud provider default if omitted. Valid units: MB, GB, TB. The actual disk may be larger if the base image requires more. |
 
 #### Data Sections
 

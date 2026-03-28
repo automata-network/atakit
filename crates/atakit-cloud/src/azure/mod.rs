@@ -129,6 +129,7 @@ impl CloudProvider for AzureProvider {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             disks,
+            boot_disk_size_gb: opts.boot_disk_size_gb,
         });
 
         if !opts.skip_init {
@@ -342,6 +343,7 @@ impl CloudProvider for AzureProvider {
                 nsg,
                 metadata,
                 disks,
+                boot_disk_size_gb,
             } => {
                 // The image_id in the step is empty - look it up from state
                 // updates (set during UploadImageAzure). We need the gallery
@@ -369,6 +371,7 @@ impl CloudProvider for AzureProvider {
                     *cc_type,
                     nsg,
                     metadata,
+                    *boot_disk_size_gb,
                     runner,
                 )
                 .await?;

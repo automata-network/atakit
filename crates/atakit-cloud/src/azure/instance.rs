@@ -15,6 +15,7 @@ pub async fn create_instance(
     _cc_type: CcType,
     nsg: &str,
     metadata: &[(String, String)],
+    boot_disk_size_gb: Option<u64>,
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
     let mut args = vec![
@@ -42,6 +43,12 @@ pub async fn create_instance(
         "--public-ip-sku",
         "Standard",
     ];
+
+    let os_disk_size_str = boot_disk_size_gb.map(|gb| gb.to_string());
+    if let Some(ref size) = os_disk_size_str {
+        args.push("--os-disk-size-gb");
+        args.push(size);
+    }
 
     // Tags (Azure equivalent of GCP labels/metadata).
     let tags_str: Vec<String> = metadata

@@ -1,14 +1,25 @@
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 
-/// Create a firewall rule allowing TCP traffic on specified ports.
+/// Create a firewall rule allowing traffic on specified ports.
+///
+/// Each entry in `ports` is `"port/proto"` (e.g. `"1024/tcp"`, `"5353/udp"`).
+/// Falls back to TCP if no protocol suffix is present.
 pub async fn create_firewall(
     project: &str,
     rule_name: &str,
     ports: &[String],
     runner: &dyn CommandRunner,
 ) -> Result<(), CloudError> {
-    let allow = format!("tcp:{}", ports.join(",tcp:"));
+    // Build gcloud --rules value: "tcp:1024,tcp:3000,udp:5353"
+    let rules: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let (port, proto) = p.split_once('/').unwrap_or((p, "tcp"));
+            format!("{proto}:{port}")
+        })
+        .collect();
+    let allow = rules.join(",");
     runner
         .run_capture(
             "gcloud",

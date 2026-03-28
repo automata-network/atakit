@@ -126,7 +126,7 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		.set_status(DeployStatus::Destroying, &env.data_dir)
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-	let runner = ProcessRunner;
+	let runner = ProcessRunner::default();
 	let total = plan.steps.len();
 
 	for (i, step) in plan.steps.iter().enumerate() {

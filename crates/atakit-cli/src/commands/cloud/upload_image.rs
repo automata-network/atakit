@@ -117,7 +117,7 @@ pub async fn run(args: UploadImageArgs, env: &Env, config: &Config, verbose: boo
 	}
 
 	// 5. Execute steps.
-	let runner = ProcessRunner;
+	let runner = ProcessRunner::new(verbose);
 
 	match target.platform {
 		PlatformKind::Gcp => {

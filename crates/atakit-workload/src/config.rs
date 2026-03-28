@@ -96,6 +96,9 @@ pub struct WorkloadSection {
     pub unmeasured_data: Vec<String>,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
+    #[serde(default, rename = "boot-disk-size")]
+    pub boot_disk_size: Option<String>,
 }
 
 /// Default TTL: ~100 years in seconds. The contract computes
