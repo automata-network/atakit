@@ -252,3 +252,133 @@ async fn inspect_dir_matches_archive() {
     assert_eq!(archive_result.pcr23, dir_result.pcr23);
     assert_eq!(archive_result.manifest_hash, dir_result.manifest_hash);
 }
+
+/// Set up a workload with a dependency using `image = { file = "..." }`.
+fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
+    let wl_dir = tmp.join("multi-container");
+    std::fs::create_dir_all(&wl_dir).unwrap();
+
+    // Fake image tars
+    std::fs::write(wl_dir.join("app.tar"), b"fake-main-image").unwrap();
+    std::fs::write(wl_dir.join("sidecar.tar"), b"fake-sidecar-image").unwrap();
+
+    let config = r#"
+format = 1
+
+[workload]
+name = "multi-app"
+version = "v0.2.0"
+base-image-mode = "blacklist"
+image = { file = "./app.tar" }
+ports = ["3000:3000"]
+
+[dependencies.redis]
+image = { file = "./sidecar.tar" }
+ports = ["6379:6379"]
+restart = "unless-stopped"
+
+[dependencies.redis.environment]
+REDIS_MAX_MEMORY = "256mb"
+"#;
+    std::fs::write(wl_dir.join("atakit-workload.toml"), config).unwrap();
+    wl_dir
+}
+
+#[tokio::test]
+async fn build_with_dependency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wl_dir = setup_workload_with_dependency(tmp.path());
+    let out_dir = tmp.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let result = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir,
+            output_dir: Some(out_dir),
+            engine: None,
+            verbose: false,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.name, "multi-app");
+    assert_eq!(result.version, "v0.2.0");
+    assert_eq!(result.image_count, 2);
+
+    // Verify archive contains both image tars
+    let file = std::fs::File::open(&result.archive_path).unwrap();
+    let gz = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let entry_names: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .filter_map(|e| Some(e.ok()?.path().ok()?.to_string_lossy().into_owned()))
+        .collect();
+
+    assert!(
+        entry_names.iter().any(|n| n.contains("images/multi-app.tar")),
+        "archive must contain main image tar, got: {entry_names:?}"
+    );
+    assert!(
+        entry_names.iter().any(|n| n.contains("images/redis.tar")),
+        "archive must contain dependency image tar, got: {entry_names:?}"
+    );
+
+    // Verify manifest has dependency populated
+    let inspect_result = inspect_workload(&InspectOptions {
+        archive: Some(result.archive_path),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    })
+    .await
+    .unwrap();
+
+    let deps = inspect_result.manifest.config.dependencies.as_ref()
+        .expect("manifest should have dependencies");
+    assert!(deps.contains_key("redis"));
+    let redis = &deps["redis"];
+    assert_eq!(redis.image, "redis:v0.2.0"); // auto-tagged from file source
+    assert_eq!(redis.ports, vec!["6379:6379"]);
+    assert_eq!(redis.restart, "unless-stopped");
+    assert_eq!(redis.environment.get("REDIS_MAX_MEMORY").unwrap(), "256mb");
+}
+
+#[tokio::test]
+async fn build_with_dependency_is_deterministic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wl_dir = setup_workload_with_dependency(tmp.path());
+
+    let out1 = tmp.path().join("out1");
+    let out2 = tmp.path().join("out2");
+    std::fs::create_dir_all(&out1).unwrap();
+    std::fs::create_dir_all(&out2).unwrap();
+
+    let r1 = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir.clone(),
+            output_dir: Some(out1),
+            engine: None,
+            verbose: false,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let r2 = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir,
+            output_dir: Some(out2),
+            engine: None,
+            verbose: false,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(r1.archive_hash, r2.archive_hash, "dependency builds must be deterministic");
+}

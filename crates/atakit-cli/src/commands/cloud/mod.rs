@@ -231,7 +231,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 archive_path: blob,
                 name,
                 version,
-                ports: result.manifest.config.ports,
+                ports: collect_all_ports_from_manifest(&result.manifest),
                 disks,
                 boot_disk_size: result.manifest.config.boot_disk_size,
             });
@@ -254,11 +254,12 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         let disks = result.manifest.disks.iter()
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
+        let ports = collect_all_ports_from_manifest(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
-            ports: result.manifest.config.ports,
+            ports,
             disks,
             boot_disk_size: result.manifest.config.boot_disk_size,
         });
@@ -281,14 +282,29 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             (k.clone(), (index, v.size.clone()))
         })
         .collect();
+    let mut ports = wl_config.workload.ports;
+    for dep in wl_config.dependencies.values() {
+        ports.extend(dep.ports.iter().cloned());
+    }
     Ok(ResolvedWorkload {
         archive_path,
         name: wl_config.workload.name,
         version: wl_config.workload.version,
-        ports: wl_config.workload.ports,
+        ports,
         disks,
         boot_disk_size: wl_config.workload.boot_disk_size,
     })
+}
+
+/// Collect all ports from a manifest (workload + dependencies).
+fn collect_all_ports_from_manifest(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
+    let mut ports = m.config.ports.clone();
+    if let Some(ref deps) = m.config.dependencies {
+        for dep in deps.values() {
+            ports.extend(dep.ports.iter().cloned());
+        }
+    }
+    ports
 }
 
 /// Parse metadata key=value strings into a map.

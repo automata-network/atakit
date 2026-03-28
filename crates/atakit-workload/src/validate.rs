@@ -104,6 +104,33 @@ pub fn validate_config(
         }
     }
 
+    // ── host port uniqueness ─────────────────────────────
+    {
+        let mut seen_host_ports: HashSet<u16> = HashSet::new();
+        for spec in &w.ports {
+            if let Ok(parsed) = config::parse_port_spec(spec) {
+                if !seen_host_ports.insert(parsed.host) {
+                    return Err(WorkloadError::Validation(format!(
+                        "duplicate host port {} in workload.ports",
+                        parsed.host
+                    )));
+                }
+            }
+        }
+        for (dep_name, dep) in &config.dependencies {
+            for spec in &dep.ports {
+                if let Ok(parsed) = config::parse_port_spec(spec) {
+                    if !seen_host_ports.insert(parsed.host) {
+                        return Err(WorkloadError::Validation(format!(
+                            "host port {} in dependencies.{dep_name}.ports conflicts with another container",
+                            parsed.host
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     // ── image source ──────────────────────────────────────
     validate_image_source(&w.image, workload_dir)?;
 
@@ -265,6 +292,14 @@ pub fn validate_config(
                     disk.size
                 )));
             }
+            if let Some(gb) = parse_size_gb(&disk.size) {
+                if gb < 10 {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?} size must be at least 10GB, got {:?}",
+                        disk.size
+                    )));
+                }
+            }
             if let Some(ref enc) = disk.encryption {
                 if enc.enable && enc.key_security != "standard" && enc.key_security != "strong" {
                     return Err(WorkloadError::Validation(format!(
@@ -275,24 +310,13 @@ pub fn validate_config(
         }
     }
 
-    // ── disk single-mount constraint ─────────────────────
-    {
-        let mut mounted_disks: HashSet<&str> = HashSet::new();
-        for disk_name in w.disks.keys() {
-            if !mounted_disks.insert(disk_name) {
+    // ── dependency disk refs ────────────────────────────
+    for (dep_name, dep) in &config.dependencies {
+        for disk_name in dep.disks.keys() {
+            if !config.disks.contains_key(disk_name) {
                 return Err(WorkloadError::Validation(format!(
-                    "disk {disk_name:?} is mounted more than once"
+                    "dependencies.{dep_name}.disks references undefined disk: {disk_name:?}"
                 )));
-            }
-        }
-        for (dep_name, dep) in &config.dependencies {
-            for disk_name in dep.disks.keys() {
-                if !mounted_disks.insert(disk_name) {
-                    return Err(WorkloadError::Validation(format!(
-                        "disk {disk_name:?} is mounted by multiple containers \
-                         (also used by dependency {dep_name:?})"
-                    )));
-                }
             }
         }
     }
@@ -321,13 +345,62 @@ pub fn validate_config(
         }
     }
 
-    // ── dependencies (warn, not error) ────────────────────
-    if !config.dependencies.is_empty() {
-        warnings.push(
-            "[dependencies] section found but dependencies are not yet implemented; \
-             only the main workload will be built"
-                .into(),
-        );
+    // ── dependencies ───────────────────────────────────────
+    let dep_names: HashSet<&str> = config.dependencies.keys().map(|s| s.as_str()).collect();
+    for (dep_name, dep) in &config.dependencies {
+        // Image source validation.
+        validate_image_source(&dep.image, workload_dir)?;
+
+        // depends_on must reference other defined dependencies.
+        for ref_name in &dep.depends_on {
+            if !dep_names.contains(ref_name.as_str()) {
+                return Err(WorkloadError::Validation(format!(
+                    "dependencies.{dep_name}.depends_on references undefined dependency: {ref_name:?}"
+                )));
+            }
+            if ref_name == dep_name {
+                return Err(WorkloadError::Validation(format!(
+                    "dependencies.{dep_name}.depends_on cannot reference itself"
+                )));
+            }
+        }
+
+        // env_file validation.
+        if let Some(ref env_files) = dep.env_file {
+            for ef in env_files.as_vec() {
+                if !ef.starts_with("./") {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{dep_name}.env_file path must start with \"./\": {ef:?}"
+                    )));
+                }
+                ensure_no_traversal(&ef, &format!("dependencies.{dep_name}.env_file"))?;
+                let abs = workload_dir.join(&ef);
+                if !abs.exists() {
+                    return Err(WorkloadError::EnvFileMissing(abs));
+                }
+                ensure_within(&abs, workload_dir, &format!("dependencies.{dep_name}.env_file"))?;
+            }
+        }
+
+        // measured-data path format.
+        for p in &dep.measured_data {
+            if !p.starts_with("./") {
+                return Err(WorkloadError::Validation(format!(
+                    "dependencies.{dep_name}.measured-data path must start with \"./\": {p:?}"
+                )));
+            }
+            ensure_no_traversal(p, &format!("dependencies.{dep_name}.measured-data"))?;
+        }
+
+        // unmeasured-data path format.
+        for p in &dep.unmeasured_data {
+            if !p.starts_with("./") {
+                return Err(WorkloadError::Validation(format!(
+                    "dependencies.{dep_name}.unmeasured-data path must start with \"./\": {p:?}"
+                )));
+            }
+            ensure_no_traversal(p, &format!("dependencies.{dep_name}.unmeasured-data"))?;
+        }
     }
 
     Ok(warnings)
@@ -394,6 +467,27 @@ fn is_valid_size(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Parse a size string to gigabytes. Returns None for invalid formats.
+fn parse_size_gb(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num_str, suffix) = if let Some(n) = s.strip_suffix("TB") {
+        (n, "TB")
+    } else if let Some(n) = s.strip_suffix("GB") {
+        (n, "GB")
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n, "MB")
+    } else {
+        return None;
+    };
+    let num: u64 = num_str.trim().parse().ok()?;
+    match suffix {
+        "TB" => Some(num * 1024),
+        "GB" => Some(num),
+        "MB" => Some(num.div_ceil(1024)),
+        _ => None,
+    }
 }
 
 /// Collect all auto-derived `(port, protocol)` pairs from `ports` fields.
@@ -538,7 +632,7 @@ measured-data = ["./does-not-exist"]
     }
 
     #[test]
-    fn warns_on_dependencies() {
+    fn accepts_dependencies() {
         let toml = r#"
 format = 1
 
@@ -554,8 +648,73 @@ image = "redis:7"
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("dependencies"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_host_port() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+ports = ["3000:3000"]
+
+[dependencies.sidecar]
+image = "redis:7"
+ports = ["3000:6379"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("host port 3000"));
+    }
+
+    #[test]
+    fn rejects_invalid_depends_on() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.redis]
+image = "redis:7"
+depends_on = ["nonexistent"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("undefined dependency"));
+    }
+
+    #[test]
+    fn rejects_dependency_undefined_disk_ref() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+missing-disk = "/data"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("undefined disk"));
     }
 
     #[test]
@@ -618,7 +777,7 @@ size = "10GB"
 
 [disks.b]
 index = 11
-size = "500MB"
+size = "20GB"
 
 [disks.c]
 index = 12
@@ -676,7 +835,7 @@ size = "5GB"
     }
 
     #[test]
-    fn rejects_disk_mounted_by_multiple_containers() {
+    fn allows_disk_shared_between_containers() {
         let toml = r#"
 format = 1
 
@@ -701,8 +860,7 @@ size = "10GB"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("mounted by multiple containers"));
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
     }
 
     #[test]

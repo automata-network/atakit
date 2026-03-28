@@ -109,19 +109,20 @@ image = "{{name}}:latest"
 # ── persistent disk mounts ───────────────────────────────────────
 #
 # Maps disk names (defined in [disks.*] below) to container mount paths.
-# Each disk can only be mounted by one container (workload or dependency).
+# Disks can be shared between the workload and dependencies.
 # [workload.disks]
 # my-disk = "/data"
 
-# ── dependencies (not yet implemented) ───────────────────────────
+# ── dependencies ──────────────────────────────────────────────────
 #
 # Sidecar containers that run alongside the main workload. Each dependency
-# has the same container config options as [workload] (image, ports, restart,
-# command, entrypoint, environment, env_file, measured-data, unmeasured-data,
-# disks) plus depends_on for startup ordering.
+# has its own image, ports, restart, command, entrypoint, environment,
+# env_file, depends_on, and disk mounts. Host ports must be unique
+# across all containers.
 #
-# WARNING: dependencies are parsed but NOT built. The build will warn and
-# only include the main workload.
+# Dependencies can also specify measured-data and unmeasured-data arrays
+# to control which workload-level data files get mounted into their
+# containers.
 #
 # [dependencies.redis]
 # image = "redis:7"
@@ -178,9 +179,9 @@ image = "{{name}}:latest"
 
 # ── persistent disks ─────────────────────────────────────────────
 #
-# Define persistent disks that survive container restarts. Each disk must
-# be mounted by exactly one container via [workload.disks] or
-# [dependencies.<name>.disks].
+# Define persistent disks that survive container restarts. Referenced by
+# [workload.disks] or [dependencies.<name>.disks]. Disks can be shared
+# between multiple containers.
 #
 # index: device LUN / index. Must be >= 10, unique across all disks.
 #        Auto-assigned from 10 in alphabetical order if omitted.

@@ -309,10 +309,12 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 /// `resolved_image` is the canonical `name:tag` string.
 /// `hashes` contains all content hashes computed during staging.
 /// `environment` is the already-resolved (env_file merged) environment.
+/// `dep_environments` contains resolved environments for each dependency.
 pub fn build_manifest(
     config: &WorkloadConfig,
     resolved_image: &str,
     environment: BTreeMap<String, String>,
+    dep_environments: BTreeMap<String, BTreeMap<String, String>>,
     hashes: BTreeMap<String, String>,
 ) -> Manifest {
     let w = &config.workload;
@@ -390,9 +392,49 @@ pub fn build_manifest(
         },
     });
 
-    // Dependencies are currently omitted from the manifest until the build
-    // pipeline supports staging their images/data and computing hashes.
-    let dependencies = None;
+    // Dependencies: build ManifestDependency for each.
+    let dependencies = if config.dependencies.is_empty() {
+        None
+    } else {
+        let version = &w.version;
+        let deps: BTreeMap<String, ManifestDependency> = config
+            .dependencies
+            .iter()
+            .map(|(name, dep)| {
+                let image = resolve_image_ref(&dep.image, name, version);
+                let env = dep_environments
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+                let measured = dep
+                    .measured_data
+                    .iter()
+                    .map(|p| strip_dot_slash(p).to_string())
+                    .collect();
+                let unmeasured = dep
+                    .unmeasured_data
+                    .iter()
+                    .map(|p| strip_dot_slash(p).to_string())
+                    .collect();
+                (
+                    name.clone(),
+                    ManifestDependency {
+                        image,
+                        ports: dep.ports.clone(),
+                        restart: dep.restart.clone(),
+                        command: convert_string_or_array(&dep.command),
+                        entrypoint: convert_string_or_array(&dep.entrypoint),
+                        environment: env,
+                        depends_on: dep.depends_on.clone(),
+                        measured_data: measured,
+                        unmeasured_data: unmeasured,
+                        disks: dep.disks.clone(),
+                    },
+                )
+            })
+            .collect();
+        Some(deps)
+    };
 
     // Disks (top-level) - resolve auto-assigned indices.
     let resolved_indices = config.resolved_disk_indices();
@@ -551,6 +593,7 @@ image = "my-app:latest"
         let manifest = build_manifest(
             &cfg,
             "my-app:latest",
+            BTreeMap::new(),
             BTreeMap::new(),
             hashes,
         );

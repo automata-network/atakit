@@ -227,11 +227,9 @@ model-cache = "/data/cache"
 
 Built dependency images are auto-tagged as `{dependency_name}:{workload.version}`.
 
-**Note:** Dependencies are currently parsed and validated by the tooling, but `atakit workload build` does not yet support workloads that define a `[dependencies]` section. Workloads that include dependencies will fail validation during `atakit workload build`.
-
 ### `[disks.<name>]` — Persistent Storage
 
-Defines persistent disk volumes attached to the CVM. Referenced by `[workload.disks]` or `[dependencies.<name>.disks]`.
+Defines persistent disk volumes attached to the CVM. Referenced by `[workload.disks]` or `[dependencies.<name>.disks]`. A disk can be shared between multiple containers.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -242,7 +240,6 @@ Defines persistent disk volumes attached to the CVM. Referenced by `[workload.di
 | `encryption.key_security` | string | no | Encryption key security level: `"standard"` (PCR 11 only) or `"strong"` (PCR 10+11). Default: `"standard"`. |
 
 **Constraints:**
-- Each disk may be mounted by exactly one container (workload or dependency).
 - `index` >= 10 to avoid collision with boot disk (LUN 0) and system devices.
 - `index` must be unique across all `[disks.*]` entries.
 
@@ -356,11 +353,11 @@ These compose features are intentionally excluded. The CVM runtime controls thes
 - Same image and container validation rules as workload
 - `depends_on` entries must reference other dependencies defined in the file
 - `env_file` paths must exist relative to `atakit-workload.toml`
+- Host ports must be unique across all containers (workload + dependencies)
 
 ### Disks
 
 - Each disk referenced in `[workload.disks]` or `[dependencies.*.disks]` must have a corresponding `[disks.<name>]` entry
-- Each disk may be mounted by at most one container
 - `size` must be a valid size string (e.g. `"10GB"`, `"500MB"`)
 - `encryption.key_security` must be `"standard"` or `"strong"` if present
 
