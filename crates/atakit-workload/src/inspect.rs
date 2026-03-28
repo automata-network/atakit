@@ -92,13 +92,6 @@ async fn inspect_dir(
         tracing::warn!("{}", w);
     }
 
-    // Mirror build_workload's hard error on unsupported dependencies
-    if warnings.iter().any(|w| w.contains("[dependencies]")) {
-        return Err(WorkloadError::Validation(
-            "dependencies are not yet supported in workloads".to_string(),
-        ));
-    }
-
     let name = &config.workload.name;
     let version = &config.workload.version;
     let resolved_image =
@@ -123,10 +116,81 @@ async fn inspect_dir(
     // We need to stage the image to compute hashes, but for dir mode we need
     // a container engine to save the image. Handle each image source type.
     let tar_name = crate::archive::image_tar_name(name);
-    match &config.workload.image {
+    stage_image(
+        &config.workload.image,
+        &resolved_image,
+        &tar_name,
+        &staging,
+        &workload_dir,
+        engine_override,
+        verbose,
+    )
+    .await?;
+
+    // Stage dependency images.
+    let mut dep_names: Vec<_> = config.dependencies.keys().collect();
+    dep_names.sort();
+    for dep_name in &dep_names {
+        let dep = &config.dependencies[*dep_name];
+        let dep_resolved =
+            crate::manifest::resolve_image_ref(&dep.image, dep_name, version);
+        let dep_tar = crate::archive::image_tar_name(dep_name);
+        stage_image(
+            &dep.image,
+            &dep_resolved,
+            &dep_tar,
+            &staging,
+            &workload_dir,
+            engine_override,
+            verbose,
+        )
+        .await?;
+    }
+
+    // Hash all staged content
+    let mut hashes = crate::hash::hash_directory(&staging.root, "measured-data")?;
+    let image_hashes = crate::hash::hash_directory(&staging.root, "images")?;
+    hashes.extend(image_hashes);
+
+    // Resolve environment (workload + dependencies)
+    let environment = crate::manifest::resolve_environment(
+        &config.workload.env_file,
+        &config.workload.environment,
+        &workload_dir,
+    )?;
+    let mut dep_environments = std::collections::BTreeMap::new();
+    for dep_name in &dep_names {
+        let dep = &config.dependencies[*dep_name];
+        let dep_env = crate::manifest::resolve_environment(
+            &dep.env_file,
+            &dep.environment,
+            &workload_dir,
+        )?;
+        dep_environments.insert((*dep_name).clone(), dep_env);
+    }
+
+    // Build manifest
+    let manifest =
+        crate::manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
+    let manifest_raw = toml::to_string_pretty(&manifest)?;
+
+    build_result(manifest_raw)
+}
+
+/// Stage a single container image into the staging directory.
+async fn stage_image(
+    source: &crate::config::ImageSource,
+    resolved_ref: &str,
+    tar_name: &str,
+    staging: &crate::archive::StagingDir,
+    workload_dir: &std::path::Path,
+    engine_override: Option<ContainerEngine>,
+    verbose: bool,
+) -> Result<(), WorkloadError> {
+    match source {
         crate::config::ImageSource::File { file } => {
             let src = workload_dir.join(file);
-            staging.stage_image_file(&src, &tar_name)?;
+            staging.stage_image_file(&src, tar_name)?;
         }
         crate::config::ImageSource::Registry(reference) => {
             let engine = match engine_override {
@@ -135,7 +199,7 @@ async fn inspect_dir(
             };
             engine.pull_image(reference).await?;
             engine
-                .save_image(reference, &staging.image_tar_path(&tar_name))
+                .save_image(reference, &staging.image_tar_path(tar_name))
                 .await?;
         }
         crate::config::ImageSource::Build {
@@ -149,31 +213,14 @@ async fn inspect_dir(
             };
             let context = workload_dir.join(build);
             engine
-                .build_image(&context, containerfile.as_deref(), &resolved_image, args, verbose)
+                .build_image(&context, containerfile.as_deref(), resolved_ref, args, verbose)
                 .await?;
             engine
-                .save_image(&resolved_image, &staging.image_tar_path(&tar_name))
+                .save_image(resolved_ref, &staging.image_tar_path(tar_name))
                 .await?;
         }
     }
-
-    // Hash all staged content
-    let mut hashes = crate::hash::hash_directory(&staging.root, "measured-data")?;
-    let image_hashes = crate::hash::hash_directory(&staging.root, "images")?;
-    hashes.extend(image_hashes);
-
-    // Resolve environment
-    let environment = crate::manifest::resolve_environment(
-        &config.workload.env_file,
-        &config.workload.environment,
-        &workload_dir,
-    )?;
-
-    // Build manifest
-    let manifest = crate::manifest::build_manifest(&config, &resolved_image, environment, hashes);
-    let manifest_raw = toml::to_string_pretty(&manifest)?;
-
-    build_result(manifest_raw)
+    Ok(())
 }
 
 /// Compute PCR23 and build InspectResult from raw manifest TOML.

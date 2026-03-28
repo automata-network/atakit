@@ -240,6 +240,33 @@ fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
         println!();
     }
 
+    // --- Dependencies ---
+    if let Some(ref deps) = m.config.dependencies {
+        if !deps.is_empty() {
+            section_header("Dependencies");
+            for (name, dep) in deps {
+                println!("  {}", format!("[{name}]").bold());
+                println!("    {:<16}{}", "Image:", dep.image);
+                if !dep.ports.is_empty() {
+                    let ports_str = dep.ports.join(", ");
+                    println!("    {:<16}{}", "Ports:", ports_str);
+                }
+                if dep.restart != "no" {
+                    println!("    {:<16}{}", "Restart:", dep.restart);
+                }
+                if !dep.depends_on.is_empty() {
+                    println!("    {:<16}{}", "Depends on:", dep.depends_on.join(", "));
+                }
+                if !dep.disks.is_empty() {
+                    for (dk, mount) in &dep.disks {
+                        println!("    {:<16}{} -> {}", "Disk:", dk, mount);
+                    }
+                }
+            }
+            println!();
+        }
+    }
+
     // --- Firewall Ports ---
     if !m.config.firewall_ports.is_empty() {
         section_header("Firewall Ports");

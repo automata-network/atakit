@@ -27,8 +27,8 @@ secure-signer/
       cosign_policy.json
   images/
     secure-signer.tar
-    redis.tar              # dependencies not yet implemented
-    model-server.tar       # dependencies not yet implemented
+    redis.tar
+    model-server.tar
 ```
 
 The top-level directory is always the workload name. Three entries:
@@ -73,7 +73,7 @@ LISTEN_ADDR = "0.0.0.0:3000"
 secure-signer-data = "/data"
 secure-signer-data2 = "/data2"
 
-# ── dependencies (not yet implemented) ────────────────
+# ── dependencies ──────────────────────────────────────
 
 [config.dependencies.redis]
 image = "redis:7"
@@ -222,8 +222,6 @@ secure-signer-data = "/data"
 ```
 
 ### `[config.dependencies.<name>]` — Dependency Containers
-
-> **Not yet implemented.** Dependencies are defined in the [workload TOML spec](atakit-workload-toml-spec.md) but not yet supported by the CLI or build pipeline.
 
 Same fields as the workload's `[config]` section (minus `base-image-mode` and `base-image`, which are workload-level). Each dependency gets its own sub-table.
 
@@ -491,7 +489,7 @@ The relationship is analogous to source code and a compiled binary. The source i
 | `[workload] boot-disk-size` | `[config] boot-disk-size` |
 | `[workload.environment]` + `env_file` | `[config.environment]` (merged, inlined) |
 | `[workload.disks]` | `[config.disks]` |
-| `[dependencies.<name>]` | `[config.dependencies.<name>]` *(not yet implemented)* |
+| `[dependencies.<name>]` | `[config.dependencies.<name>]` |
 | `[firewall]` + `ports` | `[config.firewall-ports]` (resolved flat list) |
 | `[baby-container]` | `[config.baby-container]` |
 | `[signing]` | `[config.signing]` (paths rewritten) |

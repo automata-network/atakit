@@ -62,15 +62,6 @@ pub async fn build_workload(
         tracing::warn!("{}", w);
     }
 
-    // Until dependencies are fully implemented, treat their presence as a hard error
-    // to avoid generating archives whose manifests reference unstaged dependency
-    // images or files.
-    if warnings.iter().any(|w| w.contains("[dependencies]")) {
-        return Err(WorkloadError::Validation(
-            "dependencies are not yet supported in workloads".to_string(),
-        ));
-    }
-
     // 3. Create staging directory
     let temp_dir = tempfile::tempdir().map_err(WorkloadError::Io)?;
     let staging = StagingDir::create(temp_dir.path(), &name)?;
@@ -123,6 +114,59 @@ pub async fn build_workload(
         }
     }
 
+    // 4b. Build dependency images (sorted by name for determinism).
+    let mut dep_names: Vec<_> = config.dependencies.keys().collect();
+    dep_names.sort();
+    for dep_name in &dep_names {
+        let dep = &config.dependencies[*dep_name];
+        let dep_resolved = manifest::resolve_image_ref(&dep.image, dep_name, &version);
+        let dep_tar = archive::image_tar_name(dep_name);
+
+        match &dep.image {
+            ImageSource::Registry(reference) => {
+                let engine = resolve_engine(opts).await?;
+                let handle = progress.create(&format!("Pulling {reference} ({dep_name})..."), 0);
+                engine.pull_image(reference).await?;
+                engine
+                    .save_image(reference, &staging.image_tar_path(&dep_tar))
+                    .await?;
+                handle.finish();
+                image_count += 1;
+            }
+            ImageSource::Build {
+                build,
+                containerfile,
+                args,
+            } => {
+                let engine = resolve_engine(opts).await?;
+                let handle =
+                    progress.create(&format!("Building {dep_resolved} ({dep_name})..."), 0);
+                let context = workload_dir.join(build);
+                engine
+                    .build_image(
+                        &context,
+                        containerfile.as_deref(),
+                        &dep_resolved,
+                        args,
+                        opts.verbose,
+                    )
+                    .await?;
+                engine
+                    .save_image(&dep_resolved, &staging.image_tar_path(&dep_tar))
+                    .await?;
+                handle.finish();
+                image_count += 1;
+            }
+            ImageSource::File { file } => {
+                let src = workload_dir.join(file);
+                let handle = progress.create(&format!("Loading {file} ({dep_name})..."), 0);
+                staging.stage_image_file(&src, &dep_tar)?;
+                handle.finish();
+                image_count += 1;
+            }
+        }
+    }
+
     // 5. Collect measured-data
     let measured_file_count = if config.workload.measured_data.is_empty()
         && config.signing.as_ref().is_none_or(|s| !s.enable)
@@ -146,12 +190,19 @@ pub async fn build_workload(
         count
     };
 
-    // 6. Resolve environment
+    // 6. Resolve environment (workload + dependencies)
     let environment = manifest::resolve_environment(
         &config.workload.env_file,
         &config.workload.environment,
         workload_dir,
     )?;
+    let mut dep_environments = std::collections::BTreeMap::new();
+    for dep_name in &dep_names {
+        let dep = &config.dependencies[*dep_name];
+        let dep_env =
+            manifest::resolve_environment(&dep.env_file, &dep.environment, workload_dir)?;
+        dep_environments.insert((*dep_name).clone(), dep_env);
+    }
 
     // 7. Hash all content
     let handle = progress.create("Hashing content...", 0);
@@ -162,7 +213,7 @@ pub async fn build_workload(
 
     // 8. Generate manifest
     let handle = progress.create("Generating manifest.toml...", 0);
-    let m = manifest::build_manifest(&config, &resolved_image, environment, hashes);
+    let m = manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
     let manifest_toml = toml::to_string_pretty(&m)?;
     staging.write_manifest(&manifest_toml)?;
     handle.finish();
