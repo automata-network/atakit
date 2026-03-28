@@ -197,6 +197,8 @@ pub(super) struct ResolvedWorkload {
     pub ports: Vec<String>,
     /// Disk name -> (index, size string e.g. "10GB").
     pub disks: BTreeMap<String, (u32, String)>,
+    /// Minimum boot/OS disk size (e.g. "50GB"). None = cloud default.
+    pub boot_disk_size: Option<String>,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -231,6 +233,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 version,
                 ports: result.manifest.config.ports,
                 disks,
+                boot_disk_size: result.manifest.config.boot_disk_size,
             });
         }
 
@@ -257,6 +260,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             version: result.manifest.meta.version,
             ports: result.manifest.config.ports,
             disks,
+            boot_disk_size: result.manifest.config.boot_disk_size,
         });
     }
 
@@ -283,6 +287,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         version: wl_config.workload.version,
         ports: wl_config.workload.ports,
         disks,
+        boot_disk_size: wl_config.workload.boot_disk_size,
     })
 }
 

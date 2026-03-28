@@ -24,12 +24,25 @@ pub trait CommandRunner: Send + Sync {
 }
 
 /// Real process-based command runner using tokio.
-pub struct ProcessRunner;
+#[derive(Default)]
+pub struct ProcessRunner {
+    /// When true, print each command to stderr before executing.
+    pub verbose: bool,
+}
+
+impl ProcessRunner {
+    pub fn new(verbose: bool) -> Self {
+        Self { verbose }
+    }
+}
 
 #[async_trait::async_trait]
 impl CommandRunner for ProcessRunner {
     async fn run_capture(&self, program: &str, args: &[&str]) -> Result<CommandOutput, CloudError> {
         tracing::debug!(program, ?args, "running command");
+        if self.verbose {
+            eprintln!("  $ {} {}", program, shell_join(args));
+        }
         let output = tokio::process::Command::new(program)
             .args(args)
             .output()
@@ -73,6 +86,9 @@ impl CommandRunner for ProcessRunner {
         verbose: bool,
     ) -> Result<CommandOutput, CloudError> {
         tracing::debug!(program, ?args, verbose, "running command (stream)");
+        if self.verbose {
+            eprintln!("  $ {} {}", program, shell_join(args));
+        }
         let stdio = if verbose {
             std::process::Stdio::inherit()
         } else {
@@ -115,4 +131,18 @@ impl CommandRunner for ProcessRunner {
             stderr,
         })
     }
+}
+
+/// Join args for display, quoting any that contain spaces or special chars.
+fn shell_join(args: &[&str]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(' ') || a.contains(';') || a.contains('\'') || a.is_empty() {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                (*a).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

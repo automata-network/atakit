@@ -78,6 +78,13 @@ pub struct ManifestConfig {
     pub baby_container: Option<ManifestBabyContainer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing: Option<ManifestSigning>,
+    /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
+    #[serde(
+        default,
+        rename = "boot-disk-size",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub boot_disk_size: Option<String>,
 }
 
 fn default_restart() -> String {
@@ -434,6 +441,7 @@ pub fn build_manifest(
             firewall_ports,
             baby_container,
             signing,
+            boot_disk_size: w.boot_disk_size.clone(),
         },
         disks,
         hashes,

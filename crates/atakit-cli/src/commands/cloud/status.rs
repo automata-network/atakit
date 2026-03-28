@@ -29,7 +29,7 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
 			}
 		};
 		if let Some(provider) = provider {
-			let runner = ProcessRunner;
+			let runner = ProcessRunner::default();
 			live_ip = provider
 				.get_instance_ip(&state, &runner)
 				.await

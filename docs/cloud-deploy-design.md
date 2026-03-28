@@ -595,19 +595,21 @@ pub struct DeployOptions {
     /// Host ports from the workload manifest (format: "host:container[/proto]").
     /// Used to derive firewall rules. No protocol = both tcp+udp.
     pub workload_ports: Vec<String>,
+    /// Disks from the workload manifest: (disk_name, index, size_gb).
+    pub workload_disks: Vec<(String, u32, u64)>,
+    /// Minimum boot/OS disk size in GB. Cloud default if None.
+    pub boot_disk_size_gb: Option<u64>,
 }
 
 pub struct DestroyOptions {
     /// Resources to preserve: "image", "disks", "firewall".
     pub preserve: Vec<String>,
-    /// Also delete the GCE image. Default: true.
-    pub delete_image: bool,
 }
 ```
 
 ### CommandRunner
 
-The `verbose` flag controls whether subprocess stderr is streamed to the terminal (for upload progress). No `ProgressReporter` trait - cloud commands use direct stderr output.
+No `ProgressReporter` trait - cloud commands use direct stderr output.
 
 ```rust
 #[async_trait]
@@ -622,12 +624,17 @@ pub trait CommandRunner: Send + Sync {
         &self,
         program: &str,
         args: &[&str],
-        verbose: bool,
+        verbose: bool,     // controls stderr streaming (upload progress)
     ) -> Result<CommandOutput, CloudError>;
 }
 
-pub struct ProcessRunner;  // unit struct, no fields
+#[derive(Default)]
+pub struct ProcessRunner {
+    pub verbose: bool,     // when true, prints "$ program args..." before each command
+}
 ```
+
+`ProcessRunner::new(verbose)` creates a runner that logs commands to stderr. The `verbose` field controls command display for both `run_capture` and `run_stream`. The `run_stream` method additionally takes its own `verbose` parameter to control whether subprocess stderr is inherited (for upload progress).
 
 ---
 

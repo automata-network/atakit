@@ -27,6 +27,8 @@ pub struct DeployOptions {
     pub workload_ports: Vec<String>,
     /// Disks from the workload manifest: (disk_name, index, size_gb).
     pub workload_disks: Vec<(String, u32, u64)>,
+    /// Minimum boot/OS disk size in GB. Cloud default if None.
+    pub boot_disk_size_gb: Option<u64>,
 }
 
 /// Options for a destroy operation.

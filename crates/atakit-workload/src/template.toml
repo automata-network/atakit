@@ -37,6 +37,11 @@ base-image-mode = "blacklist"
 # must not cause overflow.
 # ttl = 3153600000
 
+# boot-disk-size: minimum boot/OS disk size for cloud deployments.
+# Uses the cloud provider default if omitted. The actual disk may be larger
+# if the base image requires more space. Valid units: MB, GB, TB.
+# boot-disk-size = "50GB"
+
 # ── image source (pick exactly one form) ─────────────────────────
 #
 # Form 1 -- Pull from a container registry:

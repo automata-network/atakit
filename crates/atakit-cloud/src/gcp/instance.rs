@@ -1,9 +1,11 @@
 use crate::config::CcType;
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
+use crate::plan::DiskSpec;
 
 /// Create a GCE VM instance with a CVM-compatible configuration.
 /// Returns the external IP address.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_instance(
     project: &str,
     zone: &str,
@@ -12,12 +14,15 @@ pub async fn create_instance(
     image: &str,
     cc_type: CcType,
     metadata: &[(String, String)],
+    disks: &[DiskSpec],
+    boot_disk_size_gb: Option<u64>,
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
     let cc_flag = format!("--confidential-compute-type={cc_type}");
     let machine_flag = format!("--machine-type={machine_type}");
     let image_flag = format!("--image={image}");
     let tags_flag = format!("--tags={name}-ingress");
+    let boot_disk_flag = boot_disk_size_gb.map(|gb| format!("--boot-disk-size={gb}GB"));
     let cpu_flag = cc_type
         .min_cpu_platform()
         .map(|p| format!("--min-cpu-platform={p}"));
@@ -47,6 +52,9 @@ pub async fn create_instance(
         &cc_flag,
         "--maintenance-policy=TERMINATE",
     ];
+    if let Some(ref flag) = boot_disk_flag {
+        args.push(flag);
+    }
     if let Some(ref flag) = cpu_flag {
         args.push(flag);
     }
@@ -54,6 +62,21 @@ pub async fn create_instance(
         args.push(flag);
     }
     args.push(&tags_flag);
+
+    // Attach pre-created persistent disks.
+    let disk_flags: Vec<String> = disks
+        .iter()
+        .map(|d| {
+            format!(
+                "--disk=name={},device-name={},auto-delete=no",
+                d.name, d.device_name,
+            )
+        })
+        .collect();
+    for flag in &disk_flags {
+        args.push(flag);
+    }
+
     args.push("--format=json");
 
     let output = runner

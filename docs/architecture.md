@@ -66,7 +66,7 @@ Cloud deployment logic. Clap structs behind a `cli` feature flag.
 - **Plan types** -- `DeployStep` with GCP variants (CheckDeps, UploadImage, OpenPorts, CreateDisks, CreateInstance, WaitForAgent, InitializeWorkload) and Azure variants (CreateResourceGroup, UploadImageAzure, CreateInstanceAzure). `DestroyStep` with GCP variants (DeleteInstance, DeleteDisks, DeleteFirewall, DeleteImage, DeleteBucket) and Azure variants (DeleteResourceGroup, DeleteImageVersion).
 - **State management** -- `DeployState` persisted as JSON at `<data_dir>/deployments/<target>/<instance>.state.json`. `ResourceSet` contains `gcp: Option<GcpResources>` and `azure: Option<AzureResources>`. Lifecycle: Deploying, Deployed, Failed, Destroying, Destroyed. State file deleted on destroy completion.
 - **Resource naming** -- `ResourceNames::for_gcp(instance, image_ref)` for GCP; `AzureResourceNames::for_azure(instance, image_ref, region)` for Azure. All deterministic.
-- **Command execution** -- `CommandRunner` trait + `ProcessRunner` for real subprocess execution via tokio
+- **Command execution** -- `CommandRunner` trait + `ProcessRunner` for real subprocess execution via tokio. `ProcessRunner::new(verbose)` enables printing each cloud command to stderr before execution.
 - **CVM agent client** -- `wait_for_agent` (polling with backoff), `post_init` (multipart POST with archive + agent config)
 - **CLI arg structs** -- (behind `cli` feature) `CloudCommand`, `DeployArgs`, `DestroyArgs`, `StatusArgs`, `ListArgs`, `SshArgs`, `SerialArgs`, `UploadImageArgs`, `InitArgs`
 

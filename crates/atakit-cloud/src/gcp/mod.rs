@@ -116,6 +116,7 @@ impl CloudProvider for GcpProvider {
             cc_type: opts.target.cc_type,
             metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             disks,
+            boot_disk_size_gb: opts.boot_disk_size_gb,
         });
 
         if !opts.skip_init {
@@ -209,6 +210,7 @@ impl CloudProvider for GcpProvider {
                 cc_type,
                 metadata,
                 disks,
+                boot_disk_size_gb,
             } => {
                 let ip = instance::create_instance(
                     &self.project,
@@ -219,6 +221,7 @@ impl CloudProvider for GcpProvider {
                     *cc_type,
                     metadata,
                     disks,
+                    *boot_disk_size_gb,
                     runner,
                 )
                 .await?;

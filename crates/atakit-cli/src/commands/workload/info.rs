@@ -1,7 +1,7 @@
 use anyhow::Result;
 use atakit_core::Env;
 use atakit_workload::cli::InfoArgs;
-use atakit_workload::manifest::{Manifest, ManifestFirewallAllow};
+use atakit_workload::manifest::{Manifest, ManifestFirewallPort};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 use sha2::Digest;
@@ -240,23 +240,11 @@ fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
         println!();
     }
 
-    // --- Firewall ---
-    let has_fw = m
-        .config
-        .firewall
-        .as_ref()
-        .is_some_and(|fw| !fw.allow.is_empty() || !fw.deny.is_empty());
-    if has_fw {
-        let fw = m.config.firewall.as_ref().unwrap();
-        section_header("Firewall");
-        if !fw.allow.is_empty() {
-            let items: Vec<String> = fw.allow.iter().map(format_fw_allow).collect();
-            print_multi("Allow:", &items);
-        }
-        if !fw.deny.is_empty() {
-            let items: Vec<String> = fw.deny.iter().map(|p| p.to_string()).collect();
-            print_multi("Deny:", &items);
-        }
+    // --- Firewall Ports ---
+    if !m.config.firewall_ports.is_empty() {
+        section_header("Firewall Ports");
+        let items: Vec<String> = m.config.firewall_ports.iter().map(format_fw_port).collect();
+        print_multi("Open:", &items);
         println!();
     }
 
@@ -316,7 +304,7 @@ fn format_string_or_array(s: &atakit_workload::manifest::StringOrArrayOut) -> St
     }
 }
 
-fn format_fw_allow(a: &ManifestFirewallAllow) -> String {
-    format!("{}/{}", a.port, a.protocol)
+fn format_fw_port(p: &ManifestFirewallPort) -> String {
+    format!("{}/{}", p.port, p.protocol)
 }
 
