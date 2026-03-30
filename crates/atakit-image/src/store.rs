@@ -169,11 +169,11 @@ impl ImageStore {
 
     // ── download ───────────────────────────────────────────────────
 
-    /// Download disk images for the given release tag and platforms.
+    /// Download `.atabi` archives for the given release tag and platforms.
     ///
-    /// Fetches the release metadata once, downloads each platform's disk
-    /// image, then downloads secure-boot certificates once at the end.
-    /// Returns the paths to all downloaded disk image files.
+    /// Finds the minimal set of archive assets that cover the requested
+    /// platforms, downloads each to a temp file, and imports into the store
+    /// via `import_image_archive`.
     pub async fn download(
         &self,
         client: &ReleasesClient,
@@ -182,35 +182,39 @@ impl ImageStore {
         progress: &dyn ProgressReporter,
     ) -> Result<Vec<PathBuf>> {
         let release = client.get_release(image_ref).await?;
-        let disk_dir = self.disk_images_dir(image_ref);
-        let opts = DownloadOptions::default()
-            .dest_dir(&disk_dir)
-            .skip_existing(true);
 
+        // Collect the unique set of archive assets needed.
+        let mut archives_to_download: Vec<&crate::types::Asset> = Vec::new();
+        for &platform in platforms {
+            let asset = release
+                .archive_for_platform(platform)
+                .ok_or_else(|| ImageError::MissingPlatformAsset {
+                    image_ref: image_ref.to_string(),
+                    platform: platform.to_string(),
+                })?;
+            if !archives_to_download.iter().any(|a| a.name == asset.name) {
+                archives_to_download.push(asset);
+            }
+        }
+
+        let tmp_dir = tempfile::tempdir().map_err(ImageError::Io)?;
+        for asset in &archives_to_download {
+            let tmp_path = tmp_dir.path().join(&asset.name);
+            let opts = DownloadOptions::default().dest_dir(tmp_dir.path());
+            download::download_asset(client, asset, &opts, progress).await?;
+
+            let imported = crate::archive::import_image_archive(&tmp_path, &self.base_dir)?;
+            info!(%imported, "imported archive {}", asset.name);
+        }
+
+        // Return paths to the disk images that now exist.
         let mut paths = Vec::new();
         for &platform in platforms {
-            let asset =
-                release
-                    .disk_image(platform)
-                    .ok_or_else(|| ImageError::MissingPlatformAsset {
-                        image_ref: image_ref.to_string(),
-                        platform: platform.to_string(),
-                    })?;
-
-            let path = download::download_asset(client, asset, &opts, progress).await?;
-            info!(?image_ref, %platform, path = %path.display(), "image ready");
-            paths.push(path);
+            let path = self.image_path(image_ref, platform);
+            if path.exists() {
+                paths.push(path);
+            }
         }
-
-        // Download secure-boot certs into secure_boot_certs/ subdirectory.
-        if let Some(certs) = release.secure_boot_certs() {
-            let certs_dir = self.certs_dir(image_ref);
-            let certs_opts = DownloadOptions::default()
-                .dest_dir(&certs_dir)
-                .skip_existing(false);
-            download::download_asset(client, certs, &certs_opts, progress).await?;
-        }
-
         Ok(paths)
     }
 
@@ -295,11 +299,11 @@ impl ImageStore {
     }
 }
 
-/// Final (decompressed) disk image filename for each platform.
+/// Disk image filename for each platform as stored locally.
 fn disk_filename(platform: Platform) -> &'static str {
     match platform {
         Platform::Gcp => "gcp_disk.tar.gz",
         Platform::Aws => "aws_disk.vmdk",
-        Platform::Azure => "azure_disk.vhd",
+        Platform::Azure => "azure_disk.vhd.zst",
     }
 }

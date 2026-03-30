@@ -199,10 +199,48 @@ pub fn import_image_archive(
                 path: target.clone(),
                 source: e,
             })?;
+
+            // Compress VHD files to save disk space.
+            if target.extension().is_some_and(|e| e == "vhd") {
+                compress_to_zst(&target)?;
+            }
         }
     }
 
     Ok(image_ref)
+}
+
+/// Compress a file to `.zst` and remove the original.
+fn compress_to_zst(path: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let zst_path = path.with_extension("vhd.zst");
+    let mut reader = std::fs::File::open(path).map_err(|e| ImageError::ReadFile {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let out = std::fs::File::create(&zst_path).map_err(|e| ImageError::CreateFile {
+        path: zst_path.clone(),
+        source: e,
+    })?;
+    let mut encoder = zstd::Encoder::new(out, 0).map_err(ImageError::Io)?;
+
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(ImageError::Io)?;
+        if n == 0 {
+            break;
+        }
+        encoder.write_all(&buf[..n]).map_err(ImageError::Io)?;
+    }
+    encoder.finish().map_err(ImageError::Io)?;
+
+    std::fs::remove_file(path).map_err(|e| ImageError::Remove {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(())
 }
 
 /// Read and parse the manifest from an .atabi archive without full extraction.

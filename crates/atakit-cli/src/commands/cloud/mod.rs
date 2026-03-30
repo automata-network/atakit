@@ -231,7 +231,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 archive_path: blob,
                 name,
                 version,
-                ports: collect_all_ports_from_manifest(&result.manifest),
+                ports: collect_firewall_ports(&result.manifest),
                 disks,
                 boot_disk_size: result.manifest.config.boot_disk_size,
             });
@@ -254,7 +254,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         let disks = result.manifest.disks.iter()
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
-        let ports = collect_all_ports_from_manifest(&result.manifest);
+        let ports = collect_firewall_ports(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
@@ -274,37 +274,39 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         );
     }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
-    let wl_config = atakit_workload::config::WorkloadConfig::from_dir(&workload_dir)?;
-    let resolved_indices = wl_config.resolved_disk_indices();
-    let disks = wl_config.disks.iter()
-        .map(|(k, v)| {
-            let index = resolved_indices.get(k).copied().unwrap_or(10);
-            (k.clone(), (index, v.size.clone()))
-        })
+    let inspect_opts = atakit_workload::InspectOptions {
+        archive: Some(archive_path.clone()),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    };
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
+    }).context("failed to inspect archive")?;
+    let ports = collect_firewall_ports(&result.manifest);
+    let disks = result.manifest.disks.iter()
+        .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
         .collect();
-    let mut ports = wl_config.workload.ports;
-    for dep in wl_config.dependencies.values() {
-        ports.extend(dep.ports.iter().cloned());
-    }
     Ok(ResolvedWorkload {
         archive_path,
-        name: wl_config.workload.name,
-        version: wl_config.workload.version,
+        name: result.manifest.meta.name,
+        version: result.manifest.meta.version,
         ports,
         disks,
-        boot_disk_size: wl_config.workload.boot_disk_size,
+        boot_disk_size: result.manifest.config.boot_disk_size,
     })
 }
 
-/// Collect all ports from a manifest (workload + dependencies).
-fn collect_all_ports_from_manifest(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
-    let mut ports = m.config.ports.clone();
-    if let Some(ref deps) = m.config.dependencies {
-        for dep in deps.values() {
-            ports.extend(dep.ports.iter().cloned());
-        }
-    }
-    ports
+/// Collect resolved firewall ports from a manifest as `"port/proto"` strings.
+///
+/// Uses the manifest's `firewall_ports` which is the authoritative resolved list:
+/// auto-derived from container port mappings + firewall allow - deny.
+fn collect_firewall_ports(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
+    m.config
+        .firewall_ports
+        .iter()
+        .map(|fp| format!("{}/{}", fp.port, fp.protocol))
+        .collect()
 }
 
 /// Parse metadata key=value strings into a map.

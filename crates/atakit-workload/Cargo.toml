@@ -21,7 +21,7 @@ tracing.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
 
-tempfile = "3"
+tempfile.workspace = true
 
 clap = { workspace = true, optional = true }
 
