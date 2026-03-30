@@ -48,6 +48,8 @@ pub struct WorkloadMeta {
     pub name: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr23: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
@@ -396,6 +398,7 @@ mod tests {
             workload_id: "0xtest".to_string(),
             name: name.to_string(),
             version: version.to_string(),
+            sha256: None,
             pcr23: None,
             owner: None,
             archive_size: None,

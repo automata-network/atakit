@@ -9,7 +9,7 @@ use super::compute_workload_id;
 pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
-    // Inspect archive to get name, version, PCR23
+    // Inspect archive to get name, version, SHA256
     let opts = atakit_workload::InspectOptions {
         archive: Some(args.archive.clone()),
         workload_dir: None,
@@ -40,6 +40,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
     let meta = match store.load_meta(name, version)? {
         Some(mut existing) => {
             existing.workload_id = format!("0x{}", hex::encode(workload_id));
+            existing.sha256 = Some(result.sha256.clone());
             existing.pcr23 = Some(result.pcr23.clone());
             existing.archive_size = Some(size);
             existing.added_at = now;
@@ -49,6 +50,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
             workload_id: format!("0x{}", hex::encode(workload_id)),
             name: name.clone(),
             version: version.clone(),
+            sha256: Some(result.sha256.clone()),
             pcr23: Some(result.pcr23.clone()),
             owner: None,
             archive_size: Some(size),
@@ -62,7 +64,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
 
     println!("{}", "Imported.".green().bold());
     println!("  {:<18}{}:{}", "Workload:", name, version);
-    println!("  {:<18}{}", "PCR23:", result.pcr23.dimmed());
+    println!("  {:<18}{}", "SHA256:", result.sha256.dimmed());
 
     Ok(())
 }

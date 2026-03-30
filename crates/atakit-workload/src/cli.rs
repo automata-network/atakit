@@ -9,7 +9,7 @@ pub enum WorkloadCommand {
     Create(CreateArgs),
     /// Build an .atawl archive from atakit-workload.toml
     Build(BuildArgs),
-    /// Show workload details and PCR23 measurement
+    /// Show workload details and integrity measurement
     Info(InfoArgs),
     /// Publish a workload spec to the on-chain WorkloadRegistry
     Publish(PublishArgs),

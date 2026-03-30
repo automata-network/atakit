@@ -79,7 +79,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     // Check on-chain status if RPC is configured
     let on_chain_status = refresh_chain_status(name, version, env, config).await;
 
-    print_info(&result.manifest, &result.pcr23, on_chain_status.as_deref());
+    print_info(&result.manifest, &result.sha256, on_chain_status.as_deref());
     Ok(())
 }
 
@@ -149,7 +149,7 @@ fn section_header(name: &str) {
     println!("{}", format!("{prefix}{pad}").cyan().bold());
 }
 
-fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
+fn print_info(m: &Manifest, sha256: &str, chain_status: Option<&str>) {
     // Title
     println!(
         "{}",
@@ -287,10 +287,10 @@ fn print_info(m: &Manifest, pcr23: &str, chain_status: Option<&str>) {
 
     // --- Measurement ---
     section_header("Measurement");
-    println!("  {:<18}{}", "SHA256:", pcr23);
+    println!("  {:<18}{}", "SHA256:", sha256);
 
     // Compute final PCR register value: SHA-256(zeros_32 || event_hash).
-    let event_hex = pcr23.strip_prefix("0x").unwrap_or(pcr23);
+    let event_hex = sha256.strip_prefix("0x").unwrap_or(sha256);
     if let Ok(event_bytes) = hex::decode(event_hex) {
         if event_bytes.len() == 32 {
             let mut hasher = sha2::Sha256::new();

@@ -62,7 +62,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         name.green().bold(),
         version,
     );
-    println!("PCR23: {}", result.pcr23.dimmed());
+    println!("SHA256: {}", result.sha256.dimmed());
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
     // Resolve registry and stream upload from file

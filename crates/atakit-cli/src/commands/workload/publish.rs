@@ -6,7 +6,6 @@ use atakit_workload::cli::PublishArgs;
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
-use sha2::Digest;
 
 use super::looks_like_store_ref;
 use crate::config::Config;
@@ -91,18 +90,13 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let result = atakit_workload::inspect_workload(&opts).await?;
     let manifest = &result.manifest;
 
-    // Compute final PCR23 register value: SHA-256(zeros_32 || event_hash).
-    // The event hash is SHA-256(manifest.toml). The TPM extends from all zeros.
+    // Final PCR23 register value (computed by inspect).
     let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
-    let event_hash: [u8; 32] = hex::decode(pcr23_hex)
+    let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
         .context("invalid PCR23 hex")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let mut extend_hasher = sha2::Sha256::new();
-    extend_hasher.update([0u8; 32]); // PCR starts at all zeros
-    extend_hasher.update(event_hash);
-    let pcr23_final: [u8; 32] = extend_hasher.finalize().into();
-    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_final);
+    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
 
     // Parse base image IDs
     let mut base_image_ids = Vec::new();
@@ -196,7 +190,6 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // Compute workload ID and display summary before publishing.
     let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
     let workload_id_hex = format!("0x{}", hex::encode(workload_id));
-    let pcr23_final_hex = format!("0x{}", hex::encode(pcr23_final));
     let base_image_mode_str = &manifest.config.base_image_mode;
 
     println!(
@@ -206,8 +199,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     );
     println!();
     println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
-    println!("  {:<20}{}", "SHA256:".dimmed(), result.pcr23);
-    println!("  {:<20}{}", "PCR23:".dimmed(), pcr23_final_hex);
+    println!("  {:<20}{}", "SHA256:".dimmed(), result.sha256);
+    println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
     println!("  {:<20}{} ({})", "Base Image Mode:".dimmed(), base_image_mode_str, base_image_mode);
     if !args.base_image_id.is_empty() {
         for (i, id) in args.base_image_id.iter().enumerate() {
@@ -280,7 +273,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                         m.owner.clone_from(&owner);
                     }
                     m.on_chain_spec = Some(chain_spec);
-                    m.pcr23 = Some(pcr23_final_hex.clone());
+                    m.sha256 = Some(result.sha256.clone());
+                    m.pcr23 = Some(result.pcr23.clone());
                     m.revoked = revoked;
                     m.added_at = now;
                     m
@@ -289,7 +283,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                     workload_id: workload_id_hex.clone(),
                     name: manifest.meta.name.clone(),
                     version: manifest.meta.version.clone(),
-                    pcr23: Some(pcr23_final_hex.clone()),
+                    sha256: Some(result.sha256.clone()),
+                    pcr23: Some(result.pcr23.clone()),
                     owner,
                     archive_size: None,
                     on_chain_spec: Some(chain_spec),
@@ -349,7 +344,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 existing.owner.clone_from(&owner);
             }
             existing.on_chain_spec = Some(cached_chain_spec);
-            existing.pcr23 = Some(pcr23_final_hex.clone());
+            existing.sha256 = Some(result.sha256.clone());
+            existing.pcr23 = Some(result.pcr23.clone());
             existing.added_at = now;
             existing
         }
@@ -357,7 +353,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             workload_id: workload_id_hex.clone(),
             name: manifest.meta.name.clone(),
             version: manifest.meta.version.clone(),
-            pcr23: Some(pcr23_final_hex.clone()),
+            sha256: Some(result.sha256.clone()),
+            pcr23: Some(result.pcr23.clone()),
             owner,
             archive_size: None,
             on_chain_spec: Some(cached_chain_spec),

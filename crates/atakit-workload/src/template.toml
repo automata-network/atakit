@@ -31,11 +31,10 @@ base-image-mode = "blacklist"
 # base-image = ["0xabc123..."]
 
 # ttl: session TTL in seconds. Determines how long a CVM session remains
-# valid after attestation. Default: ~100 years (3153600000s). Set to 0 for
-# the contract default (30 days). Can be overridden per-publish with `--ttl`.
-# The contract computes `block.timestamp + ttl` as uint64, so the value
-# must not cause overflow.
-# ttl = 3153600000
+# valid after attestation. Default: 0 (contract default, 30 days).
+# Can be overridden per-publish with `--ttl`. The contract computes
+# `block.timestamp + ttl` as uint64, so the value must not cause overflow.
+# ttl = 0
 
 # boot-disk-size: minimum boot/OS disk size for cloud deployments.
 # Uses the cloud provider default if omitted. The actual disk may be larger

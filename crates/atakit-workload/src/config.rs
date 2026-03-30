@@ -101,10 +101,9 @@ pub struct WorkloadSection {
     pub boot_disk_size: Option<String>,
 }
 
-/// Default TTL: ~100 years in seconds. The contract computes
-/// `block.timestamp + ttl` as uint64, so u64::MAX would overflow.
+/// Default TTL: 0 means contract default (30 days).
 fn default_ttl() -> u64 {
-    100 * 365 * 86400
+    0
 }
 
 fn default_restart() -> String {

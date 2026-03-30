@@ -74,15 +74,15 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         // Check if an existing entry has a different PCR23 and confirm before overwriting
         let existing_meta = store.load_meta(name, version)?;
         if let Some(ref existing) = existing_meta {
-            if let Some(ref old_pcr23) = existing.pcr23 {
-                if *old_pcr23 != inspect.pcr23 {
+            if let Some(ref old_sha256) = existing.sha256 {
+                if *old_sha256 != inspect.sha256 {
                     println!();
                     println!(
                         "{}",
                         format!("Store already has {name}:{version} with a different measurement.").yellow().bold()
                     );
-                    println!("  {:<12}{}", "Old PCR23:".dimmed(), old_pcr23);
-                    println!("  {:<12}{}", "New PCR23:".dimmed(), inspect.pcr23);
+                    println!("  {:<12}{}", "Old SHA256:".dimmed(), old_sha256);
+                    println!("  {:<12}{}", "New SHA256:".dimmed(), inspect.sha256);
                     if let Some(ref spec) = existing.on_chain_spec {
                         println!(
                             "  {:<12}{}",
@@ -112,6 +112,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         let meta = match existing_meta {
             Some(mut existing) => {
                 existing.workload_id = format!("0x{}", hex::encode(workload_id));
+                existing.sha256 = Some(inspect.sha256);
                 existing.pcr23 = Some(inspect.pcr23);
                 existing.archive_size = Some(size);
                 existing.added_at = now;
@@ -121,6 +122,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                 workload_id: format!("0x{}", hex::encode(workload_id)),
                 name: name.clone(),
                 version: version.clone(),
+                sha256: Some(inspect.sha256),
                 pcr23: Some(inspect.pcr23),
                 owner: None,
                 archive_size: Some(size),

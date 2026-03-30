@@ -24,7 +24,7 @@ Per-workload stored data:
 | `name` | string | manifest.toml `[meta]` | Workload name |
 | `version` | string | manifest.toml `[meta]` | Workload version |
 | `owner` | bytes32 | On-chain query at upload | Owner public key fingerprint |
-| `pcr23` | bytes32 | SHA-256 of manifest.toml | Content integrity hash |
+| `sha256` | bytes32 | SHA-256 of manifest.toml | Content integrity hash |
 | `archive_size` | u64 | Computed | Size of .atawl in bytes |
 | `archive_hash` | string | Computed | SHA-256 of entire .atawl file |
 | `uploaded_at` | timestamp | Server time | When the archive was uploaded |
@@ -90,7 +90,7 @@ Response body:
   "name": "secure-signer",
   "version": "v0.0.1",
   "owner": "0x...",
-  "pcr23": "0x...",
+  "sha256": "0x...",
   "archiveSize": 12345678,
   "archiveHash": "sha256:abcd...",
   "uploadedAt": "2025-03-21T12:00:00Z"
