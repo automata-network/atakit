@@ -10,7 +10,7 @@ The on-chain [WorkloadRegistry](cvm-registry/) is the authority for workload spe
 
 **Workload reference.** `name:version` (e.g. `secure-signer:v0.0.1`) - human-readable form, resolved to a workload ID by computing the hash.
 
-**Archive.** An `.atawl` file (tar.gz) containing `manifest.toml`, `measured-data/`, and `images/`. See [atawl-archive-spec.md](atawl-archive-spec.md).
+**Archive.** An `.atawl` file (tar.zst) containing `manifest.toml`, `measured-data/`, and `images/`. See [atawl-archive-spec.md](atawl-archive-spec.md).
 
 **Integrity model.** PCR23 = SHA-256 of `manifest.toml`, registered on-chain as STATIC matchData. The registry verifies that uploaded archives match the on-chain PCR23 before accepting them.
 

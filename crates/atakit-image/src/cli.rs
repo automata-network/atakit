@@ -76,6 +76,10 @@ pub struct ExportArgs {
     /// Output directory (default: current directory)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+
+    /// Use gzip compression instead of zstd
+    #[arg(long)]
+    pub gz: bool,
 }
 
 /// Arguments for `image import`.

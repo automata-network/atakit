@@ -157,7 +157,7 @@ The main workload container starts first (or in parallel with dependencies that 
 
 ## What does NOT change
 
-- Archive format: still tar.gz with `.atawl` extension
+- Archive format: tar.zst with `.atawl` extension (reads both zstd and gzip)
 - PCR23 computation: still SHA-256 of `manifest.toml` bytes
 - Hash verification: all files in `[hashes]` verified as before (now includes dependency image tars)
 - `[meta]` section: unchanged

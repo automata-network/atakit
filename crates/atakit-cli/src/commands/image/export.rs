@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use atakit_core::Env;
+use atakit_core::{ArchiveCompression, Env};
 use atakit_image::{ExportArgs, ImageStore, create_image_archive};
 use owo_colors::OwoColorize;
 
@@ -24,9 +24,15 @@ pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to determine current directory: {e}"))?,
     };
 
+    let compression = if args.gz {
+        ArchiveCompression::Gz
+    } else {
+        ArchiveCompression::Zstd
+    };
+
     let progress = IndicatifReporter;
     let archive_path =
-        create_image_archive(&tag_dir, &args.image, &platforms, &output_dir, &progress)?;
+        create_image_archive(&tag_dir, &args.image, &platforms, &output_dir, &progress, compression)?;
 
     println!("{}", "Exported.".green().bold());
     println!("  {}", archive_path.display());

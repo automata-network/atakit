@@ -1,8 +1,7 @@
 use std::io::Read;
 
-use atakit_core::NullReporter;
+use atakit_core::{ArchiveCompression, NullReporter};
 use atakit_workload::{build_workload, inspect_workload, BuildOptions, InspectOptions};
-use flate2::read::GzDecoder;
 
 /// Set up a minimal workload directory using `image = { file = "..." }` so the
 /// build pipeline can run without Docker/Podman.
@@ -47,6 +46,7 @@ async fn build_produces_valid_archive() {
             output_dir: Some(out_dir.clone()),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -63,8 +63,8 @@ async fn build_produces_valid_archive() {
 
     // Verify archive contents
     let file = std::fs::File::open(&result.archive_path).unwrap();
-    let gz = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
+    let dec = zstd::Decoder::new(file).unwrap();
+    let mut archive = tar::Archive::new(dec);
 
     let mut entry_names: Vec<String> = archive
         .entries()
@@ -95,8 +95,8 @@ async fn build_produces_valid_archive() {
 
     // Verify manifest.toml content
     let file = std::fs::File::open(&result.archive_path).unwrap();
-    let gz = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
+    let dec = zstd::Decoder::new(file).unwrap();
+    let mut archive = tar::Archive::new(dec);
     for entry in archive.entries().unwrap() {
         let mut entry = entry.unwrap();
         if entry.path().unwrap().to_string_lossy().ends_with("manifest.toml") {
@@ -122,6 +122,7 @@ async fn build_defaults_output_to_workload_dir() {
             output_dir: None,
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -147,6 +148,7 @@ async fn build_is_deterministic() {
             output_dir: Some(out1),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -159,6 +161,7 @@ async fn build_is_deterministic() {
             output_dir: Some(out2),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -188,6 +191,7 @@ async fn inspect_archive_matches_build() {
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -225,6 +229,7 @@ async fn inspect_dir_matches_archive() {
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -297,6 +302,7 @@ async fn build_with_dependency() {
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -309,8 +315,8 @@ async fn build_with_dependency() {
 
     // Verify archive contains both image tars
     let file = std::fs::File::open(&result.archive_path).unwrap();
-    let gz = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
+    let dec = zstd::Decoder::new(file).unwrap();
+    let mut archive = tar::Archive::new(dec);
     let entry_names: Vec<String> = archive
         .entries()
         .unwrap()
@@ -362,6 +368,7 @@ async fn build_with_dependency_is_deterministic() {
             output_dir: Some(out1),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )
@@ -374,6 +381,7 @@ async fn build_with_dependency_is_deterministic() {
             output_dir: Some(out2),
             engine: None,
             verbose: false,
+            compression: ArchiveCompression::default(),
         },
         &NullReporter,
     )

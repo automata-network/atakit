@@ -1,6 +1,6 @@
 # `.atawl` Archive Format Specification
 
-A `.atawl` file is the deployable unit for CVM workloads. It packages everything the CVM agent needs to load and run a workload: a manifest, integrity-verified data, and pre-built container images. The file is a tar.gz with a custom extension — inspectable with standard tools (`tar tzf`).
+A `.atawl` file is the deployable unit for CVM workloads. It packages everything the CVM agent needs to load and run a workload: a manifest, integrity-verified data, and pre-built container images. The file is a tar.zst (tar + zstandard) with a custom extension - inspectable with standard tools (`tar --zstd -tf`). Legacy tar.gz archives are also supported for reading.
 
 ## Design Principles
 
@@ -427,7 +427,7 @@ atakit-workload.toml  ──[atakit workload build]──>  secure-signer.atawl
 
 6. **Generate `manifest.toml`.** Assemble `[meta]`, `[config]`, `[disks]`, and `[hashes]` sections.
 
-7. **Create archive.** Package into `<name>.atawl` (tar.gz):
+7. **Create archive.** Package into `<name>.atawl` (tar.zst):
    ```
    <name>/manifest.toml
    <name>/measured-data/...

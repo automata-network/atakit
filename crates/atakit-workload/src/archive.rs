@@ -1,10 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::io;
 
-use flate2::Compression;
-use flate2::GzBuilder;
-
-use atakit_core::ProgressHandle;
+use atakit_core::{ArchiveCompression, ProgressHandle};
 
 use crate::WorkloadError;
 
@@ -102,7 +99,7 @@ impl StagingDir {
     }
 }
 
-/// Create a `.atawl` archive (tar.gz) from the staging directory.
+/// Create a `.atawl` archive from the staging directory.
 ///
 /// The archive contains a single top-level directory named after the workload.
 /// Returns the path to the created archive.
@@ -112,6 +109,7 @@ pub fn create_archive(
     workload_version: &str,
     output_dir: &Path,
     progress: &dyn ProgressHandle,
+    compression: ArchiveCompression,
 ) -> Result<PathBuf, WorkloadError> {
     let archive_path = output_dir.join(format!("{workload_name}-{workload_version}.atawl"));
     let file = std::fs::File::create(&archive_path).map_err(|e| WorkloadError::WriteFile {
@@ -119,21 +117,57 @@ pub fn create_archive(
         source: e,
     })?;
 
-    let enc = GzBuilder::new()
-        .mtime(0)
-        .write(file, Compression::default());
-    let counting = ProgressWriter { inner: enc, progress };
-    let mut tar = tar::Builder::new(counting);
-
-    append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
-
-    tar.into_inner()
-        .map_err(WorkloadError::Io)?
-        .inner
-        .finish()
-        .map_err(WorkloadError::Io)?;
+    match compression {
+        ArchiveCompression::Zstd => {
+            let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
+            let counting = ProgressWriter { inner: enc, progress };
+            let mut tar = tar::Builder::new(counting);
+            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
+            tar.into_inner()
+                .map_err(WorkloadError::Io)?
+                .inner
+                .finish()
+                .map_err(WorkloadError::Io)?;
+        }
+        ArchiveCompression::Gz => {
+            let enc = flate2::GzBuilder::new()
+                .mtime(0)
+                .write(file, flate2::Compression::default());
+            let counting = ProgressWriter { inner: enc, progress };
+            let mut tar = tar::Builder::new(counting);
+            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
+            tar.into_inner()
+                .map_err(WorkloadError::Io)?
+                .inner
+                .finish()
+                .map_err(WorkloadError::Io)?;
+        }
+    }
 
     Ok(archive_path)
+}
+
+/// Open an archive file with auto-detected decompression (zstd or gzip).
+pub(crate) fn open_decoder(
+    mut file: std::fs::File,
+) -> Result<Box<dyn std::io::Read>, WorkloadError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).map_err(WorkloadError::Io)?;
+    file.seek(SeekFrom::Start(0)).map_err(WorkloadError::Io)?;
+
+    if magic[..2] == [0x1F, 0x8B] {
+        Ok(Box::new(flate2::read::GzDecoder::new(file)))
+    } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+        Ok(Box::new(
+            zstd::Decoder::new(file).map_err(WorkloadError::Io)?,
+        ))
+    } else {
+        Err(WorkloadError::Validation(
+            "unrecognized archive compression (expected zstd or gzip)".into(),
+        ))
+    }
 }
 
 /// Recursively sum file sizes in a directory. Returns 0 if it doesn't exist.
@@ -346,7 +380,7 @@ mod tests {
         let out_dir = tempfile::tempdir().unwrap();
         let null = atakit_core::NullReporter;
         let handle = null.create("test", 0);
-        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path(), handle.as_ref()).unwrap();
+        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path(), handle.as_ref(), ArchiveCompression::default()).unwrap();
         assert!(archive.exists());
         assert!(archive.to_string_lossy().ends_with("test-app-0.1.0.atawl"));
     }

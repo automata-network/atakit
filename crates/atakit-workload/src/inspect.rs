@@ -52,7 +52,7 @@ fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, Work
         path: archive_path.to_path_buf(),
         source: e,
     })?;
-    let decoder = flate2::read::GzDecoder::new(file);
+    let decoder = crate::archive::open_decoder(file)?;
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest_raw = None;
