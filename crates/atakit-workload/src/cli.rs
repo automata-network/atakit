@@ -55,6 +55,9 @@ pub struct BuildArgs {
     /// Skip importing the built archive into the local workload store
     #[arg(long)]
     pub no_store: bool,
+    /// Use gzip compression instead of zstd
+    #[arg(long)]
+    pub gz: bool,
 }
 
 /// Arguments for `workload info`.

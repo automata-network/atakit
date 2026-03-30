@@ -15,8 +15,6 @@ atakit-cloud = { workspace = true, features = ["cli"] }
 
 chrono.workspace = true
 clap.workspace = true
-flate2.workspace = true
-tar.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true

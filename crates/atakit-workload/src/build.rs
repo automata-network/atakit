@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use atakit_core::ProgressReporter;
+use atakit_core::{ArchiveCompression, ProgressReporter};
 
 use crate::archive::{self, StagingDir};
 use crate::config::{ImageSource, WorkloadConfig};
@@ -20,6 +20,8 @@ pub struct BuildOptions {
     pub engine: Option<ContainerEngine>,
     /// Show verbose output from container commands.
     pub verbose: bool,
+    /// Archive compression format (default: zstd).
+    pub compression: ArchiveCompression,
 }
 
 /// Result of a successful build.
@@ -228,7 +230,7 @@ pub async fn build_workload(
         ),
         total_bytes,
     );
-    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir, handle.as_ref())?;
+    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir, handle.as_ref(), opts.compression)?;
     handle.finish();
 
     // 10. Hash archive

@@ -29,6 +29,7 @@ toml = "0.8"
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
+zstd = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Blockchain
@@ -53,11 +54,13 @@ atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
 atakit-cloud = { path = "crates/atakit-cloud" }
 
-# Optimize compression and crypto in dev builds -- gzip decompression
+# Optimize compression and crypto in dev builds -- decompression
 # of large .atawl archives is unusably slow without this.
 [profile.dev.package.flate2]
 opt-level = 3
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zstd-sys]
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3

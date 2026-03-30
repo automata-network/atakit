@@ -1,6 +1,6 @@
 # `.atabi` Archive Format Specification
 
-A `.atabi` file is a portable package for CVM base images. It bundles the disk images for one or more cloud platforms along with secure boot certificates into a single file that can be imported into the local image store. The file is a tar.gz with a custom extension - inspectable with standard tools (`tar tzf`).
+A `.atabi` file is a portable package for CVM base images. It bundles the disk images for one or more cloud platforms along with secure boot certificates into a single file that can be imported into the local image store. The file is a tar.zst (tar + zstandard) with a custom extension - inspectable with standard tools (`tar --zstd -tf`). Legacy tar.gz archives are also supported for reading.
 
 ## Design Principles
 
@@ -126,7 +126,7 @@ The image store organizes files under `<base_dir>/<repository>/<tag>/`:
 `atakit image export automata-linux:v0.1.6` reads the store entry and creates:
 
 ```
-automata-linux-v0.1.6.atabi (tar.gz)
+automata-linux-v0.1.6.atabi (tar.zst)
   automata-linux/
     manifest.toml          <-- generated from store contents
     disk_images/            <-- copied from store
@@ -172,4 +172,4 @@ Archives are created with deterministic metadata for reproducibility:
 - Directory permissions: `0755`, file permissions: `0644`
 - Entries are sorted: files before directories, alphabetical within each group
 - `manifest.toml` appears first (before `disk_images/` and `secure_boot_certs/`)
-- Gzip header has `mtime = 0`
+- Zstd compression (default); `--gz` flag produces gzip for backwards compatibility

@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use anyhow::Result;
-use atakit_core::Env;
+use atakit_core::{ArchiveCompression, Env};
 use atakit_workload::cli::BuildArgs;
 use atakit_workload::{WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
@@ -25,11 +25,18 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         None => None,
     };
 
+    let compression = if args.gz {
+        ArchiveCompression::Gz
+    } else {
+        ArchiveCompression::Zstd
+    };
+
     let opts = atakit_workload::BuildOptions {
         workload_dir,
         output_dir: args.output,
         engine,
         verbose,
+        compression,
     };
 
     let progress = IndicatifReporter;

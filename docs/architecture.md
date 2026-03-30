@@ -47,7 +47,7 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Container images** -- `ContainerEngine` enum (`Docker`, `Podman`) with detect/build/pull/save via CLI shelling
 - **Hashing** -- SHA-256 hashing of files and directories for integrity verification
 - **Manifest generation** -- `Manifest`, `ManifestMeta` serialization types for deterministic `manifest.toml`
-- **Archive creation** -- `StagingDir` assembly + tar.gz `.atawl` archive output
+- **Archive creation** -- `StagingDir` assembly + tar.zst `.atawl` archive output (gzip via `--gz`)
 - **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
 - **Local store** -- `WorkloadStore` for local workload archive and metadata management (`workload_dir/<name>/<version>/meta.json` + `archive.atawl`)
@@ -93,7 +93,7 @@ atakit-cli ──> atakit-image (cli feature) ──> atakit-core
 ```
 
 ### Library dependencies
-- reqwest, serde, tokio, futures-util, tracing, thiserror, toml, sha2, tar, flate2
+- reqwest, serde, tokio, futures-util, tracing, thiserror, toml, sha2, tar, zstd, flate2
 - atakit-cloud additionally: serde_json, chrono, async-trait
 
 ### CLI-only dependencies
