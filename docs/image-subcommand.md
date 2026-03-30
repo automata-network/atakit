@@ -54,20 +54,21 @@ Target cloud platform: `Gcp`, `Aws`, `Azure`.
 ### AssetKind
 
 Classification of a release asset by filename:
-- `DiskImage(Platform)` -- disk image for a platform
-- `SecureBootCerts` -- secure-boot certificate bundle
+- `ImageArchive(Vec<Platform>)` -- `.atabi` archive containing images for listed platforms
 - `Unknown` -- unrecognised asset
+
+Filenames are parsed as `{repo}-{tag}-{suffix}.atabi` where suffix is `all` or dash-joined platform names (e.g. `gcp`, `aws-azure`).
 
 ### Release / Asset
 
-GitHub release metadata and individual asset metadata, deserialized from the API.
+GitHub release metadata and individual asset metadata, deserialized from the API. Key methods: `has_archives()`, `archives()`, `archive_for_platform(platform)`, `available_platforms()`.
 
 ### VersionSelector
 
 Specifies which release version to resolve:
 - `Latest` -- GitHub "latest" release
-- `LatestImage` -- most recent release containing any disk image
-- `LatestImageFor(Platform)` -- most recent release with image for a specific platform
+- `LatestImage` -- most recent release containing any `.atabi` archive
+- `LatestImageFor(Platform)` -- most recent release with archive for a specific platform
 - `Tag(ImageRef)` -- specific release by tag
 
 ## API Surface
@@ -137,7 +138,7 @@ CLI -> ImageStore::list(client, ...) -> ReleasesClient::list_image_releases() ->
 
 ### `image pull`
 ```
-CLI -> ReleasesClient::resolve() -> ImageStore::download(client, ...) -> download_asset() -> decompress -> print paths
+CLI -> ReleasesClient::resolve() -> ImageStore::download(client, ...) -> download .atabi -> import_image_archive() -> print paths
 ```
 
 ### `image rm`
@@ -151,10 +152,11 @@ CLI -> ImageStore::delete() -> remove_dir_all -> print confirmation
 ~/.local/share/atakit/images/        # default ($XDG_DATA_HOME/atakit/images)
   <repository>/
     <tag>/
-      gcp_disk.tar.gz
-      aws_disk.vmdk
-      azure_disk.vhd
-      secure_boot/
+      disk_images/
+        gcp_disk.tar.gz
+        aws_disk.vmdk
+        azure_disk.vhd.zst
+      secure_boot_certs/
         PK.crt
         KEK.crt
         db.crt

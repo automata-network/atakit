@@ -4,12 +4,40 @@ pub mod firewall;
 pub mod image;
 pub mod instance;
 
+use std::path::Path;
+
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::AzureResourceNames;
 use crate::plan::*;
 use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
+
+/// Decompress a `.zst` file to a destination path.
+fn decompress_zst(src: &Path, dest: &Path) -> Result<(), CloudError> {
+    use std::io::{Read, Write};
+
+    let file = std::fs::File::open(src).map_err(|e| CloudError::IoPath {
+        path: src.to_path_buf(),
+        source: e,
+    })?;
+    let mut decoder = zstd::Decoder::new(file).map_err(CloudError::Io)?;
+    let mut out = std::fs::File::create(dest).map_err(|e| CloudError::IoPath {
+        path: dest.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = decoder.read(&mut buf).map_err(CloudError::Io)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(CloudError::Io)?;
+    }
+    out.flush().map_err(CloudError::Io)?;
+    Ok(())
+}
 
 /// Azure cloud provider.
 pub struct AzureProvider {
@@ -71,26 +99,11 @@ impl CloudProvider for AzureProvider {
             force: opts.force_image,
         });
 
-        // Firewall - same port expansion logic as GCP.
+        // Firewall - workload_ports are already resolved "port/proto" strings.
         let mut ports = vec!["1024/tcp".to_string()];
-        for mapping in &opts.workload_ports {
-            let (ports_part, proto) = match mapping.split_once('/') {
-                Some((p, proto)) => (p, Some(proto)),
-                None => (mapping.as_str(), None),
-            };
-            let host_port = ports_part.split(':').next().unwrap_or("").trim();
-            if host_port.is_empty() {
-                continue;
-            }
-            let protos: &[&str] = match proto {
-                Some(p) => &[p],
-                None => &["tcp", "udp"],
-            };
-            for p in protos {
-                let entry = format!("{host_port}/{p}");
-                if !ports.contains(&entry) {
-                    ports.push(entry);
-                }
+        for entry in &opts.workload_ports {
+            if !ports.contains(entry) {
+                ports.push(entry.clone());
             }
         }
         steps.push(DeployStep::OpenPorts {
@@ -226,8 +239,17 @@ impl CloudProvider for AzureProvider {
                         .await?;
                         image::ensure_storage_container(storage_account, "vhds", runner).await?;
 
-                        // Upload VHD.
-                        let filename = std::path::Path::new(src)
+                        // Decompress .vhd.zst to a temp file for upload.
+                        let (upload_path, _tmp_dir) = if src.ends_with(".zst") {
+                            let tmp = tempfile::tempdir().map_err(CloudError::Io)?;
+                            let decompressed = tmp.path().join("azure_disk.vhd");
+                            decompress_zst(std::path::Path::new(src), &decompressed)?;
+                            (decompressed.display().to_string(), Some(tmp))
+                        } else {
+                            (src.clone(), None)
+                        };
+
+                        let filename = std::path::Path::new(&upload_path)
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("image.vhd");
@@ -235,7 +257,7 @@ impl CloudProvider for AzureProvider {
                             storage_account,
                             "vhds",
                             filename,
-                            src,
+                            &upload_path,
                             runner,
                             verbose,
                         )

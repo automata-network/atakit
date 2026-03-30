@@ -83,22 +83,19 @@ impl ReleasesClient {
 
     // ── high-level API ─────────────────────────────────────────────
 
-    /// Find the most recent release that contains at least one disk image.
-    ///
-    /// Scans up to 20 recent releases and returns the first one with disk
-    /// image assets.
+    /// Find the most recent release that contains at least one `.atabi` archive.
     pub async fn find_latest_image_release(&self, repo: &str) -> Result<Release> {
-        debug!("scanning recent releases for disk images");
+        debug!("scanning recent releases for .atabi archives");
         let releases = self.list_releases(repo, 20).await?;
 
         releases
             .into_iter()
-            .find(|r| r.has_disk_images())
+            .find(|r| r.has_archives())
             .ok_or(ImageError::NoDiskImages(20))
     }
 
-    /// Find the most recent release that contains a disk image for the given
-    /// platform.
+    /// Find the most recent release that contains an `.atabi` archive for the
+    /// given platform.
     pub async fn find_latest_release_for(
         &self,
         repo: &str,
@@ -106,13 +103,13 @@ impl ReleasesClient {
     ) -> Result<Release> {
         debug!(
             ?platform,
-            "scanning recent releases for platform disk image"
+            "scanning recent releases for platform archive"
         );
         let releases = self.list_releases(repo, 20).await?;
 
         releases
             .into_iter()
-            .find(|r| r.disk_image(platform).is_some())
+            .find(|r| r.archive_for_platform(platform).is_some())
             .ok_or(ImageError::NoPlatformImage {
                 platform: platform.to_string(),
                 count: 20,
@@ -129,10 +126,10 @@ impl ReleasesClient {
         }
     }
 
-    /// List recent releases that contain at least one disk image.
+    /// List recent releases that contain at least one `.atabi` archive.
     pub async fn list_image_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>> {
         let all = self.list_releases(repo, per_page).await?;
-        Ok(all.into_iter().filter(|r| r.has_disk_images()).collect())
+        Ok(all.into_iter().filter(|r| r.has_archives()).collect())
     }
 
     // ── crate-internal accessors (used by download.rs) ────────────

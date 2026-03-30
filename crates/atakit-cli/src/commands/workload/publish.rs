@@ -3,11 +3,10 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use atakit_core::Env;
 use atakit_workload::cli::PublishArgs;
-use atakit_workload::store::CachedPcrSpec;
-use atakit_workload::{CachedChainSpec, WorkloadMeta, WorkloadStore};
+use atakit_workload::{WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::looks_like_store_ref;
+use super::{apply_chain_data_to_meta, looks_like_store_ref, query_chain_data};
 use crate::config::Config;
 
 pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
@@ -135,26 +134,6 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         }],
     };
 
-    // Pre-build cached chain spec before `spec` is moved into register_workload
-    let cached_chain_spec = CachedChainSpec {
-        ttl: spec.ttl,
-        base_image_mode: spec.baseImageMode,
-        base_image_ids: spec
-            .baseImageIds
-            .iter()
-            .map(|b| format!("0x{}", hex::encode(b)))
-            .collect(),
-        pcrs: spec
-            .pcrs
-            .iter()
-            .map(|p| CachedPcrSpec {
-                pcr_index: p.pcrIndex,
-                verify_type: p.verifyType,
-                match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
-            })
-            .collect(),
-    };
-
     // Resolve relay key: CLI arg > key file from config
     let relay_key_raw = match args.relay_key {
         Some(k) => k,
@@ -229,69 +208,38 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         println!("  {:<18}{}", "Workload ID:", workload_id_hex);
         println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
 
-        // Merge on-chain data into local store if not already present
-        let store = WorkloadStore::new(&env.workload_dir);
-        let needs_merge = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
-            Some(ref m) => m.on_chain_spec.is_none(),
-            None => true,
-        };
-        if needs_merge {
-            let owner = registry
-                .get_workload_owner(workload_id)
-                .await
-                .ok()
-                .map(|fp| format!("0x{}", hex::encode(fp)));
-            let revoked = registry
-                .is_workload_revoked(workload_id)
-                .await
-                .unwrap_or(false);
-
-            let chain_spec = CachedChainSpec {
-                ttl: existing.ttl,
-                base_image_mode: existing.baseImageMode,
-                base_image_ids: existing
-                    .baseImageIds
-                    .iter()
-                    .map(|b| format!("0x{}", hex::encode(b)))
-                    .collect(),
-                pcrs: existing
-                    .pcrs
-                    .iter()
-                    .map(|p| CachedPcrSpec {
-                        pcr_index: p.pcrIndex,
-                        verify_type: p.verifyType,
-                        match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
-                    })
-                    .collect(),
-            };
-
+        // Always refresh on-chain data into local store
+        let rpc_url = config.publish.rpc_url.as_deref().unwrap();
+        let session_registry = config.publish.session_registry.as_deref().unwrap();
+        if let Ok(chain) = query_chain_data(workload_id, rpc_url, session_registry).await {
+            let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
             let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
                 Some(mut m) => {
                     m.workload_id = workload_id_hex.clone();
-                    if owner.is_some() {
-                        m.owner.clone_from(&owner);
-                    }
-                    m.on_chain_spec = Some(chain_spec);
                     m.sha256 = Some(result.sha256.clone());
                     m.pcr23 = Some(result.pcr23.clone());
-                    m.revoked = revoked;
+                    apply_chain_data_to_meta(&mut m, &chain);
                     m.added_at = now;
                     m
                 }
-                None => WorkloadMeta {
-                    workload_id: workload_id_hex.clone(),
-                    name: manifest.meta.name.clone(),
-                    version: manifest.meta.version.clone(),
-                    sha256: Some(result.sha256.clone()),
-                    pcr23: Some(result.pcr23.clone()),
-                    owner,
-                    archive_size: None,
-                    on_chain_spec: Some(chain_spec),
-                    revoked,
-                    registries: Vec::new(),
-                    added_at: now,
-                },
+                None => {
+                    let mut m = WorkloadMeta {
+                        workload_id: workload_id_hex.clone(),
+                        name: manifest.meta.name.clone(),
+                        version: manifest.meta.version.clone(),
+                        sha256: Some(result.sha256.clone()),
+                        pcr23: Some(result.pcr23.clone()),
+                        owner: None,
+                        archive_size: None,
+                        on_chain_spec: None,
+                        revoked: false,
+                        registries: Vec::new(),
+                        added_at: now,
+                    };
+                    apply_chain_data_to_meta(&mut m, &chain);
+                    m
+                }
             };
             store.save_meta(&meta)?;
             println!("{}", "Local store updated.".green());
@@ -328,43 +276,42 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         hex::encode(result_id),
     );
 
-    // Update local store with on-chain data
-    let owner = registry
-        .get_workload_owner(workload_id)
-        .await
-        .ok()
-        .map(|fp| format!("0x{}", hex::encode(fp)));
-
-    let store = WorkloadStore::new(&env.workload_dir);
-    let now = chrono::Local::now().to_rfc3339();
-    let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
-        Some(mut existing) => {
-            existing.workload_id = workload_id_hex.clone();
-            if owner.is_some() {
-                existing.owner.clone_from(&owner);
+    // Refresh on-chain data into local store
+    let rpc_url = config.publish.rpc_url.as_deref().unwrap();
+    let session_registry = config.publish.session_registry.as_deref().unwrap();
+    if let Ok(chain) = query_chain_data(workload_id, rpc_url, session_registry).await {
+        let store = WorkloadStore::new(&env.workload_dir);
+        let now = chrono::Local::now().to_rfc3339();
+        let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
+            Some(mut m) => {
+                m.workload_id = workload_id_hex.clone();
+                m.sha256 = Some(result.sha256.clone());
+                m.pcr23 = Some(result.pcr23.clone());
+                apply_chain_data_to_meta(&mut m, &chain);
+                m.added_at = now;
+                m
             }
-            existing.on_chain_spec = Some(cached_chain_spec);
-            existing.sha256 = Some(result.sha256.clone());
-            existing.pcr23 = Some(result.pcr23.clone());
-            existing.added_at = now;
-            existing
-        }
-        None => WorkloadMeta {
-            workload_id: workload_id_hex.clone(),
-            name: manifest.meta.name.clone(),
-            version: manifest.meta.version.clone(),
-            sha256: Some(result.sha256.clone()),
-            pcr23: Some(result.pcr23.clone()),
-            owner,
-            archive_size: None,
-            on_chain_spec: Some(cached_chain_spec),
-            revoked: false,
-            registries: Vec::new(),
-            added_at: now,
-        },
-    };
-    store.save_meta(&meta)?;
-    println!("{}", "Local store updated.".green());
+            None => {
+                let mut m = WorkloadMeta {
+                    workload_id: workload_id_hex.clone(),
+                    name: manifest.meta.name.clone(),
+                    version: manifest.meta.version.clone(),
+                    sha256: Some(result.sha256.clone()),
+                    pcr23: Some(result.pcr23.clone()),
+                    owner: None,
+                    archive_size: None,
+                    on_chain_spec: None,
+                    revoked: false,
+                    registries: Vec::new(),
+                    added_at: now,
+                };
+                apply_chain_data_to_meta(&mut m, &chain);
+                m
+            }
+        };
+        store.save_meta(&meta)?;
+        println!("{}", "Local store updated.".green());
+    }
 
     Ok(())
 }

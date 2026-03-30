@@ -114,10 +114,8 @@ pub enum VersionSelector {
 /// Classification of a release asset by its filename.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetKind {
-    /// A disk image for the given platform.
-    DiskImage(Platform),
-    /// Secure-boot certificate bundle.
-    SecureBootCerts,
+    /// An `.atabi` archive containing disk images (and optionally certs).
+    ImageArchive(Vec<Platform>),
     /// Unrecognised asset.
     Unknown,
 }
@@ -150,51 +148,93 @@ pub struct Asset {
 
 impl Asset {
     /// Classify this asset based on its filename.
+    ///
+    /// Recognises `.atabi` archives with platform suffix:
+    /// `{repo}-{tag}-{suffix}.atabi` where suffix is `all` or dash-separated
+    /// platform names (e.g. `gcp`, `aws-gcp`, `all`).
     pub fn kind(&self) -> AssetKind {
-        match self.name.as_str() {
-            "gcp_disk.tar.gz" => AssetKind::DiskImage(Platform::Gcp),
-            "aws_disk.vmdk" => AssetKind::DiskImage(Platform::Aws),
-            "azure_disk.vhd.xz" => AssetKind::DiskImage(Platform::Azure),
-            "secure-boot-certs.zip" => AssetKind::SecureBootCerts,
-            _ => AssetKind::Unknown,
+        let Some(stem) = self.name.strip_suffix(".atabi") else {
+            return AssetKind::Unknown;
+        };
+        // Format: {repo}-{tag}-{suffix}.atabi
+        // Suffix is "all" or dash-joined platform names (gcp, aws, azure).
+        // Greedily collect valid platform tokens from the right.
+        let segments: Vec<&str> = stem.rsplit('-').collect();
+        if segments.len() < 2 {
+            return AssetKind::Unknown;
         }
+        // Check for "all" as the last segment.
+        if segments[0] == "all" {
+            return AssetKind::ImageArchive(Platform::ALL.to_vec());
+        }
+        // Collect platform tokens from the right until one doesn't parse.
+        let mut platforms = Vec::new();
+        for seg in &segments {
+            match seg.parse::<Platform>() {
+                Ok(p) => {
+                    if !platforms.contains(&p) {
+                        platforms.push(p);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if platforms.is_empty() {
+            return AssetKind::Unknown;
+        }
+        // Reverse since we collected right-to-left.
+        platforms.reverse();
+        AssetKind::ImageArchive(platforms)
     }
 }
 
+
 impl Release {
-    /// Get the disk image asset for a specific platform, if present.
-    pub fn disk_image(&self, platform: Platform) -> Option<&Asset> {
+    /// Find an `.atabi` archive asset that contains the given platform.
+    pub fn archive_for_platform(&self, platform: Platform) -> Option<&Asset> {
+        self.assets.iter().find(|a| {
+            if let AssetKind::ImageArchive(ref platforms) = a.kind() {
+                platforms.contains(&platform)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Whether this release contains at least one `.atabi` archive.
+    pub fn has_archives(&self) -> bool {
         self.assets
             .iter()
-            .find(|a| a.kind() == AssetKind::DiskImage(platform))
+            .any(|a| matches!(a.kind(), AssetKind::ImageArchive(_)))
     }
 
-    /// Get the secure-boot-certs asset, if present.
-    pub fn secure_boot_certs(&self) -> Option<&Asset> {
+    /// List all `.atabi` archive assets.
+    pub fn archives(&self) -> Vec<&Asset> {
         self.assets
             .iter()
-            .find(|a| a.kind() == AssetKind::SecureBootCerts)
-    }
-
-    /// Whether this release contains at least one disk image asset.
-    pub fn has_disk_images(&self) -> bool {
-        self.assets
-            .iter()
-            .any(|a| matches!(a.kind(), AssetKind::DiskImage(_)))
-    }
-
-    /// Classify every asset in this release.
-    pub fn classify_assets(&self) -> Vec<(&Asset, AssetKind)> {
-        self.assets.iter().map(|a| (a, a.kind())).collect()
-    }
-
-    /// List which platforms have disk images in this release.
-    pub fn available_platforms(&self) -> Vec<Platform> {
-        Platform::ALL
-            .iter()
-            .copied()
-            .filter(|&p| self.disk_image(p).is_some())
+            .filter(|a| matches!(a.kind(), AssetKind::ImageArchive(_)))
             .collect()
+    }
+
+    /// List which platforms are available across all `.atabi` archives in this release.
+    pub fn available_platforms(&self) -> Vec<Platform> {
+        let mut platforms = Vec::new();
+        for a in &self.assets {
+            if let AssetKind::ImageArchive(ref ps) = a.kind() {
+                for p in ps {
+                    if !platforms.contains(p) {
+                        platforms.push(*p);
+                    }
+                }
+            }
+        }
+        // Sort to consistent order.
+        platforms.sort_by_key(|p| match p {
+            Platform::Gcp => 0,
+            Platform::Aws => 1,
+            Platform::Azure => 2,
+        });
+        platforms
     }
 }
 
@@ -209,16 +249,63 @@ impl fmt::Display for Release {
 
         let platforms = self.available_platforms();
         if platforms.is_empty() {
-            write!(f, "  [no disk images]")?;
+            write!(f, "  [no archives]")?;
         } else {
             let names: Vec<_> = platforms.iter().map(|p| p.to_string()).collect();
             write!(f, "  [{}]", names.join(", "))?;
         }
 
-        if self.secure_boot_certs().is_some() {
-            write!(f, " +certs")?;
-        }
-
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str) -> Asset {
+        Asset {
+            name: name.to_string(),
+            size: 0,
+            browser_download_url: String::new(),
+            url: String::new(),
+            content_type: String::new(),
+        }
+    }
+
+    #[test]
+    fn parse_atabi_all() {
+        assert_eq!(
+            asset("automata-linux-v0.1.6-all.atabi").kind(),
+            AssetKind::ImageArchive(Platform::ALL.to_vec()),
+        );
+    }
+
+    #[test]
+    fn parse_atabi_single_platform() {
+        assert_eq!(
+            asset("automata-linux-v0.1.6-gcp.atabi").kind(),
+            AssetKind::ImageArchive(vec![Platform::Gcp]),
+        );
+    }
+
+    #[test]
+    fn parse_atabi_multi_platform() {
+        assert_eq!(
+            asset("automata-linux-v0.1.6-aws-azure.atabi").kind(),
+            AssetKind::ImageArchive(vec![Platform::Aws, Platform::Azure]),
+        );
+    }
+
+    #[test]
+    fn parse_unknown_extension() {
+        assert_eq!(asset("gcp_disk.tar.gz").kind(), AssetKind::Unknown);
+        assert_eq!(asset("README.md").kind(), AssetKind::Unknown);
+    }
+
+    #[test]
+    fn parse_atabi_no_suffix() {
+        // No platform suffix - the stem is just "foo"
+        assert_eq!(asset("foo.atabi").kind(), AssetKind::Unknown);
     }
 }

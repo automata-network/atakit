@@ -141,7 +141,7 @@ fn row_from_status(status: &ReleaseStatus) -> ImageRow {
 
     let certs = if status.local_certs {
         PlatformStatus::Local
-    } else if r.secure_boot_certs().is_some() {
+    } else if r.has_archives() {
         PlatformStatus::RemoteOnly
     } else {
         PlatformStatus::Unavailable
@@ -174,7 +174,7 @@ fn row_from_release(release: &Release, store: &ImageStore, repo: &str) -> ImageR
 
     let certs = if store.certs_dir(&image_ref).exists() {
         PlatformStatus::Local
-    } else if release.secure_boot_certs().is_some() {
+    } else if release.has_archives() {
         PlatformStatus::RemoteOnly
     } else {
         PlatformStatus::Unavailable
@@ -279,40 +279,29 @@ fn print_release_detail(repo: &str, release: &Release, store: &ImageStore) {
         println!("  {} {short}", "published:".dimmed());
     }
 
-    let platforms = release.available_platforms();
-    if platforms.is_empty() {
-        println!("  {} {}", "images:".dimmed(), "(none)".bright_black());
+    let archives = release.archives();
+    if archives.is_empty() {
+        println!("  {} {}", "archives:".dimmed(), "(none)".bright_black());
     } else {
-        for p in &platforms {
-            let asset = release.disk_image(*p).unwrap();
+        for asset in &archives {
             let size_mb = asset.size / (1024 * 1024);
-            let local = if store.image_path(&image_ref, *p).exists() {
+            let local = if store.exists(&image_ref) {
                 format!(" {}", "[local]".green())
             } else {
                 String::new()
             };
             println!(
                 "  {:<8}   {} ({}){local}",
-                p.to_string().cyan(),
+                "archive".cyan(),
                 asset.name,
                 format!("{size_mb} MB").dimmed(),
             );
         }
     }
 
-    if let Some(certs) = release.secure_boot_certs() {
-        let size_kb = certs.size / 1024;
-        let local = if store.certs_dir(&image_ref).exists() {
-            format!(" {}", "[local]".green())
-        } else {
-            String::new()
-        };
-        println!(
-            "  {:<8}   {} ({}){local}",
-            "certs".cyan(),
-            certs.name,
-            format!("{size_kb} KB").dimmed(),
-        );
+    let local_certs = store.certs_dir(&image_ref).exists();
+    if local_certs {
+        println!("  {:<8}   {}", "certs".cyan(), "[local]".green());
     }
 
     if let Some(body) = &release.body {

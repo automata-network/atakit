@@ -4,9 +4,8 @@ use atakit_workload::cli::InfoArgs;
 use atakit_workload::manifest::{Manifest, ManifestFirewallPort};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
-use sha2::Digest;
 
-use super::{find_archive, looks_like_store_ref};
+use super::{apply_chain_data_to_meta, find_archive, looks_like_store_ref, query_chain_data, ChainData};
 use crate::config::Config;
 
 pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
@@ -77,66 +76,36 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     let version = &result.manifest.meta.version;
 
     // Check on-chain status if RPC is configured
-    let on_chain_status = refresh_chain_status(name, version, env, config).await;
+    let chain_data = refresh_chain(name, version, env, config).await;
 
-    print_info(&result.manifest, &result.sha256, on_chain_status.as_deref());
+    print_info(&result.manifest, &result.sha256, &result.pcr23, chain_data.as_ref());
     Ok(())
 }
 
-/// Query on-chain revocation status. Updates the store if status changed.
-/// Returns None if RPC is not configured or query fails.
-async fn refresh_chain_status(
+/// Query on-chain data and update local store. Returns None if RPC not configured.
+async fn refresh_chain(
     name: &str,
     version: &str,
     env: &Env,
     config: &Config,
-) -> Option<String> {
+) -> Option<ChainData> {
     let rpc_url = config.publish.rpc_url.as_deref()?;
-    let session_registry_str = config.publish.session_registry.as_deref()?;
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().ok()?;
-
+    let session_registry = config.publish.session_registry.as_deref()?;
     let workload_id = super::compute_workload_id(name, version);
 
-    let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
-        rpc_url: rpc_url.to_string(),
-        relay_key: None,
-        session_registry_address,
-    };
-
-    let measurement =
-        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
-            .await
-            .ok()?;
-    let registry = measurement.workload_registry();
-
-    // Check if registered
-    let spec = registry.get_workload_spec(workload_id).await.ok();
-    if spec.is_none() {
-        return Some("not registered".to_string());
-    }
-
-    // Check revocation
-    let revoked = registry
-        .is_workload_revoked(workload_id)
+    let chain = query_chain_data(workload_id, rpc_url, session_registry)
         .await
-        .unwrap_or(false);
+        .ok()?;
 
-    // Update store
+    // Update store with chain data
     let store = WorkloadStore::new(&env.workload_dir);
     if let Ok(Some(entry)) = store.get(name, version) {
-        if entry.meta.revoked != revoked {
-            let mut meta = entry.meta;
-            meta.revoked = revoked;
-            let _ = store.save_meta(&meta);
-        }
+        let mut meta = entry.meta;
+        apply_chain_data_to_meta(&mut meta, &chain);
+        let _ = store.save_meta(&meta);
     }
 
-    if revoked {
-        Some("revoked".to_string())
-    } else {
-        Some("active".to_string())
-    }
+    Some(chain)
 }
 
 fn section_header(name: &str) {
@@ -149,7 +118,7 @@ fn section_header(name: &str) {
     println!("{}", format!("{prefix}{pad}").cyan().bold());
 }
 
-fn print_info(m: &Manifest, sha256: &str, chain_status: Option<&str>) {
+fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&ChainData>) {
     // Title
     println!(
         "{}",
@@ -288,16 +257,17 @@ fn print_info(m: &Manifest, sha256: &str, chain_status: Option<&str>) {
     // --- Measurement ---
     section_header("Measurement");
     println!("  {:<18}{}", "SHA256:", sha256);
+    println!("  {:<18}{}", "PCR23:", pcr23.green());
 
-    // Compute final PCR register value: SHA-256(zeros_32 || event_hash).
-    let event_hex = sha256.strip_prefix("0x").unwrap_or(sha256);
-    if let Ok(event_bytes) = hex::decode(event_hex) {
-        if event_bytes.len() == 32 {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update([0u8; 32]);
-            hasher.update(&event_bytes);
-            let final_pcr = format!("0x{:x}", hasher.finalize());
-            println!("  {:<18}{}", "PCR23:", final_pcr.green());
+    // Show on-chain PCR23 with match/mismatch highlighting.
+    if let Some(info) = chain_info {
+        if let Some(ref on_chain) = info.pcr23 {
+            if on_chain == pcr23 {
+                println!("  {:<18}{}", "PCR23 (on-chain):", on_chain.green());
+            } else {
+                println!("  {:<18}{}", "PCR23 (on-chain):", on_chain.red().bold());
+                println!("  {:<18}{}", "", "mismatch with local PCR23".red());
+            }
         }
     }
 
@@ -305,10 +275,12 @@ fn print_info(m: &Manifest, sha256: &str, chain_status: Option<&str>) {
     // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
     let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
     println!("  {:<18}{}", "Workload ID:", format!("0x{}", hex::encode(workload_id)).dimmed());
-    match chain_status {
-        Some("active") => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
-        Some("revoked") => println!("  {:<18}{}", "On-chain:", "revoked".red().bold()),
-        Some(s) => println!("  {:<18}{}", "On-chain:", s.dimmed()),
+    match chain_info {
+        Some(info) => match info.status.as_str() {
+            "active" => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
+            "revoked" => println!("  {:<18}{}", "On-chain:", "revoked".red().bold()),
+            s => println!("  {:<18}{}", "On-chain:", s.dimmed()),
+        },
         None => println!("  {:<18}{}", "On-chain:", "-".dimmed()),
     }
 }

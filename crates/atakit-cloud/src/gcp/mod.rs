@@ -63,28 +63,11 @@ impl CloudProvider for GcpProvider {
         });
 
         // Firewall - always open agent port 1024 (tcp), plus workload ports.
-        // Port format: "port/proto" (e.g. "1024/tcp", "5353/udp").
-        // No protocol suffix in the workload config means both tcp and udp.
+        // workload_ports are already resolved "port/proto" strings from the manifest.
         let mut ports = vec!["1024/tcp".to_string()];
-        for mapping in &opts.workload_ports {
-            // Parse "host:container[/proto]" -> host port + optional proto.
-            let (ports_part, proto) = match mapping.split_once('/') {
-                Some((p, proto)) => (p, Some(proto)),
-                None => (mapping.as_str(), None),
-            };
-            let host_port = ports_part.split(':').next().unwrap_or("").trim();
-            if host_port.is_empty() {
-                continue;
-            }
-            let protos: &[&str] = match proto {
-                Some(p) => &[p],
-                None => &["tcp", "udp"],
-            };
-            for p in protos {
-                let entry = format!("{host_port}/{p}");
-                if !ports.contains(&entry) {
-                    ports.push(entry);
-                }
+        for entry in &opts.workload_ports {
+            if !ports.contains(entry) {
+                ports.push(entry.clone());
             }
         }
         steps.push(DeployStep::OpenPorts {

@@ -126,7 +126,7 @@ The image store organizes files under `<base_dir>/<repository>/<tag>/`:
 `atakit image export automata-linux:v0.1.6` reads the store entry and creates:
 
 ```
-automata-linux-v0.1.6.atabi (tar.zst)
+automata-linux-v0.1.6-gcp.atabi (tar.zst)
   automata-linux/
     manifest.toml          <-- generated from store contents
     disk_images/            <-- copied from store
@@ -160,7 +160,7 @@ automata-linux-v0.1.6.atabi (tar.zst)
 The target's platform determines which disk image file is selected from the store:
 
 - Target `platform = "gcp"` selects `disk_images/gcp_disk.tar.gz`
-- Target `platform = "azure"` selects `disk_images/azure_disk.vhd`
+- Target `platform = "azure"` selects `disk_images/azure_disk.vhd.zst` (decompressed to temp file before upload)
 
 ---
 

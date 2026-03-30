@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use alloy_ext::core::primitives::{B256, keccak256};
 use alloy_ext::core::sol_types::SolValue;
-use atakit_workload::WorkloadStore;
+use atakit_workload::store::CachedPcrSpec;
+use atakit_workload::{CachedChainSpec, WorkloadStore};
 
 /// Look for a single `.atawl` file in the directory.
 /// Returns `None` if zero or multiple archives are found.
@@ -122,6 +123,119 @@ pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(St
                 .ok_or_else(|| anyhow::anyhow!("workload ID not found in store: {id}"))?;
             Ok((entry.meta.name, entry.meta.version))
         }
+    }
+}
+
+/// On-chain workload data returned by `query_chain_data`.
+pub struct ChainData {
+    pub status: String,
+    pub owner: Option<String>,
+    pub revoked: bool,
+    pub spec: Option<CachedChainSpec>,
+    /// PCR23 from on-chain matchData (STATIC).
+    pub pcr23: Option<String>,
+}
+
+/// Query on-chain workload spec, owner, and revocation status.
+///
+/// Returns `None` if RPC is not configured. Returns `ChainData` with
+/// `status = "not registered"` if the workload is not on-chain.
+pub async fn query_chain_data(
+    workload_id: B256,
+    rpc_url: &str,
+    session_registry: &str,
+) -> anyhow::Result<ChainData> {
+    let session_registry_address: alloy_ext::core::primitives::Address =
+        session_registry.parse().map_err(|_| anyhow::anyhow!("invalid session registry address"))?;
+
+    let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
+        rpc_url: rpc_url.to_string(),
+        relay_key: None,
+        session_registry_address,
+    };
+
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect: {e}"))?;
+    let registry = measurement.workload_registry();
+
+    let spec = match registry.get_workload_spec(workload_id).await {
+        Ok(s) => s,
+        Err(_) => {
+            return Ok(ChainData {
+                status: "not registered".to_string(),
+                owner: None,
+                revoked: false,
+                spec: None,
+                pcr23: None,
+            });
+        }
+    };
+
+    let owner = registry
+        .get_workload_owner(workload_id)
+        .await
+        .ok()
+        .map(|fp| format!("0x{}", hex::encode(fp)));
+
+    let revoked = registry
+        .is_workload_revoked(workload_id)
+        .await
+        .unwrap_or(false);
+
+    let pcr23 = spec
+        .pcrs
+        .iter()
+        .find(|p| p.pcrIndex == 23)
+        .and_then(|p| p.matchData.first())
+        .map(|b| format!("0x{}", hex::encode(b)));
+
+    let cached = CachedChainSpec {
+        ttl: spec.ttl,
+        base_image_mode: spec.baseImageMode,
+        base_image_ids: spec
+            .baseImageIds
+            .iter()
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .collect(),
+        pcrs: spec
+            .pcrs
+            .iter()
+            .map(|p| CachedPcrSpec {
+                pcr_index: p.pcrIndex,
+                verify_type: p.verifyType,
+                match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
+            })
+            .collect(),
+    };
+
+    let status = if revoked { "revoked" } else { "active" }.to_string();
+
+    Ok(ChainData {
+        status,
+        owner,
+        revoked,
+        spec: Some(cached),
+        pcr23,
+    })
+}
+
+/// Update WorkloadMeta in the store with on-chain data.
+/// Merges chain data into existing metadata if present, or creates fields on existing.
+pub fn apply_chain_data_to_meta(
+    meta: &mut atakit_workload::WorkloadMeta,
+    chain: &ChainData,
+) {
+    meta.revoked = chain.revoked;
+    if chain.owner.is_some() {
+        meta.owner.clone_from(&chain.owner);
+    }
+    if chain.spec.is_some() {
+        meta.on_chain_spec.clone_from(&chain.spec);
+    }
+    if chain.pcr23.is_some() && meta.pcr23.is_none() {
+        meta.pcr23.clone_from(&chain.pcr23);
     }
 }
 

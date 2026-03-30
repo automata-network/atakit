@@ -30,6 +30,6 @@ automata-tee-workload-measurement.workspace = true
 hex.workspace = true
 sha2.workspace = true
 
-tempfile = "3"
+tempfile.workspace = true
 
 [dev-dependencies]
