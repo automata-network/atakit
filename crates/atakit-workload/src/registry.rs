@@ -10,7 +10,7 @@ pub struct RegistryMeta {
     pub name: String,
     pub version: String,
     pub owner: String,
-    pub pcr23: String,
+    pub sha256: String,
     pub archive_size: u64,
     pub archive_hash: String,
     pub uploaded_at: String,

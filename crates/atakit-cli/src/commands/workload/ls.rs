@@ -13,7 +13,7 @@ struct DisplayEntry {
     version: String,
     status: Status,
     revoked: bool,
-    pcr23: Option<String>,
+    sha256: Option<String>,
     owner: Option<String>,
     archive_size: Option<u64>,
 }
@@ -60,7 +60,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                     (false, _) => Status::Tracked,
                 },
                 revoked: e.meta.revoked,
-                pcr23: e.meta.pcr23.clone(),
+                sha256: e.meta.sha256.clone(),
                 owner: e.meta.owner.clone(),
                 archive_size: e.meta.archive_size,
             });
@@ -141,7 +141,7 @@ fn from_registry_meta(rm: &RegistryMeta) -> DisplayEntry {
         version: rm.version.clone(),
         status: Status::Remote,
         revoked: false,
-        pcr23: Some(rm.pcr23.clone()),
+        sha256: Some(rm.sha256.clone()),
         owner: Some(rm.owner.clone()),
         archive_size: Some(rm.archive_size),
     }
@@ -188,25 +188,25 @@ fn print_table(entries: &[DisplayEntry]) {
     let fixed = w_name + gap + w_ver + sym + w_size;
     let remaining = tw.saturating_sub(fixed);
 
-    let (w_owner, w_pcr23) = if has_owner {
-        // Two hex columns, two gaps: remaining = gap + owner + gap + pcr23
+    let (w_owner, w_sha256) = if has_owner {
+        // Two hex columns, two gaps: remaining = gap + owner + gap + sha256
         let avail = remaining.saturating_sub(gap * 2);
         let half = avail / 2;
         (half.max(10), (avail - half).max(10))
     } else {
-        // One hex column, one gap: remaining = gap + pcr23
+        // One hex column, one gap: remaining = gap + sha256
         (0, remaining.saturating_sub(gap).max(10))
     };
 
     // Header -- "   " matches " X " symbol column in data rows
     if has_owner {
         println!(
-            "{:<w_name$}  {:<w_ver$}   {:<w_size$}  {:<w_owner$}  PCR23",
+            "{:<w_name$}  {:<w_ver$}   {:<w_size$}  {:<w_owner$}  SHA256",
             "NAME", "VERSION", "SIZE", "OWNER"
         );
     } else {
         println!(
-            "{:<w_name$}  {:<w_ver$}   {:<w_size$}  PCR23",
+            "{:<w_name$}  {:<w_ver$}   {:<w_size$}  SHA256",
             "NAME", "VERSION", "SIZE"
         );
     }
@@ -232,8 +232,8 @@ fn print_table(entries: &[DisplayEntry]) {
         let size_padded = format!("{:<w_size$}", size_plain);
         let size_col = size_padded.dimmed();
 
-        let pcr23_plain = match &e.pcr23 {
-            Some(h) => truncate_hex(h, w_pcr23),
+        let sha256_plain = match &e.sha256 {
+            Some(h) => truncate_hex(h, w_sha256),
             None => "-".to_string(),
         };
 
@@ -248,14 +248,14 @@ fn print_table(entries: &[DisplayEntry]) {
                 name_col,
                 size_col,
                 owner_padded.dimmed(),
-                pcr23_plain.dimmed(),
+                sha256_plain.dimmed(),
             );
         } else {
             println!(
                 "{:<w_name$}  {ver_padded} {symbol} {}  {}",
                 name_col,
                 size_col,
-                pcr23_plain.dimmed(),
+                sha256_plain.dimmed(),
             );
         }
     }

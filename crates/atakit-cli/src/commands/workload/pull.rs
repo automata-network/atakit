@@ -57,6 +57,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let inspection = atakit_workload::inspect_workload(&inspect_opts)
         .await
         .context("failed to inspect downloaded archive")?;
+    let sha256 = &inspection.sha256;
     let pcr23 = &inspection.pcr23;
     let archive_name = &inspection.manifest.meta.name;
     let archive_version = &inspection.manifest.meta.version;
@@ -77,8 +78,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Optionally verify against on-chain spec
     if args.verify {
-        println!("Verifying PCR23 against on-chain spec...");
-        verify_pcr23(&workload_id_hex, pcr23, config).await?;
+        println!("Verifying SHA256 against on-chain spec...");
+        verify_sha256(&workload_id_hex, sha256, config).await?;
     }
 
     // Import blob from temp file into store
@@ -88,6 +89,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let meta = match store.load_meta(&name, &version)? {
         Some(mut existing) => {
             existing.workload_id = workload_id_hex.clone();
+            existing.sha256 = Some(sha256.clone());
             existing.pcr23 = Some(pcr23.clone());
             existing.archive_size = Some(archive_size);
             if !existing.registries.contains(&registry_url) {
@@ -100,6 +102,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
             workload_id: workload_id_hex.clone(),
             name: name.clone(),
             version: version.clone(),
+            sha256: Some(sha256.clone()),
             pcr23: Some(pcr23.clone()),
             owner: None,
             archive_size: Some(archive_size),
@@ -115,12 +118,12 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     println!("{}", "Pull complete.".green().bold());
     println!("  {:<18}{}:{}", "Workload:", name, version);
     println!("  {:<18}{}", "Size:", format_size(archive_size));
-    println!("  {:<18}{}", "PCR23:", pcr23.dimmed());
+    println!("  {:<18}{}", "SHA256:", sha256.dimmed());
 
     Ok(())
 }
 
-async fn verify_pcr23(workload_id_hex: &str, pcr23: &str, config: &Config) -> Result<()> {
+async fn verify_sha256(workload_id_hex: &str, sha256: &str, config: &Config) -> Result<()> {
     let rpc_url = config
         .publish
         .rpc_url
@@ -160,22 +163,22 @@ async fn verify_pcr23(workload_id_hex: &str, pcr23: &str, config: &Config) -> Re
         .context("failed to query on-chain spec")?;
 
     // Find PCR23 in the spec
-    let on_chain_pcr23 = spec
+    let on_chain_sha256 = spec
         .pcrs
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| p.matchData.first())
         .map(|b| format!("0x{}", hex::encode(b)));
 
-    if let Some(ref expected) = on_chain_pcr23 {
-        if expected != pcr23 {
+    if let Some(ref expected) = on_chain_sha256 {
+        if expected != sha256 {
             anyhow::bail!(
-                "PCR23 mismatch: archive={pcr23}, on-chain={expected}"
+                "SHA256 mismatch: archive={sha256}, on-chain={expected}"
             );
         }
-        println!("  PCR23 verified: {}", "match".green());
+        println!("  SHA256 verified: {}", "match".green());
     } else {
-        println!("  {}", "No PCR23 found in on-chain spec.".yellow());
+        println!("  {}", "No SHA256 found in on-chain spec.".yellow());
     }
 
     Ok(())

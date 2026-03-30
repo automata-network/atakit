@@ -33,7 +33,7 @@ Workload archives and metadata are stored at `~/.local/share/atakit/workloads/`:
 workloads/
   <name>/
     <version>/
-      meta.json       # WorkloadMeta: workload_id, pcr23, owner, on_chain_spec, etc.
+      meta.json       # WorkloadMeta: workload_id, sha256, owner, on_chain_spec, etc.
       archive.atawl   # The .atawl archive blob (optional - metadata-only entries allowed)
 ```
 
@@ -75,7 +75,7 @@ List local and/or remote workloads.
 
 Default: local only (like `image ls`).
 
-Display: name-grouped table with blank-on-repeat names, status symbols, truncated PCR23.
+Display: name-grouped table with blank-on-repeat names, status symbols, truncated SHA256.
 
 ### `atakit workload import <archive>`
 
@@ -85,7 +85,7 @@ Import a local `.atawl` file into the store.
 |------|-------------|
 | `--force` | Overwrite if already exists |
 
-Inspects the archive to extract name, version, and PCR23. Copies the blob and writes metadata.
+Inspects the archive to extract name, version, and SHA256. Copies the blob and writes metadata.
 
 ### `atakit workload export <name:version>`
 
@@ -104,7 +104,7 @@ Download a workload from a registry into the local store.
 | Flag | Description |
 |------|-------------|
 | `--registry <name\|url>` | Override registry |
-| `--verify` | Verify PCR23 against on-chain spec (requires RPC config) |
+| `--verify` | Verify SHA256 against on-chain spec (requires RPC config) |
 | `--force` | Force overwrite if already in store |
 
 Downloads the archive, inspects it, and saves both blob and metadata.

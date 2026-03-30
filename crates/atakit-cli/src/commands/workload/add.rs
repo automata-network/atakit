@@ -23,8 +23,8 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         None
     };
 
-    // If we have an archive, inspect it to get name+version+pcr23
-    let (name, version, archive_pcr23, archive_size) = if let Some(ref path) = archive_path {
+    // If we have an archive, inspect it to get name+version+sha256+pcr23
+    let (name, version, archive_sha256, archive_pcr23, archive_size) = if let Some(ref path) = archive_path {
         let opts = atakit_workload::InspectOptions {
             archive: Some(path.clone()),
             workload_dir: None,
@@ -38,6 +38,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         (
             result.manifest.meta.name.clone(),
             result.manifest.meta.version.clone(),
+            Some(result.sha256),
             Some(result.pcr23),
             Some(size),
         )
@@ -45,11 +46,11 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         // Parse as name:version or 0x<id>
         let wref = parse_workload_ref(&args.reference)?;
         match wref {
-            WorkloadRef::NameVersion { name, version } => (name, version, None, None),
+            WorkloadRef::NameVersion { name, version } => (name, version, None, None, None),
             WorkloadRef::Id(_) => {
                 // For 0x IDs without an archive, we need on-chain to resolve name+version.
                 // We'll handle this below after the chain query.
-                (String::new(), String::new(), None, None)
+                (String::new(), String::new(), None, None, None)
             }
         }
     };
@@ -138,7 +139,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         (name, version)
     };
 
-    // Extract PCR23 from on-chain spec
+    // On-chain STATIC matchData stores the final PCR23 value
     let chain_pcr23 = spec
         .pcrs
         .iter()
@@ -146,7 +147,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         .and_then(|p| p.matchData.first())
         .map(|b| format!("0x{}", hex::encode(b)));
 
-    // Use archive PCR23 if we have it, fall back to chain
+    let sha256 = archive_sha256;
     let pcr23 = archive_pcr23.or(chain_pcr23);
 
     // Build cached chain spec
@@ -178,6 +179,9 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         if owner.is_some() {
             m.owner.clone_from(&owner);
         }
+        if sha256.is_some() && m.sha256.is_none() {
+            m.sha256.clone_from(&sha256);
+        }
         if pcr23.is_some() && m.pcr23.is_none() {
             m.pcr23.clone_from(&pcr23);
         }
@@ -196,6 +200,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             workload_id: workload_id_hex.clone(),
             name: name.clone(),
             version: version.clone(),
+            sha256: sha256.clone(),
             pcr23: pcr23.clone(),
             owner: owner.clone(),
             archive_size,
@@ -214,8 +219,8 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
     if let Some(ref o) = owner {
         println!("  {:<18}{}", "Owner:", o.dimmed());
     }
-    if let Some(ref p) = pcr23 {
-        println!("  {:<18}{}", "PCR23:", p.dimmed());
+    if let Some(ref p) = sha256 {
+        println!("  {:<18}{}", "SHA256:", p.dimmed());
     }
     if archive_path.is_some() {
         println!("  {:<18}imported", "Archive:");

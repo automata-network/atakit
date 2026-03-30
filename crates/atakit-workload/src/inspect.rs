@@ -21,7 +21,9 @@ pub struct InspectOptions {
 
 /// Result of inspecting a workload.
 pub struct InspectResult {
-    /// PCR23 measurement as `0x<64-hex-chars>`.
+    /// SHA-256 of manifest.toml as `0x<64-hex-chars>` (the event hash).
+    pub sha256: String,
+    /// Final PCR23 register value as `0x<64-hex-chars>`: `SHA-256(zeros_32 || sha256)`.
     pub pcr23: String,
     /// SHA-256 hash of the manifest as `sha256:<64-hex-chars>`.
     pub manifest_hash: String,
@@ -233,11 +235,18 @@ fn build_result(manifest_raw: String) -> Result<InspectResult, WorkloadError> {
 
     let mut hasher = Sha256::new();
     hasher.update(manifest_raw.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{:x}", digest);
+    let event_hash = hasher.finalize();
+    let hex = format!("{:x}", event_hash);
+
+    // Final PCR23 = SHA-256(zeros_32 || event_hash)
+    let mut extend_hasher = Sha256::new();
+    extend_hasher.update([0u8; 32]);
+    extend_hasher.update(event_hash);
+    let pcr23_hex = format!("0x{:x}", extend_hasher.finalize());
 
     Ok(InspectResult {
-        pcr23: format!("0x{hex}"),
+        sha256: format!("0x{hex}"),
+        pcr23: pcr23_hex,
         manifest_hash: format!("sha256:{hex}"),
         manifest,
         manifest_raw,

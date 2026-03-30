@@ -209,8 +209,8 @@ async fn inspect_archive_matches_build() {
 
     assert_eq!(inspect_result.manifest.meta.name, "my-workload");
     assert_eq!(inspect_result.manifest.meta.version, "v0.1.0");
-    assert!(!inspect_result.pcr23.is_empty());
-    assert!(inspect_result.pcr23.starts_with("0x"));
+    assert!(!inspect_result.sha256.is_empty());
+    assert!(inspect_result.sha256.starts_with("0x"));
     assert!(!inspect_result.manifest_hash.is_empty());
     assert!(inspect_result.manifest_hash.starts_with("sha256:"));
     assert!(inspect_result.manifest_raw.contains("name = \"my-workload\""));
@@ -254,7 +254,7 @@ async fn inspect_dir_matches_archive() {
     .await
     .unwrap();
 
-    assert_eq!(archive_result.pcr23, dir_result.pcr23);
+    assert_eq!(archive_result.sha256, dir_result.sha256);
     assert_eq!(archive_result.manifest_hash, dir_result.manifest_hash);
 }
 
