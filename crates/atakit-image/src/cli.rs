@@ -39,7 +39,7 @@ pub struct LsArgs {
     #[arg(long)]
     pub tag: Option<ImageRef>,
 
-    /// Repository name
+    /// GitHub repository (owner/repo)
     #[arg(long)]
     pub repo: Option<String>,
 
