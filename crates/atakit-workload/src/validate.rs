@@ -104,11 +104,17 @@ pub fn validate_config(
         }
     }
 
-    // ── host port uniqueness ─────────────────────────────
+    // ── host port uniqueness and privileged port check ───
     {
         let mut seen_host_ports: HashSet<u16> = HashSet::new();
         for spec in &w.ports {
             if let Ok(parsed) = config::parse_port_spec(spec) {
+                if parsed.host < 1024 {
+                    return Err(WorkloadError::Validation(format!(
+                        "host port {} in workload.ports is a privileged port (must be >= 1024)",
+                        parsed.host
+                    )));
+                }
                 if !seen_host_ports.insert(parsed.host) {
                     return Err(WorkloadError::Validation(format!(
                         "duplicate host port {} in workload.ports",
@@ -120,6 +126,12 @@ pub fn validate_config(
         for (dep_name, dep) in &config.dependencies {
             for spec in &dep.ports {
                 if let Ok(parsed) = config::parse_port_spec(spec) {
+                    if parsed.host < 1024 {
+                        return Err(WorkloadError::Validation(format!(
+                            "host port {} in dependencies.{dep_name}.ports is a privileged port (must be >= 1024)",
+                            parsed.host
+                        )));
+                    }
                     if !seen_host_ports.insert(parsed.host) {
                         return Err(WorkloadError::Validation(format!(
                             "host port {} in dependencies.{dep_name}.ports conflicts with another container",

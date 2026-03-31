@@ -200,13 +200,29 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {
+        let is_revoked = registry.is_workload_revoked(workload_id).await.unwrap_or(false);
         println!();
-        println!(
-            "{}",
-            "Workload already registered.".yellow().bold()
-        );
-        println!("  {:<18}{}", "Workload ID:", workload_id_hex);
-        println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
+        if is_revoked {
+            println!(
+                "{}",
+                "Workload version was previously deactivated.".yellow().bold()
+            );
+            println!("  {:<18}{}", "Workload ID:", workload_id_hex);
+            println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
+            println!();
+            println!("{}", "A deactivated version cannot be re-registered. Please use a new version tag.".yellow());
+            println!("  {}", "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow());
+        } else {
+            println!(
+                "{}",
+                "Workload already registered.".yellow().bold()
+            );
+            println!("  {:<18}{}", "Workload ID:", workload_id_hex);
+            println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
+            println!();
+            println!("{}", "To publish updated measurements, use a new version tag.".yellow());
+            println!("  {}", "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow());
+        }
 
         // Always refresh on-chain data into local store
         let rpc_url = config.publish.rpc_url.as_deref().unwrap();
@@ -242,7 +258,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 }
             };
             store.save_meta(&meta)?;
-            println!("{}", "Local store updated.".green());
+            println!("{}", "Local metadata synced with on-chain state.".green());
         }
 
         return Ok(());
