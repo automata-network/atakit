@@ -133,12 +133,12 @@ pub fn validate_config(
 
     // ── reserved host ports (CVM agent) ─────────────────
     {
-        const RESERVED_RANGE: std::ops::RangeInclusive<u16> = 7999..=8000;
+        const RESERVED_PORTS: &[u16] = &[1024, 8000];
         for spec in &w.ports {
             if let Ok(parsed) = config::parse_port_spec(spec) {
-                if RESERVED_RANGE.contains(&parsed.host) {
+                if RESERVED_PORTS.contains(&parsed.host) {
                     return Err(WorkloadError::Validation(format!(
-                        "host port {} in workload.ports is reserved for CVM use (ports 7999-8000)",
+                        "host port {} in workload.ports is reserved for CVM use (ports 1024, 8000)",
                         parsed.host
                     )));
                 }
@@ -147,9 +147,9 @@ pub fn validate_config(
         for (dep_name, dep) in &config.dependencies {
             for spec in &dep.ports {
                 if let Ok(parsed) = config::parse_port_spec(spec) {
-                    if RESERVED_RANGE.contains(&parsed.host) {
+                    if RESERVED_PORTS.contains(&parsed.host) {
                         return Err(WorkloadError::Validation(format!(
-                            "host port {} in dependencies.{dep_name}.ports is reserved for CVM use (ports 7999-8000)",
+                            "host port {} in dependencies.{dep_name}.ports is reserved for CVM use (ports 1024, 8000)",
                             parsed.host
                         )));
                     }
