@@ -107,16 +107,20 @@ impl ImageStore {
     // ── list ───────────────────────────────────────────────────────
 
     /// Query remote image releases and annotate each with local status.
+    ///
+    /// `github_repo` is the full `owner/repo` path for GitHub API queries.
+    /// `local_name` is the plain repository name used for local store lookups.
     pub async fn list(
         &self,
         client: &ReleasesClient,
-        repo: &str,
+        github_repo: &str,
+        local_name: &str,
         per_page: u32,
     ) -> Result<Vec<ReleaseStatus>> {
-        let releases = client.list_image_releases(repo, per_page).await?;
+        let releases = client.list_image_releases(github_repo, per_page).await?;
         Ok(releases
             .into_iter()
-            .map(|r| self.annotate(repo, r))
+            .map(|r| self.annotate(local_name, r))
             .collect())
     }
 
@@ -174,14 +178,17 @@ impl ImageStore {
     /// Finds the minimal set of archive assets that cover the requested
     /// platforms, downloads each to a temp file, and imports into the store
     /// via `import_image_archive`.
+    ///
+    /// `github_repo` is the full `owner/repo` path for GitHub API queries.
     pub async fn download(
         &self,
         client: &ReleasesClient,
+        github_repo: &str,
         image_ref: &ImageRef,
         platforms: &[Platform],
         progress: &dyn ProgressReporter,
     ) -> Result<Vec<PathBuf>> {
-        let release = client.get_release(image_ref).await?;
+        let release = client.get_release(github_repo, &image_ref.tag).await?;
 
         // Collect the unique set of archive assets needed.
         let mut archives_to_download: Vec<&crate::types::Asset> = Vec::new();

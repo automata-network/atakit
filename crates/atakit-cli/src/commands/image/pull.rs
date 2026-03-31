@@ -2,11 +2,12 @@ use anyhow::{Result, bail};
 use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform, PullArgs, ReleasesClient};
 
-use crate::config::Config;
+use crate::config::{Config, repo_local_name};
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
-    let repo = &config.image.repository;
+    let github_repo = &config.image.repository;
+    let local_name = repo_local_name(github_repo);
 
     let platforms = match &args.csps {
         Some(s) => parse_platforms(s)?,
@@ -27,9 +28,9 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         Some(i) => i,
         None => {
             println!("No image specified, finding latest image release...");
-            let release = client.find_latest_image_release(repo).await?;
-            println!("Using {repo}:{}", release.tag_name);
-            ImageRef::new(repo, &release.tag_name)
+            let release = client.find_latest_image_release(github_repo).await?;
+            println!("Using {local_name}:{}", release.tag_name);
+            ImageRef::new(local_name, &release.tag_name)
         }
     };
 
@@ -37,7 +38,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     println!("Pulling {} image(s) for {image_ref}...", names.join(", "));
 
     let paths = store
-        .download(&client, &image_ref, &platforms, &progress)
+        .download(&client, github_repo, &image_ref, &platforms, &progress)
         .await?;
     for path in &paths {
         println!("  {}", path.display());
