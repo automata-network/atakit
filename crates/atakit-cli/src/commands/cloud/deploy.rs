@@ -59,6 +59,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		.clone();
 
 	// 3. Validate platform-specific requirements.
+	atakit_cloud::validate_target(&target, target_name)?;
 	match target.platform {
 		PlatformKind::Gcp => {
 			if target.project.is_none() {
