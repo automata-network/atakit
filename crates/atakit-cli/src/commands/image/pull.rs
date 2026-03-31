@@ -6,7 +6,7 @@ use crate::config::{Config, repo_local_name};
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
-    let github_repo = &config.image.repository;
+    let github_repo = config.image.primary_repo();
     let local_name = repo_local_name(github_repo);
 
     let platforms = match &args.csps {

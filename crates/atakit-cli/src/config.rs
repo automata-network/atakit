@@ -4,7 +4,7 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use atakit_cloud::CloudConfig;
-use serde::Deserialize;
+use serde::{Deserialize, de};
 
 /// Application configuration loaded from `config.toml`.
 ///
@@ -24,10 +24,14 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ImageConfig {
-    /// Default GitHub repository (`owner/repo`) for image commands.
-    pub repository: String,
-    /// Additional GitHub repositories to query (used by `image ls --remote`).
-    pub repositories: Option<Vec<String>>,
+    /// GitHub repositories (`owner/repo`) for image commands.
+    /// Accepts a single string or an array in config.
+    /// The first entry is the default for `image pull`.
+    #[serde(
+        alias = "repository",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub repositories: Vec<String>,
     /// Default platforms for `image pull`.
     pub platforms: Option<Vec<String>>,
     /// Default limit for `image ls`.
@@ -37,8 +41,7 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         Self {
-            repository: "automata-network/automata-linux".to_string(),
-            repositories: None,
+            repositories: vec!["automata-network/automata-linux".to_string()],
             platforms: None,
             list_limit: 10,
         }
@@ -46,14 +49,31 @@ impl Default for ImageConfig {
 }
 
 impl ImageConfig {
-    /// All configured GitHub repositories. Returns `repositories` if set,
-    /// otherwise a single-element list from `repository`.
+    /// All configured GitHub repositories.
     pub fn repos(&self) -> Vec<&str> {
-        if let Some(ref repos) = self.repositories {
-            repos.iter().map(|s| s.as_str()).collect()
-        } else {
-            vec![&self.repository]
-        }
+        self.repositories.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// The primary (first) repository, used as default for `image pull`.
+    pub fn primary_repo(&self) -> &str {
+        self.repositories.first().map_or("", |s| s.as_str())
+    }
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Array(Vec<String>),
+    }
+
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Single(s) => Ok(vec![s]),
+        StringOrVec::Array(v) => Ok(v),
     }
 }
 
@@ -175,11 +195,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        Self::validate_repo(&self.image.repository)?;
-        if let Some(ref repos) = self.image.repositories {
-            for repo in repos {
-                Self::validate_repo(repo)?;
-            }
+        if self.image.repositories.is_empty() {
+            bail!("image.repositories must contain at least one entry");
+        }
+        for repo in &self.image.repositories {
+            Self::validate_repo(repo)?;
         }
         Ok(())
     }
@@ -231,7 +251,7 @@ impl Config {
     fn apply_env_overrides(&mut self) {
         if let Ok(v) = env::var("ATAKIT_DEFAULT_REPO") {
             if !v.is_empty() {
-                self.image.repository = v;
+                self.image.repositories = vec![v];
             }
         }
         if let Ok(v) = env::var("ATAKIT_DEFAULT_PLATFORMS") {
@@ -333,7 +353,10 @@ mod tests {
     fn missing_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(config.image.repository, "automata-network/automata-linux");
+        assert_eq!(
+            config.image.repositories,
+            vec!["automata-network/automata-linux"],
+        );
         assert_eq!(config.image.list_limit, 10);
         assert!(config.image.platforms.is_none());
         assert!(config.github.token.is_none());
@@ -358,7 +381,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.image.repository, "my-images");
+        assert_eq!(config.image.repositories, vec!["my-images"]);
         assert_eq!(
             config.image.platforms.as_deref(),
             Some(&["gcp".to_string(), "aws".to_string()][..])
@@ -378,7 +401,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.image.repository, "automata-network/automata-linux");
+        assert_eq!(
+            config.image.repositories,
+            vec!["automata-network/automata-linux"],
+        );
         assert_eq!(config.image.list_limit, 5);
         assert!(config.image.platforms.is_none());
         assert_eq!(config.build.container_engine, "auto");
@@ -387,12 +413,15 @@ mod tests {
     #[test]
     fn empty_config_returns_defaults() {
         let config = Config::load_from_str("").unwrap();
-        assert_eq!(config.image.repository, "automata-network/automata-linux");
+        assert_eq!(
+            config.image.repositories,
+            vec!["automata-network/automata-linux"],
+        );
         assert_eq!(config.image.list_limit, 10);
     }
 
     #[test]
-    fn accepts_slash_in_repository() {
+    fn accepts_singular_repository() {
         let config = Config::load_from_str(
             r#"
             [image]
@@ -400,7 +429,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.image.repository, "automata-network/debug-linux");
+        assert_eq!(
+            config.image.repositories,
+            vec!["automata-network/debug-linux"],
+        );
     }
 
     #[test]
@@ -420,7 +452,6 @@ mod tests {
 
     #[test]
     fn rejects_backslash_in_repository() {
-        // Use a TOML literal string (single quotes) to avoid TOML escape processing.
         let err = Config::load_from_str(
             r#"
             [image]
@@ -448,7 +479,7 @@ mod tests {
         let err = Config::load_from_str(
             r#"
             [image]
-            repository = ""
+            repositories = [""]
             "#,
         )
         .unwrap_err();
@@ -465,6 +496,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("empty path segment"));
+    }
+
+    #[test]
+    fn rejects_empty_repositories_list() {
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repositories = []
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at least one"));
     }
 
     #[test]
@@ -493,7 +536,7 @@ mod tests {
         .unwrap();
 
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(config.image.repository, "custom-images");
+        assert_eq!(config.image.repositories, vec!["custom-images"]);
         assert_eq!(config.image.list_limit, 3);
     }
 }
