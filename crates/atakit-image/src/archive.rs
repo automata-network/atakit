@@ -61,8 +61,9 @@ pub fn create_image_archive(
     let archive_name = format!("{}-{}-{}.atabi", image_ref.repository, image_ref.tag, suffix);
     let archive_path = output_dir.join(&archive_name);
 
-    // Compute total source bytes for progress tracking.
-    let total_bytes = dir_size(&tag_dir.join("disk_images"))
+    // Compute total source bytes for progress tracking (only matching platform disk images).
+    let platform_prefixes: Vec<String> = platforms.iter().map(|p| format!("{}_", p)).collect();
+    let total_bytes = filtered_dir_size(&tag_dir.join("disk_images"), &platform_prefixes)
         + dir_size(&tag_dir.join("secure_boot_certs"));
     let handle = progress.create(
         &format!("Packing {}", image_ref),
@@ -94,7 +95,7 @@ pub fn create_image_archive(
             let enc = zstd::Encoder::new(file, 0).map_err(ImageError::Io)?;
             let counting = ProgressWriter::new(enc, handle.as_ref());
             let mut tar = tar::Builder::new(counting);
-            write_archive_contents(&mut tar, prefix, &manifest_toml, tag_dir)?;
+            write_archive_contents(&mut tar, prefix, &manifest_toml, tag_dir, platforms)?;
             tar.into_inner()
                 .map_err(ImageError::Io)?
                 .into_inner()
@@ -105,7 +106,7 @@ pub fn create_image_archive(
             let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
             let counting = ProgressWriter::new(enc, handle.as_ref());
             let mut tar = tar::Builder::new(counting);
-            write_archive_contents(&mut tar, prefix, &manifest_toml, tag_dir)?;
+            write_archive_contents(&mut tar, prefix, &manifest_toml, tag_dir, platforms)?;
             tar.into_inner()
                 .map_err(ImageError::Io)?
                 .into_inner()
@@ -305,15 +306,37 @@ fn write_archive_contents<W: std::io::Write>(
     prefix: &Path,
     manifest_toml: &str,
     tag_dir: &Path,
+    platforms: &[Platform],
 ) -> Result<()> {
     append_dir_entry(tar, prefix)?;
     append_file_bytes(tar, &prefix.join("manifest.toml"), manifest_toml.as_bytes())?;
 
+    // Only include disk images for the specified platforms.
     let disk_images_src = tag_dir.join("disk_images");
     if disk_images_src.is_dir() {
         let disk_prefix = prefix.join("disk_images");
         append_dir_entry(tar, &disk_prefix)?;
-        append_dir_contents(tar, &disk_images_src, &disk_prefix)?;
+
+        let platform_prefixes: Vec<String> =
+            platforms.iter().map(|p| format!("{}_", p)).collect();
+
+        let mut entries: Vec<_> = std::fs::read_dir(&disk_images_src)
+            .map_err(|e| ImageError::ReadDir { path: disk_images_src.clone(), source: e })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ImageError::Io)?;
+        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        for entry in entries {
+            let path = entry.path();
+            let fname = path.file_name().expect("entry has a filename");
+            let name_str = fname.to_string_lossy();
+            if !platform_prefixes.iter().any(|pfx| name_str.starts_with(pfx.as_str())) {
+                continue;
+            }
+            if entry.file_type().map_err(ImageError::Io)?.is_file() {
+                append_file(tar, &path, &disk_prefix.join(fname))?;
+            }
+        }
     }
 
     let certs_src = tag_dir.join("secure_boot_certs");
@@ -411,6 +434,26 @@ fn dir_size(path: &Path) -> u64 {
     walk(path)
 }
 
+/// Sum file sizes in a directory, only counting files whose name starts with one of the prefixes.
+fn filtered_dir_size(path: &Path, prefixes: &[String]) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if prefixes.iter().any(|pfx| name_str.starts_with(pfx.as_str())) {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
+}
+
 // ── tar helpers ──────────────────────────────────────────────
 
 fn append_dir_entry<W: std::io::Write>(
@@ -482,24 +525,34 @@ fn append_dir_contents<W: std::io::Write>(
             append_dir_entry(tar, &child_archive)?;
             append_dir_contents(tar, &child_src, &child_archive)?;
         } else if ft.is_file() {
-            let metadata = std::fs::metadata(&child_src).map_err(ImageError::Io)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(metadata.len());
-            header.set_mtime(0);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            let file = std::fs::File::open(&child_src).map_err(|e| ImageError::ReadFile {
-                path: child_src.clone(),
-                source: e,
-            })?;
-            tar.append_data(&mut header, &child_archive, file)
-                .map_err(ImageError::Io)?;
+            append_file(tar, &child_src, &child_archive)?;
         }
     }
 
+    Ok(())
+}
+
+/// Append a single file from disk to the tar with deterministic metadata.
+fn append_file<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    src_path: &Path,
+    archive_path: &Path,
+) -> Result<()> {
+    let metadata = std::fs::metadata(src_path).map_err(ImageError::Io)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(metadata.len());
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mode(0o644);
+    header.set_cksum();
+    let file = std::fs::File::open(src_path).map_err(|e| ImageError::ReadFile {
+        path: src_path.to_path_buf(),
+        source: e,
+    })?;
+    tar.append_data(&mut header, archive_path, file)
+        .map_err(ImageError::Io)?;
     Ok(())
 }
 
