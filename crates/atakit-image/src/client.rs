@@ -4,10 +4,7 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use tracing::debug;
 
 use crate::error::{ImageError, Result};
-use crate::types::{ImageRef, Platform, Release, VersionSelector};
-
-/// Default repository for automata-linux images.
-pub const DEFAULT_REPO: &str = "automata-network/automata-linux";
+use crate::types::{Platform, Release, VersionSelector};
 
 /// Async client for the GitHub Releases API.
 pub struct ReleasesClient {
@@ -44,39 +41,36 @@ impl ReleasesClient {
 
     // ── low-level API ──────────────────────────────────────────────
 
-    fn map_repo<'a>(&self, repo: &'a str) -> &'a str {
-        if repo == "automata-linux" {
-            DEFAULT_REPO
-        } else {
-            repo
-        }
-    }
-
     /// List the most recent releases (up to `per_page`, max 100).
+    ///
+    /// `repo` must be the full GitHub `owner/repo` path.
     pub async fn list_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>> {
         let url = format!(
             "https://api.github.com/repos/{}/releases?per_page={}",
-            self.map_repo(repo),
+            repo,
             per_page.min(100),
         );
         self.get_json(&url).await
     }
 
     /// Fetch a specific release by its Git tag.
-    pub async fn get_release(&self, image_ref: &ImageRef) -> Result<Release> {
+    ///
+    /// `repo` must be the full GitHub `owner/repo` path.
+    pub async fn get_release(&self, repo: &str, tag: &str) -> Result<Release> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/tags/{}",
-            self.map_repo(&image_ref.repository),
-            image_ref.tag,
+            repo, tag,
         );
         self.get_json(&url).await
     }
 
     /// Fetch the release marked as "latest" by GitHub.
+    ///
+    /// `repo` must be the full GitHub `owner/repo` path.
     pub async fn get_latest_release(&self, repo: &str) -> Result<Release> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/latest",
-            self.map_repo(repo)
+            repo
         );
         self.get_json(&url).await
     }
@@ -122,7 +116,9 @@ impl ReleasesClient {
             VersionSelector::Latest => self.get_latest_release(repo).await,
             VersionSelector::LatestImage => self.find_latest_image_release(repo).await,
             VersionSelector::LatestImageFor(p) => self.find_latest_release_for(repo, *p).await,
-            VersionSelector::Tag(image_ref) => self.get_release(image_ref).await,
+            VersionSelector::Tag(image_ref) => {
+                self.get_release(repo, &image_ref.tag).await
+            }
         }
     }
 

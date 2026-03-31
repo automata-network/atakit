@@ -8,11 +8,17 @@ use atakit_image::{
 };
 use owo_colors::OwoColorize;
 
-use crate::config::Config;
+use crate::config::{Config, repo_local_name};
 
 pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
-    let repo = args.repo.unwrap_or_else(|| config.image.repository.clone());
     let limit = args.limit.unwrap_or(config.image.list_limit);
+
+    // Determine which GitHub repos to query.
+    let repos: Vec<String> = if let Some(ref r) = args.repo {
+        vec![r.clone()]
+    } else {
+        config.image.repos().into_iter().map(String::from).collect()
+    };
 
     let store = ImageStore::new(&env.image_dir);
     let client = match config.github_token() {
@@ -22,8 +28,10 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 
     // --tag mode: show detailed view for a single release.
     if let Some(tag) = &args.tag {
-        let release = client.get_release(tag).await?;
-        print_release_detail(&tag.repository, &release, &store);
+        let github_repo = &repos[0];
+        let release = client.get_release(github_repo, &tag.tag).await?;
+        let local_name = repo_local_name(github_repo);
+        print_release_detail(local_name, &release, &store);
         return Ok(());
     }
 
@@ -43,29 +51,39 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 .push(row_from_local(tag, &store));
         }
     } else {
-        // Fetch remote releases + merge local state (--remote).
+        // Fetch remote releases + merge local state (--remote / --all).
         let local_tags = store.list_local()?;
-        let remote_tags: HashSet<ImageRef>;
+        let mut remote_tags: HashSet<ImageRef> = HashSet::new();
 
-        if args.all {
-            let releases = client.list_releases(&repo, limit).await?;
-            remote_tags = releases
-                .iter()
-                .map(|r| ImageRef::new(&repo, &r.tag_name))
-                .collect();
-            let rows: Vec<_> = releases
-                .iter()
-                .map(|r| row_from_release(r, &store, &repo))
-                .collect();
-            groups.entry(repo.clone()).or_default().extend(rows);
-        } else {
-            let statuses = store.list(&client, &repo, limit).await?;
-            remote_tags = statuses
-                .iter()
-                .map(|s| ImageRef::new(&repo, &s.release.tag_name))
-                .collect();
-            let rows: Vec<_> = statuses.iter().map(row_from_status).collect();
-            groups.entry(repo.clone()).or_default().extend(rows);
+        for github_repo in &repos {
+            let local_name = repo_local_name(github_repo);
+
+            if args.all {
+                let releases = client.list_releases(github_repo, limit).await?;
+                for r in &releases {
+                    remote_tags.insert(ImageRef::new(local_name, &r.tag_name));
+                }
+                let rows: Vec<_> = releases
+                    .iter()
+                    .map(|r| row_from_release(r, &store, local_name))
+                    .collect();
+                groups
+                    .entry(local_name.to_string())
+                    .or_default()
+                    .extend(rows);
+            } else {
+                let statuses = store
+                    .list(&client, github_repo, local_name, limit)
+                    .await?;
+                for s in &statuses {
+                    remote_tags.insert(ImageRef::new(local_name, &s.release.tag_name));
+                }
+                let rows: Vec<_> = statuses.iter().map(row_from_status).collect();
+                groups
+                    .entry(local_name.to_string())
+                    .or_default()
+                    .extend(rows);
+            }
         }
 
         // Append local-only images (not present in remote).
@@ -84,7 +102,15 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    print_table(&groups);
+    // Compute version column width across ALL groups for consistent alignment.
+    let vw = groups
+        .values()
+        .flat_map(|rows| rows.iter().map(|r| r.version.len()))
+        .max()
+        .unwrap_or(7)
+        .max(7);
+
+    print_table(&groups, vw);
     Ok(())
 }
 
@@ -216,7 +242,7 @@ fn row_from_local(image_ref: &ImageRef, store: &ImageStore) -> ImageRow {
 
 // ── table renderer ──────────────────────────────────────────
 
-fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>) {
+fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>, vw: usize) {
     let mut first = true;
     for (name, rows) in groups {
         if !first {
@@ -226,17 +252,13 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>) {
 
         println!("{}", name.bold());
 
-        let vw = rows
-            .iter()
-            .map(|r| r.version.len())
-            .max()
-            .unwrap_or(7)
-            .max(7);
-
+        // Pad plain strings first, then apply color (ANSI escapes break {:<width$}).
+        let vh = format!("{:<vw$}", "VERSION");
+        let dh = format!("{:10}", "DATE");
         println!(
-            "      {:<vw$}     {:10}  GCP  AWS  AZURE  CERTS",
-            "VERSION".dimmed(),
-            "DATE".dimmed(),
+            "      {}     {}  GCP  AWS  AZURE  CERTS",
+            vh.dimmed(),
+            dh.dimmed(),
         );
 
         for row in rows {
@@ -246,14 +268,15 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>) {
                 "      ".to_string()
             };
             let date = row.date.as_deref().unwrap_or("-");
+            let version_padded = format!("{:<vw$}", row.version);
             let version = if row.has_local() {
-                row.version.green().bold().to_string()
+                version_padded.green().bold().to_string()
             } else {
-                row.version.to_string()
+                version_padded
             };
             let [g, a, z] = &row.platforms;
             println!(
-                "{prefix}{:<vw$}     {:10}  {}    {}    {}      {}",
+                "{prefix}{}     {:10}  {}    {}    {}      {}",
                 version, date, g, a, z, row.certs,
             );
         }

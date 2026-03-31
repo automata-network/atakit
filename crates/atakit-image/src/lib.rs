@@ -12,7 +12,7 @@ pub use archive::{
     ImageManifest, ImageManifestMeta, IMAGE_FORMAT_VERSION,
     create_image_archive, import_image_archive, read_manifest,
 };
-pub use client::{ReleasesClient, DEFAULT_REPO};
+pub use client::ReleasesClient;
 pub use download::{download_asset, DownloadOptions};
 pub use error::ImageError;
 pub use store::{ImageStore, ReleaseStatus};

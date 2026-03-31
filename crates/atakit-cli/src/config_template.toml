@@ -2,8 +2,10 @@
 # Precedence: CLI args > env vars > this file > defaults
 
 [image]
-# Default repository for image commands.
-# repository = "automata-linux"
+# Default GitHub repository (owner/repo) for image commands.
+# repository = "automata-network/automata-linux"
+# Additional repositories to query with `image ls --remote`.
+# repositories = ["automata-network/automata-linux", "automata-network/debug-linux"]
 # Default platforms for `image pull` (comma-separated: gcp, aws, azure).
 # platforms = ["gcp"]
 # Default limit for `image ls`.

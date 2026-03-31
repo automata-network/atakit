@@ -24,8 +24,10 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ImageConfig {
-    /// Default repository for image commands.
+    /// Default GitHub repository (`owner/repo`) for image commands.
     pub repository: String,
+    /// Additional GitHub repositories to query (used by `image ls --remote`).
+    pub repositories: Option<Vec<String>>,
     /// Default platforms for `image pull`.
     pub platforms: Option<Vec<String>>,
     /// Default limit for `image ls`.
@@ -35,11 +37,31 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         Self {
-            repository: "automata-linux".to_string(),
+            repository: "automata-network/automata-linux".to_string(),
+            repositories: None,
             platforms: None,
             list_limit: 10,
         }
     }
+}
+
+impl ImageConfig {
+    /// All configured GitHub repositories. Returns `repositories` if set,
+    /// otherwise a single-element list from `repository`.
+    pub fn repos(&self) -> Vec<&str> {
+        if let Some(ref repos) = self.repositories {
+            repos.iter().map(|s| s.as_str()).collect()
+        } else {
+            vec![&self.repository]
+        }
+    }
+}
+
+/// Extract the local image name from a GitHub `owner/repo` string.
+///
+/// Returns the part after the last `/`, or the whole string if no `/`.
+pub fn repo_local_name(repo: &str) -> &str {
+    repo.rsplit_once('/').map_or(repo, |(_, name)| name)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -153,17 +175,44 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        let repo = &self.image.repository;
-        if repo.is_empty()
-            || repo.contains('/')
-            || repo.contains('\\')
-            || Path::new(repo).is_absolute()
-            || Path::new(repo)
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
+        Self::validate_repo(&self.image.repository)?;
+        if let Some(ref repos) = self.image.repositories {
+            for repo in repos {
+                Self::validate_repo(repo)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_repo(repo: &str) -> Result<()> {
+        if repo.is_empty() {
+            bail!("invalid image repository: must not be empty");
+        }
+        if repo.contains('\\') {
+            bail!(
+                "invalid image repository {:?}: must not contain backslashes",
+                repo,
+            );
+        }
+        if Path::new(repo).is_absolute() {
+            bail!(
+                "invalid image repository {:?}: must not be an absolute path",
+                repo,
+            );
+        }
+        if Path::new(repo)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
         {
             bail!(
-                "invalid image.repository {:?}: must be a plain name without path separators",
+                "invalid image repository {:?}: must not contain path traversal",
+                repo,
+            );
+        }
+        // Each segment must be non-empty (reject leading/trailing/double slashes).
+        if repo.split('/').any(|s| s.is_empty()) {
+            bail!(
+                "invalid image repository {:?}: contains empty path segment",
                 repo,
             );
         }
@@ -284,7 +333,7 @@ mod tests {
     fn missing_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.repository, "automata-network/automata-linux");
         assert_eq!(config.image.list_limit, 10);
         assert!(config.image.platforms.is_none());
         assert!(config.github.token.is_none());
@@ -329,7 +378,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.repository, "automata-network/automata-linux");
         assert_eq!(config.image.list_limit, 5);
         assert!(config.image.platforms.is_none());
         assert_eq!(config.build.container_engine, "auto");
@@ -338,22 +387,35 @@ mod tests {
     #[test]
     fn empty_config_returns_defaults() {
         let config = Config::load_from_str("").unwrap();
-        assert_eq!(config.image.repository, "automata-linux");
+        assert_eq!(config.image.repository, "automata-network/automata-linux");
         assert_eq!(config.image.list_limit, 10);
     }
 
     #[test]
-    fn rejects_slash_in_repository() {
-        let err = Config::load_from_str(
+    fn accepts_slash_in_repository() {
+        let config = Config::load_from_str(
             r#"
             [image]
-            repository = "owner/repo"
+            repository = "automata-network/debug-linux"
             "#,
         )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("owner/repo"), "error: {msg}");
-        assert!(msg.contains("plain name"), "error: {msg}");
+        .unwrap();
+        assert_eq!(config.image.repository, "automata-network/debug-linux");
+    }
+
+    #[test]
+    fn accepts_multiple_repositories() {
+        let config = Config::load_from_str(
+            r#"
+            [image]
+            repositories = ["automata-network/automata-linux", "automata-network/debug-linux"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.image.repos(),
+            vec!["automata-network/automata-linux", "automata-network/debug-linux"],
+        );
     }
 
     #[test]
@@ -366,7 +428,7 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("plain name"));
+        assert!(err.to_string().contains("backslash"));
     }
 
     #[test]
@@ -378,7 +440,7 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("plain name"));
+        assert!(err.to_string().contains("traversal"));
     }
 
     #[test]
@@ -390,7 +452,19 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("plain name"));
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn rejects_trailing_slash_in_repository() {
+        let err = Config::load_from_str(
+            r#"
+            [image]
+            repository = "owner/"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty path segment"));
     }
 
     #[test]
