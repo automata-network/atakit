@@ -133,7 +133,7 @@ pub struct PublishArgs {
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
-    /// Base image IDs for whitelist/blacklist (hex bytes32)
+    /// Override base image IDs (hex bytes32). If omitted, derived from the manifest's base-image list.
     #[arg(long)]
     pub base_image_id: Vec<String>,
     /// Skip confirmation prompt

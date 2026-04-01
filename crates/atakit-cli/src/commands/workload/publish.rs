@@ -97,16 +97,35 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
     let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
 
-    // Parse base image IDs
-    let mut base_image_ids = Vec::new();
-    for id_str in &args.base_image_id {
-        let hex_str = id_str.strip_prefix("0x").unwrap_or(id_str);
-        let bytes: [u8; 32] = hex::decode(hex_str)
-            .context(format!("invalid base image ID hex: {id_str}"))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("base image ID must be 32 bytes: {id_str}"))?;
-        base_image_ids.push(alloy_ext::core::primitives::B256::from(bytes));
-    }
+    // Derive base image IDs from manifest's base-image list (name:version -> on-chain ID).
+    // --base-image-id CLI args override if provided.
+    let base_image_ids = if !args.base_image_id.is_empty() {
+        let mut ids = Vec::new();
+        for id_str in &args.base_image_id {
+            let hex_str = id_str.strip_prefix("0x").unwrap_or(id_str);
+            let bytes: [u8; 32] = hex::decode(hex_str)
+                .context(format!("invalid base image ID hex: {id_str}"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("base image ID must be 32 bytes: {id_str}"))?;
+            ids.push(alloy_ext::core::primitives::B256::from(bytes));
+        }
+        ids
+    } else {
+        manifest
+            .config
+            .base_image
+            .iter()
+            .map(|entry| {
+                let (name, version) = entry.split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid base-image entry '{}': expected name:version format",
+                        entry,
+                    )
+                })?;
+                Ok(super::compute_base_image_id(name, version))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
     // Map base-image-mode string to AccessMode enum value
     // Solidity: ANY=0, BLACKLIST=1, WHITELIST=2

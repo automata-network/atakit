@@ -62,6 +62,14 @@ pub fn compute_workload_id(name: &str, version: &str) -> B256 {
     keccak256(&encoded)
 }
 
+/// Compute the on-chain base image ID: `keccak256(abi.encode(BASEIMAGE_DOMAIN, name, version))`
+/// where `BASEIMAGE_DOMAIN = keccak256("CVM_BASEIMAGE_V1")`.
+pub fn compute_base_image_id(name: &str, version: &str) -> B256 {
+    let domain = keccak256("CVM_BASEIMAGE_V1");
+    let encoded = (domain, name.to_string(), version.to_string()).abi_encode_params();
+    keccak256(&encoded)
+}
+
 /// Parsed workload reference: either `name:version` or a hex workload ID.
 pub enum WorkloadRef {
     NameVersion { name: String, version: String },

@@ -27,8 +27,8 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 
 # base-image: list of base image references (name:version) for the whitelist/blacklist.
-# Used by `cloud deploy` to validate the --image argument locally.
-# On-chain, `workload publish --base-image-id` takes the hex bytes32 IDs separately.
+# Used by `cloud deploy` for local validation and by `workload publish` to derive
+# on-chain base image IDs. Override with `--base-image-id` on publish if needed.
 # base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
 
 # ttl: session TTL in seconds. Determines how long a CVM session remains
