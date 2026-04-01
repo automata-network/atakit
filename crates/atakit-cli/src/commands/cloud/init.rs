@@ -7,7 +7,7 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config};
-use super::{resolve_instance, resolve_workload};
+use super::{collect_unmeasured_tar, resolve_instance, resolve_workload};
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 	// 1. Resolve instance.
@@ -45,6 +45,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 	let archive_path = resolved.archive_path;
 	let workload_name = resolved.name;
 	let workload_version = resolved.version;
+
+	// Collect unmeasured-data files if available.
+	let unmeasured_tar = if !resolved.unmeasured_data.is_empty() {
+		if let Some(ref wdir) = resolved.workload_dir {
+			collect_unmeasured_tar(&resolved.unmeasured_data, wdir)?
+		} else {
+			None
+		}
+	} else {
+		None
+	};
 
 	// 4. Compute archive hash.
 	let bytes = std::fs::read(&archive_path)
@@ -124,7 +135,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
 	// 8. Initialize workload.
 	eprint!("  [2/2] Initialize workload... ");
-	init::post_init(&ip, &archive_path.display().to_string(), None, &agent_config).await
+	init::post_init(&ip, &archive_path.display().to_string(), unmeasured_tar.as_deref(), &agent_config).await
 		.map_err(|e| anyhow::anyhow!("{e}"))?;
 	eprintln!("{}", "done".green());
 

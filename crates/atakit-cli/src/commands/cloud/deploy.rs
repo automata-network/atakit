@@ -12,13 +12,13 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config};
-use super::{AgentEnvBuilder, parse_metadata, resolve_image, resolve_workload};
+use super::{AgentEnvBuilder, collect_unmeasured_tar, parse_metadata, resolve_image, resolve_workload, validate_base_image};
 
 pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
 	let image_only = args.image_only;
 
 	// 1. Resolve workload source (unless --image-only).
-	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb);
+	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb, base_image_mode, base_image_list, unmeasured_tar);
 	if image_only {
 		archive_path = String::new();
 		workload_name = String::new();
@@ -27,6 +27,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		workload_ports = Vec::new();
 		workload_disks = Vec::new();
 		boot_disk_size_gb = None;
+		base_image_mode = String::new();
+		base_image_list = Vec::new();
+		unmeasured_tar = None;
 	} else {
 		let resolved = resolve_workload(&args.source, &args.dir, env)?;
 		workload_name = resolved.name;
@@ -40,6 +43,22 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			})
 			.collect::<Result<Vec<_>>>()?;
 		boot_disk_size_gb = resolved.boot_disk_size.as_deref().and_then(parse_size_gb);
+		base_image_mode = resolved.base_image_mode;
+		base_image_list = resolved.base_image;
+		// Collect unmeasured-data files if a workload directory is available.
+		unmeasured_tar = if !resolved.unmeasured_data.is_empty() {
+			if let Some(ref wdir) = resolved.workload_dir {
+				collect_unmeasured_tar(&resolved.unmeasured_data, wdir)?
+			} else {
+				eprintln!(
+					"  {}: workload declares unmeasured-data but no workload directory available (store-ref/file mode)",
+					"warning".yellow(),
+				);
+				None
+			}
+		} else {
+			None
+		};
 		let ap = resolved.archive_path;
 		let bytes = std::fs::read(&ap)
 			.with_context(|| format!("failed to read archive: {}", ap.display()))?;
@@ -115,6 +134,11 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
 	let resolved_image = resolve_image(image_arg, &target.platform, env)?;
 	let image_ref = &resolved_image.display_name;
+
+	// 8b. Validate image against workload's base-image policy.
+	if !image_only && image_ref.contains(':') {
+		validate_base_image(image_ref, &base_image_mode, &base_image_list)?;
+	}
 
 	// 9. Create provider.
 	let provider: Box<dyn CloudProvider> = match target.platform {
@@ -253,6 +277,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		archive_path,
 		archive_hash,
 		agent_env: agent_env.clone(),
+		total_steps: plan.steps.len() as u32,
 	});
 	match target.platform {
 		PlatformKind::Gcp => {
@@ -364,7 +389,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					expire_offset: agent_env.expire_offset.unwrap_or(3600),
 				};
 
-				match init::post_init(&ip, ap, None, &agent_config).await {
+				match init::post_init(&ip, ap, unmeasured_tar.as_deref(), &agent_config).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());
