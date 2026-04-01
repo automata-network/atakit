@@ -297,17 +297,13 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
 
-    // Check if the source config is newer than the archive.
-    let config_path = workload_dir.join("atakit-workload.toml");
-    if let (Ok(archive_meta), Ok(config_meta)) =
-        (std::fs::metadata(&archive_path), std::fs::metadata(&config_path))
-    {
-        if let (Ok(archive_mtime), Ok(config_mtime)) =
-            (archive_meta.modified(), config_meta.modified())
-        {
-            if config_mtime > archive_mtime {
+    // Check if any source file is newer than the archive.
+    if let Ok(archive_meta) = std::fs::metadata(&archive_path) {
+        if let Ok(archive_mtime) = archive_meta.modified() {
+            if let Some(stale_file) = find_newer_source(&workload_dir, &archive_mtime) {
                 bail!(
-                    "atakit-workload.toml is newer than {} - run 'atakit workload build' first",
+                    "'{}' is newer than {} - run 'atakit workload build' first",
+                    stale_file.display(),
                     archive_path.display(),
                 );
             }
@@ -355,6 +351,41 @@ fn collect_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<Stri
         }
     }
     paths
+}
+
+/// Walk a workload directory and return the first file newer than `threshold`.
+/// Skips `.git`, `target`, and `.atawl` files.
+fn find_newer_source(
+    dir: &std::path::Path,
+    threshold: &std::time::SystemTime,
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip directories that aren't workload sources.
+        if name_str == ".git" || name_str == "target" || name_str == ".claude" {
+            continue;
+        }
+        // Skip the archive files themselves.
+        if name_str.ends_with(".atawl") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(mtime) = meta.modified() {
+                if mtime > *threshold {
+                    return Some(path);
+                }
+            }
+            if meta.is_dir() {
+                if let Some(found) = find_newer_source(&path, threshold) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Collect resolved firewall ports from a manifest as `"port/proto"` strings.

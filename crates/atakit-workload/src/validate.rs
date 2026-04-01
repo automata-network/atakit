@@ -94,6 +94,23 @@ pub fn validate_config(
         )));
     }
 
+    // ── base-image entries ───────────────────────────────
+    for entry in &w.base_image {
+        if entry.split_once(':').is_none() {
+            return Err(WorkloadError::Validation(format!(
+                "base-image entry must be name:version format, got {:?}",
+                entry,
+            )));
+        }
+        let (name, version) = entry.split_once(':').unwrap();
+        if name.is_empty() || version.is_empty() {
+            return Err(WorkloadError::Validation(format!(
+                "base-image entry has empty name or version: {:?}",
+                entry,
+            )));
+        }
+    }
+
     // ── ports ──────────────────────────────────────────────
     for spec in &w.ports {
         validate_container_port(spec, "workload.ports")?;

@@ -200,16 +200,23 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!("  {:<20}{}", "SHA256:".dimmed(), result.sha256);
     println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
     println!("  {:<20}{} ({})", "Base Image Mode:".dimmed(), base_image_mode_str, base_image_mode);
-    if !args.base_image_id.is_empty() {
-        for (i, id) in args.base_image_id.iter().enumerate() {
-            if i == 0 {
-                println!("  {:<20}{}", "Base Image IDs:".dimmed(), id);
+    if spec.baseImageIds.is_empty() {
+        println!("  {:<20}{}", "Base Image IDs:".dimmed(), "none".dimmed());
+    } else {
+        for (i, id) in spec.baseImageIds.iter().enumerate() {
+            let id_hex = format!("0x{}", hex::encode(id));
+            // Show source entry alongside hex ID when derived from manifest.
+            let source = if args.base_image_id.is_empty() {
+                manifest.config.base_image.get(i).map(|s| format!(" ({s})")).unwrap_or_default()
             } else {
-                println!("  {:<20}{}", "", id);
+                String::new()
+            };
+            if i == 0 {
+                println!("  {:<20}{}{}", "Base Image IDs:".dimmed(), id_hex, source.dimmed());
+            } else {
+                println!("  {:<20}{}{}", "", id_hex, source.dimmed());
             }
         }
-    } else {
-        println!("  {:<20}{}", "Base Image IDs:".dimmed(), "none".dimmed());
     }
     println!("  {:<20}{}", "TTL:".dimmed(), if spec.ttl == 0 {
         "contract default (30 days)".to_string()
