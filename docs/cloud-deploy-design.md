@@ -121,8 +121,7 @@ atakit cloud deploy [SOURCE] --target <name> --image <ref>
                     [--rpc-url <url>] [--session-registry <addr>]
 
 atakit cloud destroy <instance> [--target <name>]
-                     [--preserve <image,disks,firewall>]
-                     [--delete-image] [-y]
+                     [--preserve <image,disks,firewall>] [-y]
 
 atakit cloud status <instance> [--target <name>] [--live]
 
@@ -160,10 +159,11 @@ staging      azure      deploy-failed   (step 5: instance)    -
 
 ### `cloud ssh` / `cloud serial`
 
-Thin wrappers. The `CloudProvider` trait provides `ssh_command()` and `serial_command()` methods that return the full command args. The CLI execs the command directly.
+`ssh` execs the provider's SSH command directly (`ssh_command()` returns full command args). `serial` retrieves serial output via `provider.get_serial_output()` and prints it.
 
-- GCP: `gcloud compute ssh {instance} --project {project} --zone {zone}` / `gcloud compute connect-to-serial-port {instance} --project {project} --zone {zone}`
-- Azure: `az ssh vm --name {instance} --resource-group {rg}` / `az serial-console connect --name {instance} --resource-group {rg}`
+- GCP ssh: `gcloud compute ssh {instance} --project {project} --zone {zone}`
+- GCP serial: `gcloud compute instances get-serial-port-output` (output printed, not interactive)
+- Azure: similar patterns via `az` CLI
 
 ---
 
@@ -270,7 +270,9 @@ During `workload build`:
 
 Gap: no mechanism delivers the actual files to the CVM.
 
-### Proposed Solution
+### Proposed Solution (not yet implemented)
+
+The `post_init` function accepts an optional `unmeasured_tar` parameter, but the deploy flow does not yet collect and send unmeasured-data files. The plan below describes the intended behavior.
 
 Deploy collects unmeasured-data files from the workload directory and includes them in the init POST.
 
@@ -332,13 +334,13 @@ Cloud compute images (the base CVM boot disk) are scoped to the cloud project, n
 
 ### Implemented Behavior
 
-- Images are **deleted by default** on destroy (`--delete-image` defaults to `true`). Use `--preserve image` to keep the GCE image and its GCS bucket.
+- Images are deleted on destroy by default. Use `--preserve image` to keep the GCE image and its GCS bucket.
 - `--force-image` on deploy deletes the existing GCE image and bucket before re-uploading. Required when changing `cc_type` on a previously uploaded image (SEV_SNP vs TDX require different guest OS features).
 - State file records the image name as a plain string (no `shared` flag).
 
-### Image Validation
+### Image Validation (not yet implemented)
 
-Deploy validates the chosen `--image` against the workload's `base-image-mode` and `base-image` list:
+Deploy should validate the chosen `--image` against the workload's `base-image-mode` and `base-image` list. The current implementation does not perform this check.
 
 ```
 base-image-mode = "whitelist"
@@ -490,6 +492,7 @@ crates/atakit-cloud/
     gcp/
       mod.rs            -- GcpProvider (plan_deploy, execute_step, plan_destroy, execute_destroy_step, ssh/serial)
       deps.rs           -- check_gcloud
+      destroy.rs        -- destroy documentation (logic lives in GcpProvider methods and per-resource modules)
       image.rs          -- ensure_bucket, upload_image, register_image, check/delete_image, delete_bucket
       firewall.rs       -- create/check/delete_firewall
       disk.rs           -- create/check/delete_disk

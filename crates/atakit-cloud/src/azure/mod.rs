@@ -133,6 +133,7 @@ impl CloudProvider for AzureProvider {
             instance_name: names.instance.clone(),
             vm_size: opts.target.vmtype.clone(),
             image_id: String::new(), // resolved at execution time
+            image_ref: opts.image_ref.clone(),
             cc_type: opts.target.cc_type,
             resource_group: names.resource_group.clone(),
             nsg: names.nsg.clone(),
@@ -360,6 +361,7 @@ impl CloudProvider for AzureProvider {
                 instance_name,
                 vm_size,
                 image_id: _,
+                image_ref,
                 cc_type,
                 resource_group,
                 nsg,
@@ -367,12 +369,11 @@ impl CloudProvider for AzureProvider {
                 disks,
                 boot_disk_size_gb,
             } => {
-                // The image_id in the step is empty - look it up from state
-                // updates (set during UploadImageAzure). We need the gallery
-                // image version ID. Reconstruct from naming.
+                // The image_id in the step is empty at plan time. Look up the
+                // gallery image version ID using the image_ref for naming.
                 let names = AzureResourceNames::for_azure(
                     instance_name,
-                    "",
+                    image_ref,
                     &self.region,
                 );
                 let image_id = image::get_image_version_id(
@@ -617,6 +618,93 @@ impl CloudProvider for AzureProvider {
             "--resource-group".to_string(),
             rg.to_string(),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CcType, CloudTarget, PlatformKind};
+    use crate::provider::{CloudProvider, DeployOptions};
+    use crate::state::PersistedAgentEnv;
+    use std::collections::BTreeMap;
+
+    fn test_target() -> CloudTarget {
+        CloudTarget {
+            platform: PlatformKind::Azure,
+            cc_type: CcType::SevSnp,
+            project: None,
+            subscription: Some("sub-123".into()),
+            region: "eastus".into(),
+            vmtype: "Standard_DC4as_v5".into(),
+            name: None,
+            metadata: BTreeMap::new(),
+            rpc_url: None,
+            session_registry: None,
+            owner_key_file: None,
+            relay_key_file: None,
+        }
+    }
+
+    fn test_deploy_opts(image_ref: &str) -> DeployOptions {
+        DeployOptions {
+            instance_name: "test-instance".into(),
+            target_name: "test-target".into(),
+            target: test_target(),
+            image_ref: image_ref.into(),
+            source_image_path: Some("/tmp/disk.vhd".into()),
+            archive_path: "/tmp/test.atawl".into(),
+            archive_hash: "abc123".into(),
+            workload_name: "test-workload".into(),
+            workload_version: "v0.0.1".into(),
+            agent_env: PersistedAgentEnv::default(),
+            metadata: BTreeMap::new(),
+            force_image: false,
+            skip_init: true,
+            workload_ports: vec![],
+            workload_disks: vec![],
+            boot_disk_size_gb: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_carries_image_ref_to_create_instance_step() {
+        let provider = AzureProvider::new("sub-123".into(), "eastus".into());
+        let opts = test_deploy_opts("automata-linux:v0.1.6");
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+
+        // Find the CreateInstanceAzure step and verify image_ref is populated.
+        let create_step = plan.steps.iter().find(|s| {
+            matches!(s, DeployStep::CreateInstanceAzure { .. })
+        });
+        assert!(create_step.is_some(), "plan must contain CreateInstanceAzure");
+
+        if let DeployStep::CreateInstanceAzure { image_ref, .. } = create_step.unwrap() {
+            assert_eq!(image_ref, "automata-linux:v0.1.6");
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_image_ref_not_empty() {
+        // Regression: before the fix, image_ref was absent from the step,
+        // causing AzureResourceNames::for_azure to be called with "" and
+        // producing an empty image_definition.
+        let provider = AzureProvider::new("sub-123".into(), "eastus".into());
+        let opts = test_deploy_opts("debug-linux:v0.2.0");
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+
+        for step in &plan.steps {
+            if let DeployStep::CreateInstanceAzure { image_ref, .. } = step {
+                assert!(
+                    !image_ref.is_empty(),
+                    "image_ref in CreateInstanceAzure must not be empty"
+                );
+            }
+        }
     }
 }
 

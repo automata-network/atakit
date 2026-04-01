@@ -326,7 +326,7 @@ All container images — regardless of source — are resolved to OCI tar archiv
 | `image = { file = "./path.tar" }` | Copy the tar into the archive. | `<service>.tar` |
 | `image = "redis:7"` | Pull from registry, export as OCI tar. | `<service>.tar` |
 
-**Service name mapping:** The workload's tar is named after `[workload] name`. When dependencies are implemented, dependency tars will be named after the dependency key (e.g. `[dependencies.redis]` produces `redis.tar`).
+**Service name mapping:** The workload's tar is named after `[workload] name`. Dependency tars are named after the dependency key (e.g. `[dependencies.redis]` produces `redis.tar`).
 
 **Why bundle registry images?** Three reasons:
 
@@ -342,22 +342,31 @@ The tradeoff is archive size. For CVM workloads where integrity and determinism 
 
 ### What Gets Measured
 
-PCR23 is a single hash that transitively covers all workload content and configuration.
+PCR23 is a single hash that transitively covers all workload content and configuration. It is computed in two steps:
+
+1. **Event hash** = `SHA-256(manifest.toml)` -- the hash of the canonical manifest bytes
+2. **Final PCR23** = `SHA-256(zeros_32 || event_hash)` -- a TPM-style PCR extend starting from an all-zeros register
+
+The event hash is what gets extended into PCR23 at workload load time. The final PCR23 register value is what gets registered on-chain as STATIC `matchData[0]` via `workload publish`.
 
 ```
-PCR23 = SHA-256(manifest.toml)
-         |
-         +-- [config]  -- canonical runtime config (ports, env, firewall, ...)
-         +-- [hashes]  -- SHA-256 of every bundled file:
-              +-- measured-data/config/hello              = sha256:cd34...
-              +-- measured-data/config/cert.pem           = sha256:ef56...
-              +-- measured-data/signing/auth_info.json    = sha256:1a2b...
-              +-- measured-data/signing/cosign_policy.json = sha256:3c4d...
-              +-- images/secure-signer.tar               = sha256:78ab...
-              +-- images/redis.tar                       = sha256:9cde...
+event_hash = SHA-256(manifest.toml)
+                      |
+                      +-- [config]  -- canonical runtime config (ports, env, firewall, ...)
+                      +-- [hashes]  -- SHA-256 of every bundled file:
+                           +-- measured-data/config/hello              = sha256:cd34...
+                           +-- measured-data/config/cert.pem           = sha256:ef56...
+                           +-- measured-data/signing/auth_info.json    = sha256:1a2b...
+                           +-- measured-data/signing/cosign_policy.json = sha256:3c4d...
+                           +-- images/secure-signer.tar               = sha256:78ab...
+                           +-- images/redis.tar                       = sha256:9cde...
+
+final_pcr23 = SHA-256(zeros_32 || event_hash)
 ```
 
-Changing any of the following changes PCR23:
+`workload info` displays both values: `SHA256` (event hash) and `PCR23` (final register value).
+
+Changing any of the following changes both the event hash and PCR23:
 - Any file under `measured-data/`
 - Any container image
 - Any runtime config field (ports, environment, restart policy, firewall rules, etc.)
@@ -390,10 +399,10 @@ At workload load time, the CVM agent:
 1. Extracts the archive
 2. Reads `manifest.toml`
 3. Verifies every `[hashes]` entry against the actual file on disk
-4. Extends PCR23 with the SHA-256 of `manifest.toml`
+4. Computes event hash = `SHA-256(manifest.toml)`, extends into PCR23: `SHA-256(current_pcr || event_hash)`
 5. Proceeds with compose generation and container startup
 
-If any hash mismatch is detected, the agent rejects the workload.
+If any hash mismatch is detected, the agent rejects the workload. The resulting PCR23 register value can be verified against the on-chain STATIC matchData.
 
 ---
 
@@ -402,7 +411,7 @@ If any hash mismatch is detected, the agent rejects the workload.
 `atakit workload build` compiles `atakit-workload.toml` into a `.atawl` archive. Conceptual steps:
 
 ```
-atakit-workload.toml  ──[atakit workload build]──>  secure-signer.atawl
+atakit-workload.toml  ──[atakit workload build]──>  secure-signer-v0.0.1.atawl
      (source)                                (compiled)
 ```
 
@@ -410,7 +419,7 @@ atakit-workload.toml  ──[atakit workload build]──>  secure-signer.atawl
 
 1. **Read** `atakit-workload.toml` and validate against the [workload TOML spec](atakit-workload-toml-spec.md).
 
-2. **Resolve images.** For the workload container (and dependencies, when implemented):
+2. **Resolve images.** For the workload container and all dependencies:
    - `build` — run the container build, export result as OCI tar. Auto-tag as `{name}:{version}`.
    - `file` — verify the tar exists, copy it.
    - Registry string — pull from registry, export as OCI tar.
@@ -427,7 +436,7 @@ atakit-workload.toml  ──[atakit workload build]──>  secure-signer.atawl
 
 6. **Generate `manifest.toml`.** Assemble `[meta]`, `[config]`, `[disks]`, and `[hashes]` sections.
 
-7. **Create archive.** Package into `<name>.atawl` (tar.zst):
+7. **Create archive.** Package into `<name>-<version>.atawl` (tar.zst):
    ```
    <name>/manifest.toml
    <name>/measured-data/...
@@ -464,7 +473,7 @@ Done. SHA-256: ab12cd34...
 | **Build metadata** | Present (`build`, `containerfile`, `args`) | Stripped |
 | **env_file** | External file references | Inlined into `[config.environment]` |
 | **Content hashes** | Not present | `[hashes]` with SHA-256 |
-| **Deployments** | Optional `[deployments]` section | Not present |
+| **Deployment targets** | Not present (lives in operator `config.toml`) | Not present |
 | **unmeasured-data** | Files listed, must describe what operators provide | Paths listed for mount setup, files not bundled |
 
 The relationship is analogous to source code and a compiled binary. The source is human-friendly and flexible; the compiled form is machine-friendly and deterministic.

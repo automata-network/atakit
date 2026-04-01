@@ -32,10 +32,11 @@ Domain logic for public image management (ls, pull, rm). Core API is always avai
 
 - **Error types** -- `ImageError` enum via `thiserror`
 - **Domain types** -- `ImageRef`, `Platform`, `AssetKind`, `Release`, `Asset`, `VersionSelector`
-- **GitHub client** -- `ReleasesClient` for GitHub Releases API (with optional token auth)
+- **GitHub client** -- `ReleasesClient` for GitHub Releases API (with optional token auth). All methods take full `owner/repo` path.
 - **Download logic** -- download + decompress using `&dyn ProgressReporter`
-- **Local store** -- `ImageStore` for local disk management (does NOT own a `ReleasesClient`)
-- **CLI arg structs** -- (behind `cli` feature) `ImageCommand`, `LsArgs`, `PullArgs`, `RmArgs`
+- **Local store** -- `ImageStore` for local disk management (does NOT own a `ReleasesClient`). `list()` takes both `github_repo` (for API) and `local_name` (for store lookups). `download()` takes `github_repo` for API calls.
+- **Archive functions** -- `create_image_archive`, `import_image_archive`, `read_manifest`. Import compresses Azure VHD files to zstd for local storage.
+- **CLI arg structs** -- (behind `cli` feature) `ImageCommand`, `LsArgs`, `PullArgs`, `RmArgs`, `ExportArgs`, `ImportArgs`
 
 ### atakit-workload
 
@@ -75,6 +76,7 @@ Cloud deployment logic. Clap structs behind a `cli` feature flag.
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
+- **Config** -- `Config` loads optional `config.toml`. `ImageConfig` with `repositories` (accepts string or array via `deserialize_string_or_vec`). `repo_local_name()` extracts local store name from `owner/repo`.
 - **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `export`, `import`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`. Cloud: `deploy`, `destroy`, `status`, `list`, `ssh`, `serial`, `upload_image`, `init`.
 - **External subcommand delegation** -- unknown subcommands are delegated to `atakit-<name>` binaries on PATH (e.g. `atakit imgbuild` runs `atakit-imgbuild`).
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.

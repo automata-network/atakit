@@ -252,3 +252,81 @@ fn build_result(manifest_raw: String) -> Result<InspectResult, WorkloadError> {
         manifest_raw,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal manifest TOML that parses successfully.
+    fn minimal_manifest() -> String {
+        r#"
+[meta]
+format = 1
+name = "test"
+version = "v0.0.1"
+
+[config]
+image = "test:v0.0.1"
+base-image-mode = "blacklist"
+
+[hashes]
+"images/test.tar" = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn event_hash_and_pcr23_are_distinct() {
+        let result = build_result(minimal_manifest()).unwrap();
+        assert_ne!(
+            result.sha256, result.pcr23,
+            "event hash (sha256) and final PCR23 must be different values"
+        );
+    }
+
+    #[test]
+    fn pcr23_is_extend_of_event_hash() {
+        let manifest = minimal_manifest();
+        let result = build_result(manifest.clone()).unwrap();
+
+        // Recompute independently.
+        let event_hash = {
+            let mut h = Sha256::new();
+            h.update(manifest.as_bytes());
+            h.finalize()
+        };
+        let expected_pcr23 = {
+            let mut h = Sha256::new();
+            h.update([0u8; 32]);
+            h.update(event_hash);
+            format!("0x{:x}", h.finalize())
+        };
+
+        assert_eq!(result.pcr23, expected_pcr23);
+        assert_eq!(result.sha256, format!("0x{:x}", event_hash));
+    }
+
+    #[test]
+    fn sha256_is_event_hash_not_pcr23() {
+        // Regression: pull --verify previously compared sha256 (event hash)
+        // against on-chain matchData (final PCR). This test documents that
+        // sha256 and pcr23 fields have different semantics.
+        let result = build_result(minimal_manifest()).unwrap();
+
+        // sha256 starts with "0x" and is 66 chars (0x + 64 hex digits)
+        assert!(result.sha256.starts_with("0x"));
+        assert_eq!(result.sha256.len(), 66);
+
+        // pcr23 starts with "0x" and is 66 chars
+        assert!(result.pcr23.starts_with("0x"));
+        assert_eq!(result.pcr23.len(), 66);
+
+        // manifest_hash uses "sha256:" prefix (different format)
+        assert!(result.manifest_hash.starts_with("sha256:"));
+
+        // The hex digits of sha256 and manifest_hash must match
+        let sha256_hex = result.sha256.strip_prefix("0x").unwrap();
+        let manifest_hex = result.manifest_hash.strip_prefix("sha256:").unwrap();
+        assert_eq!(sha256_hex, manifest_hex);
+    }
+}

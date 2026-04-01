@@ -37,10 +37,11 @@ The top-level directory is the repository name. This matches the image store lay
 
 ### Naming Convention
 
-Archive files are named `{repository}-{tag}.atabi`. Examples:
+Archive files are named `{repository}-{tag}-{platforms}.atabi` where `{platforms}` is `all` (when all platforms are included) or dash-joined platform names sorted alphabetically. Examples:
 
-- `automata-linux-v0.1.6.atabi`
-- `automata-linux-v0.5.0-debug.atabi`
+- `automata-linux-v0.1.6-all.atabi` -- contains all platforms
+- `automata-linux-v0.1.6-gcp.atabi` -- contains only GCP
+- `automata-linux-v0.1.6-aws-azure.atabi` -- contains AWS and Azure
 
 ---
 
@@ -85,13 +86,15 @@ platforms = ["gcp"]
 
 Each platform has a fixed filename:
 
-| Platform | Filename | Format |
-|---|---|---|
-| GCP | `gcp_disk.tar.gz` | Compressed raw disk |
-| AWS | `aws_disk.vmdk` | VMDK disk image |
-| Azure | `azure_disk.vhd` | VHD disk image |
+| Platform | Filename (in archive) | Filename (in store) | Format |
+|---|---|---|---|
+| GCP | `gcp_disk.tar.gz` | `gcp_disk.tar.gz` | Compressed raw disk |
+| AWS | `aws_disk.vmdk` | `aws_disk.vmdk` | VMDK disk image |
+| Azure | `azure_disk.vhd` | `azure_disk.vhd.zst` | VHD disk image |
 
 Only platforms listed in `manifest.toml`'s `platforms` field have corresponding files in `disk_images/`. The `platforms` field reflects what is actually present in the archive.
+
+Note: Azure VHD files are stored uncompressed in the archive but compressed to zstd (`azure_disk.vhd.zst`) during import into the local store. Azure deploy decompresses to a temp file before upload.
 
 ---
 
@@ -116,6 +119,7 @@ The image store organizes files under `<base_dir>/<repository>/<tag>/`:
     v0.1.6/
       disk_images/
         gcp_disk.tar.gz
+        azure_disk.vhd.zst
       secure_boot_certs/
         PK.crt
         KEK.crt
@@ -160,7 +164,7 @@ automata-linux-v0.1.6-gcp.atabi (tar.zst)
 The target's platform determines which disk image file is selected from the store:
 
 - Target `platform = "gcp"` selects `disk_images/gcp_disk.tar.gz`
-- Target `platform = "azure"` selects `disk_images/azure_disk.vhd.zst` (decompressed to temp file before upload)
+- Target `platform = "azure"` selects `disk_images/azure_disk.vhd.zst` from the local store (decompressed to temp file before upload)
 
 ---
 

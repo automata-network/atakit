@@ -12,7 +12,7 @@ The on-chain [WorkloadRegistry](cvm-registry/) is the authority for workload spe
 
 **Archive.** An `.atawl` file (tar.zst) containing `manifest.toml`, `measured-data/`, and `images/`. See [atawl-archive-spec.md](atawl-archive-spec.md).
 
-**Integrity model.** PCR23 = SHA-256 of `manifest.toml`, registered on-chain as STATIC matchData. The registry verifies that uploaded archives match the on-chain PCR23 before accepting them.
+**Integrity model.** The event hash = SHA-256 of `manifest.toml`. The final PCR23 = `SHA-256(zeros_32 || event_hash)`. The final PCR23 is registered on-chain as STATIC matchData. The registry verifies that uploaded archives match the on-chain PCR23 before accepting them.
 
 ## Data Model
 
@@ -24,7 +24,7 @@ Per-workload stored data:
 | `name` | string | manifest.toml `[meta]` | Workload name |
 | `version` | string | manifest.toml `[meta]` | Workload version |
 | `owner` | bytes32 | On-chain query at upload | Owner public key fingerprint |
-| `sha256` | bytes32 | SHA-256 of manifest.toml | Content integrity hash |
+| `sha256` | bytes32 | SHA-256 of manifest.toml | Event hash (manifest content integrity). Not the final PCR23 value. |
 | `archive_size` | u64 | Computed | Size of .atawl in bytes |
 | `archive_hash` | string | Computed | SHA-256 of entire .atawl file |
 | `uploaded_at` | timestamp | Server time | When the archive was uploaded |
@@ -43,14 +43,15 @@ Registry verification steps:
 
 1. Parse `workload_id` from URL (hex-encoded bytes32, with or without `0x` prefix)
 2. Read archive, locate and extract `manifest.toml`
-3. Compute PCR23 = SHA-256(manifest.toml)
-4. Parse manifest: extract `name` and `version` from `[meta]`
-5. Derive workload ID from name+version, verify it matches the URL parameter
-6. Query on-chain: `get_workload_spec(workload_id)` - must exist
-7. Verify on-chain spec's PCR23 matches computed PCR23 (the STATIC matchData for pcrIndex 23)
-8. Query on-chain: `get_workload_owner(workload_id)` - store owner fingerprint as metadata
-9. Compute archive hash (SHA-256 of entire file)
-10. Store blob and metadata atomically
+3. Compute event hash = SHA-256(manifest.toml)
+4. Compute final PCR23 = SHA-256(zeros_32 || event_hash)
+5. Parse manifest: extract `name` and `version` from `[meta]`
+6. Derive workload ID from name+version, verify it matches the URL parameter
+7. Query on-chain: `get_workload_spec(workload_id)` - must exist
+8. Verify on-chain spec's STATIC matchData for pcrIndex 23 matches the computed final PCR23
+9. Query on-chain: `get_workload_owner(workload_id)` - store owner fingerprint as metadata
+10. Compute archive hash (SHA-256 of entire file)
+11. Store blob and metadata atomically
 
 Responses:
 

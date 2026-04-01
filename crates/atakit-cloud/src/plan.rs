@@ -105,6 +105,8 @@ pub enum DeployStep {
         instance_name: String,
         vm_size: String,
         image_id: String,
+        /// Original image ref (e.g. "automata-linux:v0.1.6") for resource naming.
+        image_ref: String,
         cc_type: CcType,
         resource_group: String,
         nsg: String,

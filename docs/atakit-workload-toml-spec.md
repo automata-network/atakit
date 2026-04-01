@@ -1,6 +1,6 @@
 # `atakit-workload.toml` Specification
 
-One file per workload per directory. Defines everything: workload metadata, its container, dependencies, storage, and deployment targets.
+One file per workload per directory. Defines everything: workload metadata, its container, dependencies, and storage.
 
 ## Design Principles
 
@@ -343,7 +343,7 @@ These compose features are intentionally excluded. The CVM runtime controls thes
 
 ### Image
 
-- String form: must be a valid image reference (`name:tag` or `registry/name:tag`)
+- String form: must not be empty
 - Build table: `build` (context path) is required, `containerfile` and `args` are optional
 - File table: `file` path must end in `.tar` or `.tar.gz` and exist at build time
 - Build and file tables are mutually exclusive (cannot have both `build` and `file` keys)
@@ -496,7 +496,7 @@ Done. You can delete atakit.json, ./container/compose.yml, and cvm_agent_policy.
 | `atakit.json` → `workloads[0].name/version` | `[workload]` `name`, `version` |
 | `atakit.json` → `workloads[0].image` | `[workload]` `base-image` (now a list with mode) |
 | `atakit.json` → `disks[]` | `[disks.*]` |
-| `atakit.json` → `deployment` | `[deployments.*]` |
+| `atakit.json` → `deployment` | *(moved to operator `config.toml` `[cloud.targets.*]`)* |
 | `compose.yml` → main service | `[workload]` container fields |
 | `compose.yml` → other services | `[dependencies.*]` |
 | `compose.yml` → `build` / `image` | `image` field (string, build table, or file table) |
