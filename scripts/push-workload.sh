@@ -94,7 +94,7 @@ while true; do
         die "timed out after ${WAIT_TIMEOUT}s waiting for agent"
     fi
 
-    if curl -sk --connect-timeout 5 --max-time 10 "${AGENT_URL}/" >/dev/null 2>&1; then
+    if curl -sk --connect-timeout 5 --max-time 10 "${AGENT_URL}/platform-measurements" >/dev/null 2>&1; then
         echo "Agent reachable (${elapsed}s)"
         break
     fi

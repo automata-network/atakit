@@ -78,8 +78,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Optionally verify against on-chain spec
     if args.verify {
-        println!("Verifying SHA256 against on-chain spec...");
-        verify_sha256(&workload_id_hex, sha256, config).await?;
+        println!("Verifying PCR23 against on-chain spec...");
+        verify_pcr23(&workload_id_hex, pcr23, config).await?;
     }
 
     // Import blob from temp file into store
@@ -123,7 +123,11 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn verify_sha256(workload_id_hex: &str, sha256: &str, config: &Config) -> Result<()> {
+/// Verify the archive's PCR23 (final register value) against on-chain matchData.
+///
+/// On-chain STATIC matchData for PCR23 contains the final PCR value
+/// (SHA-256(zeros_32 || event_hash)), which matches `InspectResult.pcr23`.
+async fn verify_pcr23(workload_id_hex: &str, pcr23: &str, config: &Config) -> Result<()> {
     let rpc_url = config
         .publish
         .rpc_url
@@ -162,23 +166,23 @@ async fn verify_sha256(workload_id_hex: &str, sha256: &str, config: &Config) -> 
         .await
         .context("failed to query on-chain spec")?;
 
-    // Find PCR23 in the spec
-    let on_chain_sha256 = spec
+    // Find PCR23 in the spec. matchData[0] is the final PCR register value.
+    let on_chain_pcr23 = spec
         .pcrs
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| p.matchData.first())
         .map(|b| format!("0x{}", hex::encode(b)));
 
-    if let Some(ref expected) = on_chain_sha256 {
-        if expected != sha256 {
+    if let Some(ref expected) = on_chain_pcr23 {
+        if expected != pcr23 {
             anyhow::bail!(
-                "SHA256 mismatch: archive={sha256}, on-chain={expected}"
+                "PCR23 mismatch: archive={pcr23}, on-chain={expected}"
             );
         }
-        println!("  SHA256 verified: {}", "match".green());
+        println!("  PCR23 verified: {}", "match".green());
     } else {
-        println!("  {}", "No SHA256 found in on-chain spec.".yellow());
+        println!("  {}", "No PCR23 found in on-chain spec.".yellow());
     }
 
     Ok(())

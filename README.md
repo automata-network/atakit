@@ -40,6 +40,9 @@ atakit image ls
 # Include remote (GitHub Releases) images
 atakit image ls --remote
 
+# Query a specific GitHub repository
+atakit image ls --remote --repo automata-network/debug-linux
+
 # Pull an image for a specific platform
 atakit image pull automata-linux:v0.1.6 gcp
 
@@ -80,7 +83,10 @@ Requires a configured target in `config.toml` (see [Configuration](#configuratio
 
 ```sh
 # Deploy a workload to a cloud CVM
-atakit cloud deploy my-instance my-service:v0.0.1 --target my-gcp
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6
+
+# Deploy with a custom instance name
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6 --name my-instance
 
 # Upload a base image to the cloud without deploying
 atakit cloud upload-image automata-linux:v0.1.6 --target my-gcp
@@ -111,9 +117,18 @@ atakit cloud destroy my-instance --target my-gcp
 Located at `$XDG_CONFIG_HOME/atakit/config.toml`:
 
 ```toml
-[cloud]
+[image]
+# GitHub repositories for image commands (owner/repo format)
+repositories = ["automata-network/automata-linux"]
+
+[publish]
 rpc_url = "https://..."
 session_registry = "0x..."
+# owner_key_file = "~/.config/atakit/owner_key"
+# relay_key_file = "~/.config/atakit/relay_key"
+
+[cloud]
+# Falls back to [publish] for rpc_url, session_registry, key files
 
 [cloud.targets.my-gcp]
 platform = "gcp"

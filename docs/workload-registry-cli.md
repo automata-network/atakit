@@ -139,9 +139,9 @@ Remove a workload from the local store.
 |------|-------------|
 | `--blob-only` | Remove only the archive blob, keep metadata |
 
-### `atakit workload build --store`
+### `atakit workload build`
 
-New `--store` flag on the existing build command. After a successful build, imports the archive into the local store.
+Build always imports the archive into the local store by default. Use `--no-store` to skip the import step.
 
 ### Store refs in existing commands
 
@@ -152,8 +152,8 @@ New `--store` flag on the existing build command. After a successful build, impo
 ### Provider workflow
 
 ```
-# 1. Build and import to store
-atakit workload build --store
+# 1. Build (automatically imports to store)
+atakit workload build
 
 # 2. Register on-chain
 atakit workload publish secure-signer:v0.0.1 --owner-key ... --relay-key ...
@@ -177,8 +177,8 @@ atakit workload pull secure-signer:v0.0.1 --verify
 # 3. Inspect locally
 atakit workload info secure-signer:v0.0.1
 
-# 4. Deploy to CVM (future)
-atakit cloud deploy --workload secure-signer:v0.0.1 --image automata-linux:v0.1.6
+# 4. Deploy to CVM
+atakit cloud deploy secure-signer:v0.0.1 --target my-gcp --image automata-linux:v0.1.6
 ```
 
 ### Tracking on-chain workloads
