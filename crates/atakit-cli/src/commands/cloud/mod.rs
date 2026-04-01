@@ -354,7 +354,8 @@ fn collect_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<Stri
 }
 
 /// Walk a workload directory and return the first file newer than `threshold`.
-/// Skips `.git`, `target`, and `.atawl` files.
+/// Skips `.git`, `target`, and `.atawl` files. Only compares file mtimes,
+/// not directory mtimes (directories update on unrelated changes like new files).
 fn find_newer_source(
     dir: &std::path::Path,
     threshold: &std::time::SystemTime,
@@ -363,24 +364,21 @@ fn find_newer_source(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Skip directories that aren't workload sources.
-        if name_str == ".git" || name_str == "target" || name_str == ".claude" {
+        if name_str == ".git" || name_str == "target" || name_str == ".claude" || name_str == ".codex" {
             continue;
         }
-        // Skip the archive files themselves.
         if name_str.ends_with(".atawl") {
             continue;
         }
         let path = entry.path();
         if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(mtime) = meta.modified() {
-                if mtime > *threshold {
-                    return Some(path);
-                }
-            }
             if meta.is_dir() {
                 if let Some(found) = find_newer_source(&path, threshold) {
                     return Some(found);
+                }
+            } else if let Ok(mtime) = meta.modified() {
+                if mtime > *threshold {
+                    return Some(path);
                 }
             }
         }

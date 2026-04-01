@@ -94,18 +94,23 @@ pub fn validate_config(
         )));
     }
 
-    // ── base-image entries ───────────────────────────────
+    // ── base-image entries (must be name:version, no / in name) ──
     for entry in &w.base_image {
-        if entry.split_once(':').is_none() {
+        let Some((name, version)) = entry.split_once(':') else {
             return Err(WorkloadError::Validation(format!(
                 "base-image entry must be name:version format, got {:?}",
                 entry,
             )));
-        }
-        let (name, version) = entry.split_once(':').unwrap();
+        };
         if name.is_empty() || version.is_empty() {
             return Err(WorkloadError::Validation(format!(
                 "base-image entry has empty name or version: {:?}",
+                entry,
+            )));
+        }
+        if name.contains('/') {
+            return Err(WorkloadError::Validation(format!(
+                "base-image name must not contain '/': {:?}",
                 entry,
             )));
         }
