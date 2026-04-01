@@ -16,6 +16,8 @@ use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
 use atakit_workload::WorkloadStore;
 
+use owo_colors::OwoColorize;
+
 use crate::config::PublishConfig;
 
 /// Resolve agent env fields with precedence: CLI > target > [cloud] > [publish].
@@ -199,6 +201,14 @@ pub(super) struct ResolvedWorkload {
     pub disks: BTreeMap<String, (u32, String)>,
     /// Minimum boot/OS disk size (e.g. "50GB"). None = cloud default.
     pub boot_disk_size: Option<String>,
+    /// Base image access control mode: "any", "whitelist", or "blacklist".
+    pub base_image_mode: String,
+    /// Base image references for whitelist/blacklist filtering.
+    pub base_image: Vec<String>,
+    /// Paths listed in the manifest's unmeasured-data (archive-relative, no ./ prefix).
+    pub unmeasured_data: Vec<String>,
+    /// Workload source directory (available in dir mode, None for store-ref/file modes).
+    pub workload_dir: Option<PathBuf>,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -234,6 +244,10 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 ports: collect_firewall_ports(&result.manifest),
                 disks,
                 boot_disk_size: result.manifest.config.boot_disk_size,
+                base_image_mode: result.manifest.config.base_image_mode,
+                base_image: result.manifest.config.base_image,
+                unmeasured_data: result.manifest.config.unmeasured_data,
+                workload_dir: None,
             });
         }
 
@@ -262,6 +276,10 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             ports,
             disks,
             boot_disk_size: result.manifest.config.boot_disk_size,
+            base_image_mode: result.manifest.config.base_image_mode,
+            base_image: result.manifest.config.base_image,
+            unmeasured_data: result.manifest.config.unmeasured_data,
+            workload_dir: None,
         });
     }
 
@@ -294,6 +312,10 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         ports,
         disks,
         boot_disk_size: result.manifest.config.boot_disk_size,
+        base_image_mode: result.manifest.config.base_image_mode,
+        base_image: result.manifest.config.base_image,
+        unmeasured_data: result.manifest.config.unmeasured_data,
+        workload_dir: Some(workload_dir),
     })
 }
 
@@ -307,6 +329,129 @@ fn collect_firewall_ports(m: &atakit_workload::manifest::Manifest) -> Vec<String
         .iter()
         .map(|fp| format!("{}/{}", fp.port, fp.protocol))
         .collect()
+}
+
+/// Validate that the given image ref is allowed by the workload's base-image policy.
+pub(super) fn validate_base_image(
+    image_display_name: &str,
+    base_image_mode: &str,
+    base_image: &[String],
+) -> Result<()> {
+    match base_image_mode {
+        "any" => {}
+        "whitelist" => {
+            if !base_image.iter().any(|b| b == image_display_name) {
+                bail!(
+                    "image '{}' is not in the workload's base-image whitelist: [{}]",
+                    image_display_name,
+                    base_image.join(", "),
+                );
+            }
+        }
+        "blacklist" => {
+            if base_image.iter().any(|b| b == image_display_name) {
+                bail!(
+                    "image '{}' is blacklisted by the workload",
+                    image_display_name,
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Collect unmeasured-data files from a workload directory into a gzipped tar.
+///
+/// `paths` are archive-relative (no `./` prefix, e.g. `"runtime-data/key.pem"`).
+/// Files are resolved under `workload_dir` with a `./` prefix re-added.
+/// Returns `None` if no files are found. Warns about missing files.
+pub(super) fn collect_unmeasured_tar(
+    paths: &[String],
+    workload_dir: &std::path::Path,
+) -> Result<Option<Vec<u8>>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut found_any = false;
+    let buf = Vec::new();
+    let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+    let mut tar = tar::Builder::new(encoder);
+
+    for rel_path in paths {
+        // Manifest stores paths without ./ prefix. The source files live at
+        // workload_dir/./path (the original config used ./ relative paths).
+        let src = workload_dir.join(rel_path);
+        if !src.exists() {
+            eprintln!(
+                "  {}: unmeasured-data file not found: {}",
+                "warning".yellow(),
+                src.display(),
+            );
+            continue;
+        }
+
+        if src.is_file() {
+            let metadata = std::fs::metadata(&src)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len());
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            let file = std::fs::File::open(&src)?;
+            tar.append_data(&mut header, rel_path, file)?;
+            found_any = true;
+        } else if src.is_dir() {
+            append_dir_recursive(&mut tar, &src, rel_path)?;
+            found_any = true;
+        }
+    }
+
+    if !found_any {
+        return Ok(None);
+    }
+
+    let encoder = tar.into_inner()?;
+    let bytes = encoder.finish()?;
+    Ok(Some(bytes))
+}
+
+/// Recursively append a directory to a tar archive.
+fn append_dir_recursive<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    src_dir: &std::path::Path,
+    archive_prefix: &str,
+) -> Result<()> {
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let child_src = entry.path();
+        let child_name = child_src
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let child_archive = format!("{archive_prefix}/{child_name}");
+        let ft = entry.file_type()?;
+
+        if ft.is_file() {
+            let metadata = std::fs::metadata(&child_src)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len());
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            let file = std::fs::File::open(&child_src)?;
+            tar.append_data(&mut header, &child_archive, file)?;
+        } else if ft.is_dir() {
+            append_dir_recursive(tar, &child_src, &child_archive)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse metadata key=value strings into a map.

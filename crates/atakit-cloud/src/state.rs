@@ -127,6 +127,8 @@ pub struct NewDeployParams {
     pub archive_path: String,
     pub archive_hash: String,
     pub agent_env: PersistedAgentEnv,
+    /// Total number of steps in the deployment plan.
+    pub total_steps: u32,
 }
 
 impl DeployState {
@@ -142,7 +144,7 @@ impl DeployState {
             platform: params.platform,
             created_at: now,
             updated_at: now,
-            status: DeployStatus::Deploying { step: 0, total: 7 },
+            status: DeployStatus::Deploying { step: 0, total: params.total_steps },
             image_ref: params.image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
@@ -418,6 +420,7 @@ mod tests {
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             agent_env: PersistedAgentEnv::default(),
+            total_steps: 7,
         });
         state.resources.gcp = Some(GcpResources {
             project: "my-project".into(),
@@ -456,6 +459,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             agent_env: PersistedAgentEnv::default(),
+            total_steps: 7,
         });
         state.save(dir.path()).unwrap();
 
@@ -478,6 +482,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 agent_env: PersistedAgentEnv::default(),
+                total_steps: 7,
             });
             state.save(dir.path()).unwrap();
         }
@@ -500,6 +505,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 agent_env: PersistedAgentEnv::default(),
+                total_steps: 7,
             });
             state.save(dir.path()).unwrap();
         }
@@ -521,6 +527,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             agent_env: PersistedAgentEnv::default(),
+            total_steps: 7,
         });
         state.save(dir.path()).unwrap();
 

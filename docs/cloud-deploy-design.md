@@ -270,11 +270,9 @@ During `workload build`:
 
 Gap: no mechanism delivers the actual files to the CVM.
 
-### Proposed Solution (not yet implemented)
+### Solution
 
-The `post_init` function accepts an optional `unmeasured_tar` parameter, but the deploy flow does not yet collect and send unmeasured-data files. The plan below describes the intended behavior.
-
-Deploy collects unmeasured-data files from the workload directory and includes them in the init POST.
+Deploy collects unmeasured-data files from the workload directory and includes them in the init POST. This is only available in dir mode (where the workload source directory is known). Store-ref and file modes warn if the manifest declares unmeasured-data but no workload directory is available.
 
 **During deploy (atakit-ng side):**
 
@@ -338,9 +336,9 @@ Cloud compute images (the base CVM boot disk) are scoped to the cloud project, n
 - `--force-image` on deploy deletes the existing GCE image and bucket before re-uploading. Required when changing `cc_type` on a previously uploaded image (SEV_SNP vs TDX require different guest OS features).
 - State file records the image name as a plain string (no `shared` flag).
 
-### Image Validation (not yet implemented)
+### Image Validation
 
-Deploy should validate the chosen `--image` against the workload's `base-image-mode` and `base-image` list. The current implementation does not perform this check.
+Deploy validates the chosen `--image` against the workload's `base-image-mode` and `base-image` list when the image is specified as a `repository:tag` reference (not a bare cloud image name):
 
 ```
 base-image-mode = "whitelist"
