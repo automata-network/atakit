@@ -51,6 +51,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 		if let Some(ref wdir) = resolved.workload_dir {
 			collect_unmeasured_tar(&resolved.unmeasured_data, wdir)?
 		} else {
+			eprintln!(
+				"  {}: workload declares unmeasured-data but no workload directory available (store-ref/file mode)",
+				"warning".yellow(),
+			);
 			None
 		}
 	} else {
