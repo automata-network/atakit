@@ -136,7 +136,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	let image_ref = &resolved_image.display_name;
 
 	// 8b. Validate image against workload's base-image policy.
-	if !image_only && image_ref.contains(':') {
+	if !image_only {
 		validate_base_image(image_ref, &base_image_mode, &base_image_list)?;
 	}
 
