@@ -205,7 +205,8 @@ pub(super) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// Paths listed in the manifest's unmeasured-data (archive-relative, no ./ prefix).
+    /// All unmeasured-data paths from the manifest (workload + dependencies, deduplicated).
+    /// Archive-relative, no ./ prefix.
     pub unmeasured_data: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
@@ -237,16 +238,18 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             let disks = result.manifest.disks.iter()
                 .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
                 .collect();
+            let ports = collect_firewall_ports(&result.manifest);
+            let unmeasured = collect_unmeasured_paths(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 name,
                 version,
-                ports: collect_firewall_ports(&result.manifest),
+                ports,
                 disks,
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
-                unmeasured_data: result.manifest.config.unmeasured_data,
+                unmeasured_data: unmeasured,
                 workload_dir: None,
             });
         }
@@ -269,6 +272,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
+        let unmeasured = collect_unmeasured_paths(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
@@ -278,7 +282,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
-            unmeasured_data: result.manifest.config.unmeasured_data,
+            unmeasured_data: unmeasured,
             workload_dir: None,
         });
     }
@@ -305,6 +309,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     let disks = result.manifest.disks.iter()
         .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
         .collect();
+    let unmeasured = collect_unmeasured_paths(&result.manifest);
     Ok(ResolvedWorkload {
         archive_path,
         name: result.manifest.meta.name,
@@ -314,9 +319,24 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
-        unmeasured_data: result.manifest.config.unmeasured_data,
+        unmeasured_data: unmeasured,
         workload_dir: Some(workload_dir),
     })
+}
+
+/// Collect all unmeasured-data paths from a manifest (workload + dependencies, deduplicated).
+fn collect_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
+    let mut paths: Vec<String> = m.config.unmeasured_data.clone();
+    if let Some(ref deps) = m.config.dependencies {
+        for dep in deps.values() {
+            for p in &dep.unmeasured_data {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Collect resolved firewall ports from a manifest as `"port/proto"` strings.
@@ -337,10 +357,32 @@ pub(super) fn validate_base_image(
     base_image_mode: &str,
     base_image: &[String],
 ) -> Result<()> {
+    if base_image_mode == "any" {
+        return Ok(());
+    }
+
+    // Every entry must parse as a valid ImageRef (repository:tag).
+    for entry in base_image {
+        if entry.parse::<ImageRef>().is_err() {
+            bail!(
+                "invalid base-image entry '{}': must be repository:tag format \
+                 (e.g. 'automata-linux:v0.1.6')",
+                entry,
+            );
+        }
+    }
+
     match base_image_mode {
-        "any" => {}
         "whitelist" => {
+            // Empty whitelist = nothing allowed.
             if !base_image.iter().any(|b| b == image_display_name) {
+                if base_image.is_empty() {
+                    bail!(
+                        "image '{}' rejected: base-image-mode is 'whitelist' but \
+                         base-image list is empty (no images are allowed)",
+                        image_display_name,
+                    );
+                }
                 bail!(
                     "image '{}' is not in the workload's base-image whitelist: [{}]",
                     image_display_name,
@@ -379,6 +421,8 @@ pub(super) fn collect_unmeasured_tar(
     let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(encoder);
 
+    let canon_base = workload_dir.canonicalize()?;
+
     for rel_path in paths {
         // Manifest stores paths without ./ prefix. The source files live at
         // workload_dir/./path (the original config used ./ relative paths).
@@ -390,6 +434,16 @@ pub(super) fn collect_unmeasured_tar(
                 src.display(),
             );
             continue;
+        }
+
+        // Resolve symlinks and verify the real path stays within the workload dir.
+        let canon_src = src.canonicalize()?;
+        if !canon_src.starts_with(&canon_base) {
+            bail!(
+                "unmeasured-data path '{}' resolves outside workload directory: {}",
+                rel_path,
+                canon_src.display(),
+            );
         }
 
         if src.is_file() {

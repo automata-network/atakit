@@ -26,9 +26,10 @@ version = "v0.0.1"
 # (ANY is not exposed here; use "blacklist" with an empty list for the same effect.)
 base-image-mode = "blacklist"
 
-# base-image: list of base image IDs (hex bytes32) for the whitelist/blacklist.
-# These are matched against BaseImageRegistry entries on-chain.
-# base-image = ["0xabc123..."]
+# base-image: list of base image references (name:version) for the whitelist/blacklist.
+# Used by `cloud deploy` to validate the --image argument locally.
+# On-chain, `workload publish --base-image-id` takes the hex bytes32 IDs separately.
+# base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
 
 # ttl: session TTL in seconds. Determines how long a CVM session remains
 # valid after attestation. Default: 0 (contract default, 30 days).
