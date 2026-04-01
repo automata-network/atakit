@@ -296,6 +296,24 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         );
     }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
+
+    // Check if the source config is newer than the archive.
+    let config_path = workload_dir.join("atakit-workload.toml");
+    if let (Ok(archive_meta), Ok(config_meta)) =
+        (std::fs::metadata(&archive_path), std::fs::metadata(&config_path))
+    {
+        if let (Ok(archive_mtime), Ok(config_mtime)) =
+            (archive_meta.modified(), config_meta.modified())
+        {
+            if config_mtime > archive_mtime {
+                bail!(
+                    "atakit-workload.toml is newer than {} - run 'atakit workload build' first",
+                    archive_path.display(),
+                );
+            }
+        }
+    }
+
     let inspect_opts = atakit_workload::InspectOptions {
         archive: Some(archive_path.clone()),
         workload_dir: None,
@@ -398,7 +416,12 @@ pub(super) fn validate_base_image(
                 );
             }
         }
-        _ => {}
+        other => {
+            bail!(
+                "invalid base-image-mode '{}': expected 'any', 'whitelist', or 'blacklist'",
+                other,
+            );
+        }
     }
     Ok(())
 }
