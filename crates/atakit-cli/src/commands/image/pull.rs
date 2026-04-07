@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform, PullArgs, ReleasesClient};
 
@@ -6,9 +6,6 @@ use crate::config::{Config, repo_local_name};
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
-    let github_repo = config.image.primary_repo();
-    let local_name = repo_local_name(github_repo);
-
     let platforms = match &args.csps {
         Some(s) => parse_platforms(s)?,
         None => match &config.image.platforms {
@@ -24,13 +21,40 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     };
     let progress = IndicatifReporter;
 
-    let image_ref = match args.image {
-        Some(i) => i,
+    // Resolve the GitHub repository to query. When the user specifies an
+    // image reference, its repository component (e.g. "dev-baseimage") maps
+    // to a configured `owner/repo` entry whose local name matches. Without
+    // this mapping, pull would always query the primary repo regardless of
+    // which image the user asked for.
+    let (github_repo, image_ref) = match args.image {
+        Some(image_ref) => {
+            let github_repo = config
+                .image
+                .find_repo_by_local_name(&image_ref.repository)
+                .ok_or_else(|| {
+                    let configured: Vec<String> = config
+                        .image
+                        .repos()
+                        .iter()
+                        .map(|r| format!("  - {r}"))
+                        .collect();
+                    anyhow!(
+                        "no configured repository matches '{}'. Configured repositories:\n{}",
+                        image_ref.repository,
+                        configured.join("\n"),
+                    )
+                })?
+                .to_string();
+            (github_repo, image_ref)
+        }
         None => {
+            let github_repo = config.image.primary_repo().to_string();
+            let local_name = repo_local_name(&github_repo).to_string();
             println!("No image specified, finding latest image release...");
-            let release = client.find_latest_image_release(github_repo).await?;
+            let release = client.find_latest_image_release(&github_repo).await?;
             println!("Using {local_name}:{}", release.tag_name);
-            ImageRef::new(local_name, &release.tag_name)
+            let image_ref = ImageRef::new(local_name, release.tag_name);
+            (github_repo, image_ref)
         }
     };
 
@@ -38,7 +62,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     println!("Pulling {} image(s) for {image_ref}...", names.join(", "));
 
     let paths = store
-        .download(&client, github_repo, &image_ref, &platforms, &progress)
+        .download(&client, &github_repo, &image_ref, &platforms, &progress)
         .await?;
     for path in &paths {
         println!("  {}", path.display());

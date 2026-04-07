@@ -58,6 +58,17 @@ impl ImageConfig {
     pub fn primary_repo(&self) -> &str {
         self.repositories.first().map_or("", |s| s.as_str())
     }
+
+    /// Find a configured GitHub repository whose local name (portion after
+    /// the last `/`) matches `name`. Used by `image pull` to resolve the
+    /// repository component of an image reference back to a full
+    /// `owner/repo` path.
+    pub fn find_repo_by_local_name(&self, name: &str) -> Option<&str> {
+        self.repositories
+            .iter()
+            .map(|s| s.as_str())
+            .find(|r| repo_local_name(r) == name)
+    }
 }
 
 fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
@@ -432,6 +443,32 @@ mod tests {
         assert_eq!(
             config.image.repositories,
             vec!["automata-network/debug-linux"],
+        );
+    }
+
+    #[test]
+    fn find_repo_by_local_name_matches_configured() {
+        let config = Config::load_from_str(
+            r#"
+            [image]
+            repositories = [
+                "automata-network/automata-linux",
+                "automata-network/dev-baseimage",
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.image.find_repo_by_local_name("automata-linux"),
+            Some("automata-network/automata-linux"),
+        );
+        assert_eq!(
+            config.image.find_repo_by_local_name("dev-baseimage"),
+            Some("automata-network/dev-baseimage"),
+        );
+        assert_eq!(
+            config.image.find_repo_by_local_name("nonexistent"),
+            None,
         );
     }
 
