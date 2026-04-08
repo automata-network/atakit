@@ -135,6 +135,20 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
+impl From<atakit_github::Release> for Release {
+    fn from(r: atakit_github::Release) -> Self {
+        Self {
+            tag_name: r.tag_name,
+            name: r.name,
+            body: r.body,
+            draft: r.draft,
+            prerelease: r.prerelease,
+            published_at: r.published_at,
+            assets: r.assets.into_iter().map(Asset::from).collect(),
+        }
+    }
+}
+
 /// A single asset attached to a release.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Asset {
@@ -144,6 +158,31 @@ pub struct Asset {
     /// API URL used for authenticated downloads.
     pub url: String,
     pub content_type: String,
+}
+
+impl From<atakit_github::Asset> for Asset {
+    fn from(a: atakit_github::Asset) -> Self {
+        Self {
+            name: a.name,
+            size: a.size,
+            browser_download_url: a.browser_download_url,
+            url: a.url,
+            content_type: a.content_type,
+        }
+    }
+}
+
+impl From<&Asset> for atakit_github::Asset {
+    fn from(a: &Asset) -> Self {
+        Self {
+            name: a.name.clone(),
+            size: a.size,
+            browser_download_url: a.browser_download_url.clone(),
+            url: a.url.clone(),
+            content_type: a.content_type.clone(),
+            id: None,
+        }
+    }
 }
 
 impl Asset {

@@ -19,9 +19,9 @@ pub enum WorkloadCommand {
     Spec(SpecArgs),
     /// List local and/or remote workloads
     Ls(LsArgs),
-    /// Download a workload from a registry
+    /// Download a workload from a repository
     Pull(PullArgs),
-    /// Upload a workload to a registry
+    /// Upload a workload to a repository
     Push(PushArgs),
     /// Import a local .atawl file into the store
     Import(ImportArgs),
@@ -157,7 +157,7 @@ pub struct SpecArgs {
 /// Arguments for `workload ls`.
 #[derive(Args)]
 pub struct LsArgs {
-    /// Show remote workloads from registries
+    /// Show remote workloads from a repository
     #[arg(long)]
     pub remote: bool,
     /// Show both local and remote workloads
@@ -172,9 +172,12 @@ pub struct LsArgs {
     /// Max results for remote queries
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Registry remote name or URL
+    /// Workload repository name, http(s) URL, or owner/repo path
     #[arg(long)]
-    pub registry: Option<String>,
+    pub repository: Option<String>,
+    /// Show full source repository list without truncation
+    #[arg(short = 'w', long)]
+    pub wide: bool,
 }
 
 /// Arguments for `workload pull`.
@@ -182,9 +185,9 @@ pub struct LsArgs {
 pub struct PullArgs {
     /// Workload reference (name:version or 0x<workload_id>)
     pub reference: String,
-    /// Registry remote name or URL
+    /// Workload repository name, http(s) URL, or owner/repo path
     #[arg(long)]
-    pub registry: Option<String>,
+    pub repository: Option<String>,
     /// Verify archive PCR23 against on-chain spec
     #[arg(long)]
     pub verify: bool,
@@ -201,9 +204,9 @@ pub struct PushArgs {
     /// Workload directory (for auto-detect)
     #[arg(short, long)]
     pub dir: Option<PathBuf>,
-    /// Registry remote name or URL
+    /// Workload repository name, http(s) URL, or owner/repo path
     #[arg(long)]
-    pub registry: Option<String>,
+    pub repository: Option<String>,
 }
 
 /// Arguments for `workload import`.

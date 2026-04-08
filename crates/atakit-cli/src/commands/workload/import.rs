@@ -56,7 +56,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
             archive_size: Some(size),
             on_chain_spec: None,
             revoked: false,
-            registries: Vec::new(),
+            repositories: Vec::new(),
             added_at: now,
         },
     };

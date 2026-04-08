@@ -4,6 +4,9 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use atakit_cloud::CloudConfig;
+use atakit_workload::{
+    GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository,
+};
 use serde::{Deserialize, de};
 
 /// Application configuration loaded from `config.toml`.
@@ -17,7 +20,7 @@ pub struct Config {
     pub github: GithubConfig,
     pub build: BuildConfig,
     pub publish: PublishConfig,
-    pub registry: RegistryConfig,
+    pub workload: WorkloadConfig,
     pub cloud: CloudConfig,
 }
 
@@ -130,51 +133,158 @@ pub struct PublishConfig {
     pub relay_key_file: Option<String>,
 }
 
+/// `[workload]` section: where to find and store workload archives.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct RegistryConfig {
-    /// Default registry remote name.
-    pub default: Option<String>,
-    /// Named registry remotes.
+pub struct WorkloadConfig {
+    /// Name of the default repository (must be a key in `repositories`).
+    pub default_repository: Option<String>,
+    /// Named workload repositories. Each entry is one of [`WorkloadRepositorySpec`].
     #[serde(default)]
-    pub remotes: BTreeMap<String, RemoteConfig>,
+    pub repositories: BTreeMap<String, WorkloadRepositorySpec>,
 }
 
+/// One configured workload repository.
+///
+/// TOML form is a tagged enum keyed on `type`:
+///
+/// ```toml
+/// [workload.repositories.main]
+/// type = "http"
+/// url = "https://registry.example.com"
+///
+/// [workload.repositories.gh-fallback]
+/// type = "github"
+/// repo = "automata-network/workload-archives"
+/// ```
 #[derive(Debug, Clone, Deserialize)]
-pub struct RemoteConfig {
-    pub url: String,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WorkloadRepositorySpec {
+    Http {
+        url: String,
+    },
+    Github {
+        /// Full GitHub `owner/repo` path.
+        repo: String,
+    },
 }
 
-impl RegistryConfig {
-    /// Resolve registry URL from CLI arg, default remote, or error.
+impl WorkloadConfig {
+    /// Resolve a CLI argument into a [`WorkloadRepositorySpec`].
     ///
-    /// `cli_arg` accepts either a remote name or a raw URL (starts with http).
-    pub fn resolve_url(&self, cli_arg: Option<&str>) -> Result<String> {
+    /// `cli_arg` accepts:
+    /// * a configured remote name (e.g. `main`),
+    /// * an `http(s)://...` URL (treated as an HTTP repository),
+    /// * an `owner/repo` path (treated as a GitHub repository).
+    ///
+    /// If `cli_arg` is `None`, the default repository is used.
+    pub fn resolve(&self, cli_arg: Option<&str>) -> Result<WorkloadRepositorySpec> {
         if let Some(arg) = cli_arg {
-            // If it looks like a URL, use it directly
             if arg.starts_with("http://") || arg.starts_with("https://") {
-                return Ok(arg.to_string());
+                return Ok(WorkloadRepositorySpec::Http {
+                    url: arg.to_string(),
+                });
             }
-            // Otherwise look up as a remote name
-            if let Some(remote) = self.remotes.get(arg) {
-                return Ok(remote.url.clone());
+            if let Some(spec) = self.repositories.get(arg) {
+                return Ok(spec.clone());
             }
-            bail!("unknown registry remote: {arg}");
+            // owner/repo with no other slashes -> github
+            if looks_like_owner_repo(arg) {
+                return Ok(WorkloadRepositorySpec::Github {
+                    repo: arg.to_string(),
+                });
+            }
+            bail!("unknown workload repository: {arg}");
         }
 
-        // Fall back to default remote
-        if let Some(ref default_name) = self.default {
-            if let Some(remote) = self.remotes.get(default_name) {
-                return Ok(remote.url.clone());
+        if let Some(ref default_name) = self.default_repository {
+            if let Some(spec) = self.repositories.get(default_name) {
+                return Ok(spec.clone());
             }
             bail!(
-                "default registry remote '{}' not found in config",
+                "default workload repository '{}' not found in [workload.repositories]",
                 default_name
             );
         }
 
-        bail!("no registry configured: use --registry or set [registry] in config")
+        bail!(
+            "no workload repository configured: pass --repository or add a \
+             [workload.repositories] entry in config"
+        )
     }
+
+    /// Return the set of repositories to query.
+    ///
+    /// * If `cli_arg` is provided, returns exactly one entry (honouring
+    ///   configured name / raw URL / `owner/repo` forms the same way as
+    ///   [`resolve`]).
+    /// * If `cli_arg` is `None`, returns every entry in
+    ///   `[workload.repositories]` in iteration order (BTreeMap -> sorted
+    ///   by name).
+    ///
+    /// Used by `workload pull` and `workload ls` to fan out across all
+    /// configured repositories. Unlike [`resolve`] this does NOT fall back
+    /// to `default_repository` -- `default_repository` only matters for
+    /// commands with a single-target (push).
+    ///
+    /// Errors only when `cli_arg` is `None` and zero repositories are
+    /// configured.
+    pub fn all_repositories(
+        &self,
+        cli_arg: Option<&str>,
+    ) -> Result<Vec<(String, WorkloadRepositorySpec)>> {
+        if let Some(arg) = cli_arg {
+            let spec = self.resolve(Some(arg))?;
+            // Display name: if `arg` matches a configured entry, use
+            // that key; otherwise (raw URL / owner-repo shortcut) show
+            // the argument verbatim. Both paths currently produce the
+            // same string, but keep the distinction explicit for
+            // future differentiation.
+            let name = arg.to_string();
+            return Ok(vec![(name, spec)]);
+        }
+
+        if self.repositories.is_empty() {
+            bail!(
+                "no workload repositories configured: pass --repository or add a \
+                 [workload.repositories] entry in config"
+            );
+        }
+
+        Ok(self
+            .repositories
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    /// Build a runtime [`WorkloadRepository`] from the resolved spec.
+    /// `github_token` is forwarded to GitHub-backed repositories.
+    pub fn build_repository(
+        &self,
+        spec: WorkloadRepositorySpec,
+        github_token: Option<String>,
+    ) -> WorkloadRepository {
+        match spec {
+            WorkloadRepositorySpec::Http { url } => {
+                WorkloadRepository::Http(HttpWorkloadRepository::new(&url))
+            }
+            WorkloadRepositorySpec::Github { repo } => WorkloadRepository::Github(
+                GithubWorkloadRepository::new(repo, github_token),
+            ),
+        }
+    }
+}
+
+fn looks_like_owner_repo(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let owner = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    !owner.is_empty()
+        && !name.is_empty()
+        && parts.next().is_none()
+        && !owner.contains(':')
+        && !name.contains(':')
 }
 
 impl Config {
@@ -302,20 +412,19 @@ impl Config {
                 self.publish.session_registry = Some(v);
             }
         }
-        if let Ok(v) = env::var("ATAKIT_REGISTRY_URL") {
+        if let Ok(v) = env::var("ATAKIT_WORKLOAD_REPOSITORY_URL") {
             if !v.is_empty() {
-                // If a default remote is configured, update its URL.
-                // Otherwise create a "default" remote and set it as default.
-                let remote_name = self
-                    .registry
-                    .default
+                // Create or replace a `default` HTTP repository entry.
+                let name = self
+                    .workload
+                    .default_repository
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
-                self.registry
-                    .remotes
-                    .insert(remote_name.clone(), RemoteConfig { url: v });
-                if self.registry.default.is_none() {
-                    self.registry.default = Some(remote_name);
+                self.workload
+                    .repositories
+                    .insert(name.clone(), WorkloadRepositorySpec::Http { url: v });
+                if self.workload.default_repository.is_none() {
+                    self.workload.default_repository = Some(name);
                 }
             }
         }
@@ -575,5 +684,174 @@ mod tests {
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(config.image.repositories, vec!["custom-images"]);
         assert_eq!(config.image.list_limit, 3);
+    }
+
+    #[test]
+    fn parses_workload_repositories_http_and_github() {
+        let config = Config::load_from_str(
+            r#"
+            [workload]
+            default_repository = "main"
+
+            [workload.repositories.main]
+            type = "http"
+            url = "https://registry.example.com"
+
+            [workload.repositories.gh]
+            type = "github"
+            repo = "automata-network/workload-archives"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.workload.default_repository.as_deref(),
+            Some("main")
+        );
+        assert_eq!(config.workload.repositories.len(), 2);
+
+        match config.workload.resolve(None).unwrap() {
+            WorkloadRepositorySpec::Http { url } => {
+                assert_eq!(url, "https://registry.example.com");
+            }
+            _ => panic!("expected http"),
+        }
+
+        match config.workload.resolve(Some("gh")).unwrap() {
+            WorkloadRepositorySpec::Github { repo } => {
+                assert_eq!(repo, "automata-network/workload-archives");
+            }
+            _ => panic!("expected github"),
+        }
+    }
+
+    #[test]
+    fn workload_resolve_accepts_raw_url() {
+        let config = Config::load_from_str("").unwrap();
+        match config
+            .workload
+            .resolve(Some("https://example.com"))
+            .unwrap()
+        {
+            WorkloadRepositorySpec::Http { url } => {
+                assert_eq!(url, "https://example.com");
+            }
+            _ => panic!("expected http"),
+        }
+    }
+
+    #[test]
+    fn workload_resolve_accepts_owner_repo_path() {
+        let config = Config::load_from_str("").unwrap();
+        match config.workload.resolve(Some("owner/repo")).unwrap() {
+            WorkloadRepositorySpec::Github { repo } => assert_eq!(repo, "owner/repo"),
+            _ => panic!("expected github"),
+        }
+    }
+
+    #[test]
+    fn workload_resolve_errors_when_no_default_and_no_arg() {
+        let config = Config::load_from_str("").unwrap();
+        let err = config.workload.resolve(None).unwrap_err();
+        assert!(err.to_string().contains("no workload repository"));
+    }
+
+    #[test]
+    fn workload_resolve_errors_for_unknown_name() {
+        let config = Config::load_from_str(
+            r#"
+            [workload]
+            [workload.repositories.main]
+            type = "http"
+            url = "https://example.com"
+            "#,
+        )
+        .unwrap();
+        let err = config.workload.resolve(Some("unknown")).unwrap_err();
+        assert!(err.to_string().contains("unknown workload repository"));
+    }
+
+    #[test]
+    fn all_repositories_returns_every_entry_when_no_arg() {
+        let config = Config::load_from_str(
+            r#"
+            [workload]
+            default_repository = "main"
+
+            [workload.repositories.main]
+            type = "http"
+            url = "https://main.example.com"
+
+            [workload.repositories.staging]
+            type = "http"
+            url = "https://staging.example.com"
+
+            [workload.repositories.gh]
+            type = "github"
+            repo = "owner/repo"
+            "#,
+        )
+        .unwrap();
+        let all = config.workload.all_repositories(None).unwrap();
+        // BTreeMap iteration order: alphabetical.
+        assert_eq!(all.len(), 3);
+        let names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["gh", "main", "staging"]);
+    }
+
+    #[test]
+    fn all_repositories_with_cli_arg_returns_single() {
+        let config = Config::load_from_str(
+            r#"
+            [workload]
+            [workload.repositories.main]
+            type = "http"
+            url = "https://main.example.com"
+            [workload.repositories.staging]
+            type = "http"
+            url = "https://staging.example.com"
+            "#,
+        )
+        .unwrap();
+        let only = config
+            .workload
+            .all_repositories(Some("staging"))
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].0, "staging");
+    }
+
+    #[test]
+    fn all_repositories_with_owner_repo_arg_synthesises_github_entry() {
+        let config = Config::load_from_str("").unwrap();
+        let only = config
+            .workload
+            .all_repositories(Some("owner/some-repo"))
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].0, "owner/some-repo");
+        match &only[0].1 {
+            WorkloadRepositorySpec::Github { repo } => assert_eq!(repo, "owner/some-repo"),
+            _ => panic!("expected github"),
+        }
+    }
+
+    #[test]
+    fn all_repositories_errors_when_empty_and_no_arg() {
+        let config = Config::load_from_str("").unwrap();
+        let err = config.workload.all_repositories(None).unwrap_err();
+        assert!(err.to_string().contains("no workload repositories"));
+    }
+
+    #[test]
+    fn workload_resolve_rejects_invalid_type() {
+        let err = Config::load_from_str(
+            r#"
+            [workload]
+            [workload.repositories.x]
+            type = "invalid"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to parse"));
     }
 }

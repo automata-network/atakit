@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/atakit-core",
+    "crates/atakit-github",
     "crates/atakit-image",
     "crates/atakit-workload",
     "crates/atakit-cloud",
@@ -51,6 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Internal
 atakit-core = { path = "crates/atakit-core" }
+atakit-github = { path = "crates/atakit-github" }
 atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
 atakit-cloud = { path = "crates/atakit-cloud" }

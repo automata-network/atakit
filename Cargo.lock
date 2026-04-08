@@ -965,6 +965,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "futures-util",
  "hex",
  "indicatif",
  "owo-colors",
@@ -1004,10 +1005,25 @@ name = "atakit-core"
 version = "0.1.0"
 
 [[package]]
+name = "atakit-github"
+version = "0.1.0"
+dependencies = [
+ "atakit-core",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "atakit-image"
 version = "0.1.0"
 dependencies = [
  "atakit-core",
+ "atakit-github",
  "clap",
  "flate2",
  "futures-util",
@@ -1028,9 +1044,12 @@ name = "atakit-workload"
 version = "0.1.0"
 dependencies = [
  "atakit-core",
+ "atakit-github",
+ "chrono",
  "clap",
  "flate2",
  "futures-util",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
