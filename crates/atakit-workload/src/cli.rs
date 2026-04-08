@@ -207,6 +207,9 @@ pub struct PushArgs {
     /// Workload repository name, http(s) URL, or owner/repo path
     #[arg(long)]
     pub repository: Option<String>,
+    /// Skip the confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 /// Arguments for `workload import`.
