@@ -255,10 +255,12 @@ fn merge_remote(
         }
 
         // Divergent sha256 is a red flag. Keep the first one but warn,
-        // and mark the entry so the table row is rendered in red.
+        // and mark the entry so the table row is rendered in red. Use
+        // hex_equal so harmless prefix differences (`0x` vs `sha256:`,
+        // upper vs lowercase) don't get flagged as divergence.
         if !rm.sha256.is_empty() {
             match &existing.sha256 {
-                Some(prev) if !prev.is_empty() && prev != &rm.sha256 => {
+                Some(prev) if !prev.is_empty() && !hex_equal(prev, &rm.sha256) => {
                     existing.divergent = true;
                     eprintln!(
                         "{} divergent sha256 for {}:{}: {} vs {} (source: {})",

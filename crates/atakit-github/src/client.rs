@@ -225,20 +225,17 @@ fn validate_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
-/// Percent-encode a path segment, allowing `/` so multi-segment tags
-/// (e.g. `release/v1.0.0`) work without double-encoding the separator.
+/// Percent-encode a path segment following RFC 3986 unreserved rules.
+/// `/` is encoded as `%2F` so that multi-segment tags like
+/// `release/v1.0.0` are treated as a single path parameter by the
+/// GitHub API instead of splitting into two segments.
 fn urlencode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b'/' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -295,10 +292,21 @@ mod tests {
     }
 
     #[test]
-    fn urlencode_path_segment_keeps_slashes() {
+    fn urlencode_path_segment_escapes_slash() {
+        // Slashes in workload tags (`<name>/<version>`) must be
+        // percent-encoded or GitHub's URL matcher may treat them as
+        // path segments and return 404.
         assert_eq!(
             urlencode_path_segment("secure-signer/v0.0.1"),
-            "secure-signer/v0.0.1"
+            "secure-signer%2Fv0.0.1"
+        );
+    }
+
+    #[test]
+    fn urlencode_path_segment_keeps_unreserved() {
+        assert_eq!(
+            urlencode_path_segment("abc-123_v0.0.1"),
+            "abc-123_v0.0.1"
         );
     }
 
