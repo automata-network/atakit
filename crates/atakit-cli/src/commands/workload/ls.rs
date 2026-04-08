@@ -20,8 +20,15 @@ struct DisplayEntry {
     owner: Option<String>,
     archive_size: Option<u64>,
     sources: Vec<String>,
-    /// True when at least two sources advertised the same (name, version)
-    /// but with different `sha256` values. Rendered in red.
+    /// True when this `(name, version)` has any integrity or divergence
+    /// issue across sources or versus on-chain data. Set by
+    /// `merge_remote` on inter-repository `sha256` disagreement or a
+    /// repository-reported `workload_id` that doesn't match the
+    /// canonical keccak of `(name, version)`, and by
+    /// `verify_entries_against_chain` when the advertised sha256
+    /// doesn't yield the on-chain PCR23. Rendered in red by the table
+    /// printer. See the `legend_parts` in `print_table` for the
+    /// user-facing explanation.
     divergent: bool,
 }
 
@@ -77,7 +84,12 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // Collect remote entries from every configured repository (or the
-    // single one selected via --repository).
+    // single one selected via --repository). Run the per-repository
+    // `list()` calls concurrently via `join_all` so a slow repo doesn't
+    // serialize the wait for the others -- the docs and PR description
+    // promised parallel fan-out and the previous loop was sequential.
+    // Merging is still done on the foreground task because
+    // `merge_remote` needs `&mut Vec<DisplayEntry>`.
     if show_remote {
         match config.workload.all_repositories(args.repository.as_deref()) {
             Ok(specs) => {
@@ -90,10 +102,23 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                     offset: None,
                 };
 
-                for (repo_name, spec) in specs {
+                // Build (name, repo, list_future) triples and await them
+                // concurrently. The repo handles are owned by the future
+                // chain so we keep them around to extract `display_uri`
+                // for warning output after the join.
+                let futures = specs.into_iter().map(|(repo_name, spec)| {
                     let repo = config.workload.build_repository(spec, token.clone());
-                    let uri = repo.display_uri();
-                    match repo.list(&filters).await {
+                    let filters = filters.clone();
+                    async move {
+                        let uri = repo.display_uri();
+                        let result = repo.list(&filters).await;
+                        (repo_name, uri, result)
+                    }
+                });
+                let results = join_all(futures).await;
+
+                for (repo_name, uri, result) in results {
+                    match result {
                         Ok(remote_entries) => {
                             for rm in remote_entries {
                                 // Client-side substring filter.

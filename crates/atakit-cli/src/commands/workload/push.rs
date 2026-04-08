@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use atakit_core::Env;
@@ -94,6 +94,15 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     println!();
 
     if !args.yes {
+        // Refuse to block on stdin in non-interactive contexts
+        // (CI, scripts, piped input). Without this guard `read_line`
+        // would hang forever waiting for a confirmation that will
+        // never arrive.
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "non-interactive session: pass --yes (or -y) to push without confirmation"
+            );
+        }
         eprint!("Push? [y/N] ");
         std::io::stderr().flush().ok();
         let mut input = String::new();
