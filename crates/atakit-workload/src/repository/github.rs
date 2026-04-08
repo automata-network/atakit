@@ -541,16 +541,25 @@ fn parse_body_field(body: &str, key: &str) -> Option<String> {
 /// return verbatim. We require:
 ///
 /// 1. Its `name` and `version` match the tag-derived coords exactly.
-/// 2. Its `workload_id` matches what we expect for those coords, either
-///    (a) equal to `coords.workload_id`, or (b) equal to whatever the
-///    release body's `Workload ID` line advertises (both should be the
-///    same in practice -- if they differ the sidecar is suspect).
+/// 2. Its `workload_id` matches whichever sources we have to compare it
+///    against:
+///       - If `coords.workload_id` is non-empty (caller computed it
+///         locally, e.g. `get_meta` from `pull`), the sidecar's
+///         `workload_id` must equal it.
+///       - If the release body has a `Workload ID:` line, the sidecar's
+///         `workload_id` must equal that value.
+///    Both checks are skipped when their source is missing -- in
+///    particular `list()` calls `parse_coords_from_release` which
+///    leaves `coords.workload_id` empty when the body has no `Workload
+///    ID` line, and we want such releases to still be able to use
+///    their sidecar as the source of truth (with the body line as the
+///    only available cross-check, if present).
 ///
 /// If the sidecar disagrees, the caller falls back to derived values
 /// and emits a warning. This is defence in depth: a tampered sidecar
-/// that lies about `workload_id`/`sha256`/`archive_hash` could otherwise
-/// slip past the repo-level integrity check in `workload pull` when
-/// on-chain verification is not configured.
+/// that lies about `workload_id` / `sha256` / `archive_hash` could
+/// otherwise slip past the repo-level integrity check in
+/// `workload pull` when on-chain verification is not configured.
 fn sidecar_matches_coords(
     sidecar: &RepositoryArchiveMeta,
     coords: &WorkloadCoords,
@@ -559,10 +568,11 @@ fn sidecar_matches_coords(
     if sidecar.name != coords.name || sidecar.version != coords.version {
         return false;
     }
-    if !sidecar.workload_id.eq_ignore_ascii_case(&coords.workload_id) {
+    if !coords.workload_id.is_empty()
+        && !sidecar.workload_id.eq_ignore_ascii_case(&coords.workload_id)
+    {
         return false;
     }
-    // Optional: cross-check against the body line too.
     if let Some(body) = release.body.as_deref() {
         if let Some(body_id) = parse_body_field(body, "Workload ID") {
             if !body_id.eq_ignore_ascii_case(&sidecar.workload_id) {
@@ -806,5 +816,97 @@ mod tests {
         let release = fake_release("secure-signer/v0.0.1", &["readme.txt"]);
         let err = find_atawl_asset(&release, &coords()).unwrap_err();
         assert!(err.to_string().contains("no .atawl asset"));
+    }
+
+    fn make_meta(name: &str, version: &str, workload_id: &str) -> RepositoryArchiveMeta {
+        RepositoryArchiveMeta {
+            workload_id: workload_id.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            owner: String::new(),
+            sha256: "0xdead".to_string(),
+            archive_size: 0,
+            archive_hash: "0xbeef".to_string(),
+            uploaded_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn sidecar_matches_with_full_coords() {
+        let release = fake_release("secure-signer/v0.0.1", &[]);
+        let sidecar = make_meta("secure-signer", "v0.0.1", "0xabc");
+        let c = WorkloadCoords {
+            workload_id: "0xabc".into(),
+            name: "secure-signer".into(),
+            version: "v0.0.1".into(),
+        };
+        assert!(sidecar_matches_coords(&sidecar, &c, &release));
+    }
+
+    #[test]
+    fn sidecar_rejected_when_workload_id_disagrees_with_coords() {
+        let release = fake_release("secure-signer/v0.0.1", &[]);
+        let sidecar = make_meta("secure-signer", "v0.0.1", "0xdead");
+        let c = WorkloadCoords {
+            workload_id: "0xabc".into(),
+            name: "secure-signer".into(),
+            version: "v0.0.1".into(),
+        };
+        assert!(!sidecar_matches_coords(&sidecar, &c, &release));
+    }
+
+    #[test]
+    fn sidecar_accepted_when_coords_workload_id_is_empty() {
+        // Regression: `list()` calls `parse_coords_from_release`,
+        // which leaves `workload_id` empty when the body has no
+        // `Workload ID:` line. The sidecar should still be accepted
+        // as the source of truth in that case (it's the only place
+        // we have a workload_id at all).
+        let release = fake_release("secure-signer/v0.0.1", &[]);
+        let sidecar = make_meta("secure-signer", "v0.0.1", "0xabc");
+        let c = WorkloadCoords {
+            workload_id: String::new(),
+            name: "secure-signer".into(),
+            version: "v0.0.1".into(),
+        };
+        assert!(sidecar_matches_coords(&sidecar, &c, &release));
+    }
+
+    #[test]
+    fn sidecar_cross_checked_against_body_when_present() {
+        // Body advertises a workload_id; sidecar must match it even
+        // when caller-supplied coords are empty.
+        let mut release = fake_release("secure-signer/v0.0.1", &[]);
+        release.body = Some("Workload ID: 0xabc\n".to_string());
+
+        let good = make_meta("secure-signer", "v0.0.1", "0xabc");
+        let bad = make_meta("secure-signer", "v0.0.1", "0xdead");
+        let c = WorkloadCoords {
+            workload_id: String::new(),
+            name: "secure-signer".into(),
+            version: "v0.0.1".into(),
+        };
+        assert!(sidecar_matches_coords(&good, &c, &release));
+        assert!(!sidecar_matches_coords(&bad, &c, &release));
+    }
+
+    #[test]
+    fn sidecar_rejected_when_name_or_version_mismatch() {
+        let release = fake_release("secure-signer/v0.0.1", &[]);
+        let c = WorkloadCoords {
+            workload_id: "0xabc".into(),
+            name: "secure-signer".into(),
+            version: "v0.0.1".into(),
+        };
+        assert!(!sidecar_matches_coords(
+            &make_meta("other", "v0.0.1", "0xabc"),
+            &c,
+            &release
+        ));
+        assert!(!sidecar_matches_coords(
+            &make_meta("secure-signer", "v0.0.2", "0xabc"),
+            &c,
+            &release
+        ));
     }
 }
