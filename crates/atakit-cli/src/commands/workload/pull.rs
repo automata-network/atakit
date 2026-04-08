@@ -60,7 +60,33 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
                     .await
                     .map(|opt| opt.map(|meta| (coords, meta)))
             }
-            WorkloadRef::Id(id) => repo.resolve(id).await,
+            WorkloadRef::Id(id) => {
+                // Defense-in-depth: regardless of whether the repository
+                // backend validates its server response internally, the
+                // coords it returns MUST carry the ID the user asked
+                // for. A backend that returns a different ID (whether
+                // due to a bug or an intentional redirect) is rejected
+                // with a stderr warning so the user notices the lie
+                // while the discovery loop moves on to the next repo.
+                match repo.resolve(id).await {
+                    Ok(Some((coords, meta))) => {
+                        if hex_equal(&coords.workload_id, id) {
+                            Ok(Some((coords, meta)))
+                        } else {
+                            eprintln!(
+                                "{} {}: returned metadata for {} instead of requested {}; ignoring",
+                                "warning:".yellow(),
+                                display.dimmed(),
+                                coords.workload_id.dimmed(),
+                                id.dimmed(),
+                            );
+                            Ok(None)
+                        }
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
         };
 
         match probe {
@@ -300,9 +326,13 @@ fn select_candidate(reference: &str, candidates: Vec<Candidate>) -> Result<Candi
 /// # Modes
 ///
 /// * `strict = false` (default from `workload pull`): best-effort. Missing
-///   `[publish] rpc_url` / `[publish] session_registry`, a workload that
-///   isn't registered on-chain, or an on-chain spec with no PCR23 entry
-///   are all silently skipped. A PCR23 **mismatch** is ALWAYS an error.
+///   `[publish] rpc_url` / `[publish] session_registry` is a silent skip
+///   (the user hasn't opted in to chain verification). The remaining
+///   conditions -- unreachable RPC, workload not yet registered on-chain,
+///   on-chain spec without a PCR23 entry -- do not fail the pull, but
+///   the first two emit a `warning:` on stderr so transient or
+///   configuration issues are visible. A PCR23 **mismatch** is ALWAYS a
+///   hard error regardless of mode.
 /// * `strict = true` (from `workload pull --verify`): require RPC config,
 ///   require the workload to be registered, require a PCR23 entry, and
 ///   require a match. Any gap bails.

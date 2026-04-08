@@ -11,7 +11,7 @@ use atakit_core::ProgressReporter;
 
 use crate::WorkloadError;
 
-use super::{RepositoryArchiveMeta, RepositoryFilters, UploadContext, WorkloadCoords};
+use super::{hex_equal, RepositoryArchiveMeta, RepositoryFilters, UploadContext, WorkloadCoords};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ApiError {
@@ -106,6 +106,24 @@ impl HttpWorkloadRepository {
             resp.json().await.map_err(|e| WorkloadError::RepositoryRequest {
                 reason: format!("failed to parse metadata response: {e}"),
             })?;
+
+        // Trust-but-verify: a repository must return metadata for the
+        // exact workload ID we asked for. A server that returns a
+        // different ID (whether through a bug or an intentional
+        // redirect attack) could otherwise cause the caller to pull a
+        // different workload than requested and still pass every
+        // downstream identity check, because we'd thread the server's
+        // lying ID through `WorkloadCoords` and compare the downloaded
+        // archive against it.
+        if !hex_equal(&meta.workload_id, workload_id) {
+            return Err(WorkloadError::Repository {
+                message: format!(
+                    "repository {} returned metadata for {} but we asked for {}",
+                    self.base_url, meta.workload_id, workload_id
+                ),
+            });
+        }
+
         Ok(Some(meta))
     }
 

@@ -257,28 +257,10 @@ pub fn looks_like_store_ref(s: &str) -> bool {
         && !s.ends_with(".atawl")
 }
 
-/// Compare two SHA-256 hex strings tolerantly. Strips a `0x` or `sha256:`
-/// prefix from either side and lowercases before comparing. Returns false
-/// if either side has non-hex content (so a malformed value never falsely
-/// matches another malformed value).
-pub fn hex_equal(a: &str, b: &str) -> bool {
-    fn normalize(s: &str) -> Option<String> {
-        let trimmed = s.trim();
-        let stripped = trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .or_else(|| trimmed.strip_prefix("sha256:"))
-            .unwrap_or(trimmed);
-        if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        Some(stripped.to_ascii_lowercase())
-    }
-    match (normalize(a), normalize(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
-    }
-}
+// `hex_equal` now lives in atakit-workload so library code (the
+// repository backends) can use it for identity checks. Re-export here
+// so existing command handlers keep the same import path.
+pub use atakit_workload::hex_equal;
 
 /// Compute the final PCR23 register value from a manifest event hash.
 ///
@@ -306,24 +288,9 @@ pub fn compute_final_pcr23(event_hash_hex: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hex_equal_handles_prefixes() {
-        assert!(hex_equal("0xabcd", "abcd"));
-        assert!(hex_equal("sha256:abcd", "0xabcd"));
-        assert!(hex_equal("0XABCD", "abcd"));
-        assert!(hex_equal("  0xabcd  ", "abcd"));
-    }
-
-    #[test]
-    fn hex_equal_rejects_mismatch() {
-        assert!(!hex_equal("0xabcd", "0xabce"));
-    }
-
-    #[test]
-    fn hex_equal_rejects_invalid() {
-        assert!(!hex_equal("0xnothex", "0xnothex"));
-        assert!(!hex_equal("", ""));
-    }
+    // hex_equal tests live in atakit-workload now that the helper is
+    // shared. Keep PCR23 tests here because compute_final_pcr23 is
+    // workflow-specific glue.
 
     #[test]
     fn final_pcr23_from_zero_event() {

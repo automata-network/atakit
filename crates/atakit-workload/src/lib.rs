@@ -18,8 +18,8 @@ pub use error::WorkloadError;
 pub use image::ContainerEngine;
 pub use inspect::{inspect_workload, InspectOptions, InspectResult};
 pub use repository::{
-    GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta, RepositoryFilters,
-    UploadContext, WorkloadCoords, WorkloadRepository,
+    hex_equal, GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta,
+    RepositoryFilters, UploadContext, WorkloadCoords, WorkloadRepository,
 };
 pub use scaffold::create_workload;
 pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
