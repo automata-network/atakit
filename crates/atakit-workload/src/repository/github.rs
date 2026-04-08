@@ -162,11 +162,21 @@ impl GithubWorkloadRepository {
             let Ok(coords) = parse_coords_from_release(&release) else {
                 continue;
             };
-            let Some(asset) = release.assets.iter().find(|a| {
-                a.name == format!("{}{ATAWL_EXT}", coords.asset_stem())
-                    || a.name.ends_with(ATAWL_EXT)
-            }) else {
-                continue;
+            // Reuse the canonical-with-ambiguity-rejection lookup so a
+            // release with multiple `.atawl` assets and no canonical
+            // match is skipped from the listing instead of silently
+            // associated with the wrong archive.
+            let asset = match find_atawl_asset(&release, &coords) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(
+                        repo = %self.repo,
+                        tag = %release.tag_name,
+                        error = %e,
+                        "skipping release: cannot identify .atawl asset"
+                    );
+                    continue;
+                }
             };
 
             // Apply filters.
@@ -592,6 +602,18 @@ fn parse_coords_from_release(release: &Release) -> Result<WorkloadCoords, Worklo
     })
 }
 
+/// Locate the `.atawl` asset for a release.
+///
+/// Resolution order:
+/// 1. The canonical `{name}-{version}.atawl` matching `coords.asset_stem()`.
+/// 2. A single non-canonical `.atawl` asset if exactly one exists in the
+///    release (graceful handling of hand-curated repos).
+/// 3. Otherwise: error. We deliberately refuse to pick arbitrarily when
+///    there are multiple `.atawl` assets and no canonical match, because
+///    GitHub doesn't guarantee asset order and silently returning a
+///    different archive than the one the user expected is exactly the
+///    kind of identity confusion the integrity checks are supposed to
+///    catch.
 fn find_atawl_asset<'a>(
     release: &'a Release,
     coords: &WorkloadCoords,
@@ -600,15 +622,30 @@ fn find_atawl_asset<'a>(
     if let Some(a) = release.assets.iter().find(|a| a.name == canonical) {
         return Ok(a);
     }
-    if let Some(a) = release.assets.iter().find(|a| a.name.ends_with(ATAWL_EXT)) {
-        return Ok(a);
+    let atawl_assets: Vec<&GhAsset> = release
+        .assets
+        .iter()
+        .filter(|a| a.name.ends_with(ATAWL_EXT))
+        .collect();
+    match atawl_assets.len() {
+        0 => Err(WorkloadError::Repository {
+            message: format!(
+                "release {tag} has no .atawl asset",
+                tag = release.tag_name
+            ),
+        }),
+        1 => Ok(atawl_assets[0]),
+        n => {
+            let names: Vec<&str> = atawl_assets.iter().map(|a| a.name.as_str()).collect();
+            Err(WorkloadError::Repository {
+                message: format!(
+                    "release {tag} has {n} .atawl assets ({names:?}) but no canonical \
+                     match for `{canonical}`; refusing to pick one arbitrarily",
+                    tag = release.tag_name,
+                ),
+            })
+        }
     }
-    Err(WorkloadError::Repository {
-        message: format!(
-            "release {tag} has no .atawl asset",
-            tag = release.tag_name
-        ),
-    })
 }
 
 async fn hash_archive_file(path: &Path) -> Result<(u64, String), WorkloadError> {
@@ -707,5 +744,67 @@ mod tests {
             Some("0xdead".into())
         );
         assert_eq!(parse_body_field(&body, "PCR23"), Some("0xbeef".into()));
+    }
+
+    fn fake_asset(name: &str) -> GhAsset {
+        GhAsset {
+            name: name.to_string(),
+            size: 0,
+            browser_download_url: String::new(),
+            url: String::new(),
+            content_type: String::new(),
+            id: None,
+        }
+    }
+
+    fn fake_release(tag: &str, asset_names: &[&str]) -> Release {
+        Release {
+            tag_name: tag.to_string(),
+            name: None,
+            body: None,
+            draft: false,
+            prerelease: false,
+            published_at: None,
+            assets: asset_names.iter().map(|n| fake_asset(n)).collect(),
+            upload_url: None,
+            id: None,
+            html_url: None,
+        }
+    }
+
+    #[test]
+    fn find_atawl_asset_picks_canonical() {
+        let release = fake_release(
+            "secure-signer/v0.0.1",
+            &["secure-signer-v0.0.1.atawl", "extra.atawl"],
+        );
+        let asset = find_atawl_asset(&release, &coords()).unwrap();
+        assert_eq!(asset.name, "secure-signer-v0.0.1.atawl");
+    }
+
+    #[test]
+    fn find_atawl_asset_accepts_single_non_canonical() {
+        let release = fake_release("secure-signer/v0.0.1", &["weird-name.atawl"]);
+        let asset = find_atawl_asset(&release, &coords()).unwrap();
+        assert_eq!(asset.name, "weird-name.atawl");
+    }
+
+    #[test]
+    fn find_atawl_asset_rejects_ambiguous() {
+        let release = fake_release(
+            "secure-signer/v0.0.1",
+            &["one.atawl", "two.atawl"],
+        );
+        let err = find_atawl_asset(&release, &coords()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 .atawl assets"), "got: {msg}");
+        assert!(msg.contains("refusing to pick"), "got: {msg}");
+    }
+
+    #[test]
+    fn find_atawl_asset_errors_on_none() {
+        let release = fake_release("secure-signer/v0.0.1", &["readme.txt"]);
+        let err = find_atawl_asset(&release, &coords()).unwrap_err();
+        assert!(err.to_string().contains("no .atawl asset"));
     }
 }
