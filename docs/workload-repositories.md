@@ -36,7 +36,17 @@ The `--repository` CLI flag accepts:
 - a raw `http(s)://...` URL (treated as an HTTP repository),
 - a bare `owner/repo` path (treated as a GitHub repository).
 
-If `--repository` is omitted, the entry named in `default_repository` is used.
+### How `--repository` and `default_repository` interact
+
+The two are used differently by single-target and multi-target commands:
+
+| Command | When `--repository` set | When `--repository` omitted |
+|---|---|---|
+| `workload push` | Push to that one repository | Push to the entry named by `default_repository` |
+| `workload pull` | Probe only that repository | **Probe every configured repository** (`default_repository` is not consulted) |
+| `workload ls --remote` | Query only that repository | **Query every configured repository** in parallel and merge |
+
+In other words, `default_repository` only matters for single-target operations. Pull and remote listing are inherently multi-source: they fan out across every configured entry so a workload can be found and compared wherever it lives.
 
 Env override: `ATAKIT_WORKLOAD_REPOSITORY_URL` populates a `default` HTTP entry from the environment.
 
