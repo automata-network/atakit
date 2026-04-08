@@ -371,12 +371,12 @@ fn format_sources(sources: &[String], width: usize) -> String {
         return full;
     }
     if sources.len() == 1 {
-        // Single name too long: raw truncate.
-        let w = width.max(4);
-        return format!("{}..", &sources[0][..w.saturating_sub(2).min(sources[0].len())]);
+        // Single name too long: truncate safely at a char boundary.
+        let w = width.max(4).saturating_sub(2);
+        return format!("{}..", utf8_truncate(&sources[0], w));
     }
     // Show first + "+N more".
-    let first = &sources[0];
+    let first = sources[0].as_str();
     let rest_count = sources.len() - 1;
     let suffix = format!(" +{rest_count} more");
     if first.len() + suffix.len() <= width {
@@ -384,10 +384,27 @@ fn format_sources(sources: &[String], width: usize) -> String {
     }
     // First name is still too wide; show ellipsis of first.
     let avail = width.saturating_sub(suffix.len() + 2).max(1);
-    format!(
-        "{}..{suffix}",
-        &first[..avail.min(first.len())]
-    )
+    format!("{}..{suffix}", utf8_truncate(first, avail))
+}
+
+/// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8
+/// codepoint. Walks back to the nearest char boundary <= `max_bytes`.
+/// Returns the original string unchanged if it already fits.
+///
+/// Repository names come from user-editable TOML keys and are not
+/// constrained to ASCII, so naive byte slicing (`&s[..n]`) panics when
+/// `n` lands in the middle of a multi-byte codepoint. This helper is
+/// used by `format_sources` to keep `workload ls` from crashing on
+/// non-ASCII repository labels.
+fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn print_table(entries: &[DisplayEntry], wide: bool) {
@@ -560,5 +577,54 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_truncate_passthrough() {
+        assert_eq!(utf8_truncate("abc", 10), "abc");
+        assert_eq!(utf8_truncate("", 10), "");
+    }
+
+    #[test]
+    fn utf8_truncate_ascii() {
+        assert_eq!(utf8_truncate("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn utf8_truncate_walks_back_to_char_boundary() {
+        // "é" is 2 bytes (0xC3 0xA9). Asking for 1 byte of "café"
+        // would split the "é"; we should walk back to "caf".
+        let s = "café";
+        assert_eq!(s.len(), 5);
+        assert_eq!(utf8_truncate(s, 4), "caf");
+        assert_eq!(utf8_truncate(s, 3), "caf");
+        assert_eq!(utf8_truncate(s, 5), "café");
+    }
+
+    #[test]
+    fn format_sources_does_not_panic_on_non_ascii() {
+        let sources = vec!["depósito-de-trabalhos-ñ".to_string()];
+        // Force single-name truncation path.
+        let got = format_sources(&sources, 10);
+        assert!(got.ends_with(".."));
+        // Must not panic -- we only assert it returns something valid.
+    }
+
+    #[test]
+    fn format_sources_plus_more_with_non_ascii_first_name() {
+        let sources = vec![
+            "dépôt-très-long".to_string(),
+            "other".to_string(),
+            "third".to_string(),
+        ];
+        // Force the "+N more" truncation path where the first name is
+        // still too wide for the remaining space.
+        let got = format_sources(&sources, 12);
+        assert!(got.contains("+2 more") || got.contains("more"));
     }
 }

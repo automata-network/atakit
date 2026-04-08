@@ -171,9 +171,12 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let archive_version = &inspection.manifest.meta.version;
 
     // Verify the archive's manifest matches the requested identity.
+    // Use hex_equal so harmless prefix / case differences between what
+    // the repository stored and what we compute locally don't trigger
+    // a false mismatch.
     let expected_id = compute_workload_id(archive_name, archive_version);
     let expected_id_hex = format!("0x{}", hex::encode(expected_id));
-    if expected_id_hex != coords.workload_id {
+    if !hex_equal(&expected_id_hex, &coords.workload_id) {
         anyhow::bail!(
             "archive identity mismatch: requested {}:{} ({}), \
              but archive contains {}:{} ({})",
@@ -199,8 +202,17 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         );
     }
     if !probe_meta.archive_hash.is_empty() {
-        let actual_archive_hash = atakit_workload::hash::hash_file(&tmp_path)
-            .context("failed to hash downloaded archive")?;
+        // `hash_file` uses synchronous std::fs I/O. For large `.atawl`
+        // archives (hundreds of MB) that blocks a Tokio worker thread
+        // for the duration of the hash, starving other async work.
+        // Move it onto the blocking pool.
+        let hash_path = tmp_path.clone();
+        let actual_archive_hash = tokio::task::spawn_blocking(move || {
+            atakit_workload::hash::hash_file(&hash_path)
+        })
+        .await
+        .context("archive hashing task panicked")?
+        .context("failed to hash downloaded archive")?;
         if !hex_equal(&probe_meta.archive_hash, &actual_archive_hash) {
             anyhow::bail!(
                 "archive sha256 mismatch between repository metadata and downloaded archive\n\
