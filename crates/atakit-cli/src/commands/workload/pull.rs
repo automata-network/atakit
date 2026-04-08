@@ -38,8 +38,16 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // Probe every repository for the workload. A `None` return means
     // "workload isn't in this repo" -- a clean negative, silent. An
     // `Err` means the repository itself is broken (network fault, auth
-    // failure, 5xx) -- warn to stderr and continue so other repositories
-    // can still serve the pull.
+    // failure, 5xx).
+    //
+    // Error handling differs by mode:
+    // * Pinned (--repository): the user explicitly named one repo, so
+    //   probe errors are fatal -- they shouldn't get masked by a
+    //   misleading "not found in any configured repository" message
+    //   later. Bail on the first probe error with the underlying cause.
+    // * Multi-repo discovery: warn to stderr and continue so other
+    //   repositories can still serve the pull.
+    let pinned = args.repository.is_some();
     let mut candidates: Vec<Candidate> = Vec::new();
     for (name, spec) in specs {
         let repo = config.workload.build_repository(spec, token.clone());
@@ -100,6 +108,16 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
                 // Not in this repo -- expected during multi-repo discovery.
             }
             Err(e) => {
+                if pinned {
+                    // User pinned this exact repo with --repository.
+                    // A probe failure here is the real reason the
+                    // pull can't proceed; don't swallow it as a
+                    // warning and pretend "not found in any
+                    // configured repository" later.
+                    return Err(anyhow::Error::from(e)).with_context(|| {
+                        format!("repository {display} probe failed")
+                    });
+                }
                 eprintln!(
                     "{} {}: {}",
                     "warning:".yellow(),
@@ -112,6 +130,13 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     let chosen = match candidates.len() {
         0 => {
+            if pinned {
+                anyhow::bail!(
+                    "workload {} was not found in repository {}",
+                    args.reference,
+                    args.repository.as_deref().unwrap_or("?"),
+                );
+            }
             anyhow::bail!(
                 "workload {} was not found in any configured repository",
                 args.reference
