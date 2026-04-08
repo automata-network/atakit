@@ -23,6 +23,57 @@ use crate::WorkloadError;
 pub use github::GithubWorkloadRepository;
 pub use http::HttpWorkloadRepository;
 
+/// Compare two SHA-256 hex strings tolerantly. Strips a `0x` or
+/// `sha256:` prefix from either side and lowercases before comparing.
+/// Returns false if either side has non-hex content (so a malformed
+/// value never falsely matches another malformed value).
+///
+/// Used for identity checks that may see either prefix style: HTTP
+/// repositories often return `sha256:<hex>`, while on-chain data and
+/// the GitHub sidecar convention use `0x<hex>`.
+pub fn hex_equal(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> Option<String> {
+        let trimmed = s.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .or_else(|| trimmed.strip_prefix("sha256:"))
+            .unwrap_or(trimmed);
+        if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(stripped.to_ascii_lowercase())
+    }
+    match (normalize(a), normalize(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_equal_prefixes() {
+        assert!(hex_equal("0xabcd", "abcd"));
+        assert!(hex_equal("sha256:abcd", "0xabcd"));
+        assert!(hex_equal("0XABCD", "abcd"));
+        assert!(hex_equal("  0xabcd  ", "abcd"));
+    }
+
+    #[test]
+    fn hex_equal_mismatch() {
+        assert!(!hex_equal("0xabcd", "0xabce"));
+    }
+
+    #[test]
+    fn hex_equal_invalid() {
+        assert!(!hex_equal("0xnothex", "0xnothex"));
+        assert!(!hex_equal("", ""));
+    }
+}
+
 /// Metadata describing one archive stored in a repository.
 ///
 /// Wire-compatible with the HTTP service's `RegistryMeta` JSON shape: same

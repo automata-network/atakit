@@ -168,14 +168,12 @@ After download, four integrity checks run automatically:
 3. **Archive sha256** -- the full downloaded file is SHA-256 hashed and compared to `RepositoryArchiveMeta.archive_hash`. Catches "archive corrupted or tampered in transit".
 4. **On-chain PCR23** -- if `[publish] rpc_url` and `[publish] session_registry` are configured, the archive's final PCR23 is compared to the on-chain `WorkloadRegistry` spec. Catches "repository compromise" -- the on-chain registry is the canonical source of truth.
 
-Check (1) always runs. Checks (2) and (3) are skipped when the repository didn't advertise that field (hand-curated GitHub repo without sidecar `.meta.json`). Check (4) is best-effort and silently skipped when:
+Check (1) always runs. Checks (2) and (3) are skipped when the repository didn't advertise that field (hand-curated GitHub repo without sidecar `.meta.json`). Check (4) is best-effort:
 
-* `[publish]` is not configured, OR
-* The RPC connection fails, OR
-* The workload is not yet registered on-chain, OR
-* The on-chain spec has no PCR23 entry.
-
-A PCR23 mismatch is **always** a hard error regardless of mode -- if both the repo and the chain claim to have the workload but they disagree on PCR23, something is seriously wrong and the pull aborts.
+* `[publish]` not configured -- silent skip (the user hasn't opted in to chain verification).
+* RPC connection fails, or the on-chain spec has no PCR23 entry -- the pull still succeeds, but a `warning:` is emitted on stderr so transient or configuration problems are visible instead of silently ignored.
+* Workload not yet registered on-chain -- silent skip (valid during a mirror pull before publish).
+* PCR23 mismatch -- **always** a hard error regardless of mode. If both the repo and the chain claim to have the workload but they disagree on PCR23, something is seriously wrong and the pull aborts.
 
 Pass `--verify` to make check (4) strict: it then errors instead of silently skipping when any of the conditions above hold. Use this in CI or anywhere you need a guarantee that the on-chain attestation actually happened.
 

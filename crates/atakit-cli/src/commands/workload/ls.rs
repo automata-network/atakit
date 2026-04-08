@@ -246,12 +246,38 @@ fn merge_remote(
     rm: &RepositoryArchiveMeta,
     repo_name: &str,
 ) {
+    // Canonical workload_id is deterministic from (name, version).
+    // Every honest repository must report this exact value. If a
+    // repository advertises a different one, flag the entry as
+    // divergent so the user notices -- this could indicate a bug in
+    // the repository backend, a stale sidecar, or an adversarial
+    // response trying to smuggle a different workload under a known
+    // name/version.
+    let canonical_id = compute_workload_id(&rm.name, &rm.version);
+    let canonical_id_hex = format!("0x{}", hex::encode(canonical_id));
+    let workload_id_matches_canonical =
+        rm.workload_id.is_empty() || hex_equal(&rm.workload_id, &canonical_id_hex);
+    if !workload_id_matches_canonical {
+        eprintln!(
+            "{} repository {} reported workload_id {} for {}:{}, but canonical is {}",
+            "warning:".yellow(),
+            repo_name,
+            shorten(&rm.workload_id),
+            rm.name,
+            rm.version,
+            shorten(&canonical_id_hex),
+        );
+    }
+
     if let Some(existing) = entries
         .iter_mut()
         .find(|e| e.name == rm.name && e.version == rm.version)
     {
         if !existing.sources.iter().any(|s| s == repo_name) {
             existing.sources.push(repo_name.to_string());
+        }
+        if !workload_id_matches_canonical {
+            existing.divergent = true;
         }
 
         // Divergent sha256 is a red flag. Keep the first one but warn,
@@ -302,7 +328,7 @@ fn merge_remote(
         },
         archive_size: Some(rm.archive_size),
         sources: vec![repo_name.to_string()],
-        divergent: false,
+        divergent: !workload_id_matches_canonical,
     });
 }
 
