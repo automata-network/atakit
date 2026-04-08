@@ -18,6 +18,9 @@ pub enum ImageError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error(transparent)]
+    Github(#[from] atakit_github::GithubError),
+
     #[error("no release containing disk images found in the last {0} releases")]
     NoDiskImages(u32),
 

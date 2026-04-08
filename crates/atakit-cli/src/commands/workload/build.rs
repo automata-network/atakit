@@ -128,7 +128,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                 archive_size: Some(size),
                 on_chain_spec: None,
                 revoked: false,
-                registries: Vec::new(),
+                repositories: Vec::new(),
                 added_at: now,
             },
         };

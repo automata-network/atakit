@@ -206,7 +206,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             archive_size,
             on_chain_spec: Some(chain_spec),
             revoked,
-            registries: Vec::new(),
+            repositories: Vec::new(),
             added_at: now,
         }
     };

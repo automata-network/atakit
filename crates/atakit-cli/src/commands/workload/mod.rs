@@ -18,6 +18,7 @@ use alloy_ext::core::primitives::{B256, keccak256};
 use alloy_ext::core::sol_types::SolValue;
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadStore};
+use sha2::{Digest, Sha256};
 
 /// Look for a single `.atawl` file in the directory.
 /// Returns `None` if zero or multiple archives are found.
@@ -254,4 +255,92 @@ pub fn looks_like_store_ref(s: &str) -> bool {
         && !s.starts_with('/')
         && !s.starts_with('.')
         && !s.ends_with(".atawl")
+}
+
+/// Compare two SHA-256 hex strings tolerantly. Strips a `0x` or `sha256:`
+/// prefix from either side and lowercases before comparing. Returns false
+/// if either side has non-hex content (so a malformed value never falsely
+/// matches another malformed value).
+pub fn hex_equal(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> Option<String> {
+        let trimmed = s.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .or_else(|| trimmed.strip_prefix("sha256:"))
+            .unwrap_or(trimmed);
+        if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(stripped.to_ascii_lowercase())
+    }
+    match (normalize(a), normalize(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Compute the final PCR23 register value from a manifest event hash.
+///
+/// The CVM agent records `SHA-256(prev_pcr || event_hash)` where the
+/// previous PCR value is all zeros for a fresh PCR23 extend. So the
+/// final PCR23 value the on-chain registry stores is
+/// `SHA-256(zeros_32 || event_hash)`.
+///
+/// `event_hash_hex` accepts an optional `0x` prefix. Returns `None` if
+/// the input isn't valid 32-byte hex.
+pub fn compute_final_pcr23(event_hash_hex: &str) -> Option<String> {
+    let stripped = event_hash_hex
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| event_hash_hex.trim().strip_prefix("0X"))
+        .unwrap_or(event_hash_hex.trim());
+    let event_bytes: [u8; 32] = hex::decode(stripped).ok()?.try_into().ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update([0u8; 32]);
+    hasher.update(event_bytes);
+    Some(format!("0x{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_equal_handles_prefixes() {
+        assert!(hex_equal("0xabcd", "abcd"));
+        assert!(hex_equal("sha256:abcd", "0xabcd"));
+        assert!(hex_equal("0XABCD", "abcd"));
+        assert!(hex_equal("  0xabcd  ", "abcd"));
+    }
+
+    #[test]
+    fn hex_equal_rejects_mismatch() {
+        assert!(!hex_equal("0xabcd", "0xabce"));
+    }
+
+    #[test]
+    fn hex_equal_rejects_invalid() {
+        assert!(!hex_equal("0xnothex", "0xnothex"));
+        assert!(!hex_equal("", ""));
+    }
+
+    #[test]
+    fn final_pcr23_from_zero_event() {
+        // SHA-256(zeros_32 || zeros_32) is deterministic; verify against
+        // a known value computed once with a hex tool.
+        let zero_event = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let got = compute_final_pcr23(zero_event).unwrap();
+        // SHA-256 of 64 zero bytes
+        assert_eq!(
+            got,
+            "0xf5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"
+        );
+    }
+
+    #[test]
+    fn final_pcr23_rejects_bad_hex() {
+        assert!(compute_final_pcr23("notahex").is_none());
+        assert!(compute_final_pcr23("0xdeadbeef").is_none()); // too short
+    }
 }

@@ -97,12 +97,15 @@ pub enum WorkloadError {
     #[error("failed to parse metadata {path}: {reason}")]
     ParseMeta { path: PathBuf, reason: String },
 
-    // ── registry ─────────────────────────────────────────
-    #[error("registry error: {message}")]
-    Registry { message: String },
+    // ── repository ───────────────────────────────────────
+    #[error("repository error: {message}")]
+    Repository { message: String },
 
-    #[error("registry request failed: {reason}")]
-    RegistryRequest { reason: String },
+    #[error("repository request failed: {reason}")]
+    RepositoryRequest { reason: String },
+
+    #[error(transparent)]
+    Github(#[from] atakit_github::GithubError),
 
     #[error("JSON serialization error: {0}")]
     Json(String),

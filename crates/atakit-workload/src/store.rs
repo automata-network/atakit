@@ -59,8 +59,16 @@ pub struct WorkloadMeta {
     pub on_chain_spec: Option<CachedChainSpec>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub revoked: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub registries: Vec<String>,
+    /// Repository URIs this archive has been pulled from or pushed to.
+    /// HTTP repos use `https://...`; github repos use `github://owner/repo`.
+    /// `#[serde(alias = "registries")]` keeps existing `meta.json` files
+    /// loadable after the rename.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        alias = "registries"
+    )]
+    pub repositories: Vec<String>,
     pub added_at: String,
 }
 
@@ -404,7 +412,7 @@ mod tests {
             archive_size: None,
             on_chain_spec: None,
             revoked: false,
-            registries: Vec::new(),
+            repositories: Vec::new(),
             added_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }

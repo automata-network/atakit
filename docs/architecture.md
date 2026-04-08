@@ -11,6 +11,7 @@ atakit-ng/
   Cargo.toml                    # workspace root
   crates/
     atakit-core/                # shared types (Env, ProgressReporter trait)
+    atakit-github/              # generic GitHub Releases client (reused by image+workload)
     atakit-image/               # image subcommand library
     atakit-workload/            # workload subcommand library
     atakit-cloud/               # cloud deployment library
@@ -26,14 +27,23 @@ Minimal shared crate with no heavy dependencies. Provides:
 - **`Env`** -- runtime context holding XDG-compliant paths (`data_dir`, `config_dir`, `cache_dir`, `image_dir`, `workload_dir`). Only global state, no project-scoped config. Resolution: `ATAKIT_*_DIR` > `XDG_*_HOME/atakit` > `$HOME/<default>/atakit`.
 - **`ProgressReporter` + `ProgressHandle`** -- traits for pluggable progress reporting. Includes `NullReporter` no-op impl. This is the key abstraction that lets CLI use indicatif while TUI can use ratatui gauges.
 
+### atakit-github
+
+Generic, domain-free client for the GitHub Releases REST API. Used by both `atakit-image` (base image distribution) and `atakit-workload` (the github workload repository backend). Knows about releases, tags, assets, and asset upload/download; knows nothing about `.atabi` or `.atawl` archive layouts.
+
+- **`ReleasesClient`** -- token auth, `list_releases`, `get_release_by_tag`, `try_get_release_by_tag`, `get_latest_release`, `create_release`, `delete_release`, `build_asset_upload_url`.
+- **Asset I/O** -- `download_asset` (writes asset using its name as filename), `download_asset_to_path` (caller controls dest), `download_asset_bytes` (in-memory, for small sidecars), `upload_release_asset` (streams a file), `upload_release_asset_bytes`.
+- **Types** -- `Release`, `Asset`, `CreateReleaseRequest`.
+- **Errors** -- `GithubError`.
+
 ### atakit-image
 
 Domain logic for public image management (ls, pull, rm). Core API is always available; clap structs are behind a `cli` feature flag. Internal image-build tooling (scaffolding, config parsing, platform profiles) lives in the separate `atakit-imgbuild` crate.
 
-- **Error types** -- `ImageError` enum via `thiserror`
-- **Domain types** -- `ImageRef`, `Platform`, `AssetKind`, `Release`, `Asset`, `VersionSelector`
-- **GitHub client** -- `ReleasesClient` for GitHub Releases API (with optional token auth). All methods take full `owner/repo` path.
-- **Download logic** -- download + decompress using `&dyn ProgressReporter`
+- **Error types** -- `ImageError` enum via `thiserror`. Wraps `atakit_github::GithubError`.
+- **Domain types** -- `ImageRef`, `Platform`, `AssetKind`, `Release`, `Asset`, `VersionSelector`. Local `Release`/`Asset` are thin wrappers around the generic `atakit_github` types with image-specific helpers (`archive_for_platform`, `available_platforms`, `kind`).
+- **GitHub client** -- `ReleasesClient` is a thin wrapper around `atakit_github::ReleasesClient` with image-specific helpers (`find_latest_image_release`, `find_latest_release_for`, `list_image_releases`, `resolve`).
+- **Download logic** -- delegates to `atakit_github::download_asset` after type conversion.
 - **Local store** -- `ImageStore` for local disk management (does NOT own a `ReleasesClient`). `list()` takes both `github_repo` (for API) and `local_name` (for store lookups). `download()` takes `github_repo` for API calls.
 - **Archive functions** -- `create_image_archive`, `import_image_archive`, `read_manifest`. Import compresses Azure VHD files to zstd for local storage.
 - **CLI arg structs** -- (behind `cli` feature) `ImageCommand`, `LsArgs`, `PullArgs`, `RmArgs`, `ExportArgs`, `ImportArgs`
@@ -52,7 +62,7 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config
 - **Local store** -- `WorkloadStore` for local workload archive and metadata management (`workload_dir/<name>/<version>/meta.json` + `archive.atawl`)
-- **Registry client** -- `RegistryClient` for HTTP workload registry API (upload, download, list, metadata)
+- **Repository abstraction** -- `WorkloadRepository` enum dispatching between `HttpWorkloadRepository` (the in-house registry service) and `GithubWorkloadRepository` (GitHub releases). Common surface: `resolve`, `get_meta`, `download_to_file`, `list`, `upload`, `display_uri`, `supports_upload`. Wire types: `RepositoryArchiveMeta`, `RepositoryFilters`, `WorkloadCoords`, `UploadContext`.
 - **CLI arg structs** -- (behind `cli` feature) `WorkloadCommand`, `CreateArgs`, `BuildArgs`, `InfoArgs`, `PublishArgs`, `DeactivateArgs`, `SpecArgs`, `LsArgs`, `PullArgs`, `PushArgs`, `ImportArgs`, `ExportArgs`, `AddArgs`, `RmArgs`
 
 ### atakit-cloud
@@ -76,7 +86,7 @@ Cloud deployment logic. Clap structs behind a `cli` feature flag.
 Binary crate. Owns all presentation: output formatting, progress bars, error display.
 
 - **`IndicatifReporter`** -- implements `ProgressReporter` using indicatif
-- **Config** -- `Config` loads optional `config.toml`. `ImageConfig` with `repositories` (accepts string or array via `deserialize_string_or_vec`). `repo_local_name()` extracts local store name from `owner/repo`.
+- **Config** -- `Config` loads optional `config.toml`. `ImageConfig` with `repositories` (accepts string or array via `deserialize_string_or_vec`). `repo_local_name()` extracts local store name from `owner/repo`. `WorkloadConfig` (the `[workload]` section) holds `default_repository` and a map of named `WorkloadRepositorySpec` entries (`type = "http"` with `url`, or `type = "github"` with `repo`). `Config::workload.resolve()` accepts a config name, raw URL, or bare `owner/repo` and returns the matching spec. `Config::workload.build_repository()` constructs a runtime `WorkloadRepository`.
 - **Command handlers** -- `commands/<domain>/<action>.rs` modules bridging clap args to library API. Image: `ls`, `pull`, `rm`, `export`, `import`. Workload: `create`, `build`, `info`, `publish`, `deactivate`, `spec`, `ls`, `pull`, `push`, `import`, `export`, `add`, `rm`. Cloud: `deploy`, `destroy`, `status`, `list`, `ssh`, `serial`, `upload_image`, `init`.
 - **External subcommand delegation** -- unknown subcommands are delegated to `atakit-<name>` binaries on PATH (e.g. `atakit imgbuild` runs `atakit-imgbuild`).
 - **On-chain integration** -- `publish`, `deactivate`, and `spec` commands interact with the on-chain WorkloadRegistry via `automata-tee-workload-measurement` contract bindings and `alloy-ext` for transaction management.
@@ -85,13 +95,14 @@ Binary crate. Owns all presentation: output formatting, progress bars, error dis
 ## Dependency Graph
 
 ```
-atakit-cli ──> atakit-image (cli feature) ──> atakit-core
-    │                                              ^
-    ├──> atakit-workload (cli feature)             │
-    │                                              │
-    ├──> atakit-cloud (cli feature) ───────────────┘
+atakit-cli ──> atakit-image (cli feature) ──> atakit-github ──> atakit-core
+    │                ^                              ^                ^
+    │                │                              │                │
+    ├──> atakit-workload (cli feature) ─────────────┘                │
+    │                                                                │
+    ├──> atakit-cloud (cli feature) ─────────────────────────────────┘
     │
-    └──────────────────────────────────────────────┘
+    └────────────────────────────────────────────────────────────────┘
 ```
 
 ### Library dependencies
