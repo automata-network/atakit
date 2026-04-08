@@ -402,13 +402,44 @@ async fn verify_pcr23(
     let registry = measurement.workload_registry();
     let spec = match registry.get_workload_spec(workload_id).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            // Distinguish "workload not yet registered" (a valid state
+            // during an early pull) from transient RPC / contract
+            // errors (user should know). We don't have typed errors
+            // from the automata-tee-workload-measurement binding, so
+            // use a best-effort string match on the error message.
+            // Anything that doesn't look like "revert / not found /
+            // not registered" is treated as unexpected.
+            let msg = e.to_string();
+            let m = msg.to_ascii_lowercase();
+            let looks_not_registered = m.contains("revert")
+                || m.contains("not found")
+                || m.contains("not registered")
+                || m.contains("empty return data");
+
             if strict {
-                anyhow::bail!("workload not registered on-chain (id {workload_id_hex})");
+                if looks_not_registered {
+                    anyhow::bail!("workload not registered on-chain (id {workload_id_hex})");
+                }
+                anyhow::bail!(
+                    "failed to query on-chain spec for {workload_id_hex}: {e}"
+                );
             }
-            // Not-registered is a perfectly valid state during iteration
-            // (user may be pulling a workload before publishing it on a
-            // mirror). Silent skip.
+
+            if !looks_not_registered {
+                // Transient or unexpected failure: make it visible so
+                // users don't mistake a broken RPC for a missing spec.
+                eprintln!(
+                    "{} on-chain spec query for {} failed: {}",
+                    "warning:".yellow(),
+                    workload_id_hex,
+                    e,
+                );
+            }
+            // Either way we skip the check and let the pull continue.
+            // Not-registered is an expected state during a mirror pull
+            // before publish; unexpected errors shouldn't block pulls
+            // either, they just need to be visible.
             return Ok(());
         }
     };

@@ -34,6 +34,13 @@ use super::{RepositoryArchiveMeta, RepositoryFilters, UploadContext, WorkloadCoo
 const ATAWL_EXT: &str = ".atawl";
 const META_EXT: &str = ".meta.json";
 const LIST_PAGE_SIZE: u32 = 100;
+/// Upper bound on the bytes we're willing to download for a sidecar
+/// `*.meta.json`. The asset's reported size is attacker-controlled
+/// (whoever owns the release decides what to upload), so a malicious
+/// repo could otherwise publish a huge sidecar to OOM the client
+/// during `ls` / `pull`. Real metadata files are typically <1 KiB;
+/// 1 MiB is far more than any legitimate sidecar should need.
+const MAX_SIDECAR_SIZE: u64 = 1024 * 1024;
 
 /// GitHub releases-backed workload repository.
 pub struct GithubWorkloadRepository {
@@ -406,31 +413,47 @@ impl GithubWorkloadRepository {
         let meta_name = format!("{stem}{META_EXT}");
 
         if let Some(meta_asset) = release.assets.iter().find(|a| a.name == meta_name) {
-            match download_asset_bytes(&self.client, meta_asset).await {
-                Ok(bytes) => match serde_json::from_slice::<RepositoryArchiveMeta>(&bytes) {
-                    Ok(parsed) => {
-                        if sidecar_matches_coords(&parsed, coords, release) {
-                            return parsed;
+            // Refuse to download absurdly large sidecars. The asset
+            // size is attacker-controlled (whoever publishes the
+            // release decides), so without a cap a malicious repo
+            // could OOM the client by uploading a huge `.meta.json`.
+            // Real sidecars are typically <1 KiB; anything over
+            // MAX_SIDECAR_SIZE is either buggy or hostile.
+            if meta_asset.size > MAX_SIDECAR_SIZE {
+                warn!(
+                    repo = %self.repo,
+                    asset = %meta_name,
+                    size = meta_asset.size,
+                    limit = MAX_SIDECAR_SIZE,
+                    "sidecar exceeds size cap; ignoring and falling back to derived metadata"
+                );
+            } else {
+                match download_asset_bytes(&self.client, meta_asset).await {
+                    Ok(bytes) => match serde_json::from_slice::<RepositoryArchiveMeta>(&bytes) {
+                        Ok(parsed) => {
+                            if sidecar_matches_coords(&parsed, coords, release) {
+                                return parsed;
+                            }
+                            warn!(
+                                repo = %self.repo,
+                                asset = %meta_name,
+                                "sidecar disagrees with release tag/body; ignoring and falling back to derived metadata"
+                            );
                         }
-                        warn!(
+                        Err(e) => warn!(
                             repo = %self.repo,
                             asset = %meta_name,
-                            "sidecar disagrees with release tag/body; ignoring and falling back to derived metadata"
-                        );
-                    }
+                            error = %e,
+                            "failed to parse sidecar; falling back to derived metadata"
+                        ),
+                    },
                     Err(e) => warn!(
                         repo = %self.repo,
                         asset = %meta_name,
                         error = %e,
-                        "failed to parse sidecar; falling back to derived metadata"
+                        "failed to download sidecar; falling back to derived metadata"
                     ),
-                },
-                Err(e) => warn!(
-                    repo = %self.repo,
-                    asset = %meta_name,
-                    error = %e,
-                    "failed to download sidecar; falling back to derived metadata"
-                ),
+                }
             }
         }
 
