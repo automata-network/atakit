@@ -414,18 +414,29 @@ impl Config {
         }
         if let Ok(v) = env::var("ATAKIT_WORKLOAD_REPOSITORY_URL") {
             if !v.is_empty() {
-                // Create or replace a `default` HTTP repository entry.
-                let name = self
+                // Always write the env-provided URL into a dedicated
+                // `default` entry so it never overwrites a user's named
+                // GitHub repository. Also only promote it to
+                // default_repository when the user hasn't already set
+                // their own default.
+                const ENV_KEY: &str = "default";
+                let target_is_http_or_missing = self
                     .workload
-                    .default_repository
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
-                self.workload
                     .repositories
-                    .insert(name.clone(), WorkloadRepositorySpec::Http { url: v });
-                if self.workload.default_repository.is_none() {
-                    self.workload.default_repository = Some(name);
+                    .get(ENV_KEY)
+                    .map(|spec| matches!(spec, WorkloadRepositorySpec::Http { .. }))
+                    .unwrap_or(true);
+                if target_is_http_or_missing {
+                    self.workload.repositories.insert(
+                        ENV_KEY.to_string(),
+                        WorkloadRepositorySpec::Http { url: v },
+                    );
+                    if self.workload.default_repository.is_none() {
+                        self.workload.default_repository = Some(ENV_KEY.to_string());
+                    }
                 }
+                // Else: user has a non-HTTP `default` entry; don't
+                // clobber it with an HTTP url from env.
             }
         }
         if let Ok(v) = env::var("ATAKIT_GCP_PROJECT") {

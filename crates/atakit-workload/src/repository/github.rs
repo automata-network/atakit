@@ -25,7 +25,7 @@ use atakit_github::{
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::WorkloadError;
 
@@ -242,16 +242,21 @@ impl GithubWorkloadRepository {
             .await
             .map_err(WorkloadError::from)?;
 
-        let upload_url = release.upload_url.clone().ok_or_else(|| {
-            WorkloadError::Repository {
-                message: format!(
-                    "github release {tag} response missing upload_url",
-                ),
+        let upload_url = match release.upload_url.clone() {
+            Some(u) => u,
+            None => {
+                self.try_rollback_release(&release, &tag).await;
+                return Err(WorkloadError::Repository {
+                    message: format!("github release {tag} response missing upload_url"),
+                });
             }
-        })?;
+        };
 
+        // Helper to delete the release on asset upload failure so the
+        // tag doesn't get stuck in a half-uploaded state and block
+        // future retries.
         let archive_name = format!("{}{ATAWL_EXT}", ctx.coords.asset_stem());
-        upload_release_asset(
+        if let Err(e) = upload_release_asset(
             &self.client,
             &upload_url,
             &archive_name,
@@ -259,7 +264,10 @@ impl GithubWorkloadRepository {
             "application/octet-stream",
         )
         .await
-        .map_err(WorkloadError::from)?;
+        {
+            self.try_rollback_release(&release, &tag).await;
+            return Err(WorkloadError::from(e));
+        }
 
         let meta = RepositoryArchiveMeta {
             workload_id: ctx.coords.workload_id.clone(),
@@ -271,10 +279,16 @@ impl GithubWorkloadRepository {
             archive_hash,
             uploaded_at,
         };
-        let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(|e| WorkloadError::Json(e.to_string()))?;
+        let meta_bytes = match serde_json::to_vec_pretty(&meta) {
+            Ok(b) => b,
+            Err(e) => {
+                self.try_rollback_release(&release, &tag).await;
+                return Err(WorkloadError::Json(e.to_string()));
+            }
+        };
 
         let meta_name = format!("{}{META_EXT}", ctx.coords.asset_stem());
-        upload_release_asset_bytes(
+        if let Err(e) = upload_release_asset_bytes(
             &self.client,
             &upload_url,
             &meta_name,
@@ -282,9 +296,40 @@ impl GithubWorkloadRepository {
             "application/json",
         )
         .await
-        .map_err(WorkloadError::from)?;
+        {
+            self.try_rollback_release(&release, &tag).await;
+            return Err(WorkloadError::from(e));
+        }
 
         Ok(meta)
+    }
+
+    /// Best-effort cleanup after a failed upload. We just created the
+    /// release so the tag exists on the remote, but one of the asset
+    /// uploads failed; if we leave the release in place, future push
+    /// attempts will hit the "release already exists" guard and refuse
+    /// to retry. A failed delete is logged but swallowed -- we want the
+    /// original upload error to be what the caller sees, not a
+    /// secondary cleanup failure.
+    async fn try_rollback_release(&self, release: &Release, tag: &str) {
+        let Some(id) = release.id else {
+            warn!(
+                repo = %self.repo,
+                %tag,
+                "cannot rollback orphan release: github response did not include a release id"
+            );
+            return;
+        };
+        debug!(%tag, release_id = id, "rolling back orphan github release after upload failure");
+        if let Err(e) = self.client.delete_release(&self.repo, id).await {
+            warn!(
+                repo = %self.repo,
+                %tag,
+                release_id = id,
+                error = %e,
+                "failed to rollback orphan github release; tag may block future pushes until deleted manually"
+            );
+        }
     }
 
     // ── internals ──────────────────────────────────────────────
@@ -335,9 +380,21 @@ impl GithubWorkloadRepository {
             .await)
     }
 
-    /// Build a metadata record for a release. If a sidecar `<stem>.meta.json`
-    /// asset exists, prefer its values; otherwise fall back to what we can
-    /// derive from the release body and asset size.
+    /// Build a metadata record for a release.
+    ///
+    /// If a sidecar `<stem>.meta.json` asset exists and its `name` /
+    /// `version` / `workload_id` agree with what we derived from the
+    /// release's tag and body, we trust and return its values. If the
+    /// sidecar disagrees (malicious or stale), or is unparseable, we
+    /// ignore it, emit a warning, and fall back to values derived from
+    /// the tag / body / asset metadata only.
+    ///
+    /// This matters because `build_meta` feeds the integrity comparison
+    /// in `workload pull`: if we trusted a lying sidecar, an attacker
+    /// could adjust both the sidecar and the archive so the repo-level
+    /// checks pass, defeating them. On-chain PCR23 would still catch it
+    /// when configured, but the repo-level check is our first line of
+    /// defence for workloads that aren't on-chain yet.
     async fn build_meta(
         &self,
         release: &Release,
@@ -349,14 +406,35 @@ impl GithubWorkloadRepository {
         let meta_name = format!("{stem}{META_EXT}");
 
         if let Some(meta_asset) = release.assets.iter().find(|a| a.name == meta_name) {
-            if let Ok(bytes) = download_asset_bytes(&self.client, meta_asset).await {
-                if let Ok(parsed) = serde_json::from_slice::<RepositoryArchiveMeta>(&bytes) {
-                    return parsed;
-                }
+            match download_asset_bytes(&self.client, meta_asset).await {
+                Ok(bytes) => match serde_json::from_slice::<RepositoryArchiveMeta>(&bytes) {
+                    Ok(parsed) => {
+                        if sidecar_matches_coords(&parsed, coords, release) {
+                            return parsed;
+                        }
+                        warn!(
+                            repo = %self.repo,
+                            asset = %meta_name,
+                            "sidecar disagrees with release tag/body; ignoring and falling back to derived metadata"
+                        );
+                    }
+                    Err(e) => warn!(
+                        repo = %self.repo,
+                        asset = %meta_name,
+                        error = %e,
+                        "failed to parse sidecar; falling back to derived metadata"
+                    ),
+                },
+                Err(e) => warn!(
+                    repo = %self.repo,
+                    asset = %meta_name,
+                    error = %e,
+                    "failed to download sidecar; falling back to derived metadata"
+                ),
             }
         }
 
-        // Sidecar missing or unparseable: derive what we can.
+        // Sidecar missing or rejected: derive what we can.
         let body = release.body.as_deref().unwrap_or("");
         let workload_id = parse_body_field(body, "Workload ID")
             .unwrap_or_else(|| coords.workload_id.clone());
@@ -424,6 +502,42 @@ fn parse_body_field(body: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Decide whether a sidecar `meta.json` asset is trustworthy enough to
+/// return verbatim. We require:
+///
+/// 1. Its `name` and `version` match the tag-derived coords exactly.
+/// 2. Its `workload_id` matches what we expect for those coords, either
+///    (a) equal to `coords.workload_id`, or (b) equal to whatever the
+///    release body's `Workload ID` line advertises (both should be the
+///    same in practice -- if they differ the sidecar is suspect).
+///
+/// If the sidecar disagrees, the caller falls back to derived values
+/// and emits a warning. This is defence in depth: a tampered sidecar
+/// that lies about `workload_id`/`sha256`/`archive_hash` could otherwise
+/// slip past the repo-level integrity check in `workload pull` when
+/// on-chain verification is not configured.
+fn sidecar_matches_coords(
+    sidecar: &RepositoryArchiveMeta,
+    coords: &WorkloadCoords,
+    release: &Release,
+) -> bool {
+    if sidecar.name != coords.name || sidecar.version != coords.version {
+        return false;
+    }
+    if !sidecar.workload_id.eq_ignore_ascii_case(&coords.workload_id) {
+        return false;
+    }
+    // Optional: cross-check against the body line too.
+    if let Some(body) = release.body.as_deref() {
+        if let Some(body_id) = parse_body_field(body, "Workload ID") {
+            if !body_id.eq_ignore_ascii_case(&sidecar.workload_id) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Parse `<name>/<version>` out of the release tag.
