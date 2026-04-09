@@ -441,7 +441,7 @@ impl GithubWorkloadRepository {
                     "sidecar exceeds size cap; ignoring and falling back to derived metadata"
                 );
             } else {
-                match download_asset_bytes(&self.client, meta_asset).await {
+                match download_asset_bytes(&self.client, meta_asset, MAX_SIDECAR_SIZE).await {
                     Ok(bytes) => match serde_json::from_slice::<RepositoryArchiveMeta>(&bytes) {
                         Ok(parsed) => {
                             if sidecar_matches_coords(&parsed, coords, release) {

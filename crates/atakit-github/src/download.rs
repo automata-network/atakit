@@ -151,14 +151,27 @@ pub async fn download_asset_to_path(
     Ok(written)
 }
 
-/// Download an asset's full body into memory. Useful for small sidecar files
-/// like a JSON metadata blob; do not use for large archives.
+/// Download an asset's full body into memory with a hard size cap.
+///
+/// Useful for small sidecar files like a JSON metadata blob. The
+/// `max_bytes` parameter bounds the total bytes read from the
+/// response body so a malicious server (or compromised release)
+/// cannot OOM the client by sending an arbitrarily large payload.
+///
+/// Defence in depth:
+/// 1. If the response carries a `Content-Length` header that exceeds
+///    `max_bytes`, the download is rejected immediately without
+///    reading the body.
+/// 2. Even if `Content-Length` is absent or lies (claims small but
+///    sends big), the streaming read loop aborts as soon as the
+///    running byte count passes `max_bytes`.
 pub async fn download_asset_bytes(
     client: &ReleasesClient,
     asset: &Asset,
+    max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let url = asset_download_url(client, asset);
-    debug!(%url, "downloading asset bytes");
+    debug!(%url, max_bytes, "downloading asset bytes");
 
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(header::USER_AGENT, HeaderValue::from_static("atakit"));
@@ -176,12 +189,46 @@ pub async fn download_asset_bytes(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        // Truncate error bodies too -- a malicious server could
+        // send a huge error response.
+        let body = if body.len() > max_bytes as usize {
+            let mut truncated = body[..max_bytes as usize].to_string();
+            truncated.push_str("...(truncated)");
+            truncated
+        } else {
+            body
+        };
         return Err(GithubError::DownloadFailed {
             status: status.as_u16(),
             body,
         });
     }
-    Ok(resp.bytes().await?.to_vec())
+
+    // Early rejection: if Content-Length exceeds the cap, don't
+    // start reading.
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            return Err(GithubError::DownloadTooLarge { limit: max_bytes });
+        }
+    }
+
+    // Stream with running cap. Content-Length can be absent or lie
+    // (claims small, sends big), so we enforce the cap on actual
+    // bytes received regardless.
+    let hint = resp
+        .content_length()
+        .unwrap_or(0)
+        .min(max_bytes) as usize;
+    let mut buf = Vec::with_capacity(hint);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > max_bytes as usize {
+            return Err(GithubError::DownloadTooLarge { limit: max_bytes });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Choose the right URL for downloading: API url (authenticated) or
