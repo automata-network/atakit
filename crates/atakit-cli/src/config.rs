@@ -621,34 +621,6 @@ fn inherit_github_credential(
     }
 }
 
-/// Build the single-entry image repository spec produced by the
-/// `ATAKIT_DEFAULT_REPO` env override.
-///
-/// If any already-configured entry has the same `repo` path, inherit
-/// its credential and `list_limit` so users who set the env var to
-/// steer image commands at a private mirror don't silently lose
-/// their auth. Otherwise synthesize an anonymous entry (public repos
-/// still work, private repos will fail at the API with a clear 401
-/// the same way they would without the env override).
-///
-/// Factored out of `apply_env_overrides` so it can be unit-tested
-/// without mutating process env vars (which would race with other
-/// tests running in parallel via `Config::load_from_str`).
-fn default_repo_entry(
-    repositories: &IndexMap<String, ImageRepositorySpec>,
-    repo_path: &str,
-) -> ImageRepositorySpec {
-    repositories
-        .values()
-        .find(|s| s.repo == repo_path)
-        .cloned()
-        .unwrap_or_else(|| ImageRepositorySpec {
-            repo: repo_path.to_string(),
-            credential: None,
-            list_limit: None,
-        })
-}
-
 fn looks_like_owner_repo(s: &str) -> bool {
     let mut parts = s.split('/');
     let owner = parts.next().unwrap_or("");
@@ -851,14 +823,6 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = env::var("ATAKIT_DEFAULT_REPO") {
-            if !v.is_empty() {
-                let spec = default_repo_entry(&self.image.repositories, &v);
-                let mut repos = IndexMap::new();
-                repos.insert("default".to_string(), spec);
-                self.image.repositories = repos;
-            }
-        }
         if let Ok(v) = env::var("ATAKIT_DEFAULT_PLATFORMS") {
             if !v.is_empty() {
                 let parsed: Vec<String> = v
@@ -2229,66 +2193,6 @@ mod tests {
             msg.contains("unknown field") || msg.contains("foo"),
             "expected unknown-field rejection, got: {msg}"
         );
-    }
-
-    // ── ATAKIT_DEFAULT_REPO env override ─────────────────────────
-    //
-    // These test the pure helper `default_repo_entry` rather than
-    // setting `ATAKIT_DEFAULT_REPO` via `env::set_var` and calling
-    // `Config::load_from_str`, because unit tests run in parallel
-    // and process env mutation races with any other test that
-    // reads env inside `apply_env_overrides`. The helper is the
-    // only logic the env branch actually owns; everything else is
-    // the one-line IndexMap insertion.
-
-    fn spec(repo: &str, credential: Option<&str>, list_limit: Option<u32>) -> ImageRepositorySpec {
-        ImageRepositorySpec {
-            repo: repo.to_string(),
-            credential: credential.map(str::to_string),
-            list_limit,
-        }
-    }
-
-    #[test]
-    fn atakit_default_repo_inherits_credential_and_list_limit_from_matching_entry() {
-        let mut repositories = IndexMap::new();
-        repositories.insert("automata".to_string(), spec("automata-network/automata-linux", None, None));
-        repositories.insert(
-            "private".to_string(),
-            spec("myorg/private-images", Some("private"), Some(3)),
-        );
-        let result = default_repo_entry(&repositories, "myorg/private-images");
-        assert_eq!(result.repo, "myorg/private-images");
-        assert_eq!(result.credential.as_deref(), Some("private"));
-        assert_eq!(result.list_limit, Some(3));
-    }
-
-    #[test]
-    fn atakit_default_repo_synthesizes_anonymous_when_no_match() {
-        let mut repositories = IndexMap::new();
-        repositories.insert("automata".to_string(), spec("automata-network/automata-linux", None, None));
-        let result = default_repo_entry(&repositories, "unconfigured/public");
-        assert_eq!(result.repo, "unconfigured/public");
-        assert!(result.credential.is_none());
-        assert!(result.list_limit.is_none());
-    }
-
-    #[test]
-    fn atakit_default_repo_inherits_from_public_entry_keeps_credential_none() {
-        // An entry without a credential (public repo) is also a
-        // valid inheritance target: the helper preserves the None
-        // rather than "re-synthesizing" a new anonymous spec. This
-        // matters for the `list_limit` inheritance edge case where
-        // a public entry wants its limit respected even though it
-        // has no credential.
-        let mut repositories = IndexMap::new();
-        repositories.insert(
-            "fast-public".to_string(),
-            spec("automata-network/automata-linux", None, Some(5)),
-        );
-        let result = default_repo_entry(&repositories, "automata-network/automata-linux");
-        assert!(result.credential.is_none());
-        assert_eq!(result.list_limit, Some(5));
     }
 
     // ── list_limit precedence ────────────────────────────────────
