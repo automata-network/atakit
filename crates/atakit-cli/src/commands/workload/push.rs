@@ -62,11 +62,18 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     let workload_id = compute_workload_id(&name, &version);
     let workload_id_hex = format!("0x{}", hex::encode(workload_id));
 
-    // Resolve repository.
-    let spec = config.workload.resolve(args.repository.as_deref())?;
-    let repo = config
-        .workload
-        .build_repository(spec, config.github_token().map(str::to_string));
+    // Resolve repository and its credential (if any). A github repo
+    // without a configured credential will fail the upload() gate
+    // further down with a clear "requires credential" message.
+    let (_, spec) = config.workload.resolve(args.repository.as_deref())?;
+    let resolved_token = match &spec {
+        crate::config::WorkloadRepositorySpec::Github {
+            credential: Some(cred_name),
+            ..
+        } => Some(config.resolve_credential(cred_name)?),
+        _ => None,
+    };
+    let repo = config.workload.build_repository(spec, resolved_token);
     let repo_uri = repo.display_uri();
 
     if !repo.supports_upload() {

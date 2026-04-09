@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform, PullArgs, ReleasesClient};
 
-use crate::config::{Config, repo_local_name};
+use crate::config::{Config, ImageRepositorySpec, repo_local_name};
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
@@ -15,46 +15,61 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     let store = ImageStore::new(&env.image_dir);
-    let client = match config.github_token() {
-        Some(token) => ReleasesClient::new().with_token(token),
-        None => ReleasesClient::new().with_token_from_env(),
-    };
     let progress = IndicatifReporter;
 
-    // Resolve the GitHub repository to query. When the user specifies an
-    // image reference, its repository component (e.g. "dev-baseimage") maps
-    // to a configured `owner/repo` entry whose local name matches. Without
-    // this mapping, pull would always query the primary repo regardless of
-    // which image the user asked for.
-    let (github_repo, image_ref) = match args.image {
+    // Resolve the target entry first: when an image ref is provided,
+    // look it up by local name; otherwise use the primary (first
+    // declared) configured entry. This lets us read the credential off
+    // the spec BEFORE building the network client.
+    let (spec, image_ref): (ImageRepositorySpec, Option<ImageRef>) = match args.image {
         Some(image_ref) => {
-            let github_repo = config
+            let (_, spec) = config
                 .image
-                .find_repo_by_local_name(&image_ref.repository)
+                .find_by_local_name(&image_ref.repository)
                 .ok_or_else(|| {
                     let configured: Vec<String> = config
                         .image
-                        .repos()
+                        .repositories
                         .iter()
-                        .map(|r| format!("  - {r}"))
+                        .map(|(name, s)| format!("  - {name}: {}", s.repo))
                         .collect();
                     anyhow!(
                         "no configured repository matches '{}'. Configured repositories:\n{}",
                         image_ref.repository,
                         configured.join("\n"),
                     )
-                })?
-                .to_string();
-            (github_repo, image_ref)
+                })?;
+            (spec.clone(), Some(image_ref))
         }
         None => {
-            let github_repo = config.image.primary_repo().to_string();
+            let (_, spec) = config
+                .image
+                .primary_entry()
+                .ok_or_else(|| anyhow!("no image repositories configured"))?;
+            (spec.clone(), None)
+        }
+    };
+
+    // Resolve the credential for the chosen entry (if any).
+    let token = match spec.credential.as_deref() {
+        Some(name) => Some(config.resolve_credential(name)?),
+        None => None,
+    };
+
+    let mut client = ReleasesClient::new();
+    if let Some(ref t) = token {
+        client = client.with_token(t);
+    }
+
+    let github_repo = spec.repo.clone();
+    let image_ref = match image_ref {
+        Some(r) => r,
+        None => {
             let local_name = repo_local_name(&github_repo).to_string();
             println!("No image specified, finding latest image release...");
             let release = client.find_latest_image_release(&github_repo).await?;
             println!("Using {local_name}:{}", release.tag_name);
-            let image_ref = ImageRef::new(local_name, release.tag_name);
-            (github_repo, image_ref)
+            ImageRef::new(local_name, release.tag_name)
         }
     };
 
