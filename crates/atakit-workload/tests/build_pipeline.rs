@@ -69,9 +69,9 @@ async fn build_produces_valid_archive() {
     let mut entry_names: Vec<String> = archive
         .entries()
         .unwrap()
-        .filter_map(|e| {
+        .map(|e| {
             let e = e.unwrap();
-            Some(e.path().unwrap().to_string_lossy().into_owned())
+            e.path().unwrap().to_string_lossy().into_owned()
         })
         .collect();
     entry_names.sort();
