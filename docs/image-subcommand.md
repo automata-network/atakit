@@ -106,7 +106,6 @@ All methods take the full GitHub `owner/repo` path as the `repo` parameter.
 impl ReleasesClient {
     fn new() -> Self;
     fn with_token(self, token: impl Into<String>) -> Self;
-    fn with_token_from_env(self) -> Self;
 
     // Low-level
     async fn list_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>>;
@@ -120,6 +119,8 @@ impl ReleasesClient {
     async fn find_latest_release_for(&self, repo: &str, platform: Platform) -> Result<Release>;
 }
 ```
+
+Tokens are resolved by the CLI caller (from a named entry under `[github.credentials]`) and passed to `with_token`. There is no magic env-var fallback.
 
 ### ImageStore
 
@@ -254,17 +255,45 @@ Note: Azure VHD files are stored compressed as `azure_disk.vhd.zst`. The `.atabi
 
 ## Configuration
 
-Image repositories are configured in `config.toml` under `[image]`:
+Image repositories are configured in `config.toml` under `[image.repositories]` as named inline tables:
 
 ```toml
-[image]
-# Single repository (string)
-repository = "automata-network/automata-linux"
-
-# Or multiple repositories (array)
-repositories = ["automata-network/automata-linux", "automata-network/debug-linux"]
+[image.repositories]
+automata = { repo = "automata-network/automata-linux" }
+debug    = { repo = "automata-network/debug-linux" }
+private  = { repo = "myorg/private-images", credential = "private" }
+fast-dev = { repo = "myorg/dev-mirror", list_limit = 3 }
 ```
 
-Both `repository` (singular) and `repositories` (plural) are accepted. The first entry is the default for `image pull`. The `--repo` CLI flag overrides with a single repository.
+Each entry has:
+
+- `repo` -- required, the full GitHub `owner/repo` path.
+- `credential` -- optional, names a credential under `[github.credentials]`. If omitted, requests are anonymous (public repos only).
+- `list_limit` -- optional, overrides the global `[image] list_limit` for just this entry.
+
+Declaration order is preserved (`IndexMap`). The first-declared entry is the implicit default for `image pull` when no image reference is given. The `--repo` CLI flag overrides with a single repository; if its `owner/repo` matches a configured entry, the credential and `list_limit` from that entry are inherited.
+
+`list_limit` precedence at call sites: `--limit` CLI flag > per-repo `list_limit` > `[image] list_limit` global.
+
+Section form is also valid when an entry wants inline comments:
+
+```toml
+[image.repositories.automata]
+repo = "automata-network/automata-linux"
+# pinned to the public mirror; anonymous access is fine
+```
 
 `repo_local_name(repo)` in `atakit-cli/src/config.rs` extracts the local store name from an `owner/repo` string (e.g. `"automata-network/debug-linux"` -> `"debug-linux"`). This is used for local store directory names and `ImageRef` construction.
+
+### GitHub credentials
+
+Tokens for private repositories come from named entries under `[github.credentials]`:
+
+```toml
+[github.credentials]
+public  = { file    = "~/.config/atakit/tokens/public" }
+private = { command = ["pass", "show", "github/atakit-private"] }
+ci      = { env     = "GH_CI_TOKEN" }
+```
+
+Each credential sets exactly one of `file` / `command` / `env`; `command` credentials default to a 30-second timeout with an optional `timeout_secs` override. Credentials are validated eagerly at config load but tokens are only read on first use, so `image ls` against a public repo never touches the credential files.

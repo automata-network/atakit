@@ -212,7 +212,7 @@ Upload a workload to a repository.
 
 Source can be: `name:version` (from store), a file path, or auto-detected via `find_versioned_archive()`.
 
-For HTTP repositories the upload is a single `PUT /v1/workloads/{id}` request. For GitHub repositories push (a) refuses if a release with the canonical tag already exists, (b) creates a new release with tag `<name>/<version>`, name `<name>:<version>`, and body containing the workload ID and PCRs, then (c) uploads both the `.atawl` archive and the sidecar `.meta.json`. A `GITHUB_TOKEN` with `contents: write` is required.
+For HTTP repositories the upload is a single `PUT /v1/workloads/{id}` request. For GitHub repositories push (a) refuses if a release with the canonical tag already exists, (b) creates a new release with tag `<name>/<version>`, name `<name>:<version>`, and body containing the workload ID and PCRs, then (c) uploads both the `.atawl` archive and the sidecar `.meta.json`. A credential with `contents: write` scope is required, configured under `[github.credentials]` and referenced via `credential = "<name>"` on the repository entry.
 
 ### `atakit workload add <ref>`
 
@@ -252,7 +252,7 @@ atakit workload build
 # 2. Register on-chain
 atakit workload publish secure-signer:v0.0.1 --owner-key ... --relay-key ...
 
-# 3. Upload to default repository
+# 3. Upload to the first-declared entry in [workload.repositories]
 atakit workload push secure-signer:v0.0.1
 
 # 4. Verify listing
@@ -266,15 +266,17 @@ atakit workload ls --all
 atakit workload build
 atakit workload publish secure-signer:v0.0.1 --owner-key ... --relay-key ...
 
-# 2. Push to a github repository (creates release + uploads assets)
-GITHUB_TOKEN=ghp_... atakit workload push secure-signer:v0.0.1 \
-    --repository owner/workload-archives
+# 2. Push to a github repository (creates release + uploads assets).
+# The target repo is configured under [workload.repositories.gh-private]
+# with credential = "private"; the credential in turn points at a
+# chmod 600 token file (or a `pass show` command, etc.).
+atakit workload push secure-signer:v0.0.1 --repository gh-private
 ```
 
 ### Operator workflow
 
 ```
-# 1. Browse available workloads (uses default repository)
+# 1. Browse available workloads (fans out across every configured repository)
 atakit workload ls --remote --name secure-signer
 
 # 2. Download to local store
