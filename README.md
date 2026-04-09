@@ -50,8 +50,8 @@ atakit image pull automata-linux:v0.1.6 gcp
 atakit image rm automata-linux:v0.1.6
 
 # Export/import portable .atabi archives
-atakit image export automata-linux:v0.1.6 gcp -o image.atabi
-atakit image import image.atabi
+atakit image export automata-linux:v0.1.6
+atakit image import automata-linux-v0.1.6-gcp.atabi
 ```
 
 ### Workload management
@@ -64,14 +64,14 @@ atakit workload create my-workload
 atakit workload build -d ./my-workload
 
 # Inspect a built workload (shows PCR23 measurement)
-atakit workload info my-service v0.0.1
+atakit workload info my-service:v0.0.1
 
-# Push/pull workloads to a registry
-atakit workload push my-service v0.0.1
-atakit workload pull my-service v0.0.1
+# Push/pull workloads to a repository
+atakit workload push my-service:v0.0.1
+atakit workload pull my-service:v0.0.1
 
 # Publish workload spec on-chain
-atakit workload publish my-service v0.0.1
+atakit workload publish my-service:v0.0.1
 
 # Query on-chain workload spec
 atakit workload spec <workload-id>

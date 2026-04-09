@@ -212,6 +212,177 @@ fn workload_ls_remote_with_one_broken_credential_repo_errors_strictly() {
     );
 }
 
+// ── multi-repo best-effort path ──────────────────────────────────
+
+#[test]
+fn image_ls_remote_with_two_repos_and_one_broken_credential_warns_and_continues() {
+    // Exercise the best-effort path: more than one configured
+    // target, one with a broken credential. The credential failure
+    // must be a per-credential warning + per-repo skip, not a hard
+    // error. The working repo should still be queried. We can't
+    // assert network success without live GitHub, so the passing
+    // signal is: (a) the credential-failure warning fires, (b) the
+    // skip-repo warning names the broken entry, and (c) the
+    // command makes it past credential resolution without exiting
+    // non-zero on the credential issue alone.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        ok     = { repo = "automata-network/automata-linux" }
+        broken = { repo = "myorg/private-images", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(&cfg, &dat, &cache, &["image", "ls", "--remote"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stderr.contains("credential 'broken' failed") || stderr.contains("broken"),
+        "expected per-credential warning naming the broken credential.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("skipping") && stderr.contains("broken"),
+        "expected per-repo skip warning naming the broken entry.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn workload_ls_remote_with_two_repos_and_one_broken_credential_warns_and_continues() {
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        x = { repo = "a/b" }
+
+        [workload.repositories]
+        http-ok = { type = "http",   url  = "https://definitely-not-a-real-registry.invalid" }
+        broken  = { type = "github", repo = "myorg/private-workloads", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(&cfg, &dat, &cache, &["workload", "ls", "--remote"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stderr.contains("credential 'broken' failed") || stderr.contains("broken"),
+        "expected per-credential warning naming the broken credential.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("skipping") && stderr.contains("broken"),
+        "expected per-repo skip warning naming the broken entry.\nstderr: {stderr}"
+    );
+    // The http-ok entry SHOULD also fail (no such host) -- that's
+    // an API error, and the docs promise it's warn-and-continue in
+    // multi-target mode. Make sure at least one "warning:" line
+    // mentioning "http-ok" appears.
+    assert!(
+        stderr.contains("http-ok"),
+        "expected a per-repo warning for the unreachable http-ok entry.\nstderr: {stderr}"
+    );
+}
+
+// ── --tag mode with broken credential ─────────────────────────────
+
+#[test]
+fn image_ls_tag_with_broken_credential_errors_strictly() {
+    // --tag mode targets exactly one repository and makes a direct
+    // GitHub API call to fetch that release. A broken credential
+    // on the chosen entry must be fatal with the real cause, not
+    // silently skipped.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        private = { repo = "myorg/private-images", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(
+        &cfg,
+        &dat,
+        &cache,
+        &["image", "ls", "--tag", "private-images:v0.0.1"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; got success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken") || stderr.contains("ATAKIT_TEST_BROKEN_TOKEN"),
+        "expected the credential name or env var name in the error.\nstderr: {stderr}"
+    );
+}
+
+// ── file / command credential sources in cardinality context ──────
+
+#[test]
+fn image_ls_remote_with_missing_file_credential_errors_strictly() {
+    // Exercises the `file` credential source in the cardinality
+    // path. The previous cardinality tests all used `env`
+    // credentials; this one points at a chmod 600 file that
+    // doesn't exist and asserts the full io error cause chain
+    // reaches the user.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { file = "/nonexistent/atakit-test/credential-file" }
+
+        [image.repositories]
+        private = { repo = "myorg/private-images", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(&cfg, &dat, &cache, &["image", "ls", "--remote"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("broken")
+            && (stderr.contains("No such file") || stderr.contains("cannot find")),
+        "expected file source error with underlying io cause.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn image_ls_remote_with_failing_command_credential_errors_strictly() {
+    // Exercises the `command` credential source in the cardinality
+    // path. The helper exits 1 with stderr output; the poll-loop
+    // runner must surface the exit status and stderr snippet
+    // through the strict single-target error, not panic or hang.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { command = ["sh", "-c", "echo 'nope: no such entry' >&2; exit 7"] }
+
+        [image.repositories]
+        private = { repo = "myorg/private-images", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(&cfg, &dat, &cache, &["image", "ls", "--remote"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("broken") && stderr.contains("exited with status"),
+        "expected command-source error naming the credential and exit status.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("7") || stderr.contains("nope"),
+        "expected the exit code 7 or the stderr snippet in the error.\nstderr: {stderr}"
+    );
+}
+
 #[test]
 fn workload_ls_remote_with_pinned_broken_repository_errors_strictly() {
     // Same test but reaching "single target" via `--repository`

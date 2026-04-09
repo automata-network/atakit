@@ -66,13 +66,18 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     // without a configured credential will fail the upload() gate
     // further down with a clear "requires credential" message.
     let (_, spec) = config.workload.resolve(args.repository.as_deref())?;
-    let resolved_token = match &spec {
-        crate::config::WorkloadRepositorySpec::Github {
-            credential: Some(cred_name),
-            ..
-        } => Some(config.resolve_credential(cred_name)?),
-        _ => None,
-    };
+    // `command` credentials can block up to `timeout_secs`, so wrap
+    // in `block_in_place` to let tokio schedule other work instead
+    // of holding the worker thread captive.
+    let resolved_token = tokio::task::block_in_place(|| -> Result<Option<String>> {
+        match &spec {
+            crate::config::WorkloadRepositorySpec::Github {
+                credential: Some(cred_name),
+                ..
+            } => Ok(Some(config.resolve_credential(cred_name)?)),
+            _ => Ok(None),
+        }
+    })?;
     let repo = config.workload.build_repository(spec, resolved_token);
     let repo_uri = repo.display_uri();
 

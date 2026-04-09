@@ -51,10 +51,15 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     // Resolve the credential for the chosen entry (if any).
-    let token = match spec.credential.as_deref() {
-        Some(name) => Some(config.resolve_credential(name)?),
-        None => None,
-    };
+    // `command` credentials can block up to `timeout_secs`, so wrap
+    // in `block_in_place` to let tokio schedule other work instead
+    // of holding the worker thread captive.
+    let token = tokio::task::block_in_place(|| -> Result<Option<String>> {
+        match spec.credential.as_deref() {
+            Some(name) => Ok(Some(config.resolve_credential(name)?)),
+            None => Ok(None),
+        }
+    })?;
 
     let mut client = ReleasesClient::new();
     if let Some(ref t) = token {

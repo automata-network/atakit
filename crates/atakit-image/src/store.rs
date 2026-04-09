@@ -188,7 +188,7 @@ impl ImageStore {
         platforms: &[Platform],
         progress: &dyn ProgressReporter,
     ) -> Result<Vec<PathBuf>> {
-        let release = client.get_release(github_repo, &image_ref.tag).await?;
+        let release = client.get_release_by_tag(github_repo, &image_ref.tag).await?;
 
         // Collect the unique set of archive assets needed.
         let mut archives_to_download: Vec<&crate::types::Asset> = Vec::new();

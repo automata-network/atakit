@@ -109,7 +109,7 @@ impl ReleasesClient {
 
     // Low-level
     async fn list_releases(&self, repo: &str, per_page: u32) -> Result<Vec<Release>>;
-    async fn get_release(&self, repo: &str, tag: &str) -> Result<Release>;
+    async fn get_release_by_tag(&self, repo: &str, tag: &str) -> Result<Release>;
     async fn get_latest_release(&self, repo: &str) -> Result<Release>;
 
     // High-level

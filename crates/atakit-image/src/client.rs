@@ -40,7 +40,7 @@ impl ReleasesClient {
     }
 
     /// Fetch a specific release by its Git tag.
-    pub async fn get_release(&self, repo: &str, tag: &str) -> Result<Release> {
+    pub async fn get_release_by_tag(&self, repo: &str, tag: &str) -> Result<Release> {
         Ok(self.inner.get_release_by_tag(repo, tag).await?.into())
     }
 
@@ -87,7 +87,7 @@ impl ReleasesClient {
             VersionSelector::Latest => self.get_latest_release(repo).await,
             VersionSelector::LatestImage => self.find_latest_image_release(repo).await,
             VersionSelector::LatestImageFor(p) => self.find_latest_release_for(repo, *p).await,
-            VersionSelector::Tag(image_ref) => self.get_release(repo, &image_ref.tag).await,
+            VersionSelector::Tag(image_ref) => self.get_release_by_tag(repo, &image_ref.tag).await,
         }
     }
 
