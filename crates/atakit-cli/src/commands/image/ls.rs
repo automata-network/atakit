@@ -53,9 +53,40 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 
     // --tag mode: single-target, single repo, strict.
     if let Some(tag) = &args.tag {
-        let (_, spec) = targets
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no image repositories configured"))?;
+        // Pick the repository to query for this tag. When `--repo`
+        // was passed, `targets` has already been narrowed to that
+        // single entry (see the top of the function) so we honour
+        // it. When it wasn't, look up the configured entry whose
+        // local name matches the tag's `repository` component --
+        // running `--tag debug-linux:v0.5` must query the entry
+        // that actually points at `*/debug-linux`, not whichever
+        // entry happens to be declared first. Mirrors the same
+        // lookup `image pull` does for image references.
+        let spec = if args.repo.is_some() {
+            targets
+                .first()
+                .map(|(_, s)| s.clone())
+                .ok_or_else(|| anyhow::anyhow!("no image repositories configured"))?
+        } else {
+            let (_, s) = config
+                .image
+                .find_by_local_name(&tag.repository)?
+                .ok_or_else(|| {
+                    let configured: Vec<String> = config
+                        .image
+                        .repositories
+                        .iter()
+                        .map(|(name, s)| format!("  - {name}: {}", s.repo))
+                        .collect();
+                    anyhow::anyhow!(
+                        "no configured repository matches '{}'. Configured repositories:\n{}",
+                        tag.repository,
+                        configured.join("\n"),
+                    )
+                })?;
+            s.clone()
+        };
+
         // `command` credentials can block up to `timeout_secs`, so
         // wrap the resolve in `block_in_place`.
         let token = tokio::task::block_in_place(|| -> Result<Option<String>> {

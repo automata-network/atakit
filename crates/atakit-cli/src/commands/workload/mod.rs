@@ -72,6 +72,7 @@ pub fn compute_base_image_id(name: &str, version: &str) -> B256 {
 }
 
 /// Parsed workload reference: either `name:version` or a hex workload ID.
+#[derive(Clone)]
 pub enum WorkloadRef {
     NameVersion { name: String, version: String },
     Id(String),

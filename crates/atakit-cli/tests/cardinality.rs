@@ -289,6 +289,77 @@ fn workload_ls_remote_with_two_repos_and_one_broken_credential_warns_and_continu
 // ── --tag mode with broken credential ─────────────────────────────
 
 #[test]
+fn image_ls_tag_routes_to_matching_configured_entry() {
+    // Regression: `--tag debug-linux:v0.5` used to query the
+    // first-declared repository regardless of what the tag's
+    // `repository` component said. With two configured entries
+    // and a broken credential on the SECOND entry, the old code
+    // would hit the FIRST entry for the network call (and then
+    // fail on the fake token). After the fix, `--tag` looks up
+    // the entry by the ref's repository component, so pointing
+    // at "debug-linux" must route to the second entry and
+    // surface its broken credential.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        automata = { repo = "automata-network/automata-linux" }
+        debug    = { repo = "owner/debug-linux", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(
+        &cfg,
+        &dat,
+        &cache,
+        &["image", "ls", "--tag", "debug-linux:v0.5"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; got success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // Must reach the `debug` entry and surface its broken
+    // credential, not silently query `automata` instead.
+    assert!(
+        stderr.contains("broken") || stderr.contains("ATAKIT_TEST_BROKEN_TOKEN"),
+        "expected the `debug` entry's credential failure to surface.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn image_ls_tag_errors_on_unknown_repository() {
+    // --tag with a local name that doesn't match any configured
+    // entry should produce a helpful error listing the configured
+    // entries, not silently query the first one.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [image.repositories]
+        automata = { repo = "automata-network/automata-linux" }
+        "#,
+    );
+
+    let out = run_atakit(
+        &cfg,
+        &dat,
+        &cache,
+        &["image", "ls", "--tag", "nonexistent:v0.5"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("no configured repository matches")
+            && stderr.contains("nonexistent"),
+        "expected helpful unknown-repo error.\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn image_ls_tag_with_broken_credential_errors_strictly() {
     // --tag mode targets exactly one repository and makes a direct
     // GitHub API call to fetch that release. A broken credential
