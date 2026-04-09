@@ -460,7 +460,7 @@ fn write_archive_contents<W: std::io::Write>(
             .map_err(|e| ImageError::ReadDir { path: disk_images_src.clone(), source: e })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ImageError::Io)?;
-        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        entries.sort_by_key(|a| a.file_name());
 
         for entry in entries {
             let path = entry.path();
@@ -837,7 +837,7 @@ mod tests {
             if size > 0 {
                 out.extend_from_slice(data);
                 let padding = (512 - (size % 512)) % 512;
-                out.extend(std::iter::repeat(0u8).take(padding));
+                out.extend(std::iter::repeat_n(0u8, padding));
             }
         }
 
@@ -871,7 +871,7 @@ mod tests {
         }
 
         // End-of-archive marker (two 512-byte zero blocks).
-        tar_bytes.extend(std::iter::repeat(0u8).take(1024));
+        tar_bytes.extend(std::iter::repeat_n(0u8, 1024));
 
         let file = std::fs::File::create(&archive_path).unwrap();
         let mut enc = zstd::Encoder::new(file, 0).unwrap();

@@ -540,28 +540,35 @@ fn parse_body_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Decide whether a sidecar `meta.json` asset is trustworthy enough to
-/// return verbatim. We require:
+/// Decide whether a sidecar `meta.json` asset is trustworthy enough
+/// to return verbatim.
+///
+/// We require both of:
 ///
 /// 1. Its `name` and `version` match the tag-derived coords exactly.
-/// 2. Its `workload_id` matches whichever sources we have to compare it
-///    against:
-///       - If `coords.workload_id` is non-empty (caller computed it
-///         locally, e.g. `get_meta` from `pull`), the sidecar's
-///         `workload_id` must equal it.
-///       - If the release body has a `Workload ID:` line, the sidecar's
-///         `workload_id` must equal that value.
-///    Both checks are skipped when their source is missing -- in
-///    particular `list()` calls `parse_coords_from_release` which
-///    leaves `coords.workload_id` empty when the body has no `Workload
-///    ID` line, and we want such releases to still be able to use
-///    their sidecar as the source of truth (with the body line as the
-///    only available cross-check, if present).
+/// 2. Its `workload_id` agrees with every source we have available
+///    to compare it against (see below).
 ///
-/// If the sidecar disagrees, the caller falls back to derived values
-/// and emits a warning. This is defence in depth: a tampered sidecar
-/// that lies about `workload_id` / `sha256` / `archive_hash` could
-/// otherwise slip past the repo-level integrity check in
+/// The `workload_id` cross-check uses two sources, each only applied
+/// when present:
+///
+/// * If `coords.workload_id` is non-empty (caller computed it
+///   locally, e.g. `get_meta` from `pull`), the sidecar's
+///   `workload_id` must equal it.
+/// * If the release body has a `Workload ID:` line, the sidecar's
+///   `workload_id` must equal that value.
+///
+/// Both cross-checks are skipped when their source is missing. In
+/// particular `list()` calls `parse_coords_from_release` which
+/// leaves `coords.workload_id` empty when the body has no
+/// `Workload ID` line, and such releases must still be able to use
+/// their sidecar as the source of truth (with the body line as the
+/// only available cross-check, if present).
+///
+/// If the sidecar disagrees, the caller falls back to derived
+/// values and emits a warning. This is defence in depth: a tampered
+/// sidecar that lies about `workload_id` / `sha256` / `archive_hash`
+/// could otherwise slip past the repo-level integrity check in
 /// `workload pull` when on-chain verification is not configured.
 fn sidecar_matches_coords(
     sidecar: &RepositoryArchiveMeta,
