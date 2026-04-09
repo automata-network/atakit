@@ -1,8 +1,13 @@
 # atakit configuration
 # Precedence: CLI args > env vars > this file > defaults
 #
-# This template is written on first run. Feel free to edit or delete
-# entries you don't need; the defaults will take over.
+# This template is written on first run. Every section is commented
+# out -- edit the ones you need to configure repositories, credentials,
+# cloud targets, etc. `[image.repositories]` and
+# `[workload.repositories]` both default to empty: commands that need
+# a specific target (`image pull`, `workload push`, `image ls --remote`,
+# etc.) error with "no repositories configured" until you add at
+# least one entry.
 
 # ─── GitHub credentials ───────────────────────────────────────────────
 #
@@ -35,6 +40,12 @@
 # Each entry may set `list_limit = <n>` to override the global
 # `[image] list_limit`. Precedence: `--limit` CLI flag > per-repo
 # `list_limit` > global `[image] list_limit`.
+#
+# CI / scripting note: there is no env var that selects an image
+# repository. The old `ATAKIT_DEFAULT_REPO` was removed. Pass
+# `--repo <owner/repo>` on every command instead; if the value
+# matches a configured entry here, the entry's credential and
+# `list_limit` are inherited automatically.
 
 [image]
 # Global default limit for `image ls`.
