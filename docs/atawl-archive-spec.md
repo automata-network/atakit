@@ -266,7 +266,9 @@ Each entry represents a single port/protocol rule to open. Ports without a proto
 | `allow` | bool | `false` | `[baby-container] allow` |
 | `max_count` | integer | `1` | `[baby-container] max_count` |
 
-### `[config.signing]` — Image Signature Verification
+### `[config.signing]` — Image Signature Verification (legacy, being redesigned)
+
+> **Legacy -- do not rely on this section.** The signing mechanism is being redesigned. The current `[config.signing]` fields and the `measured-data/signing/` directory layout described below will be replaced.
 
 | Field | Type | Default | Source in TOML |
 |---|---|---|---|
