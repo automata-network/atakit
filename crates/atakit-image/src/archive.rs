@@ -335,7 +335,7 @@ fn validate_path_component(value: &str, field: &str, archive_path: &Path) -> Res
     Ok(())
 }
 
-/// Check that a relative path has no traversal components (`..", root, or prefix).
+/// Check that a relative path has no traversal components (`..`, root, or prefix).
 fn is_safe_relative_path(path: &Path) -> bool {
     use std::path::Component;
     for component in path.components() {

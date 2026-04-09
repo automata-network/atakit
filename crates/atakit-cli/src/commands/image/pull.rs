@@ -25,7 +25,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         Some(image_ref) => {
             let (_, spec) = config
                 .image
-                .find_by_local_name(&image_ref.repository)
+                .find_by_local_name(&image_ref.repository)?
                 .ok_or_else(|| {
                     let configured: Vec<String> = config
                         .image

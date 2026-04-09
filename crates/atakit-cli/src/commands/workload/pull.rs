@@ -4,8 +4,10 @@ use anyhow::{Context, Result};
 use atakit_core::Env;
 use atakit_workload::cli::PullArgs;
 use atakit_workload::{
-    RepositoryArchiveMeta, WorkloadCoords, WorkloadMeta, WorkloadRepository, WorkloadStore,
+    RepositoryArchiveMeta, WorkloadCoords, WorkloadError, WorkloadMeta, WorkloadRepository,
+    WorkloadStore,
 };
+use futures_util::future::join_all;
 use owo_colors::OwoColorize;
 
 use super::{compute_workload_id, hex_equal, parse_workload_ref, WorkloadRef};
@@ -89,103 +91,133 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // for github backends).
     let wref = parse_workload_ref(&args.reference)?;
 
-    // Probe every repository for the workload. A `None` return means
-    // "workload isn't in this repo" -- a clean negative, silent. An
-    // `Err` means the repository itself is broken (network fault, auth
-    // failure, 5xx).
-    //
-    // Error handling differs by mode:
-    // * Pinned (--repository): the user explicitly named one repo, so
-    //   probe errors are fatal -- they shouldn't get masked by a
-    //   misleading "not found in any configured repository" message
-    //   later. Bail on the first probe error with the underlying cause.
-    // * Multi-repo discovery: warn to stderr and continue so other
-    //   repositories can still serve the pull.
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for (name, spec) in specs {
-        // Skip repos whose credential failed to resolve (discovery
-        // mode only -- pinned mode would have already errored via
-        // `resolve_credentials_for?` above).
-        if let crate::config::WorkloadRepositorySpec::Github {
-            credential: Some(cred_name),
-            ..
-        } = &spec
-        {
-            if cred_errs.contains_key(cred_name) {
-                eprintln!(
-                    "{} skipping {} (credential '{}' failed)",
-                    "warning:".yellow(),
-                    name.dimmed(),
-                    cred_name.dimmed(),
-                );
-                continue;
-            }
-        }
-        let resolved_token = match &spec {
-            crate::config::WorkloadRepositorySpec::Github {
+    // Filter out repos whose credential resolution failed (discovery
+    // mode only -- pinned/single-target mode would have already
+    // errored via `resolve_credentials_for?` above) and build a
+    // ready-to-probe list of (display-name, WorkloadRepository)
+    // pairs. Each surviving entry will be probed in parallel.
+    let ready_repos: Vec<(String, WorkloadRepository)> = specs
+        .into_iter()
+        .filter_map(|(name, spec)| {
+            if let crate::config::WorkloadRepositorySpec::Github {
                 credential: Some(cred_name),
                 ..
-            } => tokens.get(cred_name).cloned(),
-            _ => None,
-        };
-        let repo = config.workload.build_repository(spec, resolved_token);
-        let display = repo.display_uri();
-
-        let probe: Result<Option<(WorkloadCoords, RepositoryArchiveMeta)>, _> = match &wref {
-            WorkloadRef::NameVersion {
-                name: wname,
-                version: wversion,
-            } => {
-                let id = compute_workload_id(wname, wversion);
-                let coords = WorkloadCoords {
-                    workload_id: format!("0x{}", hex::encode(id)),
-                    name: wname.clone(),
-                    version: wversion.clone(),
-                };
-                repo.get_meta(&coords)
-                    .await
-                    .map(|opt| opt.map(|meta| (coords, meta)))
-            }
-            WorkloadRef::Id(id) => {
-                // Defense-in-depth: regardless of whether the repository
-                // backend validates its server response internally, the
-                // coords it returns MUST carry the ID the user asked
-                // for. A backend that returns a different ID (whether
-                // due to a bug or an intentional redirect) is rejected
-                // with a stderr warning so the user notices the lie
-                // while the discovery loop moves on to the next repo.
-                match repo.resolve(id).await {
-                    Ok(Some((coords, meta))) => {
-                        if hex_equal(&coords.workload_id, id) {
-                            Ok(Some((coords, meta)))
-                        } else {
-                            eprintln!(
-                                "{} {}: returned metadata for {} instead of requested {}; ignoring",
-                                "warning:".yellow(),
-                                display.dimmed(),
-                                coords.workload_id.dimmed(),
-                                id.dimmed(),
-                            );
-                            Ok(None)
-                        }
-                    }
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(e),
+            } = &spec
+            {
+                if cred_errs.contains_key(cred_name) {
+                    eprintln!(
+                        "{} skipping {} (credential '{}' failed)",
+                        "warning:".yellow(),
+                        name.dimmed(),
+                        cred_name.dimmed(),
+                    );
+                    return None;
                 }
             }
-        };
+            let resolved_token = match &spec {
+                crate::config::WorkloadRepositorySpec::Github {
+                    credential: Some(cred_name),
+                    ..
+                } => tokens.get(cred_name).cloned(),
+                _ => None,
+            };
+            let repo = config.workload.build_repository(spec, resolved_token);
+            Some((name, repo))
+        })
+        .collect();
 
-        match probe {
-            Ok(Some((coords, meta))) => candidates.push(Candidate {
+    // Probe every ready repository for the workload IN PARALLEL.
+    // `get_meta` for name:version and `resolve` for 0xhex are both
+    // read-only network calls, so running them concurrently is a
+    // pure latency win -- the docs already promised this behavior
+    // and `workload ls --remote` has the same shape. Each future
+    // owns its `(name, repo)` pair and the workload ref and
+    // returns everything the post-join loop needs to build a
+    // `Candidate` or emit a warning.
+    //
+    // A `Hit` probe result means the workload was found and
+    // carries coords + metadata. A `Miss` means the workload
+    // isn't in this repo -- expected during multi-repo discovery,
+    // silent. An `IdMismatch` means the repository returned a
+    // workload whose id doesn't match what we asked for (defense
+    // in depth against a backend that redirects / mis-routes) --
+    // we warn and treat it as a miss. An `Err` means the
+    // repository itself is broken (network fault, auth failure,
+    // 5xx) -- single-target: fatal with the real cause;
+    // multi-target: warn and continue.
+    enum ProbeResult {
+        Hit(WorkloadCoords, RepositoryArchiveMeta),
+        Miss,
+        IdMismatch {
+            returned: String,
+            expected: String,
+        },
+        Error(WorkloadError),
+    }
+
+    let probe_futures = ready_repos.into_iter().map(|(name, repo)| {
+        let wref = wref.clone();
+        async move {
+            let display = repo.display_uri();
+            let result = match wref {
+                WorkloadRef::NameVersion {
+                    name: wname,
+                    version: wversion,
+                } => {
+                    let id = compute_workload_id(&wname, &wversion);
+                    let coords = WorkloadCoords {
+                        workload_id: format!("0x{}", hex::encode(id)),
+                        name: wname,
+                        version: wversion,
+                    };
+                    match repo.get_meta(&coords).await {
+                        Ok(Some(meta)) => ProbeResult::Hit(coords, meta),
+                        Ok(None) => ProbeResult::Miss,
+                        Err(e) => ProbeResult::Error(e),
+                    }
+                }
+                WorkloadRef::Id(id) => match repo.resolve(&id).await {
+                    Ok(Some((coords, meta))) => {
+                        if hex_equal(&coords.workload_id, &id) {
+                            ProbeResult::Hit(coords, meta)
+                        } else {
+                            ProbeResult::IdMismatch {
+                                returned: coords.workload_id,
+                                expected: id,
+                            }
+                        }
+                    }
+                    Ok(None) => ProbeResult::Miss,
+                    Err(e) => ProbeResult::Error(e),
+                },
+            };
+            (name, repo, display, result)
+        }
+    });
+    let probe_results = join_all(probe_futures).await;
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (name, repo, display, result) in probe_results {
+        match result {
+            ProbeResult::Hit(coords, meta) => candidates.push(Candidate {
                 name,
                 repo,
                 coords,
                 meta,
             }),
-            Ok(None) => {
+            ProbeResult::Miss => {
                 // Not in this repo -- expected during multi-repo discovery.
             }
-            Err(e) => {
+            ProbeResult::IdMismatch { returned, expected } => {
+                eprintln!(
+                    "{} {}: returned metadata for {} instead of requested {}; ignoring",
+                    "warning:".yellow(),
+                    display.dimmed(),
+                    returned.dimmed(),
+                    expected.dimmed(),
+                );
+            }
+            ProbeResult::Error(e) => {
                 if single_target {
                     // Exactly one target in play (either user pinned
                     // it with --repository or the config has a

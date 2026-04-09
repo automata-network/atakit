@@ -89,14 +89,39 @@ impl ImageConfig {
     /// after the last `/`) matches `name`. Returns the entry name and
     /// its spec so callers can resolve the credential and list_limit
     /// override for that entry.
+    ///
+    /// Rejects ambiguity: if multiple configured entries share the
+    /// same local name suffix (e.g. `owner-a/debug-linux` and
+    /// `owner-b/debug-linux`), returns an error instead of silently
+    /// picking the first match. Matches the "prefer canonical /
+    /// accept one non-canonical / error on multiple" pattern used
+    /// for release asset lookup in `find_atawl_asset`.
     pub fn find_by_local_name(
         &self,
         name: &str,
-    ) -> Option<(&str, &ImageRepositorySpec)> {
-        self.repositories
+    ) -> Result<Option<(&str, &ImageRepositorySpec)>> {
+        let matches: Vec<(&str, &ImageRepositorySpec)> = self
+            .repositories
             .iter()
-            .find(|(_, s)| repo_local_name(&s.repo) == name)
+            .filter(|(_, s)| repo_local_name(&s.repo) == name)
             .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [single] => Ok(Some(*single)),
+            many => {
+                let entries: Vec<String> = many
+                    .iter()
+                    .map(|(k, s)| format!("{k} ({})", s.repo))
+                    .collect();
+                bail!(
+                    "local name '{name}' matches multiple configured image \
+                     repositories: [{}]; pass `--repo <owner/repo>` or rename \
+                     one of the entries to disambiguate",
+                    entries.join(", ")
+                )
+            }
+        }
     }
 }
 
@@ -1110,15 +1135,56 @@ mod tests {
             "#,
         )
         .unwrap();
-        let (name, spec) = config.image.find_by_local_name("automata-linux").unwrap();
+        let (name, spec) = config
+            .image
+            .find_by_local_name("automata-linux")
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "automata");
         assert_eq!(spec.repo, "automata-network/automata-linux");
 
-        let (name, spec) = config.image.find_by_local_name("dev-baseimage").unwrap();
+        let (name, spec) = config
+            .image
+            .find_by_local_name("dev-baseimage")
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "baseimg");
         assert_eq!(spec.repo, "automata-network/dev-baseimage");
 
-        assert!(config.image.find_by_local_name("nonexistent").is_none());
+        assert!(
+            config
+                .image
+                .find_by_local_name("nonexistent")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_by_local_name_rejects_ambiguous_matches() {
+        // Two configured image entries point at different owners
+        // but share the same local name suffix. The old behavior
+        // silently returned the first match, which meant
+        // `image pull debug-linux:v0.5` would pull from whichever
+        // owner happened to be first in the file -- an identity-
+        // confusion footgun. Require the user to pass
+        // `--repo <owner/repo>` or rename one of the entries.
+        let config = Config::load_from_str(
+            r#"
+            [image.repositories]
+            owner-a = { repo = "owner-a/debug-linux" }
+            owner-b = { repo = "owner-b/debug-linux" }
+            "#,
+        )
+        .unwrap();
+        let err = config
+            .image
+            .find_by_local_name("debug-linux")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multiple"), "got: {msg}");
+        assert!(msg.contains("owner-a"), "got: {msg}");
+        assert!(msg.contains("owner-b"), "got: {msg}");
     }
 
     // ── legacy field rejection ───────────────────────────────────
