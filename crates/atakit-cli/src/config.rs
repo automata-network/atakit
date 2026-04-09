@@ -58,17 +58,14 @@ pub struct ImageConfig {
 
 impl Default for ImageConfig {
     fn default() -> Self {
-        let mut repositories = IndexMap::new();
-        repositories.insert(
-            "automata".to_string(),
-            ImageRepositorySpec {
-                repo: "automata-network/automata-linux".to_string(),
-                credential: None,
-                list_limit: None,
-            },
-        );
+        // No hardcoded default repository. Symmetric with
+        // `[workload.repositories]`, which also defaults to empty.
+        // Commands that need a repository (`image pull`,
+        // `image ls --remote`, etc.) error at their own call site
+        // when the map is empty; `image ls` (local-only) works fine
+        // against an empty map.
         Self {
-            repositories,
+            repositories: IndexMap::new(),
             platforms: None,
             list_limit: 10,
         }
@@ -795,9 +792,12 @@ impl Config {
     fn validate(&self) -> Result<()> {
         // Image repositories must be non-empty and each entry must be
         // a well-formed `owner/repo` path.
-        if self.image.repositories.is_empty() {
-            bail!("image.repositories must contain at least one entry");
-        }
+        // Empty `[image.repositories]` is allowed: `image ls`
+        // (local-only) doesn't need any configured remote, and
+        // commands that DO need one (`pull`, `ls --remote`, etc.)
+        // error at their own call sites with "no image repositories
+        // configured" when the map is empty. This is symmetric with
+        // `[workload.repositories]`, which is also empty by default.
         for (name, spec) in &self.image.repositories {
             validate_repo_path("image", name, &spec.repo)?;
         }
@@ -1059,7 +1059,10 @@ mod tests {
     fn missing_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(repo_paths(&config), vec!["automata-network/automata-linux"]);
+        // No hardcoded default repository; the map is empty until
+        // the user configures one. Symmetric with
+        // `workload.repositories`.
+        assert!(config.image.repositories.is_empty());
         assert_eq!(config.image.list_limit, 10);
         assert!(config.image.platforms.is_none());
         assert!(config.github.credentials.is_empty());
@@ -1069,7 +1072,7 @@ mod tests {
     #[test]
     fn empty_config_returns_defaults() {
         let config = Config::load_from_str("").unwrap();
-        assert_eq!(repo_paths(&config), vec!["automata-network/automata-linux"]);
+        assert!(config.image.repositories.is_empty());
         assert_eq!(config.image.list_limit, 10);
     }
 
@@ -1362,17 +1365,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_image_repositories() {
-        // Have to explicitly define an empty map -- default seeds one.
-        let err = Config::load_from_str(
+    fn empty_image_repositories_is_allowed() {
+        // Symmetric with `[workload.repositories]`. Commands that
+        // actually need a repository error at their own call
+        // sites; `image ls` (local-only) works fine against an
+        // empty map.
+        let config = Config::load_from_str(
             r#"
             [image]
             list_limit = 5
             [image.repositories]
             "#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("at least one"));
+        .unwrap();
+        assert!(config.image.repositories.is_empty());
+        assert_eq!(config.image.list_limit, 5);
     }
 
     // ── credentials: xor + timeout validation ────────────────────
