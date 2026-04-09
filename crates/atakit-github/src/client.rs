@@ -150,15 +150,15 @@ impl ReleasesClient {
 
     // ── crate-internal accessors (used by download.rs) ────────────
 
-    pub fn token(&self) -> Option<&str> {
+    pub(crate) fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 
-    pub fn http(&self) -> &reqwest::Client {
+    pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
     }
 
-    pub fn auth_headers(&self) -> HeaderMap {
+    pub(crate) fn auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::USER_AGENT, HeaderValue::from_static("atakit"));
         if let Some(ref token) = self.token {

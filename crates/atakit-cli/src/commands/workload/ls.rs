@@ -120,17 +120,24 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                         _ => None,
                     })
                     .collect();
+                // Credential resolution can spawn a `command`-type
+                // helper with up to `timeout_secs` of blocking
+                // wait. Wrap in `block_in_place` so the tokio
+                // worker thread can yield to other tasks instead
+                // of being held captive.
                 let (tokens, cred_errs): (
                     std::collections::HashMap<String, String>,
                     std::collections::HashMap<String, String>,
-                ) = if single_target {
-                    (
-                        config.resolve_credentials_for(&cred_names)?,
-                        std::collections::HashMap::new(),
-                    )
-                } else {
-                    config.resolve_credentials_best_effort(&cred_names)
-                };
+                ) = tokio::task::block_in_place(|| -> Result<_> {
+                    Ok(if single_target {
+                        (
+                            config.resolve_credentials_for(&cred_names)?,
+                            std::collections::HashMap::new(),
+                        )
+                    } else {
+                        config.resolve_credentials_best_effort(&cred_names)
+                    })
+                })?;
                 for (cred_name, msg) in &cred_errs {
                     eprintln!(
                         "{} credential '{}' failed: {}",

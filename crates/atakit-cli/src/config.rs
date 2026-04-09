@@ -774,7 +774,7 @@ impl Config {
             bail!("image.repositories must contain at least one entry");
         }
         for (name, spec) in &self.image.repositories {
-            validate_repo_path(name, &spec.repo)?;
+            validate_repo_path("image", name, &spec.repo)?;
         }
 
         // Every credential must pass its own xor / timeout checks.
@@ -802,13 +802,22 @@ impl Config {
             }
         }
         for (name, spec) in &self.workload.repositories {
-            if let WorkloadRepositorySpec::Github { credential: Some(cred), .. } = spec {
-                if !self.github.credentials.contains_key(cred) {
-                    bail!(
-                        "workload repository '{name}' references unknown credential \
-                         '{cred}'; defined: [{}]",
-                        defined.join(", ")
-                    );
+            if let WorkloadRepositorySpec::Github { repo, credential } = spec {
+                // Apply the same path sanity checks to workload
+                // github repos that image repos get -- empty,
+                // backslash, path traversal, leading/trailing or
+                // internal empty segment. Otherwise a typo like
+                // `repo = "owner/"` silently loads and only fails
+                // much later with a confusing GitHub API error.
+                validate_repo_path("workload", name, repo)?;
+                if let Some(cred) = credential {
+                    if !self.github.credentials.contains_key(cred) {
+                        bail!(
+                            "workload repository '{name}' references unknown credential \
+                             '{cred}'; defined: [{}]",
+                            defined.join(", ")
+                        );
+                    }
                 }
             }
         }
@@ -871,21 +880,21 @@ impl Config {
     }
 }
 
-fn validate_repo_path(entry_name: &str, repo: &str) -> Result<()> {
+fn validate_repo_path(section: &str, entry_name: &str, repo: &str) -> Result<()> {
     if repo.is_empty() {
         bail!(
-            "invalid image repository '{entry_name}': `repo` must not be empty"
+            "invalid {section} repository '{entry_name}': `repo` must not be empty"
         );
     }
     if repo.contains('\\') {
         bail!(
-            "invalid image repository '{entry_name}': `repo = {:?}` must not contain backslashes",
+            "invalid {section} repository '{entry_name}': `repo = {:?}` must not contain backslashes",
             repo,
         );
     }
     if Path::new(repo).is_absolute() {
         bail!(
-            "invalid image repository '{entry_name}': `repo = {:?}` must not be an absolute path",
+            "invalid {section} repository '{entry_name}': `repo = {:?}` must not be an absolute path",
             repo,
         );
     }
@@ -894,13 +903,13 @@ fn validate_repo_path(entry_name: &str, repo: &str) -> Result<()> {
         .any(|c| matches!(c, Component::ParentDir))
     {
         bail!(
-            "invalid image repository '{entry_name}': `repo = {:?}` must not contain path traversal",
+            "invalid {section} repository '{entry_name}': `repo = {:?}` must not contain path traversal",
             repo,
         );
     }
     if repo.split('/').any(|s| s.is_empty()) {
         bail!(
-            "invalid image repository '{entry_name}': `repo = {:?}` contains empty path segment",
+            "invalid {section} repository '{entry_name}': `repo = {:?}` contains empty path segment",
             repo,
         );
     }
@@ -962,16 +971,20 @@ fn check_legacy_fields(content: &str) -> Result<()> {
         }
     }
 
-    // GITHUB_TOKEN env magic override is gone; warn if the environment
-    // sets it so users don't silently lose behavior. We surface this as
-    // a stderr warning (non-fatal) because unsetting GITHUB_TOKEN in CI
-    // is extra friction and some users may have it set for reasons
-    // unrelated to atakit (e.g. gh CLI).
-    // Note: the warning lives here rather than in apply_env_overrides
-    // because `check_legacy_fields` runs once at load, whereas
-    // apply_env_overrides runs after parse and we only want one warning
-    // per invocation.
-    // Intentionally no action -- just don't auto-consume it any more.
+    // The old `[registry]` section (pre-redesign http-registry-only
+    // config) silently dropped through serde's default skipping,
+    // leaving users staring at a working config that ignored their
+    // actual settings. Catch it explicitly so the migration error is
+    // actionable.
+    if value.get("registry").is_some() {
+        bail!(
+            "`[registry]` is no longer supported. Move the URL into \
+             `[workload.repositories]`, e.g. \
+             `main = {{ type = \"http\", url = \"https://...\" }}`. \
+             See config_template.toml for examples."
+        );
+    }
+
     Ok(())
 }
 
@@ -1152,6 +1165,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bare string/array form"), "got: {msg}");
         assert!(msg.contains("inline table"), "got: {msg}");
+    }
+
+    #[test]
+    fn legacy_registry_section_errors_with_migration_hint() {
+        let err = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            [registry]
+            url = "https://old-registry.example.com"
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[registry]"), "got: {msg}");
+        assert!(msg.contains("workload.repositories"), "got: {msg}");
+    }
+
+    #[test]
+    fn workload_github_repo_with_empty_path_errors_at_load_time() {
+        let err = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            bad = { type = "github", repo = "" }
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workload repository"), "got: {msg}");
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn workload_github_repo_with_traversal_errors_at_load_time() {
+        let err = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            bad = { type = "github", repo = ".." }
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workload repository"), "got: {msg}");
+        assert!(msg.contains("traversal"), "got: {msg}");
+    }
+
+    #[test]
+    fn workload_github_repo_with_trailing_slash_errors_at_load_time() {
+        let err = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            bad = { type = "github", repo = "owner/" }
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workload repository"), "got: {msg}");
+        assert!(msg.contains("empty path segment"), "got: {msg}");
     }
 
     #[test]

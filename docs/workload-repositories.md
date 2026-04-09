@@ -120,11 +120,13 @@ workloads/
 
 ### Status symbols
 
-- `◉` local+tracked - present in the local store (metadata and archive) and tracked in a repository
-- `◔` local - present in the local store only (metadata and archive), not tracked in a repository
-- `◌` tracked - tracked in a repository with local metadata only (e.g. from `workload add`)
+Determined by the local store's `(has_blob, on_chain_spec.is_some())` pair (see `commands/workload/ls.rs::Status`):
+
+- `◉` local+tracked - archive present in the local store AND on-chain spec data is recorded in `meta.json`
+- `◔` local - archive present in the local store but no on-chain spec data yet (e.g. not published yet)
+- `◌` tracked - metadata only, no archive blob in the local store (e.g. entry created via `workload add` before a pull)
 - `◊` remote - only exists in a remote repository, not present in the local store
-- `✗` revoked - present locally or remotely but marked as revoked
+- `✗` revoked - present locally or remotely but marked as revoked on-chain
 
 ## Workload Reference Format
 

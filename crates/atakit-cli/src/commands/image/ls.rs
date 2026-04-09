@@ -56,11 +56,19 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
         let (_, spec) = targets
             .first()
             .ok_or_else(|| anyhow::anyhow!("no image repositories configured"))?;
+        // `command` credentials can block up to `timeout_secs`, so
+        // wrap the resolve in `block_in_place`.
+        let token = tokio::task::block_in_place(|| -> Result<Option<String>> {
+            match spec.credential.as_deref() {
+                Some(cred_name) => Ok(Some(config.resolve_credential(cred_name)?)),
+                None => Ok(None),
+            }
+        })?;
         let mut client = ReleasesClient::new();
-        if let Some(ref cred_name) = spec.credential {
-            client = client.with_token(config.resolve_credential(cred_name)?);
+        if let Some(t) = token {
+            client = client.with_token(t);
         }
-        let release = client.get_release(&spec.repo, &tag.tag).await?;
+        let release = client.get_release_by_tag(&spec.repo, &tag.tag).await?;
         let local_name = repo_local_name(&spec.repo);
         print_release_detail(local_name, &release, &store);
         return Ok(());
@@ -104,12 +112,20 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
             .iter()
             .filter_map(|(_, spec)| spec.credential.as_deref())
             .collect();
+        // Credential resolution can spawn a `command`-type helper
+        // with up to `timeout_secs` of blocking wait. Wrap in
+        // `block_in_place` so the tokio worker thread can yield to
+        // other tasks instead of being held captive -- matches the
+        // other two fan-out call sites in workload/ls and
+        // workload/pull.
         let (tokens, cred_errs): (HashMap<String, String>, HashMap<String, String>) =
-            if single_target {
-                (config.resolve_credentials_for(&cred_names)?, HashMap::new())
-            } else {
-                config.resolve_credentials_best_effort(&cred_names)
-            };
+            tokio::task::block_in_place(|| -> Result<_> {
+                Ok(if single_target {
+                    (config.resolve_credentials_for(&cred_names)?, HashMap::new())
+                } else {
+                    config.resolve_credentials_best_effort(&cred_names)
+                })
+            })?;
         for (cred_name, msg) in &cred_errs {
             eprintln!(
                 "{} credential '{}' failed: {}",
@@ -161,31 +177,68 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 .or(spec.list_limit)
                 .unwrap_or(config.image.list_limit);
 
+            // API errors are handled differently based on cardinality,
+            // matching the credential-failure rule earlier in this
+            // function and the `workload ls` fan-out behavior:
+            // * Single target: fatal. There's no fallback repository,
+            //   so returning "No images found" on a 500 / rate-limit
+            //   would hide the real cause.
+            // * Multi-target fan-out: warn to stderr and continue so
+            //   one broken or slow repository doesn't kill the
+            //   listing for every other configured repo.
             if args.all {
-                let releases = client.list_releases(github_repo, limit).await?;
-                for r in &releases {
-                    remote_tags.insert(ImageRef::new(local_name, &r.tag_name));
+                match client.list_releases(github_repo, limit).await {
+                    Ok(releases) => {
+                        for r in &releases {
+                            remote_tags.insert(ImageRef::new(local_name, &r.tag_name));
+                        }
+                        let rows: Vec<_> = releases
+                            .iter()
+                            .map(|r| row_from_release(r, &store, local_name))
+                            .collect();
+                        groups
+                            .entry(local_name.to_string())
+                            .or_default()
+                            .extend(rows);
+                    }
+                    Err(e) => {
+                        if single_target {
+                            return Err(e.into());
+                        }
+                        eprintln!(
+                            "{} {} ({}): {}",
+                            "warning:".yellow(),
+                            name.dimmed(),
+                            github_repo.dimmed(),
+                            e,
+                        );
+                    }
                 }
-                let rows: Vec<_> = releases
-                    .iter()
-                    .map(|r| row_from_release(r, &store, local_name))
-                    .collect();
-                groups
-                    .entry(local_name.to_string())
-                    .or_default()
-                    .extend(rows);
             } else {
-                let statuses = store
-                    .list(&client, github_repo, local_name, limit)
-                    .await?;
-                for s in &statuses {
-                    remote_tags.insert(ImageRef::new(local_name, &s.release.tag_name));
+                match store.list(&client, github_repo, local_name, limit).await {
+                    Ok(statuses) => {
+                        for s in &statuses {
+                            remote_tags.insert(ImageRef::new(local_name, &s.release.tag_name));
+                        }
+                        let rows: Vec<_> = statuses.iter().map(row_from_status).collect();
+                        groups
+                            .entry(local_name.to_string())
+                            .or_default()
+                            .extend(rows);
+                    }
+                    Err(e) => {
+                        if single_target {
+                            return Err(e.into());
+                        }
+                        eprintln!(
+                            "{} {} ({}): {}",
+                            "warning:".yellow(),
+                            name.dimmed(),
+                            github_repo.dimmed(),
+                            e,
+                        );
+                    }
                 }
-                let rows: Vec<_> = statuses.iter().map(row_from_status).collect();
-                groups
-                    .entry(local_name.to_string())
-                    .or_default()
-                    .extend(rows);
             }
         }
 
