@@ -407,7 +407,7 @@ pub struct WorkloadConfig {
 /// gh-private = { type = "github", repo = "owner/private-archives", credential = "private" }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum WorkloadRepositorySpec {
     Http {
         url: String,
@@ -2011,6 +2011,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn workload_repository_rejects_typo_in_credential_field_name() {
+        // Regression: before adding `deny_unknown_fields`, a typo
+        // like `credentail = "private"` was silently accepted. The
+        // repo deserialized as `{ repo, credential: None }` and
+        // the command ran as anonymous, so a user who thought they
+        // were authenticating a private repo would quietly hit
+        // rate limits or 404s with no indication that their
+        // credential reference was even parsed.
+        let err = Config::load_from_str(
+            r#"
+            [github.credentials]
+            private = { env = "GH_PRIVATE" }
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            gh = { type = "github", repo = "owner/repo", credentail = "private" }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("credentail"),
+            "expected unknown-field rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_repository_rejects_unknown_field_on_http_variant() {
+        let err = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            main = { type = "http", url = "https://example.com", foo = "bar" }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("foo"),
+            "expected unknown-field rejection, got: {msg}"
+        );
     }
 
     // ── ATAKIT_DEFAULT_REPO env override ─────────────────────────

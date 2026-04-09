@@ -33,7 +33,7 @@ The `--repository` CLI flag accepts:
 
 - a configured repository name (e.g. `main`, `gh-public`),
 - a raw `http(s)://...` URL (treated as an anonymous HTTP repository),
-- a bare `owner/repo` path (treated as an anonymous GitHub repository).
+- a bare `owner/repo` path (treated as a GitHub repository). If one or more `[workload.repositories]` github entries already point at the same `owner/repo`, the shorthand inherits the credential from the matching entry so private-repo shorthand still works without duplicating configuration. If multiple matching entries disagree on the credential the CLI errors and asks you to use the entry name explicitly. If no entry matches, the request is anonymous.
 
 ### How `--repository` interacts with declaration order
 
