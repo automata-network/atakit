@@ -390,11 +390,19 @@ impl WorkloadConfig {
                 return Ok((arg.to_string(), spec.clone()));
             }
             if looks_like_owner_repo(arg) {
+                // If the user has one or more configured github
+                // entries pointing at the same `owner/repo`, inherit
+                // their credential. Otherwise the shorthand would
+                // dead-end for private repos: push refuses to run
+                // without a credential, so `--repository owner/repo`
+                // would silently lose the credential that a named
+                // entry would have carried.
+                let credential = inherit_github_credential(&self.repositories, arg)?;
                 return Ok((
                     arg.to_string(),
                     WorkloadRepositorySpec::Github {
                         repo: arg.to_string(),
-                        credential: None,
+                        credential,
                     },
                 ));
             }
@@ -461,6 +469,51 @@ impl WorkloadConfig {
             WorkloadRepositorySpec::Github { repo, .. } => WorkloadRepository::Github(
                 GithubWorkloadRepository::new(repo, resolved_token),
             ),
+        }
+    }
+}
+
+/// Look for any configured `[workload.repositories.*]` github entry
+/// whose `repo` path equals `arg`, and return its credential so the
+/// raw `owner/repo` shorthand can inherit it.
+///
+/// If multiple configured entries share the same `repo` path but
+/// disagree on credential, refuse to guess -- force the user to pass
+/// the specific entry name.
+///
+/// Returns `Ok(None)` when no entry matches; the caller proceeds
+/// with an anonymous github spec (public repos still work).
+fn inherit_github_credential(
+    repositories: &IndexMap<String, WorkloadRepositorySpec>,
+    arg: &str,
+) -> Result<Option<String>> {
+    let matches: Vec<&Option<String>> = repositories
+        .values()
+        .filter_map(|spec| match spec {
+            WorkloadRepositorySpec::Github { repo, credential } if repo == arg => {
+                Some(credential)
+            }
+            _ => None,
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [single] => Ok((*single).clone()),
+        many => {
+            let distinct: std::collections::BTreeSet<&str> = many
+                .iter()
+                .map(|c| c.as_deref().unwrap_or("(none)"))
+                .collect();
+            if distinct.len() > 1 {
+                bail!(
+                    "multiple [workload.repositories] entries point at `{arg}` \
+                     with different credentials ({:?}); pass the specific \
+                     entry name instead of the raw owner/repo path",
+                    distinct
+                );
+            }
+            Ok(many[0].clone())
         }
     }
 }
@@ -536,12 +589,16 @@ impl Config {
         }
     }
 
-    /// Deduplicating batch resolver. Call this once with every
-    /// credential name a command will touch, then look up per-repo
-    /// tokens in the returned map. Avoids re-running the same
-    /// `token_command` N times during a multi-repo fan-out.
+    /// Deduplicating batch resolver (strict). Call this once with
+    /// every credential name a single-target command will touch, then
+    /// look up per-repo tokens in the returned map. Avoids re-running
+    /// the same `token_command` N times.
     ///
     /// Errors if any named credential is unknown or fails to resolve.
+    /// Callers in multi-repo fan-out paths (`image ls`, `workload ls`,
+    /// `workload pull` in discovery mode) must use
+    /// [`resolve_credentials_best_effort`] instead so one broken
+    /// credential doesn't abort discovery for every other repository.
     pub fn resolve_credentials_for(
         &self,
         names: &[&str],
@@ -555,6 +612,42 @@ impl Config {
             out.insert((*name).to_string(), token);
         }
         Ok(out)
+    }
+
+    /// Deduplicating batch resolver (best-effort). Like
+    /// [`resolve_credentials_for`] but collects per-credential failures
+    /// instead of aborting on the first one.
+    ///
+    /// Returns `(successes, failures)` where `failures` maps each
+    /// credential name that failed to its error message. Callers
+    /// should warn on every failure and skip any repository whose
+    /// `credential` field is in the failures map.
+    ///
+    /// Used by multi-repo fan-out commands (`image ls`, `workload ls`,
+    /// `workload pull` in discovery mode) so a single broken
+    /// `token_command` (stale file, missing env var, dead helper)
+    /// doesn't swallow the entire listing / pull.
+    pub fn resolve_credentials_best_effort(
+        &self,
+        names: &[&str],
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut ok = HashMap::new();
+        let mut err = HashMap::new();
+        for name in names {
+            let key = *name;
+            if ok.contains_key(key) || err.contains_key(key) {
+                continue;
+            }
+            match self.resolve_credential(key) {
+                Ok(t) => {
+                    ok.insert(key.to_string(), t);
+                }
+                Err(e) => {
+                    err.insert(key.to_string(), e.to_string());
+                }
+            }
+        }
+        (ok, err)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1407,6 +1500,126 @@ mod tests {
         .unwrap();
         let err = config.workload.resolve(None).unwrap_err();
         assert!(err.to_string().contains("no workload repository"));
+    }
+
+    #[test]
+    fn workload_resolve_shorthand_inherits_credential_from_matching_entry() {
+        // Raw `owner/repo` shorthand should inherit the credential of
+        // any configured `[workload.repositories]` github entry with
+        // the same `repo` path. Otherwise push would silently fail at
+        // the upload gate because the synthesised spec has no
+        // credential attached.
+        let config = Config::load_from_str(
+            r#"
+            [github.credentials]
+            private = { env = "PRIVATE_TOKEN" }
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            gh-private = { type = "github", repo = "owner/private", credential = "private" }
+            "#,
+        )
+        .unwrap();
+        let (_, spec) = config.workload.resolve(Some("owner/private")).unwrap();
+        match spec {
+            WorkloadRepositorySpec::Github { repo, credential } => {
+                assert_eq!(repo, "owner/private");
+                assert_eq!(credential.as_deref(), Some("private"));
+            }
+            _ => panic!("expected github"),
+        }
+    }
+
+    #[test]
+    fn workload_resolve_shorthand_stays_anonymous_when_no_matching_entry() {
+        // No configured entry points at `owner/public`, so the
+        // synthesised spec keeps `credential = None`. Public repos
+        // still work anonymously.
+        let config = Config::load_from_str(
+            r#"
+            [image.repositories]
+            x = { repo = "a/b" }
+            "#,
+        )
+        .unwrap();
+        let (_, spec) = config.workload.resolve(Some("owner/public")).unwrap();
+        match spec {
+            WorkloadRepositorySpec::Github { credential, .. } => {
+                assert!(credential.is_none());
+            }
+            _ => panic!("expected github"),
+        }
+    }
+
+    #[test]
+    fn workload_resolve_shorthand_errors_on_ambiguous_credential_match() {
+        // Two configured entries point at the same `owner/repo` path
+        // but reference different credentials. Refuse to guess.
+        let config = Config::load_from_str(
+            r#"
+            [github.credentials]
+            one = { env = "ONE_TOKEN" }
+            two = { env = "TWO_TOKEN" }
+            [image.repositories]
+            x = { repo = "a/b" }
+            [workload.repositories]
+            first  = { type = "github", repo = "owner/same", credential = "one" }
+            second = { type = "github", repo = "owner/same", credential = "two" }
+            "#,
+        )
+        .unwrap();
+        let err = config.workload.resolve(Some("owner/same")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("different credentials"), "got: {msg}");
+        assert!(msg.contains("owner/same"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_credentials_best_effort_collects_failures() {
+        // Two credentials: one readable env var, one pointing at an
+        // unset env var. The batch resolver must return both the
+        // success AND the failure without aborting.
+        let ok_var = "ATAKIT_TEST_BEST_EFFORT_OK";
+        let bad_var = "ATAKIT_TEST_BEST_EFFORT_BAD_THAT_DOES_NOT_EXIST";
+        unsafe {
+            env::set_var(ok_var, "tok");
+            env::remove_var(bad_var);
+        }
+        let config = Config::load_from_str(&format!(
+            r#"
+            [github.credentials]
+            good = {{ env = "{ok_var}" }}
+            bad  = {{ env = "{bad_var}" }}
+            [image.repositories]
+            x = {{ repo = "a/b" }}
+            "#,
+        ))
+        .unwrap();
+        let (ok, err) = config.resolve_credentials_best_effort(&["good", "bad"]);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok.get("good").map(String::as_str), Some("tok"));
+        assert_eq!(err.len(), 1);
+        assert!(err.contains_key("bad"));
+        unsafe { env::remove_var(ok_var) };
+    }
+
+    #[test]
+    fn resolve_credentials_best_effort_dedupes_names() {
+        let var = "ATAKIT_TEST_BEST_EFFORT_DEDUPE";
+        unsafe { env::set_var(var, "x") };
+        let config = Config::load_from_str(&format!(
+            r#"
+            [github.credentials]
+            pub = {{ env = "{var}" }}
+            [image.repositories]
+            x = {{ repo = "a/b" }}
+            "#,
+        ))
+        .unwrap();
+        let (ok, err) = config.resolve_credentials_best_effort(&["pub", "pub", "pub"]);
+        assert_eq!(ok.len(), 1);
+        assert!(err.is_empty());
+        unsafe { env::remove_var(var) };
     }
 
     #[test]

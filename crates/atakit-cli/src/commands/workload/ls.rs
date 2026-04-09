@@ -99,6 +99,12 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 // helper (biometric prompt, remote HSM) only runs a
                 // single time regardless of how many repos share the
                 // credential.
+                //
+                // Best-effort: a single broken credential must not
+                // abort the whole fan-out. Repositories that don't
+                // need the failing credential still get listed;
+                // repositories that do are skipped with a per-repo
+                // warning so the user can tell *which* repo is stuck.
                 let cred_names: Vec<&str> = specs
                     .iter()
                     .filter_map(|(_, spec)| match spec {
@@ -109,13 +115,41 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                         _ => None,
                     })
                     .collect();
-                let tokens = match config.resolve_credentials_for(&cred_names) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("{} {}", "warning:".yellow(), e);
-                        return Ok(());
+                let (tokens, cred_errs) =
+                    config.resolve_credentials_best_effort(&cred_names);
+                for (cred_name, msg) in &cred_errs {
+                    eprintln!(
+                        "{} credential '{}' failed: {}",
+                        "warning:".yellow(),
+                        cred_name.dimmed(),
+                        msg,
+                    );
+                }
+
+                // Partition specs into those ready to query and those
+                // skipped because their credential failed. Emit a
+                // per-repo warning so the user sees exactly which
+                // entries were dropped from the listing.
+                let mut ready: Vec<(String, crate::config::WorkloadRepositorySpec)> =
+                    Vec::new();
+                for (repo_name, spec) in specs {
+                    if let crate::config::WorkloadRepositorySpec::Github {
+                        credential: Some(cred_name),
+                        ..
+                    } = &spec
+                    {
+                        if cred_errs.contains_key(cred_name) {
+                            eprintln!(
+                                "{} skipping {} (credential '{}' failed)",
+                                "warning:".yellow(),
+                                repo_name.dimmed(),
+                                cred_name.dimmed(),
+                            );
+                            continue;
+                        }
                     }
-                };
+                    ready.push((repo_name, spec));
+                }
 
                 let filters = RepositoryFilters {
                     owner: args.owner.clone(),
@@ -129,7 +163,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 // concurrently. The repo handles are owned by the future
                 // chain so we keep them around to extract `display_uri`
                 // for warning output after the join.
-                let futures = specs.into_iter().map(|(repo_name, spec)| {
+                let futures = ready.into_iter().map(|(repo_name, spec)| {
                     let resolved_token = match &spec {
                         crate::config::WorkloadRepositorySpec::Github {
                             credential: Some(name),
