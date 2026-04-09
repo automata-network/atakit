@@ -43,32 +43,23 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
             .collect()
     };
 
-    // Resolve every referenced credential up front so a slow helper
-    // only runs once even when multiple repos share a credential.
-    let cred_names: Vec<&str> = targets
-        .iter()
-        .filter_map(|(_, spec)| spec.credential.as_deref())
-        .collect();
-    let tokens: HashMap<String, String> = config.resolve_credentials_for(&cred_names)?;
-
-    let build_client = |spec: &ImageRepositorySpec| -> ReleasesClient {
-        let mut c = ReleasesClient::new();
-        if let Some(ref name) = spec.credential {
-            if let Some(token) = tokens.get(name) {
-                c = c.with_token(token);
-            }
-        }
-        c
-    };
-
     let store = ImageStore::new(&env.image_dir);
 
-    // --tag mode: show detailed view for a single release.
+    // Credential resolution is deferred until we actually need to
+    // talk to GitHub. Local-only `image ls` (the default, no
+    // `--remote` / `--all` / `--tag`) must never touch any
+    // credential files / env vars / helpers -- that's the whole
+    // point of lazy resolution.
+
+    // --tag mode: single-target, single repo, strict.
     if let Some(tag) = &args.tag {
         let (_, spec) = targets
             .first()
             .ok_or_else(|| anyhow::anyhow!("no image repositories configured"))?;
-        let client = build_client(spec);
+        let mut client = ReleasesClient::new();
+        if let Some(ref cred_name) = spec.credential {
+            client = client.with_token(config.resolve_credential(cred_name)?);
+        }
         let release = client.get_release(&spec.repo, &tag.tag).await?;
         let local_name = repo_local_name(&spec.repo);
         print_release_detail(local_name, &release, &store);
@@ -78,7 +69,8 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     let mut groups: BTreeMap<String, Vec<ImageRow>> = BTreeMap::new();
 
     if !args.remote && !args.all {
-        // Local-only mode (default): just scan the filesystem.
+        // Local-only mode (default): just scan the filesystem. No
+        // network, no credential resolution.
         let local_tags = store.list_local()?;
         if local_tags.is_empty() {
             println!("No local images found.");
@@ -92,10 +84,66 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
         }
     } else {
         // Fetch remote releases + merge local state (--remote / --all).
+        //
+        // Resolve every referenced credential up front so a slow
+        // helper only runs once even when multiple repos share a
+        // credential. Strictness:
+        // * Single-target (--repo selected exactly one configured
+        //   entry): strict. A credential failure is fatal because
+        //   there's no fallback.
+        // * Multi-target fan-out: best-effort. One broken credential
+        //   must not abort listing for repositories that don't need
+        //   it. Repos whose credential fails are skipped with a
+        //   per-repo warning.
+        let single_target = args.repo.is_some();
+        let cred_names: Vec<&str> = targets
+            .iter()
+            .filter_map(|(_, spec)| spec.credential.as_deref())
+            .collect();
+        let (tokens, cred_errs): (HashMap<String, String>, HashMap<String, String>) =
+            if single_target {
+                (config.resolve_credentials_for(&cred_names)?, HashMap::new())
+            } else {
+                config.resolve_credentials_best_effort(&cred_names)
+            };
+        for (cred_name, msg) in &cred_errs {
+            eprintln!(
+                "{} credential '{}' failed: {}",
+                "warning:".yellow(),
+                cred_name.dimmed(),
+                msg,
+            );
+        }
+
+        let build_client = |spec: &ImageRepositorySpec| -> ReleasesClient {
+            let mut c = ReleasesClient::new();
+            if let Some(ref name) = spec.credential {
+                if let Some(token) = tokens.get(name) {
+                    c = c.with_token(token);
+                }
+            }
+            c
+        };
+
         let local_tags = store.list_local()?;
         let mut remote_tags: HashSet<ImageRef> = HashSet::new();
 
-        for (_, spec) in &targets {
+        for (name, spec) in &targets {
+            // Skip targets whose credential failed to resolve (only
+            // relevant in multi-target mode; single-target mode
+            // already errored strictly above).
+            if let Some(ref cred_name) = spec.credential {
+                if cred_errs.contains_key(cred_name) {
+                    eprintln!(
+                        "{} skipping {} (credential '{}' failed)",
+                        "warning:".yellow(),
+                        name.dimmed(),
+                        cred_name.dimmed(),
+                    );
+                    continue;
+                }
+            }
+
             let github_repo = spec.repo.as_str();
             let local_name = repo_local_name(github_repo);
             let client = build_client(spec);

@@ -28,9 +28,19 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // the workload is present). Otherwise we fan out across every
     // configured repository.
     let specs = config.workload.all_repositories(args.repository.as_deref())?;
+    let pinned = args.repository.is_some();
 
     // Resolve every distinct credential up front so a slow helper is
     // invoked at most once even in multi-repo discovery mode.
+    //
+    // Strictness depends on mode:
+    // * Pinned (--repository): the user explicitly named one target,
+    //   so a failing credential is fatal -- no fallback repository
+    //   exists to discover from.
+    // * Multi-repo discovery: best-effort. One broken credential
+    //   must not abort discovery for unrelated repositories that
+    //   could still serve the pull. Repos whose credential fails
+    //   are skipped with a per-repo warning.
     let cred_names: Vec<&str> = specs
         .iter()
         .filter_map(|(_, spec)| match spec {
@@ -41,7 +51,22 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
             _ => None,
         })
         .collect();
-    let tokens = config.resolve_credentials_for(&cred_names)?;
+    let (tokens, cred_errs): (
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+    ) = if pinned {
+        (config.resolve_credentials_for(&cred_names)?, std::collections::HashMap::new())
+    } else {
+        config.resolve_credentials_best_effort(&cred_names)
+    };
+    for (cred_name, msg) in &cred_errs {
+        eprintln!(
+            "{} credential '{}' failed: {}",
+            "warning:".yellow(),
+            cred_name.dimmed(),
+            msg,
+        );
+    }
 
     // Parse the user's reference. We need it up front so we know whether
     // to do name-based lookups (cheap) or id-based scans (more expensive
@@ -60,9 +85,26 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     //   later. Bail on the first probe error with the underlying cause.
     // * Multi-repo discovery: warn to stderr and continue so other
     //   repositories can still serve the pull.
-    let pinned = args.repository.is_some();
     let mut candidates: Vec<Candidate> = Vec::new();
     for (name, spec) in specs {
+        // Skip repos whose credential failed to resolve (discovery
+        // mode only -- pinned mode would have already errored via
+        // `resolve_credentials_for?` above).
+        if let crate::config::WorkloadRepositorySpec::Github {
+            credential: Some(cred_name),
+            ..
+        } = &spec
+        {
+            if cred_errs.contains_key(cred_name) {
+                eprintln!(
+                    "{} skipping {} (credential '{}' failed)",
+                    "warning:".yellow(),
+                    name.dimmed(),
+                    cred_name.dimmed(),
+                );
+                continue;
+            }
+        }
         let resolved_token = match &spec {
             crate::config::WorkloadRepositorySpec::Github {
                 credential: Some(cred_name),
