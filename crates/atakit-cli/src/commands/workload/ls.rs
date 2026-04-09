@@ -100,11 +100,17 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 // single time regardless of how many repos share the
                 // credential.
                 //
-                // Best-effort: a single broken credential must not
-                // abort the whole fan-out. Repositories that don't
-                // need the failing credential still get listed;
-                // repositories that do are skipped with a per-repo
-                // warning so the user can tell *which* repo is stuck.
+                // Strictness keys off fan-out CARDINALITY, matching
+                // image ls / workload pull:
+                // * Exactly one target: strict. Credential failure is
+                //   a hard error -- downgrading it to a skip would
+                //   bottom out at "No workloads found.", hiding the
+                //   actionable "your token is bad" signal.
+                // * Multi-target fan-out: best-effort. One broken
+                //   credential must not abort listing for repositories
+                //   that don't need it. Repos whose credential fails
+                //   are skipped with a per-repo warning.
+                let single_target = specs.len() == 1;
                 let cred_names: Vec<&str> = specs
                     .iter()
                     .filter_map(|(_, spec)| match spec {
@@ -115,8 +121,17 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                         _ => None,
                     })
                     .collect();
-                let (tokens, cred_errs) =
-                    config.resolve_credentials_best_effort(&cred_names);
+                let (tokens, cred_errs): (
+                    std::collections::HashMap<String, String>,
+                    std::collections::HashMap<String, String>,
+                ) = if single_target {
+                    (
+                        config.resolve_credentials_for(&cred_names)?,
+                        std::collections::HashMap::new(),
+                    )
+                } else {
+                    config.resolve_credentials_best_effort(&cred_names)
+                };
                 for (cred_name, msg) in &cred_errs {
                     eprintln!(
                         "{} credential '{}' failed: {}",

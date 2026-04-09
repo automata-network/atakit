@@ -167,3 +167,89 @@ fn workload_pull_with_one_broken_credential_repo_errors_strictly() {
         "broken credential leaked through to the generic not-found path.\nstderr: {stderr}"
     );
 }
+
+// ── workload ls --remote ─────────────────────────────────────────
+
+#[test]
+fn workload_ls_remote_with_one_broken_credential_repo_errors_strictly() {
+    // Regression: `workload ls --remote` used to hard-code
+    // best-effort credential resolution, so a one-entry config
+    // with a broken credential printed warnings and "No workloads
+    // found." with exit 0, matching neither image-ls nor
+    // workload-pull behavior. The cardinality rule now applies
+    // here too: exactly one target -> strict -> the credential
+    // failure surfaces with a non-zero exit and the real cause.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        x = { repo = "a/b" }
+
+        [workload.repositories]
+        only = { type = "github", repo = "myorg/private-workloads", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(&cfg, &dat, &cache, &["workload", "ls", "--remote"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; got success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken") || stderr.contains("ATAKIT_TEST_BROKEN_TOKEN"),
+        "expected the credential name or env var name in stderr.\nstderr: {stderr}"
+    );
+    // Critical: must NOT bottom out at the misleading "No
+    // workloads found." success path with exit 0.
+    assert!(
+        !stdout.contains("No workloads found"),
+        "broken credential leaked through to 'No workloads found' path.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn workload_ls_remote_with_pinned_broken_repository_errors_strictly() {
+    // Same test but reaching "single target" via `--repository`
+    // instead of a one-entry config. Both paths should produce
+    // the same strict behavior now.
+    let (_c, _d, _ca, cfg, dat, cache) = temp_env(
+        r#"
+        [github.credentials]
+        broken = { env = "ATAKIT_TEST_BROKEN_TOKEN" }
+
+        [image.repositories]
+        x = { repo = "a/b" }
+
+        [workload.repositories]
+        public = { type = "http", url = "https://example.com" }
+        private = { type = "github", repo = "myorg/private-workloads", credential = "broken" }
+        "#,
+    );
+
+    let out = run_atakit(
+        &cfg,
+        &dat,
+        &cache,
+        &["workload", "ls", "--remote", "--repository", "private"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; got success.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken") || stderr.contains("ATAKIT_TEST_BROKEN_TOKEN"),
+        "expected the credential name or env var name in stderr.\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("No workloads found"),
+        "broken credential leaked through to 'No workloads found' path.\nstdout: {stdout}"
+    );
+}
