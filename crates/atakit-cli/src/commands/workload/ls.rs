@@ -95,10 +95,9 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
             Ok(specs) => {
                 // Collect every distinct credential referenced by the
                 // github entries in this fan-out and resolve each one
-                // exactly once up front. A slow `token_command`
-                // helper (biometric prompt, remote HSM) only runs a
-                // single time regardless of how many repos share the
-                // credential.
+                // exactly once up front. A slow `command` credential
+                // (biometric prompt, remote HSM) only runs a single
+                // time regardless of how many repos share it.
                 //
                 // Strictness keys off fan-out CARDINALITY, matching
                 // image ls / workload pull:

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
@@ -12,9 +12,13 @@ use atakit_workload::{
 };
 use indexmap::IndexMap;
 use serde::Deserialize;
-use wait_timeout::ChildExt;
 
 const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Poll interval for the credential-command timeout loop. Chosen so
+/// that short-lived helpers finish within one or two ticks and the
+/// observed wall-time overhead is < 100 ms while the timeout bound
+/// is still tight (user-facing `timeout_secs` is in seconds anyway).
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Application configuration loaded from `config.toml`.
 ///
@@ -271,11 +275,11 @@ fn resolve_command(
         })?;
 
     // Drain stdout and stderr on background threads CONCURRENTLY
-    // with `wait_timeout`. Reading pipes only after the child has
+    // with the wait loop. Reading pipes only after the child has
     // exited (the obvious approach) deadlocks when the helper
     // writes more than the kernel pipe buffer can hold (~64 KiB on
     // Linux): the child blocks on write() waiting for a reader,
-    // never exits, and wait_timeout fires -- so a helper that
+    // never exits, and the timeout fires -- so a helper that
     // spews debug output to stderr before printing the token would
     // look like a timeout when the real problem is backpressure.
     // Spawning drainers up front prevents the deadlock.
@@ -300,22 +304,41 @@ fn resolve_command(
         buf
     });
 
-    let status = match child.wait_timeout(Duration::from_secs(timeout_secs))? {
-        Some(status) => status,
-        None => {
-            // Best-effort cleanup; we're already erroring so ignore
-            // secondary failures. The kill closes the child's pipe
-            // ends, which releases the drainer threads from their
-            // blocking reads.
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            bail!(
-                "credential '{cred_name}': token_command timed out after {timeout_secs}s \
-                 (command: `{}`)",
-                program
-            );
+    // Bound the child's lifetime via a polling loop on `try_wait`.
+    // We previously used the `wait-timeout` crate, but its
+    // SIGCHLD + self-pipe machinery panics in sandboxed /
+    // seccomp-restricted Linux environments with "bad error on
+    // write fd: Operation not permitted", which aborts the whole
+    // process instead of surfacing a clean credential error. A
+    // plain `waitpid(pid, WNOHANG)` poll loop touches none of that
+    // machinery and works everywhere `kill(pid, SIGKILL)` does.
+    //
+    // Overhead is negligible: ~20 wakeups/sec during the wait, and
+    // credential resolution happens once per CLI invocation.
+    let timeout = Duration::from_secs(timeout_secs);
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= timeout {
+                    // Best-effort cleanup; we're already erroring
+                    // so ignore secondary failures. The kill
+                    // closes the child's pipe ends, which
+                    // releases the drainer threads from their
+                    // blocking reads.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    bail!(
+                        "credential '{cred_name}': command timed out after {timeout_secs}s \
+                         (command: `{}`)",
+                        program
+                    );
+                }
+                std::thread::sleep(COMMAND_POLL_INTERVAL);
+            }
         }
     };
 
@@ -330,7 +353,7 @@ fn resolve_command(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string());
         bail!(
-            "credential '{cred_name}': token_command exited with status {code} \
+            "credential '{cred_name}': command exited with status {code} \
              (command: `{}`): {}",
             program,
             stderr.trim()
@@ -345,7 +368,7 @@ fn resolve_command(
     let token = stdout.trim().to_string();
     if token.is_empty() {
         bail!(
-            "credential '{cred_name}': token_command produced no token \
+            "credential '{cred_name}': command produced no token \
              (empty or whitespace-only output)"
         );
     }
@@ -678,7 +701,7 @@ impl Config {
     /// Deduplicating batch resolver (strict). Call this once with
     /// every credential name a single-target command will touch, then
     /// look up per-repo tokens in the returned map. Avoids re-running
-    /// the same `token_command` N times.
+    /// the same `command` credential N times.
     ///
     /// Errors if any named credential is unknown or fails to resolve.
     /// Callers in multi-repo fan-out paths (`image ls`, `workload ls`,
@@ -711,7 +734,7 @@ impl Config {
     ///
     /// Used by multi-repo fan-out commands (`image ls`, `workload ls`,
     /// `workload pull` in discovery mode) so a single broken
-    /// `token_command` (stale file, missing env var, dead helper)
+    /// credential (stale file, missing env var, dead helper)
     /// doesn't swallow the entire listing / pull.
     pub fn resolve_credentials_best_effort(
         &self,
