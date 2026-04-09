@@ -117,9 +117,28 @@ atakit cloud destroy my-instance --target my-gcp
 Located at `$XDG_CONFIG_HOME/atakit/config.toml`:
 
 ```toml
-[image]
-# GitHub repositories for image commands (owner/repo format)
-repositories = ["automata-network/automata-linux"]
+# GitHub credentials. Each entry sets exactly one of `file` / `command` / `env`.
+# Repositories reference a credential by name via `credential = "<name>"`;
+# entries without a `credential` field make anonymous requests (public repos only).
+[github.credentials]
+public  = { file    = "~/.config/atakit/tokens/public" }
+private = { command = ["pass", "show", "github/atakit-private"] }
+# ci    = { env     = "GH_CI_TOKEN" }
+
+# Image repositories. Declaration order matters: first-declared is the
+# implicit default for `image pull`. Each entry may set a `credential`
+# and/or a per-repo `list_limit` override.
+[image.repositories]
+automata = { repo = "automata-network/automata-linux" }
+# private  = { repo = "myorg/private-images", credential = "private" }
+
+# Workload repositories. Declaration order matters: first-declared is the
+# implicit default for `workload push`. Pull and `ls --remote` fan out
+# across every entry.
+[workload.repositories]
+# main       = { type = "http",   url  = "https://registry.example.com" }
+# gh-public  = { type = "github", repo = "automata-network/workload-archives", credential = "public" }
+# gh-private = { type = "github", repo = "myorg/private-workloads",            credential = "private" }
 
 [publish]
 rpc_url = "https://..."

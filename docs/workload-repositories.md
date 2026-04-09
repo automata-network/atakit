@@ -64,6 +64,27 @@ ci      = { env     = "GH_CI_TOKEN" }
 
 A workload repository references its credential by name via `credential = "<name>"`. Entries without a `credential` field make anonymous GitHub requests (public reads only; `workload push` against such an entry errors with a clear "requires credential" message). A credential with `contents: write` scope is required for `workload push` against a GitHub repository.
 
+### Scripting and CI
+
+There is no environment variable that selects or creates a workload repository (`ATAKIT_WORKLOAD_REPOSITORY_URL` was removed). Scripts and CI pipelines that need to steer workload commands at a specific target pass `--repository` explicitly on every invocation:
+
+```sh
+# Push to a specific HTTP registry URL with no config file edits
+atakit workload push my-service:v0.0.1 --repository "$REGISTRY_URL"
+
+# List against a named entry from config
+atakit workload ls --remote --repository main
+
+# Push to a GitHub repo shorthand; the credential is inherited from
+# a matching [workload.repositories] entry if one exists, otherwise
+# the request is anonymous
+atakit workload push my-service:v0.0.1 --repository owner/repo
+```
+
+`--repository` accepts any of: a name defined under `[workload.repositories]`, a raw `http(s)://...` URL, or a bare `owner/repo` path (treated as GitHub). When given a bare `owner/repo`, the CLI scans configured entries and inherits the credential from any matching entry so private-repo shorthand still works without duplicating configuration.
+
+Credentials themselves can still be sourced from env vars via `[github.credentials.<name>] = { env = "VARNAME" }`, so a CI pipeline that sets `GH_CI_TOKEN` and declares a matching credential in `config.toml` does not need to rewrite config on every run -- only the repository target needs to move to the CLI flag.
+
 ## GitHub Repository Layout
 
 Each workload version is published as one GitHub release.
