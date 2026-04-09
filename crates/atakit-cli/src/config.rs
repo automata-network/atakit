@@ -270,13 +270,47 @@ fn resolve_command(
             )
         })?;
 
+    // Drain stdout and stderr on background threads CONCURRENTLY
+    // with `wait_timeout`. Reading pipes only after the child has
+    // exited (the obvious approach) deadlocks when the helper
+    // writes more than the kernel pipe buffer can hold (~64 KiB on
+    // Linux): the child blocks on write() waiting for a reader,
+    // never exits, and wait_timeout fires -- so a helper that
+    // spews debug output to stderr before printing the token would
+    // look like a timeout when the real problem is backpressure.
+    // Spawning drainers up front prevents the deadlock.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("credential '{cred_name}': child stdout unavailable"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("credential '{cred_name}': child stderr unavailable"))?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut pipe = stdout_pipe;
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut pipe = stderr_pipe;
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+
     let status = match child.wait_timeout(Duration::from_secs(timeout_secs))? {
         Some(status) => status,
         None => {
             // Best-effort cleanup; we're already erroring so ignore
-            // secondary failures.
+            // secondary failures. The kill closes the child's pipe
+            // ends, which releases the drainer threads from their
+            // blocking reads.
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             bail!(
                 "credential '{cred_name}': token_command timed out after {timeout_secs}s \
                  (command: `{}`)",
@@ -285,14 +319,10 @@ fn resolve_command(
         }
     };
 
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    // Child exited; its pipe ends are closed, so the drainers have
+    // already seen EOF. Joining gives us whatever they buffered.
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
 
     if !status.success() {
         let code = status
@@ -1538,6 +1568,60 @@ mod tests {
         assert!(msg.contains("timed out after 1s"), "got: {msg}");
         // Sanity: we didn't actually wait 5 seconds.
         assert!(elapsed < Duration::from_secs(3), "elapsed: {:?}", elapsed);
+    }
+
+    #[test]
+    fn credential_command_does_not_deadlock_on_large_stderr_output() {
+        // Regression: writing more than the kernel pipe buffer (~64
+        // KiB on Linux) to stderr would block the helper because
+        // the parent only read pipes AFTER `wait_timeout` returned.
+        // The child blocked on write(), never exited, and the
+        // command was misreported as a timeout.
+        //
+        // Drainer threads now read both pipes concurrently with
+        // wait, so a helper that dumps 200 KiB of debug to stderr
+        // and then prints a small token must succeed cleanly.
+        let spec = CredentialSpec {
+            file: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                // 200 KiB of stderr, then a token on stdout.
+                "yes 'noisy debug line that fills the pipe buffer' | head -c 200000 >&2; \
+                 echo ghp_real_token"
+                    .into(),
+            ]),
+            env: None,
+            // Bound the timeout so a regression manifests as a
+            // failed test rather than a CI hang.
+            timeout_secs: Some(10),
+        };
+        let token = spec
+            .resolve("noisy")
+            .expect("large stderr output must not deadlock or time out");
+        assert_eq!(token, "ghp_real_token");
+    }
+
+    #[test]
+    fn credential_command_does_not_deadlock_on_large_stdout_output() {
+        // Same regression in the other direction: a helper that
+        // emits a giant stdout payload (which we'll then trim to
+        // get a token from) must not deadlock.
+        let spec = CredentialSpec {
+            file: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "head -c 200000 /dev/zero | tr '\\0' x".into(),
+            ]),
+            env: None,
+            timeout_secs: Some(10),
+        };
+        let token = spec
+            .resolve("big")
+            .expect("large stdout output must not deadlock or time out");
+        // Sanity: we got the full 200 KiB back, not a truncated read.
+        assert_eq!(token.len(), 200_000);
     }
 
     // ── Config::resolve_credential ───────────────────────────────

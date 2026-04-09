@@ -29,15 +29,22 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // configured repository.
     let specs = config.workload.all_repositories(args.repository.as_deref())?;
     let pinned = args.repository.is_some();
+    // Strictness keys off fan-out CARDINALITY, not whether
+    // --repository was passed. With exactly one target, failures
+    // (credential or probe) are fatal because there's no fallback --
+    // downgrading them to warnings leaves the user staring at a
+    // misleading "not found in any configured repository" message
+    // when the real problem was a stale token or a network hiccup.
+    // A one-entry config behaves the same as --repository=<that
+    // entry> without the user having to spell it out.
+    let single_target = specs.len() == 1;
 
     // Resolve every distinct credential up front so a slow helper is
     // invoked at most once even in multi-repo discovery mode.
     //
-    // Strictness depends on mode:
-    // * Pinned (--repository): the user explicitly named one target,
-    //   so a failing credential is fatal -- no fallback repository
-    //   exists to discover from.
-    // * Multi-repo discovery: best-effort. One broken credential
+    // * Single target: strict. Credential failure -> hard error with
+    //   the real cause, not a downgraded skip.
+    // * Multi-target discovery: best-effort. One broken credential
     //   must not abort discovery for unrelated repositories that
     //   could still serve the pull. Repos whose credential fails
     //   are skipped with a per-repo warning.
@@ -54,7 +61,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let (tokens, cred_errs): (
         std::collections::HashMap<String, String>,
         std::collections::HashMap<String, String>,
-    ) = if pinned {
+    ) = if single_target {
         (config.resolve_credentials_for(&cred_names)?, std::collections::HashMap::new())
     } else {
         config.resolve_credentials_best_effort(&cred_names)
@@ -170,11 +177,12 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
                 // Not in this repo -- expected during multi-repo discovery.
             }
             Err(e) => {
-                if pinned {
-                    // User pinned this exact repo with --repository.
-                    // A probe failure here is the real reason the
-                    // pull can't proceed; don't swallow it as a
-                    // warning and pretend "not found in any
+                if single_target {
+                    // Exactly one target in play (either user pinned
+                    // it with --repository or the config has a
+                    // single entry). A probe failure is the real
+                    // reason the pull can't proceed; don't swallow
+                    // it as a warning and pretend "not found in any
                     // configured repository" later.
                     return Err(anyhow::Error::from(e)).with_context(|| {
                         format!("repository {display} probe failed")
