@@ -164,5 +164,5 @@ The main workload container starts first (or in parallel with dependencies that 
 - `[disks.*]` section: unchanged (disk definitions are top-level, not per-container)
 - `[config.firewall-ports]`: unchanged (already includes dependency ports)
 - `[config.baby-container]`: unchanged
-- `[config.signing]`: unchanged
+- `[config.signing]`: unchanged (legacy, being redesigned)
 - `/init` endpoint: unchanged (same multipart form)
