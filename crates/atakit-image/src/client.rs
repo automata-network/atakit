@@ -26,12 +26,6 @@ impl ReleasesClient {
         self
     }
 
-    /// Read authentication token from the `GITHUB_TOKEN` environment variable.
-    pub fn with_token_from_env(mut self) -> Self {
-        self.inner = self.inner.with_token_from_env();
-        self
-    }
-
     /// Borrow the underlying generic client (used by the download module).
     pub(crate) fn inner(&self) -> &InnerClient {
         &self.inner

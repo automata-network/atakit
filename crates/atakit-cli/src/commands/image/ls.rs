@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use anyhow::Result;
@@ -8,29 +8,69 @@ use atakit_image::{
 };
 use owo_colors::OwoColorize;
 
-use crate::config::{Config, repo_local_name};
+use crate::config::{Config, ImageRepositorySpec, repo_local_name};
 
 pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
-    let limit = args.limit.unwrap_or(config.image.list_limit);
-
-    // Determine which GitHub repos to query.
-    let repos: Vec<String> = if let Some(ref r) = args.repo {
-        vec![r.clone()]
+    // Resolve the set of (entry name, spec) pairs to visit. When
+    // `--repo` is given we look up the matching configured entry to
+    // inherit its credential and list_limit override; if no entry
+    // matches we synthesize an anonymous spec so raw `owner/repo`
+    // arguments still work.
+    let targets: Vec<(String, ImageRepositorySpec)> = if let Some(ref r) = args.repo {
+        if let Some((name, spec)) = config
+            .image
+            .repositories
+            .iter()
+            .find(|(_, s)| s.repo == *r)
+        {
+            vec![(name.clone(), spec.clone())]
+        } else {
+            vec![(
+                r.clone(),
+                ImageRepositorySpec {
+                    repo: r.clone(),
+                    credential: None,
+                    list_limit: None,
+                },
+            )]
+        }
     } else {
-        config.image.repos().into_iter().map(String::from).collect()
+        config
+            .image
+            .repositories
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect()
+    };
+
+    // Resolve every referenced credential up front so a slow helper
+    // only runs once even when multiple repos share a credential.
+    let cred_names: Vec<&str> = targets
+        .iter()
+        .filter_map(|(_, spec)| spec.credential.as_deref())
+        .collect();
+    let tokens: HashMap<String, String> = config.resolve_credentials_for(&cred_names)?;
+
+    let build_client = |spec: &ImageRepositorySpec| -> ReleasesClient {
+        let mut c = ReleasesClient::new();
+        if let Some(ref name) = spec.credential {
+            if let Some(token) = tokens.get(name) {
+                c = c.with_token(token);
+            }
+        }
+        c
     };
 
     let store = ImageStore::new(&env.image_dir);
-    let client = match config.github_token() {
-        Some(token) => ReleasesClient::new().with_token(token),
-        None => ReleasesClient::new().with_token_from_env(),
-    };
 
     // --tag mode: show detailed view for a single release.
     if let Some(tag) = &args.tag {
-        let github_repo = &repos[0];
-        let release = client.get_release(github_repo, &tag.tag).await?;
-        let local_name = repo_local_name(github_repo);
+        let (_, spec) = targets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no image repositories configured"))?;
+        let client = build_client(spec);
+        let release = client.get_release(&spec.repo, &tag.tag).await?;
+        let local_name = repo_local_name(&spec.repo);
         print_release_detail(local_name, &release, &store);
         return Ok(());
     }
@@ -55,8 +95,19 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
         let local_tags = store.list_local()?;
         let mut remote_tags: HashSet<ImageRef> = HashSet::new();
 
-        for github_repo in &repos {
+        for (_, spec) in &targets {
+            let github_repo = spec.repo.as_str();
             let local_name = repo_local_name(github_repo);
+            let client = build_client(spec);
+
+            // Precedence: --limit CLI flag > per-repo list_limit >
+            // [image] list_limit. The CLI flag is an explicit
+            // per-invocation override and wins uniformly across every
+            // repo in the fan-out.
+            let limit = args
+                .limit
+                .or(spec.list_limit)
+                .unwrap_or(config.image.list_limit);
 
             if args.all {
                 let releases = client.list_releases(github_repo, limit).await?;

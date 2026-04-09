@@ -25,6 +25,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 owo-colors.workspace = true
 terminal_size = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+wait-timeout = "0.2"
 alloy-ext.workspace = true
 automata-tee-workload-measurement.workspace = true
 hex.workspace = true

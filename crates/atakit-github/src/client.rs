@@ -1,5 +1,3 @@
-use std::env;
-
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use tracing::debug;
 
@@ -24,18 +22,6 @@ impl ReleasesClient {
     /// Authenticate with a GitHub token (required for private repos and writes).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
-        self
-    }
-
-    /// Read authentication token from the `GITHUB_TOKEN` environment variable.
-    ///
-    /// No-op if the variable is unset or empty.
-    pub fn with_token_from_env(mut self) -> Self {
-        if let Ok(t) = env::var("GITHUB_TOKEN") {
-            if !t.is_empty() {
-                self.token = Some(t);
-            }
-        }
         self
     }
 

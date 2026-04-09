@@ -93,7 +93,30 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     if show_remote {
         match config.workload.all_repositories(args.repository.as_deref()) {
             Ok(specs) => {
-                let token = config.github_token().map(str::to_string);
+                // Collect every distinct credential referenced by the
+                // github entries in this fan-out and resolve each one
+                // exactly once up front. A slow `token_command`
+                // helper (biometric prompt, remote HSM) only runs a
+                // single time regardless of how many repos share the
+                // credential.
+                let cred_names: Vec<&str> = specs
+                    .iter()
+                    .filter_map(|(_, spec)| match spec {
+                        crate::config::WorkloadRepositorySpec::Github {
+                            credential: Some(name),
+                            ..
+                        } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let tokens = match config.resolve_credentials_for(&cred_names) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{} {}", "warning:".yellow(), e);
+                        return Ok(());
+                    }
+                };
+
                 let filters = RepositoryFilters {
                     owner: args.owner.clone(),
                     name: None,
@@ -107,7 +130,14 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 // chain so we keep them around to extract `display_uri`
                 // for warning output after the join.
                 let futures = specs.into_iter().map(|(repo_name, spec)| {
-                    let repo = config.workload.build_repository(spec, token.clone());
+                    let resolved_token = match &spec {
+                        crate::config::WorkloadRepositorySpec::Github {
+                            credential: Some(name),
+                            ..
+                        } => tokens.get(name).cloned(),
+                        _ => None,
+                    };
+                    let repo = config.workload.build_repository(spec, resolved_token);
                     let filters = filters.clone();
                     async move {
                         let uri = repo.display_uri();

@@ -50,9 +50,10 @@ pub struct GithubWorkloadRepository {
 }
 
 impl GithubWorkloadRepository {
-    /// Construct a repository for `owner/repo`. The token, if any, is read
-    /// from `GITHUB_TOKEN` and is required for uploads and for accessing
-    /// private repos.
+    /// Construct a repository for `owner/repo`. The token, if any, is
+    /// resolved by the caller from a named credential under
+    /// `[github.credentials]`; it's required for uploads and for
+    /// accessing private repos.
     pub fn new(repo: impl Into<String>, token: Option<String>) -> Self {
         let has_token = token.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
         let mut client = ReleasesClient::new();
@@ -213,7 +214,9 @@ impl GithubWorkloadRepository {
         if !self.has_token {
             return Err(WorkloadError::Repository {
                 message: format!(
-                    "github://{} requires GITHUB_TOKEN with `contents: write` to push",
+                    "github://{} requires a credential with `contents: write` to push. \
+                     Configure one under `[github.credentials]` and set \
+                     `credential = \"<name>\"` on the repository entry.",
                     self.repo
                 ),
             });

@@ -28,7 +28,20 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // the workload is present). Otherwise we fan out across every
     // configured repository.
     let specs = config.workload.all_repositories(args.repository.as_deref())?;
-    let token = config.github_token().map(str::to_string);
+
+    // Resolve every distinct credential up front so a slow helper is
+    // invoked at most once even in multi-repo discovery mode.
+    let cred_names: Vec<&str> = specs
+        .iter()
+        .filter_map(|(_, spec)| match spec {
+            crate::config::WorkloadRepositorySpec::Github {
+                credential: Some(name),
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tokens = config.resolve_credentials_for(&cred_names)?;
 
     // Parse the user's reference. We need it up front so we know whether
     // to do name-based lookups (cheap) or id-based scans (more expensive
@@ -50,7 +63,14 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let pinned = args.repository.is_some();
     let mut candidates: Vec<Candidate> = Vec::new();
     for (name, spec) in specs {
-        let repo = config.workload.build_repository(spec, token.clone());
+        let resolved_token = match &spec {
+            crate::config::WorkloadRepositorySpec::Github {
+                credential: Some(cred_name),
+                ..
+            } => tokens.get(cred_name).cloned(),
+            _ => None,
+        };
+        let repo = config.workload.build_repository(spec, resolved_token);
         let display = repo.display_uri();
 
         let probe: Result<Option<(WorkloadCoords, RepositoryArchiveMeta)>, _> = match &wref {

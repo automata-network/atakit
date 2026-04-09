@@ -11,46 +11,58 @@ The on-chain [WorkloadRegistry](cvm-registry/) contract is the authority for wor
 
 ## Configuration
 
-Workload repositories are declared under `[workload.repositories]` in `~/.config/atakit/config.toml`. Each entry is a tagged TOML table with a `type` discriminator.
+Workload repositories are declared under `[workload.repositories]` in `~/.config/atakit/config.toml`. Each entry is a tagged TOML table with a `type` discriminator. Declaration order matters: the first entry is the implicit default for single-target commands like `workload push`.
 
 ```toml
-[workload]
-default_repository = "main"
+[workload.repositories]
+main       = { type = "http",   url  = "https://registry.example.com" }
+staging    = { type = "http",   url  = "https://staging-registry.example.com" }
+gh-public  = { type = "github", repo = "automata-network/workload-archives",  credential = "public" }
+gh-private = { type = "github", repo = "myorg/private-workloads",             credential = "private" }
+```
 
+Section form is also valid if an entry wants inline comments:
+
+```toml
 [workload.repositories.main]
 type = "http"
-url = "https://registry.example.com"
-
-[workload.repositories.staging]
-type = "http"
-url = "https://staging-registry.example.com"
-
-[workload.repositories.gh-fallback]
-type = "github"
-repo = "automata-network/workload-archives"
+url  = "https://registry.example.com"
 ```
 
 The `--repository` CLI flag accepts:
 
-- a configured repository name (e.g. `main`, `gh-fallback`),
-- a raw `http(s)://...` URL (treated as an HTTP repository),
-- a bare `owner/repo` path (treated as a GitHub repository).
+- a configured repository name (e.g. `main`, `gh-public`),
+- a raw `http(s)://...` URL (treated as an anonymous HTTP repository),
+- a bare `owner/repo` path (treated as an anonymous GitHub repository).
 
-### How `--repository` and `default_repository` interact
+### How `--repository` interacts with declaration order
 
-The two are used differently by single-target and multi-target commands:
+Declaration order in `[workload.repositories]` determines the implicit default for single-target commands and the visit order for multi-target commands:
 
 | Command | When `--repository` set | When `--repository` omitted |
 |---|---|---|
-| `workload push` | Push to that one repository | Push to the entry named by `default_repository` |
-| `workload pull` | Probe only that repository | **Probe every configured repository** (`default_repository` is not consulted) |
+| `workload push` | Push to that one repository | Push to the **first declared** entry in `[workload.repositories]` |
+| `workload pull` | Probe only that repository | **Probe every configured repository** in declaration order |
 | `workload ls --remote` | Query only that repository | **Query every configured repository** in parallel and merge |
 
-In other words, `default_repository` only matters for single-target operations. Pull and remote listing are inherently multi-source: they fan out across every configured entry so a workload can be found and compared wherever it lives.
+Pull and remote listing are inherently multi-source: they fan out across every configured entry so a workload can be found and compared wherever it lives. Reorder entries in `[workload.repositories]` if the implicit default for `workload push` should change.
 
-Env override: `ATAKIT_WORKLOAD_REPOSITORY_URL` populates a `default` HTTP entry from the environment.
+### GitHub authentication
 
-GitHub authentication uses the same `[github] token` (or `GITHUB_TOKEN` env var) already used by `atakit image pull`. A token with `contents: write` is required for `workload push` against a GitHub repository.
+GitHub-backed repositories access the API through **named credentials** defined under `[github.credentials]`. Each credential sets exactly one token source:
+
+```toml
+[github.credentials]
+public  = { file    = "~/.config/atakit/tokens/public" }
+private = { command = ["pass", "show", "github/atakit-private"] }
+ci      = { env     = "GH_CI_TOKEN" }
+```
+
+- `file` -- path to a `chmod 600` file containing the token. `~/` is expanded. Whitespace is trimmed.
+- `command` -- exec the given argv (no shell), read stdout as the token. 30-second default timeout; override per-credential via `timeout_secs` for slow helpers (biometric prompts, remote HSMs).
+- `env` -- read from a named environment variable.
+
+A workload repository references its credential by name via `credential = "<name>"`. Entries without a `credential` field make anonymous GitHub requests (public reads only; `workload push` against such an entry errors with a clear "requires credential" message). A credential with `contents: write` scope is required for `workload push` against a GitHub repository.
 
 ## GitHub Repository Layout
 
