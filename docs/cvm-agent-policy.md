@@ -1,5 +1,9 @@
 # cvm-agent Policy File Reference
 
+> **DEPRECATED.** `cvm_agent_policy.json` is being removed from cvm-agent. It is superseded by `manifest.toml`, which the agent reads directly from the `.atawl` archive. Workload authors define the workload in `atakit-workload.toml`, which the atakit build pipeline compiles into `manifest.toml`; the agent consumes the manifest natively -- no JSON policy file is written or read.
+>
+> This document remains as a historical reference for the legacy JSON format while the migration is in progress. Do not use it as a guide for new workloads or new cvm-agent code paths. See [`atakit-workload-toml-spec.md`](atakit-workload-toml-spec.md) and [`atawl-archive-spec.md`](atawl-archive-spec.md) for the current source of truth.
+
 The `cvm_agent_policy.json` file is the central configuration authority for cvm-agent. Nearly every subsystem reads from it: container engine selection, firewall rules, disk setup, baby container limits, UID isolation, socket injection, and image verification.
 
 ## File Location
