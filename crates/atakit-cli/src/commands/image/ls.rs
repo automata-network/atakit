@@ -87,15 +87,19 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
         //
         // Resolve every referenced credential up front so a slow
         // helper only runs once even when multiple repos share a
-        // credential. Strictness:
-        // * Single-target (--repo selected exactly one configured
-        //   entry): strict. A credential failure is fatal because
-        //   there's no fallback.
+        // credential. Strictness keys off fan-out CARDINALITY, not
+        // whether the user passed --repo:
+        // * Exactly one target: strict. A credential failure is
+        //   fatal because there's no fallback -- skipping would
+        //   downgrade the actionable "your token is bad" signal
+        //   into a misleading "no images found". Applies equally
+        //   whether the single target came from --repo or from
+        //   a one-entry config.
         // * Multi-target fan-out: best-effort. One broken credential
         //   must not abort listing for repositories that don't need
         //   it. Repos whose credential fails are skipped with a
         //   per-repo warning.
-        let single_target = args.repo.is_some();
+        let single_target = targets.len() == 1;
         let cred_names: Vec<&str> = targets
             .iter()
             .filter_map(|(_, spec)| spec.credential.as_deref())
