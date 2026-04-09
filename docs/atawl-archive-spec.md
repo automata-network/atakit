@@ -62,6 +62,7 @@ base-image = ["mola-linux:v0.1.0-debug", "automata-linux:v0.1.5-debug"]
 ports = ["3000:3000"]
 restart = "unless-stopped"
 cvm_agent = true
+boot-disk-size = "50GB"
 measured-data = ["config/hello", "config/cert.pem"]
 unmeasured-data = ["additional-data/signer_key"]
 
