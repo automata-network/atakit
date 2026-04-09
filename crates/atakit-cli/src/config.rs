@@ -202,6 +202,15 @@ impl CredentialSpec {
 
     /// Lazily resolve this credential to a token string.
     ///
+    /// All three source kinds apply identical whitespace handling:
+    /// the raw value is `.trim()`-ed and a whitespace-only result is
+    /// rejected as empty. This keeps behavior consistent across
+    /// `file` (which already trimmed via [`read_key_file`]), `env`
+    /// (which previously let `GH_TOKEN=""` slip through and fail at
+    /// the API with a cryptic 401), and `command` (which previously
+    /// only trimmed trailing newlines, so leading whitespace from a
+    /// `pass show` output would leak into the Bearer header).
+    ///
     /// Errors always name the credential so users can find the
     /// offending entry immediately.
     pub fn resolve(&self, name: &str) -> Result<String> {
@@ -211,11 +220,22 @@ impl CredentialSpec {
             });
         }
         if let Some(ref env_name) = self.env {
-            return env::var(env_name).map_err(|_| {
-                anyhow::anyhow!(
+            return match env::var(env_name) {
+                Ok(v) => {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() {
+                        Err(anyhow::anyhow!(
+                            "credential '{name}': env var '{env_name}' is set but \
+                             empty or whitespace-only"
+                        ))
+                    } else {
+                        Ok(trimmed)
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
                     "credential '{name}': env var '{env_name}' is not set"
-                )
-            });
+                )),
+            };
         }
         if let Some(ref argv) = self.command {
             return resolve_command(name, argv, self.timeout_secs);
@@ -287,9 +307,17 @@ fn resolve_command(
         );
     }
 
-    let token = stdout.trim_end_matches(['\n', '\r']).to_string();
+    // Full whitespace trim (not just trailing newlines) so that
+    // `pass show` output with a leading blank line or helpers that
+    // wrap the token in `echo "  $TOKEN  "` don't leak whitespace
+    // into the Bearer header. Matches the behavior of the `file`
+    // source, which has always used `read_key_file`'s `.trim()`.
+    let token = stdout.trim().to_string();
     if token.is_empty() {
-        bail!("credential '{cred_name}': token_command produced no output");
+        bail!(
+            "credential '{cred_name}': token_command produced no token \
+             (empty or whitespace-only output)"
+        );
     }
     Ok(token)
 }
@@ -643,7 +671,15 @@ impl Config {
                     ok.insert(key.to_string(), t);
                 }
                 Err(e) => {
-                    err.insert(key.to_string(), e.to_string());
+                    // anyhow's alternate formatter includes the full
+                    // cause chain. Without this, a `file` credential
+                    // pointing at a missing path would surface as
+                    // "credential 'x': failed to read token from `/p`"
+                    // with the underlying ENOENT / EACCES hidden.
+                    // Using `{e:#}` preserves the distinction so the
+                    // user can tell "file missing" from "permission
+                    // denied".
+                    err.insert(key.to_string(), format!("{e:#}"));
                 }
             }
         }
@@ -1340,7 +1376,127 @@ mod tests {
             timeout_secs: None,
         };
         let err = spec.resolve("empty").unwrap_err();
-        assert!(err.to_string().contains("no output"));
+        let msg = err.to_string();
+        assert!(msg.contains("no token"), "got: {msg}");
+        assert!(msg.contains("empty or whitespace-only"), "got: {msg}");
+    }
+
+    #[test]
+    fn credential_command_errors_on_whitespace_only_output() {
+        // Whitespace-only output (spaces, tabs, newlines) must be
+        // rejected as empty, not passed through as a literal
+        // whitespace token into the Bearer header.
+        let spec = CredentialSpec {
+            file: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '   \\n\\t  \\n'".into(),
+            ]),
+            env: None,
+            timeout_secs: None,
+        };
+        let err = spec.resolve("ws").unwrap_err();
+        assert!(err.to_string().contains("empty or whitespace-only"));
+    }
+
+    #[test]
+    fn credential_command_trims_leading_and_trailing_whitespace() {
+        // A helper that outputs "  ghp_xxx  \n" should produce
+        // "ghp_xxx" -- full trim, not just trailing newlines. The old
+        // behavior leaked the leading spaces into the Bearer header,
+        // which GitHub rejects with a cryptic 401.
+        let spec = CredentialSpec {
+            file: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '   ghp_xyz  \\n'".into(),
+            ]),
+            env: None,
+            timeout_secs: None,
+        };
+        let token = spec.resolve("trim").unwrap();
+        assert_eq!(token, "ghp_xyz");
+    }
+
+    #[test]
+    fn credential_env_rejects_empty_string() {
+        // `GH_TOKEN=""` in CI must be treated as "not set", not
+        // silently passed through as an empty Bearer header that
+        // later produces a cryptic 401 from the API.
+        let var = "ATAKIT_TEST_EMPTY_ENV_VAR";
+        unsafe { env::set_var(var, "") };
+        let spec = CredentialSpec {
+            file: None,
+            command: None,
+            env: Some(var.to_string()),
+            timeout_secs: None,
+        };
+        let err = spec.resolve("empty").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty"), "got: {msg}");
+        unsafe { env::remove_var(var) };
+    }
+
+    #[test]
+    fn credential_env_rejects_whitespace_only() {
+        let var = "ATAKIT_TEST_WHITESPACE_ENV_VAR";
+        unsafe { env::set_var(var, "   \t\n  ") };
+        let spec = CredentialSpec {
+            file: None,
+            command: None,
+            env: Some(var.to_string()),
+            timeout_secs: None,
+        };
+        let err = spec.resolve("ws").unwrap_err();
+        assert!(err.to_string().contains("empty or whitespace-only"));
+        unsafe { env::remove_var(var) };
+    }
+
+    #[test]
+    fn credential_env_trims_surrounding_whitespace() {
+        // Accidentally-padded env var values (copy-paste with
+        // trailing newline, leading tab) should still produce the
+        // clean token, matching file-source behavior.
+        let var = "ATAKIT_TEST_PADDED_ENV_VAR";
+        unsafe { env::set_var(var, "  ghp_abc\n") };
+        let spec = CredentialSpec {
+            file: None,
+            command: None,
+            env: Some(var.to_string()),
+            timeout_secs: None,
+        };
+        assert_eq!(spec.resolve("pad").unwrap(), "ghp_abc");
+        unsafe { env::remove_var(var) };
+    }
+
+    #[test]
+    fn best_effort_resolver_preserves_error_cause_chain() {
+        // A `file` credential pointing at a missing path must
+        // surface the underlying io error (ENOENT) in the stored
+        // error string, not just the outer "failed to read token"
+        // message. Without `format!("{e:#}")` the caller can't tell
+        // "file doesn't exist" from "permission denied".
+        let config = Config::load_from_str(
+            r#"
+            [github.credentials]
+            missing = { file = "/nonexistent/atakit-test-path/token" }
+            [image.repositories]
+            x = { repo = "a/b" }
+            "#,
+        )
+        .unwrap();
+        let (_, err) = config.resolve_credentials_best_effort(&["missing"]);
+        let msg = err.get("missing").expect("missing credential failure");
+        // Outer context (from `with_context` in `resolve`).
+        assert!(msg.contains("credential 'missing'"), "got: {msg}");
+        // Inner root cause (the io error from fs::read_to_string).
+        // On unix this is "No such file or directory".
+        assert!(
+            msg.contains("No such file or directory") || msg.contains("cannot find"),
+            "expected underlying io error in chain, got: {msg}"
+        );
     }
 
     #[test]

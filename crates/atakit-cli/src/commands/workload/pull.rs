@@ -279,7 +279,24 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // Integrity check against the repository's own advertised metadata.
     // Catches a tampered or corrupted archive served by an honest-looking
     // repository. For the stronger on-chain check pass --verify.
-    if !probe_meta.sha256.is_empty() && !hex_equal(&probe_meta.sha256, sha256) {
+    //
+    // Checks (2) and (3) can be silently skipped when the repository
+    // didn't supply the corresponding field (hand-curated github
+    // repos without sidecar `.meta.json`). In that case we warn to
+    // stderr explicitly instead of pretending "integrity verified"
+    // when two of four checks were quietly dropped -- matches the
+    // verbosity of check (4)'s skip path in `verify_pcr23`. Track
+    // whether each check actually ran so the summary line below
+    // only claims what we really verified.
+    let sha256_checked = if probe_meta.sha256.is_empty() {
+        eprintln!(
+            "{} repository {} did not advertise a manifest sha256; \
+             integrity check (2) skipped",
+            "warning:".yellow(),
+            repo_name.dimmed(),
+        );
+        false
+    } else if !hex_equal(&probe_meta.sha256, sha256) {
         anyhow::bail!(
             "manifest sha256 mismatch between repository metadata and downloaded archive\n\
              \n  repository ({}): {}\n  downloaded archive: {}",
@@ -287,8 +304,19 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
             probe_meta.sha256,
             sha256,
         );
-    }
-    if !probe_meta.archive_hash.is_empty() {
+    } else {
+        true
+    };
+
+    let archive_checked = if probe_meta.archive_hash.is_empty() {
+        eprintln!(
+            "{} repository {} did not advertise an archive hash; \
+             integrity check (3) skipped",
+            "warning:".yellow(),
+            repo_name.dimmed(),
+        );
+        false
+    } else {
         // `hash_file` uses synchronous std::fs I/O. For large `.atawl`
         // archives (hundreds of MB) that blocks a Tokio worker thread
         // for the duration of the hash, starving other async work.
@@ -309,9 +337,19 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
                 actual_archive_hash,
             );
         }
-        println!("  {}", "Archive integrity verified against repository metadata.".dimmed());
-    } else if !probe_meta.sha256.is_empty() {
-        println!("  {}", "Manifest sha256 verified against repository metadata.".dimmed());
+        true
+    };
+
+    if archive_checked {
+        println!(
+            "  {}",
+            "Archive integrity verified against repository metadata.".dimmed()
+        );
+    } else if sha256_checked {
+        println!(
+            "  {}",
+            "Manifest sha256 verified against repository metadata.".dimmed()
+        );
     }
 
     // Verify against the on-chain spec. This is always best-effort: if
