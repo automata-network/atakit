@@ -76,11 +76,20 @@
 # The `--repository` CLI flag accepts:
 # * a configured repository name (e.g. `main`, `gh-public`),
 # * a raw `http(s)://...` URL (treated as an HTTP repository),
-# * a bare `owner/repo` path (treated as an anonymous GitHub repository).
+# * a bare `owner/repo` path (treated as a GitHub repository; if a
+#   configured entry has the same repo path, its credential is
+#   inherited so private-repo shorthand still works).
 #
 # `workload pull` and `workload ls --remote` fan out across EVERY
 # configured entry in declaration order and merge results; the first
 # entry is not special for multi-target commands.
+#
+# CI / scripting note: there is no env var that selects a workload
+# repository. The old `ATAKIT_WORKLOAD_REPOSITORY_URL` was removed.
+# Pass `--repository <name|url|owner/repo>` on every command instead.
+# Credentials can still come from env via
+# `[github.credentials.ci] = { env = "GH_CI_TOKEN" }` so CI only needs
+# to set the token env var, not rewrite this file at runtime.
 
 # [workload.repositories]
 # main       = { type = "http",   url  = "https://registry.example.com" }
