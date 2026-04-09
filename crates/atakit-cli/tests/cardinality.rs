@@ -37,7 +37,6 @@ fn run_atakit(config_dir: &str, data_dir: &str, cache_dir: &str, args: &[&str]) 
         .env("ATAKIT_CACHE_DIR", cache_dir)
         // Wipe any inherited override that would change repository
         // resolution and confuse the test.
-        .env_remove("ATAKIT_DEFAULT_REPO")
         .env_remove("ATAKIT_DEFAULT_PLATFORMS")
         .env_remove("ATAKIT_LIST_LIMIT")
         // Wipe any inherited token-source env var the test
