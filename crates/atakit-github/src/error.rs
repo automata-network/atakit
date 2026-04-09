@@ -38,6 +38,9 @@ pub enum GithubError {
 
     #[error("invalid GitHub repo path '{0}': expected 'owner/repo'")]
     InvalidRepo(String),
+
+    #[error("download too large: response exceeds {limit} byte limit")]
+    DownloadTooLarge { limit: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, GithubError>;
