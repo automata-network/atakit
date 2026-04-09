@@ -292,6 +292,8 @@ max_count = 2
 
 ### `[signing]` — Image Signature Verification
 
+> **Legacy -- do not rely on this section.** The signing mechanism is being redesigned. The current `[signing]` fields (`enable`, `auth_info`, `policy`) and the cosign-based verification flow described below will be replaced. Leave `[signing]` absent or `enable = false` in new workloads until the redesign lands.
+
 Enables cosign-based image signature verification for all container images (workload and dependencies) before startup. Disabled by default.
 
 | Field | Type | Default | Description |
@@ -374,7 +376,7 @@ These compose features are intentionally excluded. The CVM runtime controls thes
 
 - `max_count` must be a positive integer (defaults to `1`)
 
-### Signing
+### Signing (legacy, being redesigned)
 
 - `auth_info` and `policy` are required when `enable = true`
 - Both paths must start with `./` (relative to `atakit-workload.toml`)
