@@ -1,4 +1,4 @@
-use crate::config::CcType;
+use crate::config::{CcType, guest_os_features_for};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 
@@ -86,9 +86,10 @@ pub async fn register_image(
     project: &str,
     image_name: &str,
     gcs_uri: &str,
-    cc_type: CcType,
+    cc_types: &[CcType],
     runner: &dyn CommandRunner,
 ) -> Result<bool, CloudError> {
+    let features_flag = guest_os_features_for(cc_types);
     match runner
         .run_capture(
             "gcloud",
@@ -101,7 +102,7 @@ pub async fn register_image(
                 project,
                 "--source-uri",
                 gcs_uri,
-                cc_type.guest_os_features(),
+                &features_flag,
                 "--format=json",
             ],
         )

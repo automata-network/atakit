@@ -857,11 +857,11 @@ impl Config {
         }
         if let Ok(v) = env::var("ATAKIT_GCP_PROJECT") {
             if !v.is_empty() {
-                for target in self.cloud.targets.values_mut() {
-                    if matches!(target.platform, atakit_cloud::PlatformKind::Gcp)
-                        && target.project.is_none()
+                for provider in self.cloud.providers.values_mut() {
+                    if matches!(provider.platform, atakit_cloud::PlatformKind::Gcp)
+                        && provider.project.is_none()
                     {
-                        target.project = Some(v.clone());
+                        provider.project = Some(v.clone());
                     }
                 }
             }

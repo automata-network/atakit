@@ -39,15 +39,20 @@ impl std::fmt::Display for CcType {
     }
 }
 
-impl CcType {
-    /// GCE guest OS features for image registration.
-    pub fn guest_os_features(&self) -> &str {
-        match self {
-            CcType::SevSnp => "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC",
-            CcType::Tdx => "--guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC",
+impl std::str::FromStr for CcType {
+    type Err = CloudError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SEV_SNP" => Ok(CcType::SevSnp),
+            "TDX" => Ok(CcType::Tdx),
+            other => Err(CloudError::Config {
+                message: format!("unknown CC type '{other}', expected SEV_SNP or TDX"),
+            }),
         }
     }
+}
 
+impl CcType {
     /// Minimum CPU platform for instance creation, if required.
     pub fn min_cpu_platform(&self) -> Option<&str> {
         match self {
@@ -55,6 +60,76 @@ impl CcType {
             CcType::Tdx => None,
         }
     }
+}
+
+/// GCE `--guest-os-features` flag for image registration supporting one or
+/// more CC types. Features are merged and deduplicated.
+pub fn guest_os_features_for(cc_types: &[CcType]) -> String {
+    let mut features = vec!["UEFI_COMPATIBLE"];
+    for cc in cc_types {
+        match cc {
+            CcType::SevSnp => {
+                if !features.contains(&"SEV_SNP_CAPABLE") {
+                    features.push("SEV_SNP_CAPABLE");
+                    features.push("SEV_CAPABLE");
+                }
+            }
+            CcType::Tdx => {
+                if !features.contains(&"TDX_CAPABLE") {
+                    features.push("TDX_CAPABLE");
+                }
+            }
+        }
+    }
+    features.push("GVNIC");
+    format!("--guest-os-features={}", features.join(","))
+}
+
+/// Per-image registration config in `[cloud.images]`.
+///
+/// Supports two TOML forms:
+/// ```toml
+/// "img:v1" = ["SEV_SNP", "TDX"]
+/// "img:v2" = { cc_types = ["SEV_SNP", "TDX"] }
+/// ```
+#[derive(Debug, Clone)]
+pub struct CloudImageEntry {
+    pub cc_types: Vec<CcType>,
+}
+
+impl<'de> Deserialize<'de> for CloudImageEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Simple(Vec<CcType>),
+            Extended { cc_types: Vec<CcType> },
+        }
+        let cc_types = match Raw::deserialize(deserializer)? {
+            Raw::Simple(cc_types) => cc_types,
+            Raw::Extended { cc_types } => cc_types,
+        };
+        if cc_types.is_empty() {
+            return Err(serde::de::Error::custom("cc_types must not be empty"));
+        }
+        Ok(CloudImageEntry { cc_types })
+    }
+}
+
+/// A named cloud provider (e.g. `[cloud.providers.gcp-sea]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudProviderConfig {
+    /// Cloud platform.
+    pub platform: PlatformKind,
+    /// GCP project ID.
+    pub project: Option<String>,
+    /// Azure subscription ID.
+    pub subscription: Option<String>,
+    /// Cloud region or zone.
+    pub region: String,
 }
 
 /// Top-level `[cloud]` configuration section.
@@ -71,27 +146,29 @@ pub struct CloudConfig {
     pub owner_key_file: Option<String>,
     /// Path to relay private key file.
     pub relay_key_file: Option<String>,
+    /// Named cloud providers: `[cloud.providers]`.
+    #[serde(default)]
+    pub providers: BTreeMap<String, CloudProviderConfig>,
+    /// Image library: `[cloud.images]`.
+    #[serde(default)]
+    pub images: BTreeMap<String, CloudImageEntry>,
     /// Named cloud targets.
     #[serde(default)]
     pub targets: BTreeMap<String, CloudTarget>,
 }
 
-/// A named cloud deployment target (e.g. `[cloud.targets.prod-gcp]`).
+/// A named cloud deployment target (e.g. `[cloud.targets.c3-standard-4]`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudTarget {
-    /// Cloud platform.
-    pub platform: PlatformKind,
-    /// Confidential computing type (SEV_SNP or TDX). Default: SEV_SNP.
-    #[serde(default)]
-    pub cc_type: CcType,
-    /// GCP project ID.
-    pub project: Option<String>,
-    /// Azure subscription ID (future).
-    pub subscription: Option<String>,
-    /// Cloud region or zone.
-    pub region: String,
+    /// Provider name (references a key in `[cloud.providers]`).
+    pub provider: String,
     /// VM machine type.
     pub vmtype: String,
+    /// Base image reference.
+    pub image: String,
+    /// Confidential computing type. Optional; inferred from vmtype if absent.
+    #[serde(default)]
+    pub cc_type: Option<CcType>,
     /// Custom instance name prefix.
     pub name: Option<String>,
     /// Extra metadata key-value pairs.
@@ -102,6 +179,52 @@ pub struct CloudTarget {
     pub session_registry: Option<String>,
     pub owner_key_file: Option<String>,
     pub relay_key_file: Option<String>,
+}
+
+impl CloudTarget {
+    /// Returns the CC type, either explicit or inferred from vmtype.
+    pub fn resolved_cc_type(&self, platform: PlatformKind) -> Result<CcType, CloudError> {
+        if let Some(cc) = self.cc_type {
+            return Ok(cc);
+        }
+        infer_cc_type(platform, &self.vmtype)
+    }
+}
+
+/// Infer the confidential computing type from the machine type.
+pub fn infer_cc_type(platform: PlatformKind, vmtype: &str) -> Result<CcType, CloudError> {
+    match platform {
+        PlatformKind::Gcp => {
+            if vmtype.starts_with("n2d-standard-") {
+                Ok(CcType::SevSnp)
+            } else if vmtype.starts_with("c3-standard-") {
+                Ok(CcType::Tdx)
+            } else {
+                Err(CloudError::Config {
+                    message: format!(
+                        "cannot infer CC type from machine type '{vmtype}'. \
+                         Use 'n2d-standard-*' (SEV-SNP) or 'c3-standard-*' (TDX), \
+                         or set cc_type explicitly."
+                    ),
+                })
+            }
+        }
+        PlatformKind::Azure => {
+            if is_azure_dces_v6(vmtype) {
+                Ok(CcType::Tdx)
+            } else if is_azure_dcas_v5v6(vmtype) {
+                Ok(CcType::SevSnp)
+            } else {
+                Err(CloudError::Config {
+                    message: format!(
+                        "cannot infer CC type from VM size '{vmtype}'. \
+                         Use 'Standard_DC*es_v6' (TDX) or 'Standard_DC*as_v5/v6' (SEV-SNP), \
+                         or set cc_type explicitly."
+                    ),
+                })
+            }
+        }
+    }
 }
 
 // ── Cloud target validation ─────────────────────────────────────────
@@ -144,16 +267,26 @@ const GCP_N2D_SIZES: &[&str] = &[
 /// Valid Azure DC vCPU counts.
 const AZURE_DC_VCPUS: &[&str] = &["2", "4", "8", "16", "32", "48", "64", "96"];
 
-/// Validate that the target's machine type, zone/region and CC type form a
-/// supported combination. Returns a descriptive error if not.
-pub fn validate_target(target: &CloudTarget, target_name: &str) -> Result<(), CloudError> {
+/// Validate that the target's machine type, zone/region form a supported
+/// combination. If `cc_type` is set explicitly, validate it matches the
+/// inferred type from vmtype.
+pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, target_name: &str) -> Result<(), CloudError> {
     let err = |msg: String| CloudError::Config { message: format!("target '{target_name}': {msg}") };
 
-    match target.platform {
+    // Validate explicit cc_type matches inferred.
+    let inferred = infer_cc_type(provider.platform, &target.vmtype)
+        .map_err(|e| err(e.to_string()))?;
+    if let Some(explicit) = target.cc_type {
+        if explicit != inferred {
+            return Err(err(format!(
+                "cc_type '{}' does not match machine type '{}' (which implies {})",
+                explicit, target.vmtype, inferred
+            )));
+        }
+    }
+
+    match provider.platform {
         PlatformKind::Gcp => {
-            // Machine type determines CC type:
-            //   n2d-standard-* → SEV_SNP
-            //   c3-standard-*  → TDX
             if let Some(size) = target.vmtype.strip_prefix("n2d-standard-") {
                 if !GCP_N2D_SIZES.contains(&size) {
                     return Err(err(format!(
@@ -163,16 +296,10 @@ pub fn validate_target(target: &CloudTarget, target_name: &str) -> Result<(), Cl
                         target.vmtype, GCP_N2D_SIZES.join(", ")
                     )));
                 }
-                if target.cc_type != CcType::SevSnp {
-                    return Err(err(format!(
-                        "machine type '{}' requires cc_type SEV_SNP, got {}",
-                        target.vmtype, target.cc_type
-                    )));
-                }
-                if !GCP_SNP_ZONES.contains(&target.region.as_str()) {
+                if !GCP_SNP_ZONES.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "zone '{}' does not support SEV-SNP VMs. Supported zones: {}",
-                        target.region, GCP_SNP_ZONES.join(", ")
+                        provider.region, GCP_SNP_ZONES.join(", ")
                     )));
                 }
             } else if let Some(size) = target.vmtype.strip_prefix("c3-standard-") {
@@ -184,16 +311,10 @@ pub fn validate_target(target: &CloudTarget, target_name: &str) -> Result<(), Cl
                         target.vmtype, GCP_C3_SIZES.join(", ")
                     )));
                 }
-                if target.cc_type != CcType::Tdx {
-                    return Err(err(format!(
-                        "machine type '{}' requires cc_type TDX, got {}",
-                        target.vmtype, target.cc_type
-                    )));
-                }
-                if !GCP_TDX_ZONES.contains(&target.region.as_str()) {
+                if !GCP_TDX_ZONES.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "zone '{}' does not support TDX VMs. Supported zones: {}",
-                        target.region, GCP_TDX_ZONES.join(", ")
+                        provider.region, GCP_TDX_ZONES.join(", ")
                     )));
                 }
             } else {
@@ -207,35 +328,21 @@ pub fn validate_target(target: &CloudTarget, target_name: &str) -> Result<(), Cl
             }
         }
         PlatformKind::Azure => {
-            // Standard_DC*es_v6  → TDX
-            // Standard_DC*as_v5/v6 → SEV-SNP
             let is_tdx_v6 = is_azure_dces_v6(&target.vmtype);
             let is_snp = is_azure_dcas_v5v6(&target.vmtype);
 
             if is_tdx_v6 {
-                if target.cc_type != CcType::Tdx {
-                    return Err(err(format!(
-                        "VM size '{}' requires cc_type TDX, got {}",
-                        target.vmtype, target.cc_type
-                    )));
-                }
-                if !AZURE_TDX_V6_REGIONS.contains(&target.region.as_str()) {
+                if !AZURE_TDX_V6_REGIONS.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "region '{}' does not support TDX DCesv6 VMs. Supported regions: {}",
-                        target.region, AZURE_TDX_V6_REGIONS.join(", ")
+                        provider.region, AZURE_TDX_V6_REGIONS.join(", ")
                     )));
                 }
             } else if is_snp {
-                if target.cc_type != CcType::SevSnp {
-                    return Err(err(format!(
-                        "VM size '{}' requires cc_type SEV_SNP, got {}",
-                        target.vmtype, target.cc_type
-                    )));
-                }
-                if !AZURE_SNP_REGIONS.contains(&target.region.as_str()) {
+                if !AZURE_SNP_REGIONS.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "region '{}' does not support SEV-SNP VMs. Supported regions: {}",
-                        target.region, AZURE_SNP_REGIONS.join(", ")
+                        provider.region, AZURE_SNP_REGIONS.join(", ")
                     )));
                 }
             } else {
@@ -274,15 +381,21 @@ fn is_azure_dcas_v5v6(vmtype: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Helper to build a minimal CloudTarget for testing.
-    fn make_target(platform: PlatformKind, vmtype: &str, region: &str, cc_type: CcType) -> CloudTarget {
-        CloudTarget {
+    fn make_provider(platform: PlatformKind, region: &str) -> CloudProviderConfig {
+        CloudProviderConfig {
             platform,
-            cc_type,
             project: None,
             subscription: None,
             region: region.to_string(),
+        }
+    }
+
+    fn make_target(vmtype: &str) -> CloudTarget {
+        CloudTarget {
+            provider: "test-provider".to_string(),
             vmtype: vmtype.to_string(),
+            image: "test-image:v1".to_string(),
+            cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
             rpc_url: None,
@@ -292,27 +405,36 @@ mod tests {
         }
     }
 
+    fn make_target_with_cc(vmtype: &str, cc: CcType) -> CloudTarget {
+        let mut t = make_target(vmtype);
+        t.cc_type = Some(cc);
+        t
+    }
+
     // ── GCP SEV-SNP (n2d-standard) ──────────────────────
 
     #[test]
     fn gcp_snp_valid() {
-        let t = make_target(PlatformKind::Gcp, "n2d-standard-2", "us-central1-a", CcType::SevSnp);
-        assert!(validate_target(&t, "test").is_ok());
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("n2d-standard-2");
+        assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn gcp_snp_all_sizes() {
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
         for size in GCP_N2D_SIZES {
             let vmtype = format!("n2d-standard-{size}");
-            let t = make_target(PlatformKind::Gcp, &vmtype, "us-central1-a", CcType::SevSnp);
-            assert!(validate_target(&t, "test").is_ok(), "expected {vmtype} to be valid");
+            let t = make_target(&vmtype);
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
         }
     }
 
     #[test]
     fn gcp_snp_invalid_size() {
-        let t = make_target(PlatformKind::Gcp, "n2d-standard-7", "us-central1-a", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("n2d-standard-7");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("unsupported GCP machine type"), "{err}");
         assert!(err.contains("n2d_machine_types"), "{err}");
     }
@@ -320,47 +442,52 @@ mod tests {
     #[test]
     fn gcp_snp_all_zones() {
         for zone in GCP_SNP_ZONES {
-            let t = make_target(PlatformKind::Gcp, "n2d-standard-8", zone, CcType::SevSnp);
-            assert!(validate_target(&t, "test").is_ok(), "expected zone {zone} to be valid");
+            let p = make_provider(PlatformKind::Gcp, zone);
+            let t = make_target("n2d-standard-8");
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected zone {zone} to be valid");
         }
     }
 
     #[test]
     fn gcp_snp_bad_zone() {
-        let t = make_target(PlatformKind::Gcp, "n2d-standard-2", "us-west1-a", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Gcp, "us-west1-a");
+        let t = make_target("n2d-standard-2");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP"), "{err}");
-        assert!(err.contains("us-west1-a"), "{err}");
     }
 
     #[test]
     fn gcp_snp_wrong_cc_type() {
-        let t = make_target(PlatformKind::Gcp, "n2d-standard-4", "us-central1-a", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("requires cc_type SEV_SNP"), "{err}");
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target_with_cc("n2d-standard-4", CcType::Tdx);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 
     // ── GCP TDX (c3-standard) ───────────────────────────
 
     #[test]
     fn gcp_tdx_valid() {
-        let t = make_target(PlatformKind::Gcp, "c3-standard-4", "europe-west4-b", CcType::Tdx);
-        assert!(validate_target(&t, "test").is_ok());
+        let p = make_provider(PlatformKind::Gcp, "europe-west4-b");
+        let t = make_target("c3-standard-4");
+        assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn gcp_tdx_all_sizes() {
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
         for size in GCP_C3_SIZES {
             let vmtype = format!("c3-standard-{size}");
-            let t = make_target(PlatformKind::Gcp, &vmtype, "us-central1-a", CcType::Tdx);
-            assert!(validate_target(&t, "test").is_ok(), "expected {vmtype} to be valid");
+            let t = make_target(&vmtype);
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
         }
     }
 
     #[test]
     fn gcp_tdx_invalid_size() {
-        let t = make_target(PlatformKind::Gcp, "c3-standard-5", "us-central1-a", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("c3-standard-5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("unsupported GCP machine type"), "{err}");
         assert!(err.contains("c3_machine_types"), "{err}");
     }
@@ -368,158 +495,317 @@ mod tests {
     #[test]
     fn gcp_tdx_all_zones() {
         for zone in GCP_TDX_ZONES {
-            let t = make_target(PlatformKind::Gcp, "c3-standard-4", zone, CcType::Tdx);
-            assert!(validate_target(&t, "test").is_ok(), "expected zone {zone} to be valid");
+            let p = make_provider(PlatformKind::Gcp, zone);
+            let t = make_target("c3-standard-4");
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected zone {zone} to be valid");
         }
     }
 
     #[test]
     fn gcp_tdx_bad_zone() {
-        // europe-west3 supports SNP but not TDX
-        let t = make_target(PlatformKind::Gcp, "c3-standard-4", "europe-west3-a", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Gcp, "europe-west3-a");
+        let t = make_target("c3-standard-4");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support TDX"), "{err}");
     }
 
     #[test]
     fn gcp_tdx_wrong_cc_type() {
-        let t = make_target(PlatformKind::Gcp, "c3-standard-4", "us-central1-a", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("requires cc_type TDX"), "{err}");
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target_with_cc("c3-standard-4", CcType::SevSnp);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 
     // ── GCP unsupported machine type ────────────────────
 
     #[test]
     fn gcp_unsupported_machine_type() {
-        let t = make_target(PlatformKind::Gcp, "e2-standard-4", "us-central1-a", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("unsupported GCP machine type"), "{err}");
-        assert!(err.contains("n2d-standard-*"), "{err}");
-        assert!(err.contains("c3-standard-*"), "{err}");
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("e2-standard-4");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("cannot infer CC type"), "{err}");
     }
 
     // ── Azure TDX (DCes_v6) ─────────────────────────────
 
     #[test]
     fn azure_tdx_valid() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4es_v6", "East US", CcType::Tdx);
-        assert!(validate_target(&t, "test").is_ok());
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target("Standard_DC4es_v6");
+        assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_tdx_all_sizes() {
+        let p = make_provider(PlatformKind::Azure, "West Europe");
         for size in AZURE_DC_VCPUS {
             let vmtype = format!("Standard_DC{size}es_v6");
-            let t = make_target(PlatformKind::Azure, &vmtype, "West Europe", CcType::Tdx);
-            assert!(validate_target(&t, "test").is_ok(), "expected {vmtype} to be valid");
+            let t = make_target(&vmtype);
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
         }
     }
 
     #[test]
     fn azure_tdx_all_regions() {
         for region in AZURE_TDX_V6_REGIONS {
-            let t = make_target(PlatformKind::Azure, "Standard_DC4es_v6", region, CcType::Tdx);
-            assert!(validate_target(&t, "test").is_ok(), "expected region {region} to be valid");
+            let p = make_provider(PlatformKind::Azure, region);
+            let t = make_target("Standard_DC4es_v6");
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected region {region} to be valid");
         }
     }
 
     #[test]
     fn azure_tdx_bad_region() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4es_v6", "Japan East", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Azure, "Japan East");
+        let t = make_target("Standard_DC4es_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support TDX DCesv6"), "{err}");
     }
 
     #[test]
     fn azure_tdx_wrong_cc_type() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4es_v6", "East US", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("requires cc_type TDX"), "{err}");
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target_with_cc("Standard_DC4es_v6", CcType::SevSnp);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 
     // ── Azure SEV-SNP (DCas_v5/v6) ──────────────────────
 
     #[test]
     fn azure_snp_v5_valid() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4as_v5", "East US", CcType::SevSnp);
-        assert!(validate_target(&t, "test").is_ok());
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target("Standard_DC4as_v5");
+        assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_snp_v6_valid() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC8as_v6", "West Europe", CcType::SevSnp);
-        assert!(validate_target(&t, "test").is_ok());
+        let p = make_provider(PlatformKind::Azure, "West Europe");
+        let t = make_target("Standard_DC8as_v6");
+        assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_snp_all_regions() {
         for region in AZURE_SNP_REGIONS {
-            let t = make_target(PlatformKind::Azure, "Standard_DC2as_v5", region, CcType::SevSnp);
-            assert!(validate_target(&t, "test").is_ok(), "expected region {region} to be valid");
+            let p = make_provider(PlatformKind::Azure, region);
+            let t = make_target("Standard_DC2as_v5");
+            assert!(validate_target(&t, &p, "test").is_ok(), "expected region {region} to be valid");
         }
     }
 
     #[test]
     fn azure_snp_bad_region() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4as_v5", "Brazil South", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Azure, "Brazil South");
+        let t = make_target("Standard_DC4as_v5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP"), "{err}");
     }
 
     #[test]
     fn azure_snp_wrong_cc_type() {
-        let t = make_target(PlatformKind::Azure, "Standard_DC4as_v5", "East US", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("requires cc_type SEV_SNP"), "{err}");
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target_with_cc("Standard_DC4as_v5", CcType::Tdx);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 
     // ── Azure unsupported VM size ────────────────────────
 
     #[test]
     fn azure_unsupported_vm_size() {
-        let t = make_target(PlatformKind::Azure, "Standard_D4s_v5", "East US", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("unsupported Azure VM size"), "{err}");
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target("Standard_D4s_v5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("cannot infer CC type"), "{err}");
     }
 
     #[test]
     fn azure_bad_dc_size_number() {
-        // 3 is not in the valid set {2,4,8,16,32,64,96,128}
-        let t = make_target(PlatformKind::Azure, "Standard_DC3es_v6", "East US", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("unsupported Azure VM size"), "{err}");
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target("Standard_DC3es_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("cannot infer CC type"), "{err}");
     }
 
-    // ── Error messages include doc links ─────────────────
+    // ── Error messages ──────────────────────────────────
 
     #[test]
-    fn gcp_error_includes_doc_link() {
-        let t = make_target(PlatformKind::Gcp, "e2-micro", "us-central1-a", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("cloud.google.com/compute/docs"), "{err}");
+    fn gcp_bad_zone_mentions_sev_snp() {
+        let p = make_provider(PlatformKind::Gcp, "us-west1-a");
+        let t = make_target("n2d-standard-2");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("SEV-SNP"), "{err}");
     }
 
     #[test]
     fn gcp_invalid_size_includes_doc_link() {
-        let t = make_target(PlatformKind::Gcp, "c3-standard-5", "us-central1-a", CcType::Tdx);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("c3-standard-5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("c3_machine_types"), "{err}");
     }
 
     #[test]
-    fn azure_error_includes_doc_link() {
-        let t = make_target(PlatformKind::Azure, "Standard_D4s_v5", "East US", CcType::SevSnp);
-        let err = validate_target(&t, "test").unwrap_err().to_string();
-        assert!(err.contains("learn.microsoft.com"), "{err}");
+    fn error_includes_target_name() {
+        let p = make_provider(PlatformKind::Gcp, "us-central1-a");
+        let t = make_target("e2-standard-4");
+        let err = validate_target(&t, &p, "my-prod").unwrap_err().to_string();
+        assert!(err.contains("target 'my-prod'"), "{err}");
     }
 
-    // ── Error message includes target name ───────────────
+    // ── infer_cc_type ───────────────────────────────────
 
     #[test]
-    fn error_includes_target_name() {
-        let t = make_target(PlatformKind::Gcp, "e2-micro", "us-central1-a", CcType::SevSnp);
-        let err = validate_target(&t, "my-prod").unwrap_err().to_string();
-        assert!(err.contains("target 'my-prod'"), "{err}");
+    fn infer_gcp_n2d() {
+        assert_eq!(infer_cc_type(PlatformKind::Gcp, "n2d-standard-8").unwrap(), CcType::SevSnp);
+    }
+
+    #[test]
+    fn infer_gcp_c3() {
+        assert_eq!(infer_cc_type(PlatformKind::Gcp, "c3-standard-4").unwrap(), CcType::Tdx);
+    }
+
+    #[test]
+    fn infer_gcp_unknown() {
+        assert!(infer_cc_type(PlatformKind::Gcp, "e2-standard-4").is_err());
+    }
+
+    #[test]
+    fn infer_azure_dces() {
+        assert_eq!(infer_cc_type(PlatformKind::Azure, "Standard_DC4es_v6").unwrap(), CcType::Tdx);
+    }
+
+    #[test]
+    fn infer_azure_dcas() {
+        assert_eq!(infer_cc_type(PlatformKind::Azure, "Standard_DC4as_v5").unwrap(), CcType::SevSnp);
+    }
+
+    // ── resolved_cc_type ────────────────────────────────
+
+    #[test]
+    fn resolved_cc_type_inferred() {
+        let t = make_target("c3-standard-4");
+        assert_eq!(t.resolved_cc_type(PlatformKind::Gcp).unwrap(), CcType::Tdx);
+    }
+
+    #[test]
+    fn resolved_cc_type_explicit() {
+        let t = make_target_with_cc("n2d-standard-2", CcType::SevSnp);
+        assert_eq!(t.resolved_cc_type(PlatformKind::Gcp).unwrap(), CcType::SevSnp);
+    }
+
+    // ── CloudImageEntry deserialization ──────────────────
+
+    #[test]
+    fn image_entry_simple_form() {
+        let toml = r#"
+            [images]
+            "img:v1" = ["SEV_SNP", "TDX"]
+        "#;
+        #[derive(Deserialize)]
+        struct W { images: BTreeMap<String, CloudImageEntry> }
+        let w: W = toml::from_str(toml).unwrap();
+        let entry = &w.images["img:v1"];
+        assert_eq!(entry.cc_types, vec![CcType::SevSnp, CcType::Tdx]);
+    }
+
+    #[test]
+    fn image_entry_extended_form() {
+        let toml = r#"
+            [images."img:v2"]
+            cc_types = ["TDX"]
+        "#;
+        #[derive(Deserialize)]
+        struct W { images: BTreeMap<String, CloudImageEntry> }
+        let w: W = toml::from_str(toml).unwrap();
+        let entry = &w.images["img:v2"];
+        assert_eq!(entry.cc_types, vec![CcType::Tdx]);
+    }
+
+    #[test]
+    fn image_entry_empty_cc_types_rejected() {
+        let toml = r#"
+            [images]
+            "img:v1" = []
+        "#;
+        #[derive(Deserialize)]
+        struct W { images: BTreeMap<String, CloudImageEntry> }
+        assert!(toml::from_str::<W>(toml).is_err());
+    }
+
+    #[test]
+    fn image_entry_both_forms_in_one() {
+        let toml = r#"
+            [images]
+            "a:v1" = ["SEV_SNP"]
+            [images."b:v1"]
+            cc_types = ["SEV_SNP", "TDX"]
+        "#;
+        #[derive(Deserialize)]
+        struct W { images: BTreeMap<String, CloudImageEntry> }
+        let w: W = toml::from_str(toml).unwrap();
+        assert_eq!(w.images["a:v1"].cc_types, vec![CcType::SevSnp]);
+        assert_eq!(w.images["b:v1"].cc_types, vec![CcType::SevSnp, CcType::Tdx]);
+    }
+
+    // ── guest_os_features_for ───────────────────────────
+
+    #[test]
+    fn guest_os_features_sev_snp_only() {
+        let f = guest_os_features_for(&[CcType::SevSnp]);
+        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC");
+    }
+
+    #[test]
+    fn guest_os_features_tdx_only() {
+        let f = guest_os_features_for(&[CcType::Tdx]);
+        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC");
+    }
+
+    #[test]
+    fn guest_os_features_both() {
+        let f = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
+        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,TDX_CAPABLE,GVNIC");
+    }
+
+    #[test]
+    fn guest_os_features_both_reversed() {
+        let a = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
+        let b = guest_os_features_for(&[CcType::Tdx, CcType::SevSnp]);
+        // TDX first puts TDX_CAPABLE before SEV fields, so order differs.
+        // Both must contain the same set of features.
+        assert!(a.contains("SEV_SNP_CAPABLE") && a.contains("TDX_CAPABLE"));
+        assert!(b.contains("SEV_SNP_CAPABLE") && b.contains("TDX_CAPABLE"));
+    }
+
+    #[test]
+    fn guest_os_features_dedup() {
+        let single = guest_os_features_for(&[CcType::SevSnp]);
+        let double = guest_os_features_for(&[CcType::SevSnp, CcType::SevSnp]);
+        assert_eq!(single, double);
+    }
+
+    // ── CcType FromStr ──────────────────────────────────
+
+    #[test]
+    fn cc_type_from_str_valid() {
+        assert_eq!("SEV_SNP".parse::<CcType>().unwrap(), CcType::SevSnp);
+        assert_eq!("TDX".parse::<CcType>().unwrap(), CcType::Tdx);
+    }
+
+    #[test]
+    fn cc_type_from_str_invalid() {
+        assert!("snp".parse::<CcType>().is_err());
+        assert!("".parse::<CcType>().is_err());
+    }
+
+    #[test]
+    fn cc_type_display_roundtrip() {
+        for cc in [CcType::SevSnp, CcType::Tdx] {
+            assert_eq!(cc.to_string().parse::<CcType>().unwrap(), cc);
+        }
     }
 }

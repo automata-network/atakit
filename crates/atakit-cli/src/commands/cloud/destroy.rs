@@ -1,7 +1,9 @@
 use anyhow::Result;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DestroyArgs;
+use atakit_cloud::cloud_images::CloudImages;
 use atakit_cloud::gcp::GcpProvider;
+use atakit_cloud::plan::DestroyStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::ProcessRunner;
@@ -27,8 +29,29 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 	};
 
+	// Auto-preserve image if any other active deployment uses the same image.
+	let mut preserve = args.preserve.clone();
+	if !preserve.contains(&"image".to_string()) && !state.image_ref.is_empty() {
+		let all = atakit_cloud::state::list_deployments(&env.data_dir)
+			.map_err(|e| anyhow::anyhow!("cannot scan deployments for shared image check: {e}"))?;
+		let is_self = |o: &DeployState| o.target_name == target_name && o.instance_name == instance_name;
+		let other_uses_image = all.iter().any(|other| {
+			!is_self(other)
+				&& !matches!(other.status, DeployStatus::Destroyed)
+				&& other.image_ref == state.image_ref
+				&& other.provider_name == state.provider_name
+		});
+		if other_uses_image {
+			eprintln!(
+				"  {}: image '{}' is used by other deployments, preserving",
+				"note".dimmed(), state.image_ref,
+			);
+			preserve.push("image".to_string());
+		}
+	}
+
 	let destroy_opts = atakit_cloud::provider::DestroyOptions {
-		preserve: args.preserve.clone(),
+		preserve,
 	};
 
 	let plan = provider
@@ -132,7 +155,26 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 	for (i, step) in plan.steps.iter().enumerate() {
 		eprint!("  [{}/{}] {step}... ", i + 1, total);
 		match provider.execute_destroy_step(step, &runner, false).await {
-			Ok(()) => eprintln!("{}", "done".green()),
+			Ok(()) => {
+				eprintln!("{}", "done".green());
+				// Remove image from CloudImages tracking when the cloud
+				// image is actually deleted (not preserved).
+				if matches!(step, DestroyStep::DeleteImage { .. } | DestroyStep::DeleteImageVersion { .. })
+					&& !state.provider_name.is_empty()
+				{
+					match CloudImages::load(&env.data_dir) {
+						Ok(mut cloud_imgs) => {
+							cloud_imgs.remove(&state.image_ref, &state.provider_name);
+							if let Err(e) = cloud_imgs.save(&env.data_dir) {
+								tracing::warn!("failed to save cloud images state: {e}");
+							}
+						}
+						Err(e) => {
+							tracing::warn!("failed to load cloud images state: {e}");
+						}
+					}
+				}
+			}
 			Err(e) => {
 				eprintln!("{}", "failed".red());
 				eprintln!("  warning: {e}");

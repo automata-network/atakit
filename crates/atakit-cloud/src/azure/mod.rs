@@ -95,7 +95,7 @@ impl CloudProvider for AzureProvider {
             image_definition: names.image_definition.clone(),
             image_version: names.image_version.clone(),
             source_path: opts.source_image_path.clone(),
-            cc_type: opts.target.cc_type,
+            cc_types: opts.cc_types.clone(),
             force: opts.force_image,
         });
 
@@ -134,7 +134,7 @@ impl CloudProvider for AzureProvider {
             vm_size: opts.target.vmtype.clone(),
             image_id: String::new(), // resolved at execution time
             image_ref: opts.image_ref.clone(),
-            cc_type: opts.target.cc_type,
+            cc_type: opts.target.resolved_cc_type(crate::PlatformKind::Azure)?,
             resource_group: names.resource_group.clone(),
             nsg: names.nsg.clone(),
             metadata: opts
@@ -182,7 +182,7 @@ impl CloudProvider for AzureProvider {
                 image_definition,
                 image_version,
                 source_path,
-                cc_type: _,
+                cc_types: _,
                 force,
             } => {
                 // Ensure gallery RG exists (shared, survives destroy).
@@ -631,12 +631,10 @@ mod tests {
 
     fn test_target() -> CloudTarget {
         CloudTarget {
-            platform: PlatformKind::Azure,
-            cc_type: CcType::SevSnp,
-            project: None,
-            subscription: Some("sub-123".into()),
-            region: "eastus".into(),
+            provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
+            image: "test-image:v1".to_string(),
+            cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
             rpc_url: None,
@@ -661,6 +659,7 @@ mod tests {
             metadata: BTreeMap::new(),
             force_image: false,
             skip_init: true,
+            cc_types: vec![CcType::SevSnp],
             workload_ports: vec![],
             workload_disks: vec![],
             boot_disk_size_gb: None,
