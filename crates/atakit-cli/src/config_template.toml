@@ -120,19 +120,33 @@
 # owner_key_file = "~/.config/atakit/owner_key"
 # relay_key_file = "~/.config/atakit/relay_key"
 
-# Cloud deployment targets.
-# [cloud.targets.my-gcp]
+# Cloud providers (platform + account + region).
+# [cloud.providers.my-gcp]
 # platform = "gcp"
 # project = "my-gcp-project"
 # region = "us-central1-a"
-# vmtype = "c3-standard-4"
-# cc_type = "SEV_SNP"  # or "TDX"
-# Per-target key overrides:
-# owner_key_file = "~/.config/atakit/my_owner_key"
 
-# [cloud.targets.my-azure]
+# [cloud.providers.my-azure]
 # platform = "azure"
 # subscription = "your-subscription-id"
 # region = "eastus"
-# vmtype = "Standard_DC4as_v5"
-# cc_type = "SEV_SNP"  # or "TDX"
+
+# Image library: CC capabilities for image registration.
+# Simple form:   "name:tag" = ["SEV_SNP", "TDX"]
+# Extended form:  [cloud.images."name:tag"]
+#                 cc_types = ["SEV_SNP", "TDX"]
+# [cloud.images]
+# "my-baseimage:v0.1.0" = ["SEV_SNP", "TDX"]
+
+# Cloud deployment targets.
+# [cloud.targets.my-gcp-tdx]
+# provider = "my-gcp"
+# vmtype = "c3-standard-4"        # cc_type inferred as TDX
+# image = "my-baseimage:v0.1.0"
+# Per-target key overrides:
+# owner_key_file = "~/.config/atakit/my_owner_key"
+
+# [cloud.targets.my-azure-snp]
+# provider = "my-azure"
+# vmtype = "Standard_DC4as_v5"    # cc_type inferred as SEV_SNP
+# image = "my-baseimage:v0.1.0"

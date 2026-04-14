@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::CloudTarget;
+use crate::config::{CcType, CloudTarget};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::plan::{DeployPlan, DeployStep, DestroyPlan, DestroyStep, StepResult};
@@ -23,6 +23,9 @@ pub struct DeployOptions {
     pub metadata: BTreeMap<String, String>,
     pub force_image: bool,
     pub skip_init: bool,
+    /// CC capabilities for image registration. Resolved by the CLI
+    /// (precedence: --cc-types > [cloud.images] > inferred cc_type).
+    pub cc_types: Vec<CcType>,
     /// Host ports from the workload manifest (format: "host:container" or "port").
     pub workload_ports: Vec<String>,
     /// Disks from the workload manifest: (disk_name, index, size_gb).

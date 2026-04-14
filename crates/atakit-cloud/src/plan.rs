@@ -58,7 +58,9 @@ pub enum DeployStep {
         /// Local file to upload. `None` means the image is assumed to already
         /// exist in GCE -- the step verifies existence but skips upload.
         source_path: Option<String>,
-        cc_type: CcType,
+        /// CC capabilities to register on the image. Multiple types produce a
+        /// GCE image usable with either CC mode.
+        cc_types: Vec<CcType>,
         /// Delete and re-register the image even if it already exists.
         force: bool,
     },
@@ -98,7 +100,7 @@ pub enum DeployStep {
         image_definition: String,
         image_version: String,
         source_path: Option<String>,
-        cc_type: CcType,
+        cc_types: Vec<CcType>,
         force: bool,
     },
     CreateInstanceAzure {
