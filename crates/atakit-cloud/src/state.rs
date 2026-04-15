@@ -17,6 +17,9 @@ pub struct DeployState {
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
+    /// Provider name from [cloud.providers] at deploy time.
+    #[serde(default)]
+    pub provider_name: String,
     pub platform: PlatformKind,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -106,7 +109,18 @@ pub struct AzureResources {
 
 /// Base directory for deployment state files.
 fn deployments_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("deployments")
+    let new_path = data_dir.join("cloud").join("deployments");
+    // Migrate from old path if it exists and new path doesn't.
+    let old_path = data_dir.join("deployments");
+    if old_path.is_dir() && !old_path.is_symlink() && !new_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::rename(&old_path, &new_path).is_ok() {
+            tracing::info!("migrated deployments to {}", new_path.display());
+        }
+    }
+    new_path
 }
 
 /// Path to a specific state file.
@@ -122,6 +136,7 @@ pub struct NewDeployParams {
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
+    pub provider_name: String,
     pub platform: PlatformKind,
     pub image_ref: String,
     pub archive_path: String,
@@ -141,6 +156,7 @@ impl DeployState {
             workload_name: params.workload_name,
             workload_version: params.workload_version,
             target_name: params.target_name,
+            provider_name: params.provider_name,
             platform: params.platform,
             created_at: now,
             updated_at: now,
@@ -415,6 +431,7 @@ mod tests {
             workload_name: "my-workload".into(),
             workload_version: "v0.0.1".into(),
             target_name: "prod-gcp".into(),
+            provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v0.1.6".into(),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
@@ -454,6 +471,7 @@ mod tests {
             workload_name: "my-app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
+            provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),
@@ -477,6 +495,7 @@ mod tests {
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
+                provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
@@ -500,6 +519,7 @@ mod tests {
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
+                provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
@@ -522,6 +542,7 @@ mod tests {
             workload_name: "app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
+            provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),

@@ -24,3 +24,4 @@ async-trait.workspace = true
 clap = { workspace = true, optional = true }
 
 [dev-dependencies]
+toml.workspace = true

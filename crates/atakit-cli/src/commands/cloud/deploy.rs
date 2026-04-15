@@ -76,17 +76,22 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		.get(target_name)
 		.ok_or_else(|| anyhow::anyhow!("target '{target_name}' not found in config"))?
 		.clone();
+	let provider_config = config
+		.cloud
+		.providers
+		.get(&target.provider)
+		.ok_or_else(|| anyhow::anyhow!("provider '{}' not found in [cloud.providers]", target.provider))?;
 
 	// 3. Validate platform-specific requirements.
-	atakit_cloud::validate_target(&target, target_name)?;
-	match target.platform {
+	atakit_cloud::validate_target(&target, provider_config, target_name)?;
+	match provider_config.platform {
 		PlatformKind::Gcp => {
-			if target.project.is_none() {
+			if provider_config.project.is_none() {
 				bail!("GCP target '{target_name}' requires 'project' (set in config or ATAKIT_GCP_PROJECT)");
 			}
 		}
 		PlatformKind::Azure => {
-			if target.subscription.is_none() {
+			if provider_config.subscription.is_none() {
 				bail!("Azure target '{target_name}' requires 'subscription' (set in config)");
 			}
 		}
@@ -127,12 +132,10 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		metadata.entry(k.clone()).or_insert_with(|| v.clone());
 	}
 
-	// 8. Resolve image reference.
-	let image_arg = args.image.as_deref().ok_or_else(|| {
-		anyhow::anyhow!("--image is required (repository:tag, .atabi file, or GCE image name)")
-	})?;
+	// 8. Resolve image reference (--image overrides target.image).
+	let image_arg = args.image.as_deref().unwrap_or(&target.image);
 
-	let resolved_image = resolve_image(image_arg, &target.platform, env)?;
+	let resolved_image = resolve_image(image_arg, &provider_config.platform, env)?;
 	let image_ref = &resolved_image.display_name;
 
 	// 8b. Validate image against workload's base-image policy.
@@ -140,15 +143,31 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		validate_base_image(image_ref, &base_image_mode, &base_image_list)?;
 	}
 
+	// 8c. Resolve CC types for image registration.
+	// Precedence: --cc-types CLI > [cloud.images] lookup (by resolved ref) > inferred cc_type.
+	// Lookup uses the resolved display_name (e.g. "dev-baseimage:v0.0.1-debug"),
+	// not the raw CLI arg (which might be a .atabi path).
+	let resolved_cc = target.resolved_cc_type(provider_config.platform)?;
+	let cc_types: Vec<atakit_cloud::CcType> = if !args.cc_types.is_empty() {
+		args.cc_types
+			.iter()
+			.map(|s| s.parse::<atakit_cloud::CcType>())
+			.collect::<Result<Vec<_>, _>>()?
+	} else if let Some(entry) = config.cloud.images.get(image_ref) {
+		entry.cc_types.clone()
+	} else {
+		vec![resolved_cc]
+	};
+
 	// 9. Create provider.
-	let provider: Box<dyn CloudProvider> = match target.platform {
+	let provider: Box<dyn CloudProvider> = match provider_config.platform {
 		PlatformKind::Gcp => Box::new(GcpProvider::new(
-			target.project.clone().unwrap(),
-			target.region.clone(),
+			provider_config.project.clone().unwrap(),
+			provider_config.region.clone(),
 		)),
 		PlatformKind::Azure => Box::new(AzureProvider::new(
-			target.subscription.clone().unwrap(),
-			target.region.clone(),
+			provider_config.subscription.clone().unwrap(),
+			provider_config.region.clone(),
 		)),
 	};
 
@@ -167,6 +186,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		metadata: metadata.clone(),
 		force_image: args.force_image,
 		skip_init: image_only || args.skip_init,
+		cc_types: cc_types.clone(),
 		workload_ports: workload_ports.clone(),
 		workload_disks: workload_disks.clone(),
 		boot_disk_size_gb,
@@ -189,15 +209,15 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	eprintln!();
 	eprintln!("{}", "Configuration:".dimmed());
 	eprintln!("  {:<15}{}", "Instance:".dimmed(), format!("{target_name}/{instance_name}").bold());
-	match target.platform {
+	match provider_config.platform {
 		PlatformKind::Gcp => {
 			let names = atakit_cloud::naming::ResourceNames::for_gcp(&instance_name, image_ref);
-			if let Some(ref project) = target.project {
+			if let Some(ref project) = provider_config.project {
 				eprintln!("  {:<15}{}", "Project:".dimmed(), project);
 			}
-			eprintln!("  {:<15}{}", "Zone:".dimmed(), target.region);
+			eprintln!("  {:<15}{}", "Zone:".dimmed(), provider_config.region);
 			eprintln!("  {:<15}{}", "Machine type:".dimmed(), target.vmtype);
-			eprintln!("  {:<15}{}", "CC type:".dimmed(), target.cc_type);
+			eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
 			eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
 			eprintln!("  {:<15}{}", "GCE name:".dimmed(), names.image);
 			if resolved_image.source_path.is_some() {
@@ -206,13 +226,13 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("  {:<15}{}", "Firewall:".dimmed(), names.firewall);
 		}
 		PlatformKind::Azure => {
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &target.region);
-			if let Some(ref sub) = target.subscription {
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
+			if let Some(ref sub) = provider_config.subscription {
 				eprintln!("  {:<15}{}", "Subscription:".dimmed(), sub);
 			}
-			eprintln!("  {:<15}{}", "Region:".dimmed(), target.region);
+			eprintln!("  {:<15}{}", "Region:".dimmed(), provider_config.region);
 			eprintln!("  {:<15}{}", "VM size:".dimmed(), target.vmtype);
-			eprintln!("  {:<15}{}", "CC type:".dimmed(), target.cc_type);
+			eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
 			eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
 			eprintln!("  {:<15}{}", "RG:".dimmed(), names.resource_group);
 			eprintln!("  {:<15}{}/{}", "Gallery:".dimmed(), names.gallery_rg, names.gallery);
@@ -227,7 +247,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		eprintln!("  {:<15}{}", "", line);
 	}
 	if !workload_disks.is_empty() {
-		let disk_type = match target.platform {
+		let disk_type = match provider_config.platform {
 			PlatformKind::Gcp => "pd-balanced",
 			PlatformKind::Azure => "Premium_LRS",
 		};
@@ -272,25 +292,26 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		workload_name: workload_name.clone(),
 		workload_version: workload_version.clone(),
 		target_name: target_name.to_string(),
-		platform: target.platform,
+		provider_name: target.provider.clone(),
+		platform: provider_config.platform,
 		image_ref: image_ref.to_string(),
 		archive_path,
 		archive_hash,
 		agent_env: agent_env.clone(),
 		total_steps: plan.steps.len() as u32,
 	});
-	match target.platform {
+	match provider_config.platform {
 		PlatformKind::Gcp => {
 			state.resources.gcp = Some(GcpResources {
-				project: target.project.clone().unwrap(),
-				zone: target.region.clone(),
+				project: provider_config.project.clone().unwrap(),
+				zone: provider_config.region.clone(),
 				..Default::default()
 			});
 		}
 		PlatformKind::Azure => {
 			state.resources.azure = Some(AzureResources {
-				subscription: target.subscription.clone().unwrap(),
-				region: target.region.clone(),
+				subscription: provider_config.subscription.clone().unwrap(),
+				region: provider_config.region.clone(),
 				..Default::default()
 			});
 		}
@@ -421,6 +442,25 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				} else {
 					eprintln!("{}", "done".green());
 				}
+				// After image upload, record in cloud images state.
+				if matches!(step, DeployStep::UploadImage { source_path: Some(_), .. }
+					| DeployStep::UploadImageAzure { source_path: Some(_), .. })
+				{
+					match atakit_cloud::cloud_images::CloudImages::load(&env.data_dir) {
+						Ok(mut cloud_imgs) => {
+							let record = super::build_cloud_image_record(
+								provider_config, image_ref, &instance_name, &cc_types,
+							);
+							cloud_imgs.record(image_ref, &target.provider, record);
+							if let Err(e) = cloud_imgs.save(&env.data_dir) {
+								tracing::warn!("failed to save cloud images state: {e}");
+							}
+						}
+						Err(e) => {
+							tracing::warn!("failed to load cloud images state: {e}");
+						}
+					}
+				}
 				// After instance creation, show VM details.
 				if matches!(step, DeployStep::CreateInstance { .. } | DeployStep::CreateInstanceAzure { .. }) {
 					if let Some(ref gcp) = state.resources.gcp {
@@ -481,15 +521,15 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	eprintln!("    {:<12}{}", "VM:".dimmed(), instance_name.bold());
 	eprintln!("    {:<12}{}", "IP:".dimmed(), if ip.is_empty() { "-" } else { &ip });
 
-	match target.platform {
+	match provider_config.platform {
 		PlatformKind::Gcp => {
-			let project = target.project.as_deref().unwrap_or("-");
-			let zone = &target.region;
+			let project = provider_config.project.as_deref().unwrap_or("-");
+			let zone = &provider_config.region;
 			let names = atakit_cloud::naming::ResourceNames::for_gcp(&instance_name, image_ref);
 			eprintln!("    {:<12}{}", "Zone:".dimmed(), zone);
 			eprintln!("    {:<12}{}", "Project:".dimmed(), project);
 			eprintln!("    {:<12}{}", "Image:".dimmed(), names.image);
-			eprintln!("    {:<12}{}", "CC type:".dimmed(), target.cc_type);
+			eprintln!("    {:<12}{}", "CC type:".dimmed(), resolved_cc);
 			eprintln!();
 			eprintln!("    {}:", "Serial console".dimmed());
 			eprintln!("      gcloud compute connect-to-serial-port {instance_name} --zone={zone} --project={project}");
@@ -498,10 +538,10 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("      gcloud compute ssh {instance_name} --zone={zone} --project={project}");
 		}
 		PlatformKind::Azure => {
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &target.region);
-			eprintln!("    {:<12}{}", "Region:".dimmed(), target.region);
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
+			eprintln!("    {:<12}{}", "Region:".dimmed(), provider_config.region);
 			eprintln!("    {:<12}{}", "RG:".dimmed(), names.resource_group);
-			eprintln!("    {:<12}{}", "CC type:".dimmed(), target.cc_type);
+			eprintln!("    {:<12}{}", "CC type:".dimmed(), resolved_cc);
 			eprintln!();
 			eprintln!("    {}:", "Serial console".dimmed());
 			eprintln!("      az serial-console connect --name {instance_name} --resource-group {}", names.resource_group);

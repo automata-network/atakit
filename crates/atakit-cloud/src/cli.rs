@@ -19,12 +19,37 @@ pub enum CloudCommand {
     Ssh(SshArgs),
     /// View serial console output
     Serial(SerialArgs),
-    /// Upload a base CVM image to the cloud (without deploying)
-    #[command(name = "upload-image", arg_required_else_help = true)]
-    UploadImage(UploadImageArgs),
+    /// Manage cloud images
+    #[command(subcommand)]
+    Image(CloudImageCommand),
+    /// Manage cloud providers
+    #[command(subcommand)]
+    Provider(CloudProviderCommand),
     /// Initialize a deployed instance with a workload
     #[command(arg_required_else_help = true)]
     Init(InitArgs),
+}
+
+/// Cloud image subcommands.
+#[derive(Subcommand)]
+pub enum CloudImageCommand {
+    /// List uploaded cloud images
+    #[command(alias = "list")]
+    Ls(CloudImageLsArgs),
+    /// Upload a base image to a cloud provider
+    Upload(CloudImageUploadArgs),
+    /// Remove an uploaded cloud image
+    Rm(CloudImageRmArgs),
+    /// Remove images not referenced by any target or active deployment
+    Gc(CloudImageGcArgs),
+}
+
+/// Cloud provider subcommands.
+#[derive(Subcommand)]
+pub enum CloudProviderCommand {
+    /// List configured cloud providers
+    #[command(alias = "list")]
+    Ls,
 }
 
 /// Arguments for `cloud deploy`.
@@ -48,6 +73,11 @@ pub struct DeployArgs {
     /// Force re-upload of base image even if it exists
     #[arg(long)]
     pub force_image: bool,
+
+    /// CC types for image registration (comma-separated: SEV_SNP,TDX).
+    /// Overrides [cloud.images] lookup. Default: inferred from vmtype.
+    #[arg(long, value_delimiter = ',')]
+    pub cc_types: Vec<String>,
 
     /// Additional metadata key=value pairs
     #[arg(long, value_name = "KEY=VALUE")]
@@ -143,20 +173,56 @@ pub struct SshArgs {
     pub target: Option<String>,
 }
 
-/// Arguments for `cloud upload-image`.
+/// Arguments for `cloud image ls`.
 #[derive(Args)]
-pub struct UploadImageArgs {
-    /// Base image: repository:tag (from image store) or path to .atabi file
+pub struct CloudImageLsArgs {
+    /// Verify images exist in cloud (queries provider APIs)
+    #[arg(long)]
+    pub live: bool,
+}
+
+/// Arguments for `cloud image upload`.
+#[derive(Args)]
+pub struct CloudImageUploadArgs {
+    /// Image to upload (repository:tag or .atabi path)
     pub image: String,
 
-    /// Target name from [cloud.targets.<name>]
+    /// Provider name from [cloud.providers.<name>]
     #[arg(long)]
-    pub target: String,
+    pub provider: String,
 
     /// Delete and re-upload if the image already exists
     #[arg(long)]
     pub force: bool,
 
+    /// CC types for image registration (comma-separated: SEV_SNP,TDX).
+    /// Overrides [cloud.images] lookup.
+    #[arg(long, value_delimiter = ',')]
+    pub cc_types: Vec<String>,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+/// Arguments for `cloud image rm`.
+#[derive(Args)]
+pub struct CloudImageRmArgs {
+    /// Image reference to remove (e.g. dev-baseimage:v0.0.1-debug)
+    pub image: String,
+
+    /// Provider to remove from
+    #[arg(long)]
+    pub provider: String,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+/// Arguments for `cloud image gc`.
+#[derive(Args)]
+pub struct CloudImageGcArgs {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
