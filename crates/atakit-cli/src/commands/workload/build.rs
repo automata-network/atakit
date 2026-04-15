@@ -42,6 +42,17 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
     let progress = IndicatifReporter;
     let result = atakit_workload::build_workload(&opts, &progress).await?;
 
+    // Inspect the built archive once: we need it to surface the manifest
+    // event hash alongside the file hash, and (below) to populate store
+    // metadata. Cheap -- just extracts manifest.toml from the archive.
+    let inspect_opts = atakit_workload::InspectOptions {
+        archive: Some(result.archive_path.clone()),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    };
+    let inspect = atakit_workload::inspect_workload(&inspect_opts).await?;
+
     println!(
         "{}",
         format!(
@@ -54,20 +65,16 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         )
         .green()
     );
-    println!("SHA-256: {}", result.archive_hash.dimmed());
+    // Two distinct hashes: the archive file hash is a content-addressable
+    // identifier for the .atawl blob; the manifest hash is the PCR23 event
+    // hash that appears on-chain and in `workload ls`. Label both clearly
+    // so users don't get confused when the values differ.
+    println!("Archive SHA-256:  {}", result.archive_hash.dimmed());
+    println!("Manifest SHA-256: {}", inspect.sha256.dimmed());
 
     // Import into store unless --no-store flag is set
     if !args.no_store {
         let store = WorkloadStore::new(&env.workload_dir);
-
-        // Inspect the built archive to get name, version, PCR23
-        let inspect_opts = atakit_workload::InspectOptions {
-            archive: Some(result.archive_path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-        };
-        let inspect = atakit_workload::inspect_workload(&inspect_opts).await?;
         let name = &inspect.manifest.meta.name;
         let version = &inspect.manifest.meta.version;
 
