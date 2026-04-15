@@ -64,7 +64,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
 
     println!("{}", "Imported.".green().bold());
     println!("  {:<18}{}:{}", "Workload:", name, version);
-    println!("  {:<18}{}", "SHA256:", result.sha256.dimmed());
+    println!("  {:<18}{}", "Manifest SHA256:", result.sha256.dimmed());
 
     Ok(())
 }

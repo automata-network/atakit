@@ -256,7 +256,7 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
 
     // --- Measurement ---
     section_header("Measurement");
-    println!("  {:<18}{}", "SHA256:", sha256);
+    println!("  {:<18}{}", "Manifest SHA256:", sha256);
     println!("  {:<18}{}", "PCR23:", pcr23.green());
 
     // Show on-chain PCR23 with match/mismatch highlighting.
