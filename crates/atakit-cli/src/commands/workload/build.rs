@@ -99,11 +99,11 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                         "{}",
                         format!("Store already has {name}:{version} with a different measurement.").yellow().bold()
                     );
-                    println!("  {:<12}{}", "Old SHA256:".dimmed(), old_sha256);
-                    println!("  {:<12}{}", "New SHA256:".dimmed(), inspect.sha256);
+                    println!("  {:<22}{}", "Old Manifest SHA256:".dimmed(), old_sha256);
+                    println!("  {:<22}{}", "New Manifest SHA256:".dimmed(), inspect.sha256);
                     if let Some(ref spec) = existing.on_chain_spec {
                         println!(
-                            "  {:<12}{}",
+                            "  {:<22}{}",
                             "On-chain:".dimmed(),
                             "yes (will be stale after overwrite)".yellow()
                         );
