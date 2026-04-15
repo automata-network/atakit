@@ -69,7 +69,18 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
     // identifier for the .atawl blob; the manifest hash is the PCR23 event
     // hash that appears on-chain and in `workload ls`. Label both clearly
     // so users don't get confused when the values differ.
-    println!("Archive SHA-256:  {}", result.archive_hash.dimmed());
+    //
+    // Normalise both to `0x<hex>` at print time so the two rows line up
+    // visually. `hash_file` returns `sha256:<hex>` (manifest uses that
+    // convention internally for `[hashes]` entries), but mixing it with
+    // `inspect.sha256`'s `0x<hex>` in terminal output makes the column
+    // edges jagged and confused a user into thinking they were looking
+    // at a bug.
+    let archive_hex = result
+        .archive_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.archive_hash);
+    println!("Archive  SHA-256: {}", format!("0x{archive_hex}").dimmed());
     println!("Manifest SHA-256: {}", inspect.sha256.dimmed());
 
     // Import into store unless --no-store flag is set
