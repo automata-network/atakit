@@ -58,7 +58,7 @@ impl CloudProvider for GcpProvider {
             bucket: names.bucket.clone(),
             image_name: names.image.clone(),
             source_path: image_source,
-            cc_type: opts.target.cc_type,
+            cc_types: opts.cc_types.clone(),
             force: opts.force_image,
         });
 
@@ -96,7 +96,7 @@ impl CloudProvider for GcpProvider {
             machine_type: opts.target.vmtype.clone(),
             zone: self.zone.clone(),
             image: names.image.clone(),
-            cc_type: opts.target.cc_type,
+            cc_type: opts.target.resolved_cc_type(crate::PlatformKind::Gcp)?,
             metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
@@ -131,7 +131,7 @@ impl CloudProvider for GcpProvider {
                 bucket,
                 image_name,
                 source_path,
-                cc_type,
+                cc_types,
                 force,
             } => {
                 let exists = image::check_image_exists(&self.project, image_name, runner).await?;
@@ -147,7 +147,7 @@ impl CloudProvider for GcpProvider {
                         image::ensure_bucket(&self.project, bucket, &self.zone, runner).await?;
                         let gcs_uri =
                             image::upload_image(bucket, src, runner, verbose).await?;
-                        image::register_image(&self.project, image_name, &gcs_uri, *cc_type, runner).await?;
+                        image::register_image(&self.project, image_name, &gcs_uri, cc_types, runner).await?;
                         updates.bucket = Some(bucket.clone());
                     } else {
                         return Err(CloudError::ImageUploadFailed {

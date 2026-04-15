@@ -1,17 +1,24 @@
 pub mod deploy;
 pub mod destroy;
+pub mod image;
 pub mod init;
 pub mod list;
+pub mod provider;
 pub mod serial;
 pub mod ssh;
 pub mod status;
-pub mod upload_image;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use atakit_cloud::{CloudConfig, CloudTarget, PlatformKind, PersistedAgentEnv};
+use atakit_cloud::{AzureResourceNames, CloudConfig, CloudTarget, PlatformKind, PersistedAgentEnv, ProcessRunner};
+use atakit_cloud::azure::AzureProvider;
+use atakit_cloud::cloud_images::{CloudImage, CloudImages};
+use atakit_cloud::config::CloudProviderConfig;
+use atakit_cloud::gcp::GcpProvider;
+use atakit_cloud::plan::DeployStep;
+use atakit_cloud::provider::CloudProvider;
 use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
 use atakit_workload::WorkloadStore;
@@ -558,6 +565,155 @@ fn append_dir_recursive<W: std::io::Write>(
         }
     }
     Ok(())
+}
+
+/// Build a `CloudImage` record for the given platform.
+pub(super) fn build_cloud_image_record(
+    provider_config: &CloudProviderConfig,
+    image_ref: &str,
+    instance_name: &str,
+    cc_types: &[atakit_cloud::CcType],
+) -> CloudImage {
+    match provider_config.platform {
+        PlatformKind::Gcp => {
+            let names = atakit_cloud::naming::ResourceNames::for_gcp(instance_name, image_ref);
+            CloudImage {
+                platform: PlatformKind::Gcp,
+                cloud_name: names.image,
+                bucket: Some(names.bucket),
+                gallery_rg: None,
+                gallery: None,
+                image_version: None,
+                cc_types: cc_types.to_vec(),
+                uploaded_at: chrono::Utc::now(),
+            }
+        }
+        PlatformKind::Azure => {
+            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
+            CloudImage {
+                platform: PlatformKind::Azure,
+                cloud_name: names.image_definition,
+                bucket: None,
+                gallery_rg: Some(names.gallery_rg),
+                gallery: Some(names.gallery),
+                image_version: Some(names.image_version),
+                cc_types: cc_types.to_vec(),
+                uploaded_at: chrono::Utc::now(),
+            }
+        }
+    }
+}
+
+/// Result of a cloud image upload attempt.
+pub(super) struct UploadResult {
+    /// Whether an upload actually happened (false = already existed).
+    pub uploaded: bool,
+}
+
+/// Ensure a cloud image is uploaded to the given provider. Checks the local
+/// `CloudImages` state first to avoid redundant cloud API calls.
+///
+/// Records the upload in `CloudImages` on success.
+/// Returns `uploaded: false` if the image already exists (in local state or cloud).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn ensure_cloud_image(
+    image_ref: &str,
+    provider_name: &str,
+    provider_config: &CloudProviderConfig,
+    source_path: &str,
+    cc_types: &[atakit_cloud::CcType],
+    force: bool,
+    env: &Env,
+    verbose: bool,
+) -> Result<UploadResult> {
+    let mut cloud_imgs = CloudImages::load(&env.data_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cloud_provider: Box<dyn CloudProvider> = match provider_config.platform {
+        PlatformKind::Gcp => Box::new(GcpProvider::new(
+            provider_config.project.clone().unwrap(),
+            provider_config.region.clone(),
+        )),
+        PlatformKind::Azure => Box::new(AzureProvider::new(
+            provider_config.subscription.clone().unwrap(),
+            provider_config.region.clone(),
+        )),
+    };
+
+    let runner = ProcessRunner::new(verbose);
+
+    // Check deps.
+    cloud_provider.execute_step(&DeployStep::CheckDeps, &runner, verbose).await?;
+
+    // Check existence before uploading so we can report accurately.
+    let already_exists = match provider_config.platform {
+        PlatformKind::Gcp => {
+            let names = atakit_cloud::naming::ResourceNames::for_gcp("upload", image_ref);
+            let exists = atakit_cloud::gcp::image::check_image_exists(
+                provider_config.project.as_deref().unwrap(), &names.image, &runner,
+            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+            exists && !force
+        }
+        PlatformKind::Azure => {
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
+            let exists = atakit_cloud::azure::image::check_image_version_exists(
+                &names.gallery_rg, &names.gallery, &names.image_definition, &names.image_version, &runner,
+            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+            exists && !force
+        }
+    };
+
+    if already_exists {
+        // Record in tracking (may be missing if uploaded before tracking existed).
+        let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
+        cloud_imgs.record(image_ref, provider_name, record);
+        cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok(UploadResult { uploaded: false });
+    }
+
+    // Upload.
+    match provider_config.platform {
+        PlatformKind::Gcp => {
+            let names = atakit_cloud::naming::ResourceNames::for_gcp("upload", image_ref);
+            let step = DeployStep::UploadImage {
+                bucket: names.bucket.clone(),
+                image_name: names.image.clone(),
+                source_path: Some(source_path.to_string()),
+                cc_types: cc_types.to_vec(),
+                force,
+            };
+            cloud_provider.execute_step(&step, &runner, verbose).await?;
+        }
+        PlatformKind::Azure => {
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
+            cloud_provider.execute_step(
+                &DeployStep::CreateResourceGroup {
+                    name: names.resource_group.clone(),
+                    region: provider_config.region.clone(),
+                },
+                &runner,
+                verbose,
+            ).await?;
+            let step = DeployStep::UploadImageAzure {
+                resource_group: names.resource_group,
+                storage_account: names.storage_account,
+                gallery_rg: names.gallery_rg,
+                gallery: names.gallery,
+                image_definition: names.image_definition,
+                image_version: names.image_version,
+                source_path: Some(source_path.to_string()),
+                cc_types: cc_types.to_vec(),
+                force,
+            };
+            cloud_provider.execute_step(&step, &runner, verbose).await?;
+        }
+    };
+
+    let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
+    cloud_imgs.record(image_ref, provider_name, record);
+    cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(UploadResult { uploaded: true })
 }
 
 /// Parse metadata key=value strings into a map.

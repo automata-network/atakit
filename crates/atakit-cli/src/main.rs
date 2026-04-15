@@ -5,7 +5,7 @@ mod progress;
 use anyhow::Result;
 use atakit_core::Env;
 use config::Config;
-use atakit_cloud::cli::CloudCommand;
+use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand};
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
 use clap::{Parser, Subcommand};
@@ -154,9 +154,25 @@ async fn main() -> Result<()> {
             CloudCommand::Serial(args) => {
                 commands::cloud::serial::run(args, &env, &config).await
             }
-            CloudCommand::UploadImage(args) => {
-                commands::cloud::upload_image::run(args, &env, &config, cli.verbose).await
-            }
+            CloudCommand::Image(cmd) => match cmd {
+                CloudImageCommand::Ls(args) => {
+                    commands::cloud::image::run_ls(args, &env)
+                }
+                CloudImageCommand::Upload(args) => {
+                    commands::cloud::image::run_upload(args, &env, &config, cli.verbose).await
+                }
+                CloudImageCommand::Rm(args) => {
+                    commands::cloud::image::run_rm(args, &env, &config).await
+                }
+                CloudImageCommand::Gc(args) => {
+                    commands::cloud::image::run_gc(args, &env, &config).await
+                }
+            },
+            CloudCommand::Provider(cmd) => match cmd {
+                CloudProviderCommand::Ls => {
+                    commands::cloud::provider::run(&config)
+                }
+            },
             CloudCommand::Init(args) => {
                 commands::cloud::init::run(args, &env, &config).await
             }
