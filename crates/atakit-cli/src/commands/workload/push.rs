@@ -97,12 +97,12 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         name.green().bold(),
         version.green().bold(),
     );
-    println!("  {:<14}{}", "Archive:", archive_path.display().to_string().dimmed());
-    println!("  {:<14}{}", "Size:", format_size(archive_size));
-    println!("  {:<14}{}", "SHA256:", result.sha256.dimmed());
-    println!("  {:<14}{}", "PCR23:", result.pcr23.dimmed());
-    println!("  {:<14}{}", "Workload ID:", workload_id_hex.dimmed());
-    println!("  {:<14}{}", "Repository:", repo_uri.cyan());
+    println!("  {:<18}{}", "Archive:", archive_path.display().to_string().dimmed());
+    println!("  {:<18}{}", "Size:", format_size(archive_size));
+    println!("  {:<18}{}", "Manifest SHA256:", result.sha256.dimmed());
+    println!("  {:<18}{}", "PCR23:", result.pcr23.dimmed());
+    println!("  {:<18}{}", "Workload ID:", workload_id_hex.dimmed());
+    println!("  {:<18}{}", "Repository:", repo_uri.cyan());
     println!();
 
     if !args.yes {

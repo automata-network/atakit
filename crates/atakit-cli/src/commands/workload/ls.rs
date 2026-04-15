@@ -552,33 +552,37 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
     // In normal mode sources gets ~1/3 of the remaining width, with the
     // rest split between owner and sha256, and long source lists are
     // truncated by `format_sources`.
+    //
+    // The sha256 column minimum is the header width ("MANIFEST SHA256",
+    // 15 chars) so the header never overflows or clips at narrow widths.
+    const SHA256_MIN: usize = 15;
     let (w_owner, w_sha256, w_sources) = if has_owner && has_sources {
         if wide {
             let avail = remaining.saturating_sub(gap * 3);
             let half = avail / 2;
-            (half.max(10), (avail - half).max(10), max_source_width)
+            (half.max(10), (avail - half).max(SHA256_MIN), max_source_width)
         } else {
             let avail = remaining.saturating_sub(gap * 3);
             let w_src = (avail / 3).max(12);
             let hex_avail = avail.saturating_sub(w_src);
             let half = hex_avail / 2;
-            (half.max(10), (hex_avail - half).max(10), w_src)
+            (half.max(10), (hex_avail - half).max(SHA256_MIN), w_src)
         }
     } else if has_owner {
         let avail = remaining.saturating_sub(gap * 2);
         let half = avail / 2;
-        (half.max(10), (avail - half).max(10), 0)
+        (half.max(10), (avail - half).max(SHA256_MIN), 0)
     } else if has_sources {
         if wide {
             let avail = remaining.saturating_sub(gap * 2);
-            (0, avail.saturating_sub(max_source_width).max(10), max_source_width)
+            (0, avail.saturating_sub(max_source_width).max(SHA256_MIN), max_source_width)
         } else {
             let avail = remaining.saturating_sub(gap * 2);
             let w_src = (avail / 3).max(12);
-            (0, avail.saturating_sub(w_src).max(10), w_src)
+            (0, avail.saturating_sub(w_src).max(SHA256_MIN), w_src)
         }
     } else {
-        (0, remaining.saturating_sub(gap).max(10), 0)
+        (0, remaining.saturating_sub(gap).max(SHA256_MIN), 0)
     };
 
     // Header.
@@ -589,7 +593,7 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
     if has_owner {
         print!("  {:<w_owner$}", "OWNER");
     }
-    print!("  {:<w_sha256$}", "SHA256");
+    print!("  {:<w_sha256$}", "MANIFEST SHA256");
     if has_sources {
         print!("  {:<w_sources$}", "REPOSITORIES");
     }
@@ -672,7 +676,7 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
         "\u{25cc} tracked",
         "\u{25ca} remote",
         "\u{2717} revoked",
-        "red = divergent sha256 across repositories",
+        "red = divergent manifest sha256 across repositories",
     ];
     println!();
     println!("{}", legend_parts.join("  ").dimmed());
