@@ -18,7 +18,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	let image_only = args.image_only;
 
 	// 1. Resolve workload source (unless --image-only).
-	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb, base_image_mode, base_image_list, unmeasured_tar);
+	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb, base_image_mode, base_image_list, unmeasured_tar, unmeasured_data_paths): (_, _, _, _, _, _, _, _, _, _, Vec<String>);
 	if image_only {
 		archive_path = String::new();
 		workload_name = String::new();
@@ -30,8 +30,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		base_image_mode = String::new();
 		base_image_list = Vec::new();
 		unmeasured_tar = None;
+		unmeasured_data_paths = Vec::<String>::new();
 	} else {
-		let resolved = resolve_workload(&args.source, &args.dir, env)?;
+		let resolved = resolve_workload(&args.source, &args.dir, env, args.force)?;
 		workload_name = resolved.name;
 		workload_version = resolved.version;
 		workload_ports = resolved.ports;
@@ -45,13 +46,16 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		boot_disk_size_gb = resolved.boot_disk_size.as_deref().and_then(parse_size_gb);
 		base_image_mode = resolved.base_image_mode;
 		base_image_list = resolved.base_image;
-		// Collect unmeasured-data files if a workload directory is available.
+		// Collect unmeasured-data files: --unmeasured-data-dir takes precedence over workload dir.
 		unmeasured_tar = if !resolved.unmeasured_data.is_empty() {
-			if let Some(ref wdir) = resolved.workload_dir {
-				collect_unmeasured_tar(&resolved.unmeasured_data, wdir)?
+			let base_dir = args.unmeasured_data_dir.as_ref()
+				.or(resolved.workload_dir.as_ref());
+			if let Some(dir) = base_dir {
+				collect_unmeasured_tar(&resolved.unmeasured_data, dir)?
 			} else {
 				eprintln!(
-					"  {}: workload declares unmeasured-data but no workload directory available (store-ref/file mode)",
+					"  {}: workload declares unmeasured-data but no source directory available; \
+					 use --unmeasured-data-dir to provide one",
 					"warning".yellow(),
 				);
 				None
@@ -59,6 +63,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		} else {
 			None
 		};
+		unmeasured_data_paths = resolved.unmeasured_data;
 		let ap = resolved.archive_path;
 		let bytes = std::fs::read(&ap)
 			.with_context(|| format!("failed to read archive: {}", ap.display()))?;
@@ -272,6 +277,17 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		for (k, v) in &metadata {
 			eprintln!("  {:<15}{}={}", "Metadata:".dimmed(), k, v);
 		}
+	}
+	if unmeasured_tar.is_some() {
+		let dir_label = args.unmeasured_data_dir.as_ref()
+			.map(|d| d.display().to_string())
+			.unwrap_or_else(|| "(workload dir)".to_string());
+		eprintln!("  {:<15}{} ({} path{})",
+			"Unmeasured:".dimmed(),
+			dir_label,
+			unmeasured_data_paths.len(),
+			if unmeasured_data_paths.len() == 1 { "" } else { "s" },
+		);
 	}
 	eprintln!();
 
