@@ -220,7 +220,7 @@ pub(super) struct ResolvedWorkload {
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
-pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env) -> Result<ResolvedWorkload> {
+pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env, force: bool) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
         // Store reference: name:version
         if crate::commands::workload::looks_like_store_ref(src) {
@@ -305,14 +305,16 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
 
     // Check if any source file is newer than the archive.
-    if let Ok(archive_meta) = std::fs::metadata(&archive_path) {
-        if let Ok(archive_mtime) = archive_meta.modified() {
-            if let Some(stale_file) = find_newer_source(&workload_dir, &archive_mtime) {
-                bail!(
-                    "'{}' is newer than {} - run 'atakit workload build' first",
-                    stale_file.display(),
-                    archive_path.display(),
-                );
+    if !force {
+        if let Ok(archive_meta) = std::fs::metadata(&archive_path) {
+            if let Ok(archive_mtime) = archive_meta.modified() {
+                if let Some(stale_file) = find_newer_source(&workload_dir, &archive_mtime) {
+                    bail!(
+                        "'{}' is newer than {} - run 'atakit workload build' first, or pass --force to skip this check",
+                        stale_file.display(),
+                        archive_path.display(),
+                    );
+                }
             }
         }
     }

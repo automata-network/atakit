@@ -41,18 +41,21 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 	};
 
 	// 3. Resolve workload.
-	let resolved = resolve_workload(&args.source, &args.dir, env)?;
+	let resolved = resolve_workload(&args.source, &args.dir, env, args.force)?;
 	let archive_path = resolved.archive_path;
 	let workload_name = resolved.name;
 	let workload_version = resolved.version;
 
-	// Collect unmeasured-data files if available.
+	// Collect unmeasured-data files: --unmeasured-data-dir takes precedence over workload dir.
 	let unmeasured_tar = if !resolved.unmeasured_data.is_empty() {
-		if let Some(ref wdir) = resolved.workload_dir {
-			collect_unmeasured_tar(&resolved.unmeasured_data, wdir)?
+		let base_dir = args.unmeasured_data_dir.as_ref()
+			.or(resolved.workload_dir.as_ref());
+		if let Some(dir) = base_dir {
+			collect_unmeasured_tar(&resolved.unmeasured_data, dir)?
 		} else {
 			eprintln!(
-				"  {}: workload declares unmeasured-data but no workload directory available (store-ref/file mode)",
+				"  {}: workload declares unmeasured-data but no source directory available; \
+				 use --unmeasured-data-dir to provide one",
 				"warning".yellow(),
 			);
 			None

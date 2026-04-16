@@ -160,7 +160,7 @@ curl_args=(
 )
 
 if [[ -n "$UNMEASURED_DIR" && -n "$unmeasured_tar" ]]; then
-    curl_args+=(-F "unmeasured=@${unmeasured_tar}")
+    curl_args+=(-F "unmeasured-data=@${unmeasured_tar}")
 fi
 
 response=$(curl "${curl_args[@]}" -w "\n%{http_code}" 2>&1)
