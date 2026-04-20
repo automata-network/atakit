@@ -32,7 +32,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		unmeasured_tar = None;
 		unmeasured_data_paths = Vec::<String>::new();
 	} else {
-		let resolved = resolve_workload(&args.source, &args.dir, env, args.force)?;
+		let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
 		workload_name = resolved.name;
 		workload_version = resolved.version;
 		workload_ports = resolved.ports;
