@@ -118,6 +118,14 @@ pub struct DeployArgs {
     /// Deploy only the base image VM without a workload (for measurements)
     #[arg(long)]
     pub image_only: bool,
+
+    /// Skip workload freshness check (deploy even if source files are newer than the archive)
+    #[arg(long)]
+    pub skip_freshness_check: bool,
+
+    /// Directory containing unmeasured-data files (overrides workload dir)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_dir: Option<PathBuf>,
 }
 
 /// Arguments for `cloud destroy`.
@@ -268,6 +276,14 @@ pub struct InitArgs {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
+
+    /// Skip workload freshness check
+    #[arg(long)]
+    pub skip_freshness_check: bool,
+
+    /// Directory containing unmeasured-data files (overrides workload dir)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_dir: Option<PathBuf>,
 }
 
 /// Arguments for `cloud serial`.
