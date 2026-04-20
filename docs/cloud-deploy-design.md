@@ -208,7 +208,7 @@ Multipart form:
 | Field | Required | Content |
 |---|---|---|
 | `atawl` | yes | The `.atawl` archive file |
-| `unmeasured` | no | Tar archive of unmeasured-data files (see below) |
+| `unmeasured-data` | no | Tar archive of unmeasured-data files (see below) |
 | `config` | yes | JSON containing `agent_env` for CVM agent on-chain operations (see below) |
 
 **Auth: deferred to v2.** For v1, no auth on `/init`. Security relies on:
@@ -298,15 +298,15 @@ Validation:
   - ./runtime-data/config.json   -> MISSING, warn: "unmeasured-data file not found: ./runtime-data/config.json"
 ```
 
-### Alternative: `--unmeasured-dir`
+### Alternative: `--unmeasured-data-dir`
 
 For cases where unmeasured-data lives outside the workload directory (e.g., secrets from a vault):
 
 ```
-atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-dir /path/to/secrets/
+atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-dir /path/to/secrets/
 ```
 
-The `--unmeasured-dir` is scanned for files matching the manifest's unmeasured-data paths.
+The `--unmeasured-data-dir` is scanned for files matching the manifest's unmeasured-data paths.
 
 ---
 

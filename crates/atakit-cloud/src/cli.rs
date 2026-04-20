@@ -121,7 +121,7 @@ pub struct DeployArgs {
 
     /// Skip workload freshness check (deploy even if source files are newer than the archive)
     #[arg(long)]
-    pub force: bool,
+    pub skip_freshness_check: bool,
 
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]
@@ -279,7 +279,7 @@ pub struct InitArgs {
 
     /// Skip workload freshness check
     #[arg(long)]
-    pub force: bool,
+    pub skip_freshness_check: bool,
 
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]

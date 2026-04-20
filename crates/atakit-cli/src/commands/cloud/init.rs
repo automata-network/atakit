@@ -41,7 +41,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 	};
 
 	// 3. Resolve workload.
-	let resolved = resolve_workload(&args.source, &args.dir, env, args.force)?;
+	let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
 	let archive_path = resolved.archive_path;
 	let workload_name = resolved.name;
 	let workload_version = resolved.version;
