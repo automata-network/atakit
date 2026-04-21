@@ -1,0 +1,202 @@
+//! V1 manifest deserialization for backward-compatible reading of old archives.
+//!
+//! These types mirror the format-1 `manifest.toml` layout. They are
+//! Deserialize-only; new archives always use format 2 (canonical JSON).
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+use crate::manifest::{
+    Manifest, ManifestBabyContainer, ManifestConfig, ManifestDependency, ManifestDisk,
+    ManifestDiskEncryption, ManifestFirewallPort, ManifestMeta, StringOrArrayOut,
+};
+
+fn default_restart_v1() -> String {
+    "no".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestV1 {
+    pub meta: ManifestMetaV1,
+    pub config: ManifestConfigV1,
+    #[serde(default)]
+    pub disks: BTreeMap<String, ManifestDiskV1>,
+    pub hashes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestMetaV1 {
+    pub format: u32,
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestConfigV1 {
+    pub image: String,
+    #[serde(rename = "base-image-mode")]
+    pub base_image_mode: String,
+    #[serde(default, rename = "base-image")]
+    pub base_image: Vec<String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default = "default_restart_v1")]
+    pub restart: String,
+    #[serde(default)]
+    pub command: Option<StringOrArrayOut>,
+    #[serde(default)]
+    pub entrypoint: Option<StringOrArrayOut>,
+    #[serde(default)]
+    pub ttl: u64,
+    #[serde(default)]
+    pub cvm_agent: bool,
+    #[serde(default, rename = "measured-data")]
+    pub measured_data: Vec<String>,
+    #[serde(default, rename = "unmeasured-data")]
+    pub unmeasured_data: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub disks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub dependencies: Option<BTreeMap<String, ManifestDependencyV1>>,
+    #[serde(default, rename = "firewall-ports")]
+    pub firewall_ports: Vec<ManifestFirewallPort>,
+    #[serde(default, rename = "baby-container")]
+    pub baby_container: Option<ManifestBabyContainer>,
+    #[serde(default, rename = "boot-disk-size")]
+    pub boot_disk_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestDependencyV1 {
+    pub image: String,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default = "default_restart_v1")]
+    pub restart: String,
+    #[serde(default)]
+    pub command: Option<StringOrArrayOut>,
+    #[serde(default)]
+    pub entrypoint: Option<StringOrArrayOut>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default, rename = "measured-data")]
+    pub measured_data: Vec<String>,
+    #[serde(default, rename = "unmeasured-data")]
+    pub unmeasured_data: Vec<String>,
+    #[serde(default)]
+    pub disks: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestDiskV1 {
+    pub index: u32,
+    pub size: String,
+    #[serde(default)]
+    pub bind_fs: bool,
+    #[serde(default)]
+    pub encryption: Option<ManifestDiskEncryptionV1>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestDiskEncryptionV1 {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub key_security: String,
+}
+
+/// Convert a v1 manifest to the current (v2) Manifest struct.
+pub fn convert_to_current(v1: ManifestV1) -> Manifest {
+    let workload_name = v1.meta.name.clone();
+
+    let dependencies = v1.config.dependencies.map(|deps| {
+        deps.into_iter()
+            .map(|(name, dep)| {
+                (
+                    name,
+                    ManifestDependency {
+                        image: dep.image,
+                        ports: dep.ports,
+                        restart: dep.restart,
+                        command: dep.command,
+                        entrypoint: dep.entrypoint,
+                        atakit_portal: false,
+                        gid_group: workload_name.clone(),
+                        environment: dep.environment,
+                        depends_on: dep.depends_on,
+                        measured_data: dep.measured_data,
+                        unmeasured_data: dep.unmeasured_data,
+                        disks: dep.disks,
+                    },
+                )
+            })
+            .collect()
+    });
+
+    let disks = v1
+        .disks
+        .into_iter()
+        .map(|(name, d)| {
+            let encryption = d.encryption.and_then(|e| convert_encryption_v1(&e));
+            (
+                name,
+                ManifestDisk {
+                    index: d.index,
+                    size: d.size,
+                    bind_fs: d.bind_fs,
+                    encryption,
+                },
+            )
+        })
+        .collect();
+
+    Manifest {
+        meta: ManifestMeta {
+            format: v1.meta.format,
+            name: v1.meta.name,
+            version: v1.meta.version,
+        },
+        config: ManifestConfig {
+            image: v1.config.image,
+            base_image_mode: v1.config.base_image_mode,
+            base_image: v1.config.base_image,
+            ports: v1.config.ports,
+            restart: v1.config.restart,
+            command: v1.config.command,
+            entrypoint: v1.config.entrypoint,
+            ttl: v1.config.ttl,
+            atakit_portal: v1.config.cvm_agent,
+            gid_group: workload_name,
+            measured_data: v1.config.measured_data,
+            unmeasured_data: v1.config.unmeasured_data,
+            environment: v1.config.environment,
+            disks: v1.config.disks,
+            dependencies,
+            firewall_ports: v1.config.firewall_ports,
+            baby_container: v1.config.baby_container,
+            boot_disk_size: v1.config.boot_disk_size,
+        },
+        disks,
+        hashes: v1.hashes,
+    }
+}
+
+/// Convert v1 encryption to v2. Returns None if encryption was disabled.
+fn convert_encryption_v1(v1: &ManifestDiskEncryptionV1) -> Option<ManifestDiskEncryption> {
+    if !v1.enable {
+        return None;
+    }
+    let bind = match v1.key_security.as_str() {
+        "strong" => vec!["platform".to_string(), "workload".to_string()],
+        _ => vec!["workload".to_string()],
+    };
+    Some(ManifestDiskEncryption {
+        unlock_method: vec!["tpm".to_string()],
+        bind,
+    })
+}
