@@ -27,7 +27,7 @@ pub struct DeployState {
     pub image_ref: String,
     pub archive_path: String,
     pub archive_hash: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     pub resources: ResourceSet,
 }
 
@@ -42,14 +42,13 @@ pub enum DeployStatus {
     Destroyed,
 }
 
-/// Agent environment config persisted for re-deploys.
+/// Init environment config persisted for re-deploys.
+/// Stores reference names into `[chains.*]` and `[keys.*]` config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PersistedAgentEnv {
-    pub rpc_url: Option<String>,
-    pub session_registry: Option<String>,
-    pub owner_key_file: Option<String>,
-    pub relay_key_file: Option<String>,
-    pub expire_offset: Option<u64>,
+pub struct PersistedInitEnv {
+    pub chain: String,
+    pub owner_key: String,
+    pub gas_wallet: String,
 }
 
 /// Cloud provider resources tracked in state.
@@ -141,7 +140,7 @@ pub struct NewDeployParams {
     pub image_ref: String,
     pub archive_path: String,
     pub archive_hash: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     /// Total number of steps in the deployment plan.
     pub total_steps: u32,
 }
@@ -164,7 +163,7 @@ impl DeployState {
             image_ref: params.image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
-            agent_env: params.agent_env,
+            init_env: params.init_env,
             resources: ResourceSet::default(),
         }
     }
@@ -436,7 +435,7 @@ mod tests {
             image_ref: "automata-linux:v0.1.6".into(),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.resources.gcp = Some(GcpResources {
@@ -476,7 +475,7 @@ mod tests {
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();
@@ -500,7 +499,7 @@ mod tests {
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
-                agent_env: PersistedAgentEnv::default(),
+                init_env: PersistedInitEnv::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -524,7 +523,7 @@ mod tests {
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
-                agent_env: PersistedAgentEnv::default(),
+                init_env: PersistedInitEnv::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -547,7 +546,7 @@ mod tests {
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();

@@ -1,20 +1,80 @@
 use std::time::Duration;
 
+use crate::config::PlatformKind;
 use crate::error::CloudError;
 
-/// Agent environment configuration for the /init POST.
+/// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
-pub struct AgentConfig {
-    pub rpc_url: String,
-    pub session_registry: String,
-    pub owner_private_key: String,
-    pub relay_private_key: String,
-    pub expire_offset: u64,
+pub struct InitConfig {
+    pub platform: PlatformKind,
+    pub chain: InitChainConfig,
+    pub owner_key: InitKeyConfig,
+    pub gas_wallet: InitKeyConfig,
 }
 
-/// Poll the CVM agent health endpoint with exponential backoff.
-pub async fn wait_for_agent(ip: &str, timeout_secs: u64) -> Result<(), CloudError> {
-    let url = format!("https://{ip}:1024/platform-measurements");
+/// Chain config section of the init payload.
+#[derive(Debug, Clone)]
+pub struct InitChainConfig {
+    pub rpc_url: String,
+    pub session_registry: String,
+    pub workload_registry: String,
+    pub base_image_registry: String,
+    pub session_ttl_seconds: u64,
+}
+
+/// Key config section of the init payload.
+#[derive(Debug, Clone)]
+pub struct InitKeyConfig {
+    pub mode: String,
+    pub key_type: String,
+    pub private_key: Option<String>,
+}
+
+/// Build the portal config JSON from an InitConfig.
+fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
+    let platform_str = match config.platform {
+        PlatformKind::Gcp => "gcp",
+        PlatformKind::Azure => "azure",
+    };
+
+    let mut owner_key = serde_json::json!({
+        "mode": config.owner_key.mode,
+        "type": config.owner_key.key_type,
+    });
+    if let Some(ref pk) = config.owner_key.private_key {
+        owner_key["private_key"] = serde_json::Value::String(pk.clone());
+    }
+
+    let mut gas_wallet = serde_json::json!({
+        "mode": config.gas_wallet.mode,
+        "type": config.gas_wallet.key_type,
+    });
+    if let Some(ref pk) = config.gas_wallet.private_key {
+        gas_wallet["private_key"] = serde_json::Value::String(pk.clone());
+    }
+
+    serde_json::json!({
+        "format": 1,
+        "platform": {
+            "declared": platform_str,
+        },
+        "chain": {
+            "rpc_url": config.chain.rpc_url,
+            "contracts": {
+                "session_registry": config.chain.session_registry,
+                "workload_registry": config.chain.workload_registry,
+                "base_image_registry": config.chain.base_image_registry,
+            },
+            "session_ttl_seconds": config.chain.session_ttl_seconds,
+        },
+        "owner_key": owner_key,
+        "gas_wallet": gas_wallet,
+    })
+}
+
+/// Poll the portal status endpoint with exponential backoff.
+pub async fn wait_for_portal(ip: &str, timeout_secs: u64) -> Result<(), CloudError> {
+    let url = format!("https://{ip}:2024/status");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
@@ -30,20 +90,20 @@ pub async fn wait_for_agent(ip: &str, timeout_secs: u64) -> Result<(), CloudErro
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!("CVM agent is ready at {ip}:1024");
+                tracing::info!("portal is ready at {ip}:2024");
                 return Ok(());
             }
             Ok(resp) => {
-                tracing::debug!("agent not ready yet (status {})", resp.status());
+                tracing::debug!("portal not ready yet (status {})", resp.status());
             }
             Err(e) => {
-                tracing::debug!("agent not reachable: {e}");
+                tracing::debug!("portal not reachable: {e}");
             }
         }
 
         if tokio::time::Instant::now() + interval > deadline {
-            return Err(CloudError::AgentTimeout {
-                address: format!("{ip}:1024"),
+            return Err(CloudError::PortalTimeout {
+                address: format!("{ip}:2024"),
                 timeout_secs,
             });
         }
@@ -53,15 +113,15 @@ pub async fn wait_for_agent(ip: &str, timeout_secs: u64) -> Result<(), CloudErro
     }
 }
 
-/// POST /init to the CVM agent with workload archive and configuration.
+/// POST /init to the portal with workload archive and configuration.
 ///
-/// Always uses HTTPS. The CVM agent serves a self-signed certificate,
+/// Always uses HTTPS. The portal serves a self-signed certificate,
 /// so we always accept invalid certs for the init request.
-pub async fn post_init(
+pub async fn post_portal_init(
     ip: &str,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
-    agent_config: &AgentConfig,
+    init_config: &InitConfig,
 ) -> Result<(), CloudError> {
     let url = format!("https://{ip}:1024/init");
 
@@ -81,16 +141,8 @@ pub async fn post_init(
         }
     })?;
 
-    // Build agent env JSON (nested under "agent_env" key as the CVM agent expects).
-    let config_json = serde_json::json!({
-        "agent_env": {
-            "rpc_url": agent_config.rpc_url,
-            "session_registry": agent_config.session_registry,
-            "owner_private_key": agent_config.owner_private_key,
-            "relay_private_key": agent_config.relay_private_key,
-            "expire_offset": agent_config.expire_offset,
-        }
-    });
+    // Build config JSON.
+    let config_json = build_portal_config_json(init_config);
 
     // Build multipart form.
     let mut form = reqwest::multipart::Form::new()
@@ -130,18 +182,63 @@ pub async fn post_init(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| CloudError::AgentInitFailed {
+        .map_err(|e| CloudError::PortalInitFailed {
             message: format!("request failed: {e}"),
         })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(CloudError::AgentInitFailed {
-            message: format!("agent returned {status}: {body}"),
+        return Err(CloudError::PortalInitFailed {
+            message: format!("portal returned {status}: {body}"),
         });
     }
 
     tracing::info!("workload initialized on CVM at {ip}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_config_json_shape() {
+        let config = InitConfig {
+            platform: PlatformKind::Gcp,
+            chain: InitChainConfig {
+                rpc_url: "https://rpc.example.com".to_string(),
+                session_registry: "0xSESS".to_string(),
+                workload_registry: "0xWORK".to_string(),
+                base_image_registry: "0xBASE".to_string(),
+                session_ttl_seconds: 3600,
+            },
+            owner_key: InitKeyConfig {
+                mode: "provisioned".to_string(),
+                key_type: "es256k".to_string(),
+                private_key: Some("0xOWNER".to_string()),
+            },
+            gas_wallet: InitKeyConfig {
+                mode: "self_generated".to_string(),
+                key_type: "es256k".to_string(),
+                private_key: None,
+            },
+        };
+
+        let json = build_portal_config_json(&config);
+
+        assert_eq!(json["format"], 1);
+        assert_eq!(json["platform"]["declared"], "gcp");
+        assert_eq!(json["chain"]["rpc_url"], "https://rpc.example.com");
+        assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
+        assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
+        assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
+        assert_eq!(json["chain"]["session_ttl_seconds"], 3600);
+        assert_eq!(json["owner_key"]["mode"], "provisioned");
+        assert_eq!(json["owner_key"]["type"], "es256k");
+        assert_eq!(json["owner_key"]["private_key"], "0xOWNER");
+        assert_eq!(json["gas_wallet"]["mode"], "self_generated");
+        assert_eq!(json["gas_wallet"]["type"], "es256k");
+        assert!(json["gas_wallet"].get("private_key").is_none());
+    }
 }

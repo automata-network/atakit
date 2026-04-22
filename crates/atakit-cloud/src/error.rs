@@ -52,14 +52,14 @@ pub enum CloudError {
     #[error("instance error: {message}")]
     InstanceError { message: String },
 
-    #[error("CVM agent at {address} did not respond within {timeout_secs}s")]
-    AgentTimeout {
+    #[error("portal at {address} did not respond within {timeout_secs}s")]
+    PortalTimeout {
         address: String,
         timeout_secs: u64,
     },
 
-    #[error("CVM agent initialization failed: {message}")]
-    AgentInitFailed { message: String },
+    #[error("portal initialization failed: {message}")]
+    PortalInitFailed { message: String },
 
     #[error("deploy failed at step '{step}': {message}")]
     DeployFailed { step: String, message: String },

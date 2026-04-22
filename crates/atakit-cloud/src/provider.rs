@@ -4,7 +4,7 @@ use crate::config::{CcType, CloudTarget};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::plan::{DeployPlan, DeployStep, DestroyPlan, DestroyStep, StepResult};
-use crate::state::{DeployState, PersistedAgentEnv};
+use crate::state::{DeployState, PersistedInitEnv};
 
 /// Options for a deploy operation.
 pub struct DeployOptions {
@@ -19,7 +19,7 @@ pub struct DeployOptions {
     pub archive_hash: String,
     pub workload_name: String,
     pub workload_version: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     pub metadata: BTreeMap<String, String>,
     pub force_image: bool,
     pub skip_init: bool,

@@ -136,16 +136,6 @@ pub struct CloudProviderConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct CloudConfig {
-    /// Default expire offset for CVM agent sessions (seconds).
-    pub expire_offset: Option<u64>,
-    /// RPC URL (falls back to `[publish]` if not set).
-    pub rpc_url: Option<String>,
-    /// Session registry contract address.
-    pub session_registry: Option<String>,
-    /// Path to owner private key file.
-    pub owner_key_file: Option<String>,
-    /// Path to relay private key file.
-    pub relay_key_file: Option<String>,
     /// Named cloud providers: `[cloud.providers]`.
     #[serde(default)]
     pub providers: BTreeMap<String, CloudProviderConfig>,
@@ -174,11 +164,12 @@ pub struct CloudTarget {
     /// Extra metadata key-value pairs.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    // Per-target agent env overrides.
-    pub rpc_url: Option<String>,
-    pub session_registry: Option<String>,
-    pub owner_key_file: Option<String>,
-    pub relay_key_file: Option<String>,
+    /// Chain config name (references a key in `[chains]`).
+    pub chain: String,
+    /// Owner key name (references a key in `[keys]`, must be provisioned).
+    pub owner_key: String,
+    /// Gas wallet key name (references a key in `[keys]`).
+    pub gas_wallet: String,
 }
 
 impl CloudTarget {
@@ -398,10 +389,9 @@ mod tests {
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            rpc_url: None,
-            session_registry: None,
-            owner_key_file: None,
-            relay_key_file: None,
+            chain: "test-chain".to_string(),
+            owner_key: "test-owner".to_string(),
+            gas_wallet: "test-gas".to_string(),
         }
     }
 
