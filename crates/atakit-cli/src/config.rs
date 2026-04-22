@@ -1259,15 +1259,21 @@ fn check_legacy_fields(content: &str) -> Result<()> {
                 );
             }
         }
-        for field in ["owner_key_file", "relay_key_file"] {
-            if publish.contains_key(field) {
-                bail!(
-                    "`[publish] {field}` is no longer supported. Define a key under \
-                     `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
-                     source, then set `[publish] owner_key = \"<name>\"`. \
-                     See config_template.toml."
-                );
-            }
+        if publish.contains_key("owner_key_file") {
+            bail!(
+                "`[publish] owner_key_file` is no longer supported. Define a key under \
+                 `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
+                 source, then set `[publish] owner_key = \"<name>\"`. \
+                 See config_template.toml."
+            );
+        }
+        if publish.contains_key("relay_key_file") {
+            bail!(
+                "`[publish] relay_key_file` is no longer supported. Define a key under \
+                 `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
+                 source, then set `[publish] relay_key = \"<name>\"`. \
+                 See config_template.toml."
+            );
         }
     }
 
@@ -2632,5 +2638,229 @@ mod tests {
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(repo_paths(&config), vec!["owner/custom-images"]);
         assert_eq!(config.image.list_limit, 3);
+    }
+
+    // ── [chains] and [keys] ─────────────────────────────────────
+
+    #[test]
+    fn parses_chains_and_keys() {
+        let config = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            session_ttl_seconds = 7200
+
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "OWNER_KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.chains.len(), 1);
+        let chain = config.chains.get("testnet").unwrap();
+        assert_eq!(chain.rpc_url, "https://rpc.test");
+        assert_eq!(chain.session_registry, "0xABCD");
+        assert_eq!(chain.session_ttl_seconds, 7200);
+        assert!(chain.workload_registry.is_none());
+
+        assert_eq!(config.keys.len(), 2);
+        let owner = config.keys.get("owner").unwrap();
+        assert_eq!(owner.key_type, KeyType::Es256k);
+        assert_eq!(owner.mode, KeyMode::Provisioned);
+        let gas = config.keys.get("gas").unwrap();
+        assert_eq!(gas.mode, KeyMode::SelfGenerated);
+    }
+
+    #[test]
+    fn key_provisioned_requires_source() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "es256k"
+            mode = "provisioned"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exactly one of"),
+            "expected xor error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_self_generated_rejects_source() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "es256k"
+            mode = "self_generated"
+            file = "/tmp/key"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must not set"),
+            "expected rejection, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_resolve_errors_on_self_generated() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+            "#,
+        )
+        .unwrap();
+        let spec = config.keys.get("gas").unwrap();
+        let err = spec.resolve("gas").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot resolve a self_generated key"),
+            "expected resolve error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn target_unknown_chain_reference_errors() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            chain = "nonexistent"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown chain 'nonexistent'"),
+            "expected chain ref error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn publish_owner_key_must_be_provisioned() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [publish]
+            owner_key = "gas"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be mode = \"provisioned\""),
+            "expected provisioned error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn publish_relay_key_reference_validated() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            relay_key = "missing"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown key 'missing'"),
+            "expected ref error, got: {err:#}"
+        );
+    }
+
+    // ── legacy field rejection ──────────────────────────────────
+
+    #[test]
+    fn legacy_publish_rpc_url_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            rpc_url = "https://old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[publish] rpc_url"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_publish_relay_key_file_points_to_relay_key() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            relay_key_file = "/tmp/old_relay"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("relay_key_file"), "expected field name in error: {msg}");
+        assert!(msg.contains("relay_key"), "expected relay_key hint in error: {msg}");
+    }
+
+    #[test]
+    fn legacy_cloud_rpc_url_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud]
+            rpc_url = "https://old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[cloud] rpc_url"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_cloud_target_owner_key_file_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            chain = "c"
+            owner_key = "o"
+            gas_wallet = "g"
+            owner_key_file = "/old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("owner_key_file"),
+            "expected migration hint, got: {err:#}"
+        );
     }
 }

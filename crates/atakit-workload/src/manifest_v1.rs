@@ -218,3 +218,45 @@ fn convert_encryption_v1(v1: &ManifestDiskEncryptionV1) -> Option<ManifestDiskEn
         bind,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_to_current_injects_portal_ports() {
+        let toml_str = r#"
+            [meta]
+            format = 1
+            name = "old-wl"
+            version = "v0.0.1"
+
+            [config]
+            image = "old-wl:v0.0.1"
+            base-image-mode = "blacklist"
+            ports = ["3000:3000"]
+            restart = "no"
+
+            [hashes]
+        "#;
+        let v1: ManifestV1 = toml::from_str(toml_str).unwrap();
+        let manifest = convert_to_current(v1);
+
+        let port_set: std::collections::HashSet<(u16, &str)> = manifest
+            .config
+            .firewall_ports
+            .iter()
+            .map(|fp| (fp.port, fp.protocol.as_str()))
+            .collect();
+
+        // Portal ports injected even though the v1 manifest had none.
+        assert!(port_set.contains(&(1024, "tcp")));
+        assert!(port_set.contains(&(1024, "udp")));
+        assert!(port_set.contains(&(2024, "tcp")));
+        assert!(port_set.contains(&(2024, "udp")));
+        assert_eq!(manifest.config.firewall_ports.len(), 4);
+        // Sorted by port then protocol.
+        let ports: Vec<u16> = manifest.config.firewall_ports.iter().map(|fp| fp.port).collect();
+        assert!(ports.windows(2).all(|w| w[0] <= w[1]));
+    }
+}
