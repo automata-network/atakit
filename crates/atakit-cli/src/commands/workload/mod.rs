@@ -175,6 +175,34 @@ pub fn resolve_owner_key(
         .ok_or_else(|| anyhow::anyhow!("owner key required: use --owner-key or [publish] owner_key in config"))?;
     let key_spec = config.keys.get(key_name)
         .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
+    if key_spec.key_type != crate::config::KeyType::Es256k {
+        anyhow::bail!(
+            "key '{key_name}' has type {}; on-chain workload commands require es256k",
+            key_spec.key_type
+        );
+    }
+    key_spec.resolve(key_name)
+}
+
+/// Resolve relay key for on-chain workload commands.
+///
+/// Precedence: `cli_relay_key` > `config.publish.relay_key`. Looks up
+/// the name in `config.keys` and resolves the private key.
+pub fn resolve_relay_key(
+    cli_relay_key: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let key_name = cli_relay_key
+        .or(config.publish.relay_key.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("relay key required: use --relay-key or [publish] relay_key in config"))?;
+    let key_spec = config.keys.get(key_name)
+        .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
+    if key_spec.key_type != crate::config::KeyType::Es256k {
+        anyhow::bail!(
+            "key '{key_name}' has type {}; on-chain workload commands require es256k",
+            key_spec.key_type
+        );
+    }
     key_spec.resolve(key_name)
 }
 

@@ -106,6 +106,7 @@
 [publish]
 # chain = "mainnet"
 # owner_key = "owner"
+# relay_key = "relayer"
 
 # ─── Workload repositories ────────────────────────────────────────────
 #

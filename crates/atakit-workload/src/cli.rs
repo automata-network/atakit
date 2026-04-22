@@ -90,6 +90,9 @@ pub struct DeactivateArgs {
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
+    /// Relay key name for transaction submission (references [keys.<name>])
+    #[arg(long)]
+    pub relay_key: Option<String>,
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
@@ -112,6 +115,9 @@ pub struct PublishArgs {
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
+    /// Relay key name for transaction submission (references [keys.<name>])
+    #[arg(long)]
+    pub relay_key: Option<String>,
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,

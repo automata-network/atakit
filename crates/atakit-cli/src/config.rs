@@ -552,14 +552,15 @@ impl KeySpec {
 
     /// Lazily resolve this key to a private key string.
     ///
-    /// Only valid for `mode = provisioned`. Panics if called on
-    /// `self_generated` (caller must check mode first).
+    /// Only valid for `mode = provisioned`. Returns an error if called
+    /// on a `self_generated` key.
     pub fn resolve(&self, name: &str) -> Result<String> {
-        assert_eq!(
-            self.mode,
-            KeyMode::Provisioned,
-            "resolve() called on self_generated key '{name}'"
-        );
+        if self.mode != KeyMode::Provisioned {
+            bail!(
+                "key '{name}': cannot resolve a self_generated key; \
+                 it must be mode = \"provisioned\" with a file/command/env source"
+            );
+        }
         if let Some(ref path) = self.file {
             return read_key_file(path).with_context(|| {
                 format!("key '{name}': failed to read key from `{path}`")
@@ -616,6 +617,9 @@ pub struct PublishConfig {
     pub chain: Option<String>,
     /// Owner key name (references a key in `[keys]`, must be provisioned).
     pub owner_key: Option<String>,
+    /// Relay key name (references a key in `[keys]`, must be provisioned).
+    /// Used for submitting on-chain transactions (pays gas).
+    pub relay_key: Option<String>,
 }
 
 // ── [workload] section ─────────────────────────────────────────────
@@ -1034,6 +1038,23 @@ impl Config {
                 if spec.mode != KeyMode::Provisioned {
                     bail!(
                         "[publish]: owner_key '{key}' must be \
+                         mode = \"provisioned\""
+                    );
+                }
+            }
+        }
+        if let Some(ref key) = self.publish.relay_key {
+            if !self.keys.contains_key(key) {
+                bail!(
+                    "[publish] references unknown key '{key}' for \
+                     relay_key; defined: [{}]",
+                    key_names.join(", ")
+                );
+            }
+            if let Some(ref spec) = self.keys.get(key) {
+                if spec.mode != KeyMode::Provisioned {
+                    bail!(
+                        "[publish]: relay_key '{key}' must be \
                          mode = \"provisioned\""
                     );
                 }
