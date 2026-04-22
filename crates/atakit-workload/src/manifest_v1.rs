@@ -177,7 +177,25 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             environment: v1.config.environment,
             disks: v1.config.disks,
             dependencies,
-            firewall_ports: v1.config.firewall_ports,
+            firewall_ports: {
+                // Inject always-allowed portal ports so v1 manifests
+                // get the same firewall behavior as v2 manifests.
+                use std::collections::HashSet;
+                let mut open: HashSet<(u16, String)> = v1.config.firewall_ports
+                    .iter()
+                    .map(|fp| (fp.port, fp.protocol.clone()))
+                    .collect();
+                for port in [1024, 2024] {
+                    open.insert((port, "tcp".to_string()));
+                    open.insert((port, "udp".to_string()));
+                }
+                let mut ports: Vec<ManifestFirewallPort> = open
+                    .into_iter()
+                    .map(|(port, protocol)| ManifestFirewallPort { port, protocol })
+                    .collect();
+                ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+                ports
+            },
             baby_container: v1.config.baby_container,
             boot_disk_size: v1.config.boot_disk_size,
         },

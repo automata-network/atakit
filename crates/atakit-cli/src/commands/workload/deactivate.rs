@@ -41,12 +41,14 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     );
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
-    // Use owner key as relay key for transaction submission.
+    // Resolve relay key for transaction submission.
+    let relay_key_raw = super::resolve_relay_key(args.relay_key.as_deref(), config)?;
+    let relay_key_hex = relay_key_raw.strip_prefix("0x").unwrap_or(&relay_key_raw);
     let relay_key = {
-        let bytes: [u8; 32] = hex::decode(private_key_hex)
-            .context("invalid owner key hex for relay")?
+        let bytes: [u8; 32] = hex::decode(relay_key_hex)
+            .context("invalid relay key hex")?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("owner key must be 32 bytes"))?;
+            .map_err(|_| anyhow::anyhow!("relay key must be 32 bytes"))?;
         alloy_ext::core::primitives::B256::from(bytes)
     };
 
