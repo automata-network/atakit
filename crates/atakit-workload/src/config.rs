@@ -19,8 +19,6 @@ pub struct WorkloadConfig {
     #[serde(default, rename = "baby-container")]
     pub baby_container: Option<BabyContainerSection>,
     #[serde(default)]
-    pub signing: Option<SigningSection>,
-    #[serde(default)]
     pub disks: BTreeMap<String, DiskSection>,
 }
 
@@ -32,7 +30,17 @@ impl WorkloadConfig {
             path: path.clone(),
             source: e,
         })?;
+        check_legacy_fields(&content)?;
         toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })
+    }
+
+    /// Parse from a TOML string. Runs legacy field checks.
+    pub fn load_from_str(content: &str) -> Result<Self, WorkloadError> {
+        check_legacy_fields(content)?;
+        toml::from_str(content).map_err(|e| WorkloadError::ParseConfig {
+            path: CONFIG_FILENAME.into(),
+            source: e,
+        })
     }
 
     /// Resolve disk indices: auto-assign starting from 10 for disks without
@@ -88,8 +96,11 @@ pub struct WorkloadSection {
     pub env_file: Option<StringOrArray>,
     #[serde(default = "default_ttl")]
     pub ttl: u64,
-    #[serde(default)]
-    pub cvm_agent: bool,
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    /// GID sharing group. Default: workload name.
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
     #[serde(default, rename = "measured-data")]
     pub measured_data: Vec<String>,
     #[serde(default, rename = "unmeasured-data")]
@@ -223,6 +234,11 @@ pub struct DependencySection {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    /// GID sharing group. Default: workload name.
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
@@ -364,15 +380,6 @@ fn default_max_count() -> u32 {
     1
 }
 
-/// Image signing / verification settings.
-#[derive(Debug, Deserialize)]
-pub struct SigningSection {
-    #[serde(default)]
-    pub enable: bool,
-    pub auth_info: Option<String>,
-    pub policy: Option<String>,
-}
-
 /// Persistent disk definition.
 #[derive(Debug, Deserialize)]
 pub struct DiskSection {
@@ -389,15 +396,77 @@ pub struct DiskSection {
 #[derive(Debug, Deserialize)]
 pub struct EncryptionSection {
     #[serde(default)]
-    pub enable: bool,
-    #[serde(default = "default_key_security")]
-    pub key_security: String,
+    pub unlock_method: Vec<String>,
+    #[serde(default)]
+    pub bind: Vec<String>,
 }
 
-fn default_key_security() -> String {
-    "standard".to_string()
-}
 
+/// Reject deprecated format-1 fields before serde parsing, with migration hints.
+fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
+    let value: toml::Value = match toml::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // defer to real parser for syntax errors
+    };
+
+    if let Some(fmt) = value.get("format").and_then(|v| v.as_integer()) {
+        if fmt == 1 {
+            return Err(WorkloadError::Validation(
+                "format = 1 is no longer supported. Update to format = 2 \
+                 and apply the v2 migration changes (cvm_agent -> atakit-portal, \
+                 encryption schema, signing removal)."
+                    .into(),
+            ));
+        }
+    }
+
+    if let Some(workload) = value.get("workload").and_then(|v| v.as_table()) {
+        if workload.contains_key("cvm_agent") {
+            return Err(WorkloadError::Validation(
+                "`cvm_agent` is no longer supported in format 2. \
+                 Rename to `atakit-portal`."
+                    .into(),
+            ));
+        }
+    }
+
+    if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
+        for (name, dep) in deps {
+            if let Some(t) = dep.as_table() {
+                if t.contains_key("cvm_agent") {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `cvm_agent` is no longer supported. \
+                         Rename to `atakit-portal`."
+                    )));
+                }
+            }
+        }
+    }
+
+    if value.get("signing").is_some() {
+        return Err(WorkloadError::Validation(
+            "`[signing]` is no longer supported in format 2. \
+             Remove the signing section."
+                .into(),
+        ));
+    }
+
+    if let Some(disks) = value.get("disks").and_then(|v| v.as_table()) {
+        for (name, disk) in disks {
+            if let Some(enc) = disk.get("encryption").and_then(|v| v.as_table()) {
+                if enc.contains_key("enable") || enc.contains_key("key_security") {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?}: encryption schema has changed in format 2. \
+                         Replace {{enable, key_security}} with \
+                         {{unlock_method, bind}}."
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -406,7 +475,7 @@ mod tests {
     #[test]
     fn parse_minimal_config() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "my-app"
@@ -423,7 +492,7 @@ image = "my-app:latest"
     #[test]
     fn parse_build_image() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -448,7 +517,7 @@ image = { build = ".", containerfile = "Containerfile" }
     #[test]
     fn parse_file_image() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -463,7 +532,7 @@ image = { file = "./images/app.tar" }
     #[test]
     fn parse_full_config() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "secure-signer"
@@ -473,7 +542,8 @@ base-image = ["mola-linux:v0.1.0-debug"]
 image = { build = ".", containerfile = "Containerfile" }
 ports = ["3000:3000"]
 restart = "unless-stopped"
-cvm_agent = true
+atakit-portal = true
+gid-group = "shared"
 measured-data = ["./config/hello", "./config/cert.pem"]
 unmeasured-data = ["./additional-data/signer_key"]
 
@@ -493,35 +563,33 @@ allow = [{ port = 4000, protocol = "tcp" }]
 allow = true
 max_count = 2
 
-[signing]
-enable = true
-auth_info = "./secrets/auth_info.json"
-policy = "./config/cosign_policy.json"
-
 [disks.data]
 index = 10
 size = "10GB"
 bind_fs = true
-encryption = { enable = true }
+encryption = { unlock_method = ["tpm"], bind = ["workload"] }
 
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.workload.name, "secure-signer");
         assert_eq!(cfg.workload.ports, vec!["3000:3000"]);
-        assert!(cfg.workload.cvm_agent);
+        assert!(cfg.workload.atakit_portal);
+        assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
         assert_eq!(cfg.workload.measured_data.len(), 2);
         assert!(cfg.dependencies.contains_key("redis"));
         assert!(cfg.firewall.is_some());
         assert!(cfg.baby_container.is_some());
-        assert!(cfg.signing.is_some());
         assert!(cfg.disks.contains_key("data"));
         assert_eq!(cfg.disks["data"].index, Some(10));
+        let enc = cfg.disks["data"].encryption.as_ref().unwrap();
+        assert_eq!(enc.unlock_method, vec!["tpm"]);
+        assert_eq!(enc.bind, vec!["workload"]);
     }
 
     #[test]
     fn rejects_build_and_file_together() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -536,7 +604,7 @@ image = { build = ".", file = "./app.tar" }
     #[test]
     fn string_or_array_single() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -555,7 +623,7 @@ command = "echo hello"
     #[test]
     fn string_or_array_array() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -569,5 +637,74 @@ command = ["echo", "hello"]
             Some(StringOrArray::Array(v)) => assert_eq!(v, &["echo", "hello"]),
             other => panic!("expected Array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_format_1() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("format = 1"));
+    }
+
+    #[test]
+    fn rejects_cvm_agent() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+cvm_agent = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("cvm_agent"));
+    }
+
+    #[test]
+    fn rejects_signing_section() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[signing]
+enable = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("signing"));
+    }
+
+    #[test]
+    fn rejects_old_encryption_schema() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { enable = true }
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("encryption schema"));
     }
 }

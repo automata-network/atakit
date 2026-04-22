@@ -3,10 +3,10 @@
 # This file defines a single workload: its container image, runtime config,
 # data mounts, on-chain parameters, and optional sidecars. Running
 # `atakit workload build` compiles it into a deterministic .atawl archive
-# containing manifest.toml + images + measured-data.
+# containing manifest.json + images + measured-data.
 
-# Schema version. Must be 1.
-format = 1
+# Schema version. Must be 2.
+format = 2
 
 [workload]
 # Workload identity. The on-chain workload ID is derived from name + version
@@ -74,9 +74,14 @@ image = "{{name}}:latest"
 # entrypoint: override the container ENTRYPOINT. String or array.
 # entrypoint = ["/app/entrypoint.sh"]
 #
-# cvm_agent: mount the CVM agent Unix socket into the container.
+# atakit-portal: mount the atakit-portal Unix socket into the container.
 # Required for workloads that communicate with the host agent.
-# cvm_agent = true
+# atakit-portal = true
+#
+# gid-group: controls GID sharing between containers. Services with the
+# same gid-group share a host GID; services with different values get
+# isolated GIDs. Default: workload name.
+# gid-group = "my-group"
 
 # ── environment variables ────────────────────────────────────────
 #
@@ -161,22 +166,6 @@ image = "{{name}}:latest"
 # allow = true
 # max_count = 2                         # max concurrent baby containers (default: 1)
 
-# ── image signing ────────────────────────────────────────────────
-#
-# Cosign-based container image signature verification. When enabled, the
-# CVM agent verifies the workload image signature before running it.
-#
-# Both auth_info and policy files must start with "./" and are copied into
-# measured-data/signing/ in the archive -- they ARE part of PCR23.
-#
-# auth_info: JSON file with registry credentials for signature verification.
-# policy: cosign verification policy file.
-#
-# [signing]
-# enable = true
-# auth_info = "./secrets/auth_info.json"
-# policy = "./config/cosign_policy.json"
-
 # ── persistent disks ─────────────────────────────────────────────
 #
 # Define persistent disks that survive container restarts. Referenced by
@@ -187,12 +176,12 @@ image = "{{name}}:latest"
 #        Auto-assigned from 10 in alphabetical order if omitted.
 # size: disk size with unit suffix. Valid units: MB, GB, TB.
 # bind_fs: use bindfs for UID translation (default: false).
-# encryption.enable: encrypt the disk at rest (default: false).
-# encryption.key_security: "standard" (default) or "strong".
+# encryption.unlock_method: list of unlock methods ("tpm", "passphrase",
+#   "keyfile", "kms"). Empty list means no encryption.
+# encryption.bind: list of PCR bindings ("platform", "baseimage", "workload").
 #
 # [disks.my-disk]
 # index = 10
 # size = "10GB"
 # bind_fs = true
-# encryption = { enable = true }
-# encryption = { enable = true, key_security = "strong" }
+# encryption = { unlock_method = ["tpm"], bind = ["workload"] }

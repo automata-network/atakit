@@ -8,6 +8,7 @@ pub mod hash;
 pub mod image;
 pub mod inspect;
 pub mod manifest;
+pub mod manifest_v1;
 pub mod repository;
 mod scaffold;
 pub mod store;
@@ -25,4 +26,4 @@ pub use scaffold::create_workload;
 pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
 
 /// Current format version for `atakit-workload.toml` and `manifest.toml`.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;

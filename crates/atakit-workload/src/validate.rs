@@ -52,11 +52,26 @@ pub fn validate_config(
     let w = &config.workload;
 
     // ── format version ───────────────────────────────────
+    if config.format < 2 {
+        return Err(WorkloadError::Validation(format!(
+            "atakit-workload.toml format version {} is no longer supported; update to format = 2",
+            config.format
+        )));
+    }
     if config.format > crate::FORMAT_VERSION {
         return Err(WorkloadError::Validation(format!(
             "atakit-workload.toml format version {} is newer than supported ({}); upgrade atakit",
             config.format, crate::FORMAT_VERSION
         )));
+    }
+
+    // ── gid-group ────────────────────────────────────────
+    if let Some(ref gg) = w.gid_group {
+        if gg.is_empty() {
+            return Err(WorkloadError::Validation(
+                "gid-group must not be empty when specified".into(),
+            ));
+        }
     }
 
     // ── name ──────────────────────────────────────────────
@@ -237,52 +252,6 @@ pub fn validate_config(
         }
     }
 
-    // ── signing ───────────────────────────────────────────
-    if let Some(ref signing) = config.signing {
-        if signing.enable {
-            let auth = signing
-                .auth_info
-                .as_ref()
-                .ok_or_else(|| {
-                    WorkloadError::Validation(
-                        "signing.auth_info is required when signing is enabled".into(),
-                    )
-                })?;
-            let policy = signing
-                .policy
-                .as_ref()
-                .ok_or_else(|| {
-                    WorkloadError::Validation(
-                        "signing.policy is required when signing is enabled".into(),
-                    )
-                })?;
-
-            if !auth.starts_with("./") {
-                return Err(WorkloadError::Validation(
-                    "signing.auth_info must start with \"./\"".into(),
-                ));
-            }
-            if !policy.starts_with("./") {
-                return Err(WorkloadError::Validation(
-                    "signing.policy must start with \"./\"".into(),
-                ));
-            }
-            ensure_no_traversal(auth, "signing.auth_info")?;
-            ensure_no_traversal(policy, "signing.policy")?;
-
-            let auth_path = workload_dir.join(auth);
-            if !auth_path.exists() {
-                return Err(WorkloadError::SigningFileMissing(auth_path));
-            }
-            ensure_within(&auth_path, workload_dir, "signing.auth_info")?;
-            let policy_path = workload_dir.join(policy);
-            if !policy_path.exists() {
-                return Err(WorkloadError::SigningFileMissing(policy_path));
-            }
-            ensure_within(&policy_path, workload_dir, "signing.policy")?;
-        }
-    }
-
     // ── boot-disk-size ─────────────────────────────────────
     if let Some(ref bds) = w.boot_disk_size {
         if !is_valid_size(bds) {
@@ -362,10 +331,21 @@ pub fn validate_config(
                 }
             }
             if let Some(ref enc) = disk.encryption {
-                if enc.enable && enc.key_security != "standard" && enc.key_security != "strong" {
-                    return Err(WorkloadError::Validation(format!(
-                        "disk {name:?} encryption.key_security must be \"standard\" or \"strong\""
-                    )));
+                let valid_unlock = ["tpm", "passphrase", "keyfile", "kms"];
+                for method in &enc.unlock_method {
+                    if !valid_unlock.contains(&method.as_str()) {
+                        return Err(WorkloadError::Validation(format!(
+                            "disk {name:?} encryption.unlock_method contains unknown method: {method:?}"
+                        )));
+                    }
+                }
+                let valid_bind = ["platform", "baseimage", "workload"];
+                for b in &enc.bind {
+                    if !valid_bind.contains(&b.as_str()) {
+                        return Err(WorkloadError::Validation(format!(
+                            "disk {name:?} encryption.bind contains unknown binding: {b:?}"
+                        )));
+                    }
                 }
             }
         }
@@ -440,6 +420,15 @@ pub fn validate_config(
                     return Err(WorkloadError::EnvFileMissing(abs));
                 }
                 ensure_within(&abs, workload_dir, &format!("dependencies.{dep_name}.env_file"))?;
+            }
+        }
+
+        // gid-group validation.
+        if let Some(ref gg) = dep.gid_group {
+            if gg.is_empty() {
+                return Err(WorkloadError::Validation(format!(
+                    "dependencies.{dep_name}.gid-group must not be empty when specified"
+                )));
             }
         }
 
@@ -606,7 +595,7 @@ mod tests {
 
     fn minimal_toml() -> &'static str {
         r#"
-format = 1
+format = 2
 
 [workload]
 name = "my-app"
@@ -627,7 +616,7 @@ image = "my-app:latest"
     #[test]
     fn rejects_bad_name() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "-bad"
@@ -643,7 +632,7 @@ image = "x:latest"
     #[test]
     fn rejects_bad_version() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -659,7 +648,7 @@ image = "x:latest"
     #[test]
     fn rejects_bad_base_image_mode() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -675,7 +664,7 @@ image = "x:latest"
     #[test]
     fn rejects_missing_measured_data() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -695,7 +684,7 @@ measured-data = ["./does-not-exist"]
     #[test]
     fn accepts_dependencies() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -715,7 +704,7 @@ image = "redis:7"
     #[test]
     fn rejects_duplicate_host_port() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -737,7 +726,7 @@ ports = ["3000:6379"]
     #[test]
     fn rejects_invalid_depends_on() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -758,7 +747,7 @@ depends_on = ["nonexistent"]
     #[test]
     fn rejects_dependency_undefined_disk_ref() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -779,31 +768,9 @@ missing-disk = "/data"
     }
 
     #[test]
-    fn rejects_signing_without_dot_slash() {
-        let toml = r#"
-format = 1
-
-[workload]
-name = "app"
-version = "v0.0.1"
-base-image-mode = "blacklist"
-image = "x:latest"
-
-[signing]
-enable = true
-auth_info = "secrets/auth_info.json"
-policy = "./config/policy.json"
-"#;
-        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("signing.auth_info must start with"));
-    }
-
-    #[test]
     fn rejects_invalid_disk_size() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -824,7 +791,7 @@ size = "big"
     #[test]
     fn accepts_valid_disk_sizes() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -852,7 +819,7 @@ size = "1TB"
     #[test]
     fn rejects_disk_index_below_10() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -873,7 +840,7 @@ size = "10GB"
     #[test]
     fn rejects_duplicate_disk_index() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -898,7 +865,7 @@ size = "5GB"
     #[test]
     fn allows_disk_shared_between_containers() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -927,7 +894,7 @@ size = "10GB"
     #[test]
     fn warns_redundant_firewall_allow() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -948,7 +915,7 @@ allow = [{ port = 3000, protocol = "tcp" }]
     #[test]
     fn warns_unmatched_firewall_deny() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -969,7 +936,7 @@ deny = [9999]
     #[test]
     fn no_warning_for_matched_firewall_deny() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -990,7 +957,7 @@ deny = [3000]
     #[test]
     fn rejects_undefined_disk_ref() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1009,7 +976,7 @@ missing-disk = "/data"
     #[test]
     fn rejects_measured_data_traversal() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1027,7 +994,7 @@ measured-data = ["./../etc/passwd"]
     #[test]
     fn rejects_unmeasured_data_traversal() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1045,7 +1012,7 @@ unmeasured-data = ["./../secrets"]
     #[test]
     fn rejects_image_build_traversal() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1062,7 +1029,7 @@ image = { build = "../other-project" }
     #[test]
     fn rejects_image_file_traversal() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1081,7 +1048,7 @@ image = { file = "./../stolen.tar" }
         for bad in &["3000", "abc:3000", "3000:xyz", "3000:3000/sctp", "80:80:80"] {
             let toml = format!(
                 r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1103,7 +1070,7 @@ ports = ["{bad}"]
     #[test]
     fn accepts_valid_port_specs() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1120,7 +1087,7 @@ ports = ["3000:3000", "8080:80/tcp", "5353:5353/udp"]
     #[test]
     fn rejects_env_file_traversal() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"
@@ -1138,7 +1105,7 @@ env_file = "./../etc/shadow"
     #[test]
     fn rejects_env_file_without_dot_slash() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "app"

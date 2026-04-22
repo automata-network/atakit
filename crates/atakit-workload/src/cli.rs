@@ -84,18 +84,12 @@ pub struct DeactivateArgs {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
-    /// Owner private key hex for signing transactions
+    pub chain: Option<String>,
+    /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
-    /// Relay private key hex for submitting transactions
-    #[arg(long)]
-    pub relay_key: Option<String>,
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
@@ -112,18 +106,12 @@ pub struct PublishArgs {
     /// Workload directory (alternative to archive)
     #[arg(short, long, conflicts_with = "archive")]
     pub dir: Option<PathBuf>,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
-    /// Owner private key hex for signing transactions
+    pub chain: Option<String>,
+    /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
-    /// Relay private key hex for submitting transactions
-    #[arg(long)]
-    pub relay_key: Option<String>,
     /// Signature expiration offset in seconds
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
@@ -146,12 +134,9 @@ pub struct PublishArgs {
 pub struct SpecArgs {
     /// Workload ID (hex bytes32, with or without 0x prefix)
     pub id: String,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub chain: Option<String>,
 }
 
 /// Arguments for `workload ls`.
@@ -237,12 +222,9 @@ pub struct ExportArgs {
 pub struct AddArgs {
     /// Workload reference (name:version or 0x<workload_id>), or path to .atawl file
     pub reference: String,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub chain: Option<String>,
     /// Force overwrite if already in store
     #[arg(long)]
     pub force: bool,

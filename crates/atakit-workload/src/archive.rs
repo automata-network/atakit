@@ -57,23 +57,6 @@ impl StagingDir {
         Ok(count)
     }
 
-    /// Copy signing files into `measured-data/signing/`.
-    pub fn stage_signing_files(
-        &self,
-        auth_info_src: &Path,
-        policy_src: &Path,
-    ) -> Result<(), WorkloadError> {
-        let signing_dir = self.measured_dir.join("signing");
-        std::fs::create_dir_all(&signing_dir).map_err(|e| WorkloadError::CreateDir {
-            path: signing_dir.clone(),
-            source: e,
-        })?;
-
-        copy_file(auth_info_src, &signing_dir.join("auth_info.json"))?;
-        copy_file(policy_src, &signing_dir.join("cosign_policy.json"))?;
-        Ok(())
-    }
-
     /// Copy or link a pre-existing image tar file into `images/`.
     pub fn stage_image_file(
         &self,
@@ -89,9 +72,9 @@ impl StagingDir {
         self.images_dir.join(tar_name)
     }
 
-    /// Write manifest.toml to the staging directory.
+    /// Write manifest.json to the staging directory.
     pub fn write_manifest(&self, content: &str) -> Result<(), WorkloadError> {
-        let path = self.root.join("manifest.toml");
+        let path = self.root.join("manifest.json");
         std::fs::write(&path, content).map_err(|e| WorkloadError::WriteFile {
             path,
             source: e,
@@ -236,7 +219,7 @@ fn append_dir_deterministic<W: std::io::Write>(
         .map_err(WorkloadError::Io)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(WorkloadError::Io)?;
-    // Sort files before directories (so manifest.toml precedes images/),
+    // Sort files before directories (so manifest.json precedes images/),
     // then alphabetically within each group.
     entries.sort_by(|a, b| {
         let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
@@ -374,7 +357,7 @@ mod tests {
     fn create_archive_produces_file() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = StagingDir::create(tmp.path(), "test-app").unwrap();
-        std::fs::write(staging.root.join("manifest.toml"), "[meta]\n").unwrap();
+        std::fs::write(staging.root.join("manifest.json"), "{\"meta\":{}}").unwrap();
         std::fs::write(staging.images_dir.join("test-app.tar"), "fake tar").unwrap();
 
         let out_dir = tempfile::tempdir().unwrap();
