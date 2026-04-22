@@ -1,41 +1,24 @@
 use std::io::{self, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use atakit_core::Env;
 use atakit_workload::cli::DeactivateArgs;
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, looks_like_store_ref};
+use super::{compute_workload_id, looks_like_store_ref, resolve_chain, resolve_owner_key};
 use crate::config::Config;
 
 pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
-    // Resolve RPC URL and session registry from args, config, or env
-    let rpc_url = args
-        .rpc_url.clone()
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-        ))?;
-
-    let session_registry_str = args
-        .session_registry.clone()
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-        ))?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+        chain.session_registry.parse().context("invalid session registry address")?;
 
-    // Resolve owner private key: CLI arg > key file from config
-    let private_key_raw = match args.owner_key.clone() {
-        Some(k) => k,
-        None => match config.publish.owner_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("owner key required: use --owner-key or set publish.owner_key_file in config"),
-        },
-    };
+    // Resolve owner private key from [keys].
+    let private_key_raw = resolve_owner_key(args.owner_key.as_deref(), config)?;
     let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
     let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
         .parse()
@@ -58,20 +41,12 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     );
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
-    // Resolve relay key: CLI arg > key file from config
-    let relay_key_raw = match args.relay_key.clone() {
-        Some(k) => k,
-        None => match config.publish.relay_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("relay key required: use --relay-key or set publish.relay_key_file in config"),
-        },
-    };
-    let relay_key_hex = relay_key_raw.strip_prefix("0x").unwrap_or(&relay_key_raw);
+    // Use owner key as relay key for transaction submission.
     let relay_key = {
-        let bytes: [u8; 32] = hex::decode(relay_key_hex)
-            .context("invalid relay key hex")?
+        let bytes: [u8; 32] = hex::decode(private_key_hex)
+            .context("invalid owner key hex for relay")?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("relay key must be 32 bytes"))?;
+            .map_err(|_| anyhow::anyhow!("owner key must be 32 bytes"))?;
         alloy_ext::core::primitives::B256::from(bytes)
     };
 

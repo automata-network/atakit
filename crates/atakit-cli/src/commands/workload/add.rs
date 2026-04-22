@@ -5,7 +5,7 @@ use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, parse_workload_ref, WorkloadRef};
+use super::{compute_workload_id, parse_workload_ref, resolve_chain, WorkloadRef};
 use crate::config::Config;
 
 pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
@@ -81,27 +81,12 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         }
     }
 
-    // Resolve RPC URL and session registry
-    let rpc_url = args
-        .rpc_url
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-            )
-        })?;
-
-    let session_registry_str = args
-        .session_registry
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-            )
-        })?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+        chain.session_registry.parse().context("invalid session registry address")?;
 
     // Query on-chain
     let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {

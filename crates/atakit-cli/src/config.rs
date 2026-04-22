@@ -27,6 +27,8 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub chains: IndexMap<String, ChainConfig>,
+    pub keys: IndexMap<String, KeySpec>,
     pub image: ImageConfig,
     pub github: GithubConfig,
     pub build: BuildConfig,
@@ -397,6 +399,197 @@ fn resolve_command(
     Ok(token)
 }
 
+// ── [chains] section ──────────────────────────────────────────────
+
+/// A named chain configuration: `[chains.<name>]`.
+///
+/// ```toml
+/// [chains.mainnet]
+/// rpc_url = "https://..."
+/// session_registry = "0x..."
+/// session_ttl_seconds = 3600
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainConfig {
+    pub rpc_url: String,
+    pub session_registry: String,
+    /// Derived from `session_registry` via on-chain call if omitted.
+    pub workload_registry: Option<String>,
+    /// Derived from `session_registry` via on-chain call if omitted.
+    pub base_image_registry: Option<String>,
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_seconds: u64,
+}
+
+fn default_session_ttl() -> u64 {
+    3600
+}
+
+// ── [keys] section ───────────────────────────────────────────────
+
+/// Key algorithm type, matching on-chain `PublicIdentity.typeId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyType {
+    Es256k,
+    Es256,
+    Rs256,
+}
+
+impl std::fmt::Display for KeyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyType::Es256k => write!(f, "es256k"),
+            KeyType::Es256 => write!(f, "es256"),
+            KeyType::Rs256 => write!(f, "rs256"),
+        }
+    }
+}
+
+/// Key provisioning mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyMode {
+    /// Operator provides the private key via file/command/env.
+    Provisioned,
+    /// Portal generates the key at init time.
+    SelfGenerated,
+}
+
+impl std::fmt::Display for KeyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyMode::Provisioned => write!(f, "provisioned"),
+            KeyMode::SelfGenerated => write!(f, "self_generated"),
+        }
+    }
+}
+
+/// A named key configuration: `[keys.<name>]`.
+///
+/// ```toml
+/// [keys.owner]
+/// type = "es256k"
+/// mode = "provisioned"
+/// file = "~/.config/atakit/owner.key"
+///
+/// [keys.gas]
+/// type = "es256k"
+/// mode = "self_generated"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeySpec {
+    #[serde(rename = "type")]
+    pub key_type: KeyType,
+    pub mode: KeyMode,
+    /// Path to a file containing the private key. `~/` is expanded.
+    pub file: Option<String>,
+    /// Command to exec (no shell) whose stdout yields the key.
+    pub command: Option<Vec<String>>,
+    /// Name of an environment variable holding the key.
+    pub env: Option<String>,
+    /// Optional timeout for `command` keys, in seconds. Default: 30s.
+    pub timeout_secs: Option<u64>,
+}
+
+impl KeySpec {
+    /// Eager validation at config-load time.
+    ///
+    /// - `mode = provisioned`: exactly one of file/command/env must be set.
+    /// - `mode = self_generated`: all of file/command/env/timeout_secs must be None.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let set_count = [self.file.is_some(), self.command.is_some(), self.env.is_some()]
+            .into_iter()
+            .filter(|b| *b)
+            .count();
+
+        match self.mode {
+            KeyMode::Provisioned => {
+                match set_count {
+                    0 => bail!(
+                        "key '{name}': mode = \"provisioned\" requires exactly one of \
+                         `file`, `command`, `env`"
+                    ),
+                    1 => {}
+                    _ => bail!(
+                        "key '{name}': sets more than one of `file` / `command` / `env`; pick one"
+                    ),
+                }
+            }
+            KeyMode::SelfGenerated => {
+                if set_count > 0 {
+                    bail!(
+                        "key '{name}': mode = \"self_generated\" must not set \
+                         `file`, `command`, or `env`"
+                    );
+                }
+                if self.timeout_secs.is_some() {
+                    bail!(
+                        "key '{name}': mode = \"self_generated\" must not set `timeout_secs`"
+                    );
+                }
+            }
+        }
+
+        if self.timeout_secs.is_some() && self.command.is_none() {
+            bail!(
+                "key '{name}': `timeout_secs` is only valid with `command`"
+            );
+        }
+        if let Some(0) = self.timeout_secs {
+            bail!("key '{name}': `timeout_secs` must be greater than 0");
+        }
+        if let Some(ref cmd) = self.command {
+            if cmd.is_empty() {
+                bail!("key '{name}': `command` must not be empty");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Lazily resolve this key to a private key string.
+    ///
+    /// Only valid for `mode = provisioned`. Panics if called on
+    /// `self_generated` (caller must check mode first).
+    pub fn resolve(&self, name: &str) -> Result<String> {
+        assert_eq!(
+            self.mode,
+            KeyMode::Provisioned,
+            "resolve() called on self_generated key '{name}'"
+        );
+        if let Some(ref path) = self.file {
+            return read_key_file(path).with_context(|| {
+                format!("key '{name}': failed to read key from `{path}`")
+            });
+        }
+        if let Some(ref env_name) = self.env {
+            return match env::var(env_name) {
+                Ok(v) => {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() {
+                        Err(anyhow::anyhow!(
+                            "key '{name}': env var '{env_name}' is set but \
+                             empty or whitespace-only"
+                        ))
+                    } else {
+                        Ok(trimmed)
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "key '{name}': env var '{env_name}' is not set"
+                )),
+            };
+        }
+        if let Some(ref argv) = self.command {
+            return resolve_command(name, argv, self.timeout_secs);
+        }
+        bail!("key '{name}': no source set (internal error: validate not called)")
+    }
+}
+
 // ── [build] section ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -419,14 +612,10 @@ impl Default for BuildConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PublishConfig {
-    /// Default RPC URL for publish commands.
-    pub rpc_url: Option<String>,
-    /// Default session registry contract address.
-    pub session_registry: Option<String>,
-    /// Path to file containing the owner private key (hex).
-    pub owner_key_file: Option<String>,
-    /// Path to file containing the relay private key (hex).
-    pub relay_key_file: Option<String>,
+    /// Chain config name (references a key in `[chains]`).
+    pub chain: Option<String>,
+    /// Owner key name (references a key in `[keys]`, must be provisioned).
+    pub owner_key: Option<String>,
 }
 
 // ── [workload] section ─────────────────────────────────────────────
@@ -779,6 +968,78 @@ impl Config {
             spec.validate(name)?;
         }
 
+        // Every key must pass its own mode / xor checks.
+        for (name, spec) in &self.keys {
+            spec.validate(name)?;
+        }
+
+        // Cloud target chain/key references must point to defined entries.
+        let chain_names: Vec<&str> = self.chains.keys().map(|k| k.as_str()).collect();
+        let key_names: Vec<&str> = self.keys.keys().map(|k| k.as_str()).collect();
+        for (tname, target) in &self.cloud.targets {
+            if !self.chains.contains_key(&target.chain) {
+                bail!(
+                    "cloud target '{tname}' references unknown chain '{}'; \
+                     defined: [{}]",
+                    target.chain,
+                    chain_names.join(", ")
+                );
+            }
+            if !self.keys.contains_key(&target.owner_key) {
+                bail!(
+                    "cloud target '{tname}' references unknown key '{}' for \
+                     owner_key; defined: [{}]",
+                    target.owner_key,
+                    key_names.join(", ")
+                );
+            }
+            if let Some(ref spec) = self.keys.get(&target.owner_key) {
+                if spec.mode != KeyMode::Provisioned {
+                    bail!(
+                        "cloud target '{tname}': owner_key '{}' must be \
+                         mode = \"provisioned\"",
+                        target.owner_key
+                    );
+                }
+            }
+            if !self.keys.contains_key(&target.gas_wallet) {
+                bail!(
+                    "cloud target '{tname}' references unknown key '{}' for \
+                     gas_wallet; defined: [{}]",
+                    target.gas_wallet,
+                    key_names.join(", ")
+                );
+            }
+        }
+
+        // Publish chain/key references.
+        if let Some(ref chain) = self.publish.chain {
+            if !self.chains.contains_key(chain) {
+                bail!(
+                    "[publish] references unknown chain '{chain}'; \
+                     defined: [{}]",
+                    chain_names.join(", ")
+                );
+            }
+        }
+        if let Some(ref key) = self.publish.owner_key {
+            if !self.keys.contains_key(key) {
+                bail!(
+                    "[publish] references unknown key '{key}' for \
+                     owner_key; defined: [{}]",
+                    key_names.join(", ")
+                );
+            }
+            if let Some(ref spec) = self.keys.get(key) {
+                if spec.mode != KeyMode::Provisioned {
+                    bail!(
+                        "[publish]: owner_key '{key}' must be \
+                         mode = \"provisioned\""
+                    );
+                }
+            }
+        }
+
         // Every repository `credential` reference must name a defined
         // credential.
         let defined: Vec<&str> = self
@@ -845,16 +1106,8 @@ impl Config {
                 self.build.container_engine = v;
             }
         }
-        if let Ok(v) = env::var("ATAKIT_RPC_URL") {
-            if !v.is_empty() {
-                self.publish.rpc_url = Some(v);
-            }
-        }
-        if let Ok(v) = env::var("ATAKIT_SESSION_REGISTRY") {
-            if !v.is_empty() {
-                self.publish.session_registry = Some(v);
-            }
-        }
+        // ATAKIT_RPC_URL and ATAKIT_SESSION_REGISTRY env overrides
+        // removed in v0.4.0; use [chains.*] config instead.
         if let Ok(v) = env::var("ATAKIT_GCP_PROJECT") {
             if !v.is_empty() {
                 for provider in self.cloud.providers.values_mut() {
@@ -972,6 +1225,74 @@ fn check_legacy_fields(content: &str) -> Result<()> {
              `main = {{ type = \"http\", url = \"https://...\" }}`. \
              See config_template.toml for examples."
         );
+    }
+
+    // v0.4.0: [publish] inline chain/key fields replaced by references.
+    if let Some(publish) = value.get("publish").and_then(|v| v.as_table()) {
+        for field in ["rpc_url", "session_registry"] {
+            if publish.contains_key(field) {
+                bail!(
+                    "`[publish] {field}` is no longer supported. Define a chain under \
+                     `[chains.<name>]` with `rpc_url` and `session_registry`, then \
+                     set `[publish] chain = \"<name>\"`. See config_template.toml."
+                );
+            }
+        }
+        for field in ["owner_key_file", "relay_key_file"] {
+            if publish.contains_key(field) {
+                bail!(
+                    "`[publish] {field}` is no longer supported. Define a key under \
+                     `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
+                     source, then set `[publish] owner_key = \"<name>\"`. \
+                     See config_template.toml."
+                );
+            }
+        }
+    }
+
+    // v0.4.0: [cloud] inline chain/key fields replaced by references.
+    if let Some(cloud) = value.get("cloud").and_then(|v| v.as_table()) {
+        for field in ["rpc_url", "session_registry"] {
+            if cloud.contains_key(field) {
+                bail!(
+                    "`[cloud] {field}` is no longer supported. Define a chain under \
+                     `[chains.<name>]` and reference it from each target via \
+                     `chain = \"<name>\"`. See config_template.toml."
+                );
+            }
+        }
+        if cloud.contains_key("expire_offset") {
+            bail!(
+                "`[cloud] expire_offset` is no longer supported. Use \
+                 `session_ttl_seconds` in `[chains.<name>]` instead."
+            );
+        }
+        for field in ["owner_key_file", "relay_key_file"] {
+            if cloud.contains_key(field) {
+                bail!(
+                    "`[cloud] {field}` is no longer supported. Define a key under \
+                     `[keys.<name>]` and reference it from each target via \
+                     `owner_key = \"<name>\"` or `gas_wallet = \"<name>\"`. \
+                     See config_template.toml."
+                );
+            }
+        }
+        // Per-target overrides.
+        if let Some(targets) = cloud.get("targets").and_then(|v| v.as_table()) {
+            for (tname, tval) in targets {
+                if let Some(t) = tval.as_table() {
+                    for field in ["rpc_url", "session_registry", "owner_key_file", "relay_key_file"] {
+                        if t.contains_key(field) {
+                            bail!(
+                                "`[cloud.targets.{tname}] {field}` is no longer supported. \
+                                 Use `chain`, `owner_key`, and `gas_wallet` references \
+                                 instead. See config_template.toml."
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

@@ -528,18 +528,20 @@ async fn verify_pcr23(
     config: &Config,
     strict: bool,
 ) -> Result<()> {
-    let Some(rpc_url) = config.publish.rpc_url.as_deref() else {
+    let Some(chain_name) = config.publish.chain.as_deref() else {
         if strict {
-            anyhow::bail!("RPC URL required for --verify");
+            anyhow::bail!("chain config required for --verify: set [publish] chain in config");
         }
         return Ok(());
     };
-    let Some(session_registry_str) = config.publish.session_registry.as_deref() else {
+    let Some(chain_config) = config.chains.get(chain_name) else {
         if strict {
-            anyhow::bail!("session registry required for --verify");
+            anyhow::bail!("chain '{chain_name}' not found in [chains]");
         }
         return Ok(());
     };
+    let rpc_url = chain_config.rpc_url.as_str();
+    let session_registry_str = chain_config.session_registry.as_str();
 
     let session_registry_address: alloy_ext::core::primitives::Address =
         session_registry_str.parse().context("invalid session registry address")?;

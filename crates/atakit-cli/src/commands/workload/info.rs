@@ -82,15 +82,18 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     Ok(())
 }
 
-/// Query on-chain data and update local store. Returns None if RPC not configured.
+/// Query on-chain data and update local store. Returns None if chain not configured.
 async fn refresh_chain(
     name: &str,
     version: &str,
     env: &Env,
     config: &Config,
 ) -> Option<ChainData> {
-    let rpc_url = config.publish.rpc_url.as_deref()?;
-    let session_registry = config.publish.session_registry.as_deref()?;
+    // Best-effort: resolve publish chain, skip if not configured.
+    let chain_name = config.publish.chain.as_deref()?;
+    let chain_config = config.chains.get(chain_name)?;
+    let rpc_url = &chain_config.rpc_url;
+    let session_registry = &chain_config.session_registry;
     let workload_id = super::compute_workload_id(name, version);
 
     let chain = query_chain_data(workload_id, rpc_url, session_registry)
@@ -140,9 +143,10 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!("  {:<18}{}", "Restart:", m.config.restart);
     println!(
         "  {:<18}{}",
-        "CVM Agent:",
-        if m.config.cvm_agent { "yes" } else { "no" }
+        "Atakit Portal:",
+        if m.config.atakit_portal { "yes" } else { "no" }
     );
+    println!("  {:<18}{}", "GID Group:", m.config.gid_group);
     if !m.config.ports.is_empty() {
         print_multi("Ports:", &m.config.ports);
     }
@@ -166,8 +170,7 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
 
     // --- Data ---
     let has_data = !m.config.measured_data.is_empty()
-        || !m.config.unmeasured_data.is_empty()
-        || m.config.signing.is_some();
+        || !m.config.unmeasured_data.is_empty();
     if has_data {
         section_header("Data");
         if !m.config.measured_data.is_empty() {
@@ -175,17 +178,6 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         }
         if !m.config.unmeasured_data.is_empty() {
             print_multi("Unmeasured:", &m.config.unmeasured_data);
-        }
-        if let Some(ref signing) = m.config.signing {
-            if signing.enable {
-                println!("  {:<18}enabled", "Signing:");
-                if let Some(ref ai) = signing.auth_info {
-                    println!("    {:<16}{}", "Auth Info:", ai);
-                }
-                if let Some(ref p) = signing.policy {
-                    println!("    {:<16}{}", "Policy:", p);
-                }
-            }
         }
         println!();
     }
@@ -197,7 +189,7 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
             let mount = m.config.disks.get(name).map(|s| s.as_str()).unwrap_or("-");
             let mut flags = vec![&disk.size[..]];
             if let Some(ref enc) = disk.encryption {
-                if enc.enable {
+                if !enc.unlock_method.is_empty() {
                     flags.push("encrypted");
                 }
             }

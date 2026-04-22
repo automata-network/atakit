@@ -3,30 +3,16 @@ use atakit_workload::cli::SpecArgs;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
+use super::resolve_chain;
 use crate::config::Config;
 
 pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
-    // Resolve RPC URL and session registry from args, config, or env
-    let rpc_url = args
-        .rpc_url
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-            )
-        })?;
-
-    let session_registry_str = args
-        .session_registry
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-            )
-        })?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+        chain.session_registry.parse().context("invalid session registry address")?;
 
     // Parse workload ID from hex
     let id_hex = args.id.strip_prefix("0x").unwrap_or(&args.id);
