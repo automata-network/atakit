@@ -16,7 +16,7 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(wl_dir.join("config/cert.pem"), b"fake-cert").unwrap();
 
     let config = r#"
-format = 1
+format = 2
 
 [workload]
 name = "my-workload"
@@ -77,8 +77,8 @@ async fn build_produces_valid_archive() {
     entry_names.sort();
 
     assert!(
-        entry_names.iter().any(|n| n.ends_with("manifest.toml")),
-        "archive must contain manifest.toml, got: {entry_names:?}"
+        entry_names.iter().any(|n| n.ends_with("manifest.json")),
+        "archive must contain manifest.json, got: {entry_names:?}"
     );
     assert!(
         entry_names
@@ -93,19 +93,19 @@ async fn build_produces_valid_archive() {
         "archive must contain measured-data, got: {entry_names:?}"
     );
 
-    // Verify manifest.toml content
+    // Verify manifest.json content
     let file = std::fs::File::open(&result.archive_path).unwrap();
     let dec = zstd::Decoder::new(file).unwrap();
     let mut archive = tar::Archive::new(dec);
     for entry in archive.entries().unwrap() {
         let mut entry = entry.unwrap();
-        if entry.path().unwrap().to_string_lossy().ends_with("manifest.toml") {
+        if entry.path().unwrap().to_string_lossy().ends_with("manifest.json") {
             let mut content = String::new();
             entry.read_to_string(&mut content).unwrap();
-            assert!(content.contains("name = \"my-workload\""));
-            assert!(content.contains("version = \"v0.1.0\""));
+            assert!(content.contains("\"name\":\"my-workload\""));
+            assert!(content.contains("\"version\":\"v0.1.0\""));
             assert!(content.contains("RUST_LOG"));
-            assert!(content.contains("[hashes]"));
+            assert!(content.contains("\"hashes\""));
             break;
         }
     }
@@ -213,7 +213,7 @@ async fn inspect_archive_matches_build() {
     assert!(inspect_result.sha256.starts_with("0x"));
     assert!(!inspect_result.manifest_hash.is_empty());
     assert!(inspect_result.manifest_hash.starts_with("sha256:"));
-    assert!(inspect_result.manifest_raw.contains("name = \"my-workload\""));
+    assert!(inspect_result.manifest_raw.contains("\"name\":\"my-workload\""));
 }
 
 #[tokio::test]
@@ -268,7 +268,7 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(wl_dir.join("sidecar.tar"), b"fake-sidecar-image").unwrap();
 
     let config = r#"
-format = 1
+format = 2
 
 [workload]
 name = "multi-app"

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ImageSource, StringOrArray, WorkloadConfig};
 use crate::WorkloadError;
 
-/// Top-level manifest written to `manifest.toml` inside the archive.
+/// Top-level manifest written to `manifest.json` inside the archive.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub meta: ManifestMeta,
     pub config: ManifestConfig,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub disks: BTreeMap<String, ManifestDisk>,
     pub hashes: BTreeMap<String, String>,
 }
@@ -28,79 +28,42 @@ pub struct ManifestConfig {
     pub image: String,
     #[serde(rename = "base-image-mode")]
     pub base_image_mode: String,
-    #[serde(
-        default,
-        rename = "base-image",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub ports: Vec<String>,
-    #[serde(default = "default_restart", skip_serializing_if = "is_default_restart")]
+    #[serde(default = "default_restart")]
     pub restart: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub command: Option<StringOrArrayOut>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub entrypoint: Option<StringOrArrayOut>,
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(default)]
     pub ttl: u64,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub cvm_agent: bool,
-    #[serde(
-        default,
-        rename = "measured-data",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    #[serde(rename = "gid-group")]
+    pub gid_group: String,
+    #[serde(default, rename = "measured-data")]
     pub measured_data: Vec<String>,
-    #[serde(
-        default,
-        rename = "unmeasured-data",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub disks: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
-    /// Resolved firewall ports to open (auto-derived + allow - deny).
-    #[serde(
-        default,
-        rename = "firewall-ports",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "firewall-ports")]
     pub firewall_ports: Vec<ManifestFirewallPort>,
-    #[serde(
-        rename = "baby-container",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "baby-container")]
     pub baby_container: Option<ManifestBabyContainer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing: Option<ManifestSigning>,
-    /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
-    #[serde(
-        default,
-        rename = "boot-disk-size",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
 }
 
 fn default_restart() -> String {
     "no".to_string()
-}
-
-fn is_default_restart(s: &str) -> bool {
-    s == "no"
-}
-
-fn is_zero(v: &u64) -> bool {
-    *v == 0
-}
-
-fn is_false(b: &bool) -> bool {
-    !b
 }
 
 /// Serialized as either a string or an array of strings.
@@ -143,31 +106,27 @@ impl<'de> Deserialize<'de> for StringOrArrayOut {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDependency {
     pub image: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub ports: Vec<String>,
-    #[serde(default = "default_restart", skip_serializing_if = "is_default_restart")]
+    #[serde(default = "default_restart")]
     pub restart: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub command: Option<StringOrArrayOut>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub entrypoint: Option<StringOrArrayOut>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    #[serde(rename = "gid-group")]
+    pub gid_group: String,
+    #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub depends_on: Vec<String>,
-    #[serde(
-        default,
-        rename = "measured-data",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "measured-data")]
     pub measured_data: Vec<String>,
-    #[serde(
-        default,
-        rename = "unmeasured-data",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub disks: BTreeMap<String, String>,
 }
 
@@ -185,38 +144,26 @@ pub struct ManifestBabyContainer {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ManifestSigning {
-    pub enable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_info: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDisk {
     /// LUN / device index for cloud disk attachment.
     pub index: u32,
     pub size: String,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub bind_fs: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub encryption: Option<ManifestDiskEncryption>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDiskEncryption {
-    pub enable: bool,
-    #[serde(default = "default_key_security", skip_serializing_if = "is_default_key_security")]
-    pub key_security: String,
+    pub unlock_method: Vec<String>,
+    pub bind: Vec<String>,
 }
 
-fn default_key_security() -> String {
-    "standard".to_string()
-}
-
-fn is_default_key_security(s: &str) -> bool {
-    s == "standard"
+/// Serialize a Manifest to RFC 8785 canonical JSON.
+pub fn serialize_canonical_json(manifest: &Manifest) -> Result<String, WorkloadError> {
+    serde_json_canonicalizer::to_string(manifest)
+        .map_err(|e| WorkloadError::Json(e.to_string()))
 }
 
 // ── env_file resolution ──────────────────────────────────────
@@ -359,6 +306,12 @@ pub fn build_manifest(
             }
         }
 
+        // Always-allowed portal ports (per spec: 1024 for init, 2024 for
+        // status/measurements). Injected after user allow/deny so they
+        // cannot be denied.
+        insert_port_protos(&mut open, 1024, &None);
+        insert_port_protos(&mut open, 2024, &None);
+
         // Sort for deterministic output.
         let mut ports: Vec<ManifestFirewallPort> = open
             .into_iter()
@@ -377,20 +330,8 @@ pub fn build_manifest(
             max_count: bc.max_count,
         });
 
-    // Signing: rewrite paths to archive-relative
-    let signing = config.signing.as_ref().map(|s| ManifestSigning {
-        enable: s.enable,
-        auth_info: if s.enable {
-            Some("signing/auth_info.json".to_string())
-        } else {
-            None
-        },
-        policy: if s.enable {
-            Some("signing/cosign_policy.json".to_string())
-        } else {
-            None
-        },
-    });
+    // Default gid-group: workload name.
+    let default_gid_group = w.name.clone();
 
     // Dependencies: build ManifestDependency for each.
     let dependencies = if config.dependencies.is_empty() {
@@ -424,6 +365,8 @@ pub fn build_manifest(
                         restart: dep.restart.clone(),
                         command: convert_string_or_array(&dep.command),
                         entrypoint: convert_string_or_array(&dep.entrypoint),
+                        atakit_portal: dep.atakit_portal,
+                        gid_group: dep.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
                         environment: env,
                         depends_on: dep.depends_on.clone(),
                         measured_data: measured,
@@ -443,8 +386,8 @@ pub fn build_manifest(
         .iter()
         .map(|(name, d)| {
             let enc = d.encryption.as_ref().map(|e| ManifestDiskEncryption {
-                enable: e.enable,
-                key_security: e.key_security.clone(),
+                unlock_method: e.unlock_method.clone(),
+                bind: e.bind.clone(),
             });
             let index = resolved_indices.get(name).copied().unwrap_or(10);
             (
@@ -474,7 +417,8 @@ pub fn build_manifest(
             command: convert_string_or_array(&w.command),
             entrypoint: convert_string_or_array(&w.entrypoint),
             ttl: w.ttl,
-            cvm_agent: w.cvm_agent,
+            atakit_portal: w.atakit_portal,
+            gid_group: w.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
             measured_data,
             unmeasured_data,
             environment,
@@ -482,7 +426,6 @@ pub fn build_manifest(
             dependencies,
             firewall_ports,
             baby_container,
-            signing,
             boot_disk_size: w.boot_disk_size.clone(),
         },
         disks,
@@ -578,7 +521,7 @@ mod tests {
     #[test]
     fn minimal_manifest_serializes() {
         let toml_str = r#"
-format = 1
+format = 2
 
 [workload]
 name = "my-app"
@@ -598,11 +541,36 @@ image = "my-app:latest"
             hashes,
         );
 
-        let output = toml::to_string_pretty(&manifest).unwrap();
-        assert!(output.contains("format = 1"));
-        assert!(output.contains("name = \"my-app\""));
-        assert!(output.contains("version = \"v0.0.1\""));
-        assert!(output.contains("image = \"my-app:latest\""));
+        let output = serialize_canonical_json(&manifest).unwrap();
+        // Canonical JSON: verify key fields are present
+        assert!(output.contains("\"format\":2"));
+        assert!(output.contains("\"name\":\"my-app\""));
+        assert!(output.contains("\"version\":\"v0.0.1\""));
+        assert!(output.contains("\"image\":\"my-app:latest\""));
         assert!(output.contains("images/my-app.tar"));
+        // gid-group defaults to workload name
+        assert!(output.contains("\"gid-group\":\"my-app\""));
+    }
+
+    #[test]
+    fn canonical_json_is_deterministic() {
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let hashes = BTreeMap::new();
+
+        let m1 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes.clone());
+        let m2 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes);
+
+        let json1 = serialize_canonical_json(&m1).unwrap();
+        let json2 = serialize_canonical_json(&m2).unwrap();
+        assert_eq!(json1, json2, "canonical JSON must be byte-identical");
     }
 }

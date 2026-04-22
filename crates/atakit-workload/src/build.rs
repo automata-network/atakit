@@ -170,24 +170,12 @@ pub async fn build_workload(
     }
 
     // 5. Collect measured-data
-    let measured_file_count = if config.workload.measured_data.is_empty()
-        && config.signing.as_ref().is_none_or(|s| !s.enable)
-    {
+    let measured_file_count = if config.workload.measured_data.is_empty() {
         0
     } else {
         let handle = progress.create("Collecting measured-data...", 0);
-        let mut count =
+        let count =
             staging.stage_measured_data(&config.workload.measured_data, workload_dir)?;
-
-        // Stage signing files under measured-data/signing/
-        if let Some(ref signing) = config.signing {
-            if signing.enable {
-                let auth = workload_dir.join(signing.auth_info.as_ref().unwrap());
-                let policy = workload_dir.join(signing.policy.as_ref().unwrap());
-                staging.stage_signing_files(&auth, &policy)?;
-                count += 2;
-            }
-        }
         handle.finish();
         count
     };
@@ -214,10 +202,10 @@ pub async fn build_workload(
     handle.finish();
 
     // 8. Generate manifest
-    let handle = progress.create("Generating manifest.toml...", 0);
+    let handle = progress.create("Generating manifest.json...", 0);
     let m = manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
-    let manifest_toml = toml::to_string_pretty(&m)?;
-    staging.write_manifest(&manifest_toml)?;
+    let manifest_json = manifest::serialize_canonical_json(&m)?;
+    staging.write_manifest(&manifest_json)?;
     handle.finish();
 
     // 9. Create archive
