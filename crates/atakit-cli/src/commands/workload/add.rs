@@ -205,7 +205,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         println!("  {:<18}{}", "Owner:", o.dimmed());
     }
     if let Some(ref p) = sha256 {
-        println!("  {:<18}{}", "SHA256:", p.dimmed());
+        println!("  {:<18}{}", "Manifest SHA256:", p.dimmed());
     }
     if archive_path.is_some() {
         println!("  {:<18}imported", "Archive:");

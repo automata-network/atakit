@@ -135,7 +135,16 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	}
 
 	// 8. Resolve image reference (--image overrides target.image).
-	let image_arg = args.image.as_deref().unwrap_or(&target.image);
+	let image_arg = args
+		.image
+		.as_deref()
+		.or(target.image.as_deref())
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"no image specified: pass --image or set `image = \"...\"` \
+				 on target '{target_name}' in [cloud.targets]"
+			)
+		})?;
 
 	let resolved_image = resolve_image(image_arg, &provider_config.platform, env)?;
 	let image_ref = &resolved_image.display_name;

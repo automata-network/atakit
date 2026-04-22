@@ -42,6 +42,17 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
     let progress = IndicatifReporter;
     let result = atakit_workload::build_workload(&opts, &progress).await?;
 
+    // Inspect the built archive once: we need it to surface the manifest
+    // event hash alongside the file hash, and (below) to populate store
+    // metadata. Cheap -- just extracts manifest.toml from the archive.
+    let inspect_opts = atakit_workload::InspectOptions {
+        archive: Some(result.archive_path.clone()),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+    };
+    let inspect = atakit_workload::inspect_workload(&inspect_opts).await?;
+
     println!(
         "{}",
         format!(
@@ -54,20 +65,27 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         )
         .green()
     );
-    println!("SHA-256: {}", result.archive_hash.dimmed());
+    // Two distinct hashes: the archive file hash is a content-addressable
+    // identifier for the .atawl blob; the manifest hash is the PCR23 event
+    // hash that appears on-chain and in `workload ls`. Label both clearly
+    // so users don't get confused when the values differ.
+    //
+    // Normalise both to `0x<hex>` at print time so the two rows line up
+    // visually. `hash_file` returns `sha256:<hex>` (manifest uses that
+    // convention internally for `[hashes]` entries), but mixing it with
+    // `inspect.sha256`'s `0x<hex>` in terminal output makes the column
+    // edges jagged and confused a user into thinking they were looking
+    // at a bug.
+    let archive_hex = result
+        .archive_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.archive_hash);
+    println!("Archive  SHA-256: {}", format!("0x{archive_hex}").dimmed());
+    println!("Manifest SHA-256: {}", inspect.sha256.dimmed());
 
     // Import into store unless --no-store flag is set
     if !args.no_store {
         let store = WorkloadStore::new(&env.workload_dir);
-
-        // Inspect the built archive to get name, version, PCR23
-        let inspect_opts = atakit_workload::InspectOptions {
-            archive: Some(result.archive_path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-        };
-        let inspect = atakit_workload::inspect_workload(&inspect_opts).await?;
         let name = &inspect.manifest.meta.name;
         let version = &inspect.manifest.meta.version;
 
@@ -81,11 +99,11 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                         "{}",
                         format!("Store already has {name}:{version} with a different measurement.").yellow().bold()
                     );
-                    println!("  {:<12}{}", "Old SHA256:".dimmed(), old_sha256);
-                    println!("  {:<12}{}", "New SHA256:".dimmed(), inspect.sha256);
+                    println!("  {:<22}{}", "Old Manifest SHA256:".dimmed(), old_sha256);
+                    println!("  {:<22}{}", "New Manifest SHA256:".dimmed(), inspect.sha256);
                     if let Some(ref spec) = existing.on_chain_spec {
                         println!(
-                            "  {:<12}{}",
+                            "  {:<22}{}",
                             "On-chain:".dimmed(),
                             "yes (will be stale after overwrite)".yellow()
                         );
