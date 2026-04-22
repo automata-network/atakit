@@ -64,7 +64,7 @@ impl CloudProvider for GcpProvider {
 
         // Firewall - always open agent port 1024 (tcp), plus workload ports.
         // workload_ports are already resolved "port/proto" strings from the manifest.
-        let mut ports = vec!["1024/tcp".to_string()];
+        let mut ports = Vec::new();
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
@@ -103,8 +103,8 @@ impl CloudProvider for GcpProvider {
         });
 
         if !opts.skip_init {
-            // Wait for agent.
-            steps.push(DeployStep::WaitForAgent { timeout_secs: 300 });
+            // Wait for portal.
+            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
             // Initialize workload.
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
@@ -212,7 +212,7 @@ impl CloudProvider for GcpProvider {
                 updates.external_ip = Some(ip);
             }
 
-            DeployStep::WaitForAgent { .. } => {
+            DeployStep::WaitForPortal { .. } => {
                 // IP must be set from a previous step - caller passes it.
                 // This will be handled by the CLI layer.
             }

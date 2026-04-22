@@ -81,7 +81,7 @@ pub enum DeployStep {
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
     },
-    WaitForAgent {
+    WaitForPortal {
         timeout_secs: u64,
     },
     InitializeWorkload {
@@ -207,8 +207,8 @@ impl fmt::Display for DeployStep {
             DeployStep::CreateInstance { instance_name, .. } => {
                 write!(f, "Create VM instance '{instance_name}'")
             }
-            DeployStep::WaitForAgent { timeout_secs } => {
-                write!(f, "Wait for CVM agent (timeout: {timeout_secs}s)")
+            DeployStep::WaitForPortal { timeout_secs } => {
+                write!(f, "Wait for portal (timeout: {timeout_secs}s)")
             }
             DeployStep::InitializeWorkload { .. } => {
                 write!(f, "Initialize workload on CVM")

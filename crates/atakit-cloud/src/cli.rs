@@ -83,21 +83,17 @@ pub struct DeployArgs {
     #[arg(long, value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
 
-    /// Owner key file path override
+    /// Chain config name override (references [chains.<name>])
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
 
-    /// Relay key file path override
+    /// Gas wallet key name override (references [keys.<name>])
     #[arg(long)]
-    pub relay_key: Option<String>,
-
-    /// RPC URL override
-    #[arg(long)]
-    pub rpc_url: Option<String>,
-
-    /// Session registry address override
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub gas_wallet: Option<String>,
 
     /// Workload directory (default: current directory)
     #[arg(short, long, conflicts_with = "source")]
@@ -253,21 +249,17 @@ pub struct InitArgs {
     #[arg(short, long, conflicts_with = "source")]
     pub dir: Option<PathBuf>,
 
-    /// RPC URL override
+    /// Chain config name override (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
+    pub chain: Option<String>,
 
-    /// Session registry address override
-    #[arg(long)]
-    pub session_registry: Option<String>,
-
-    /// Owner key file path override
+    /// Owner key name override (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
 
-    /// Relay key file path override
+    /// Gas wallet key name override (references [keys.<name>])
     #[arg(long)]
-    pub relay_key: Option<String>,
+    pub gas_wallet: Option<String>,
 
     /// Agent wait timeout in seconds
     #[arg(long, default_value = "300")]

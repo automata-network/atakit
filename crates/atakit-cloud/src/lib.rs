@@ -16,13 +16,13 @@ pub mod cli;
 pub use config::{CcType, CloudConfig, CloudImageEntry, CloudProviderConfig, CloudTarget, PlatformKind, guest_os_features_for, infer_cc_type, validate_target};
 pub use error::CloudError;
 pub use exec::{CommandOutput, CommandRunner, ProcessRunner};
-pub use init::AgentConfig;
+pub use init::{InitChainConfig, InitConfig, InitKeyConfig};
 pub use naming::{AzureResourceNames, ResourceNames};
 pub use plan::{
     DeployPlan, DeployStep, DestroyPlan, DestroyStep, DiskSpec, ResourceUpdates, StepResult,
 };
 pub use provider::{CloudProvider, DeployOptions, DestroyOptions};
 pub use state::{
-    AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams, PersistedAgentEnv,
+    AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams, PersistedInitEnv,
     ResourceSet,
 };

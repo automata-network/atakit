@@ -100,7 +100,7 @@ impl CloudProvider for AzureProvider {
         });
 
         // Firewall - workload_ports are already resolved "port/proto" strings.
-        let mut ports = vec!["1024/tcp".to_string()];
+        let mut ports = Vec::new();
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
@@ -147,7 +147,7 @@ impl CloudProvider for AzureProvider {
         });
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForAgent { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });
@@ -415,7 +415,7 @@ impl CloudProvider for AzureProvider {
                 updates.external_ip = Some(ip);
             }
 
-            DeployStep::WaitForAgent { .. } => {
+            DeployStep::WaitForPortal { .. } => {
                 // Handled by CLI layer.
             }
 
@@ -626,7 +626,7 @@ mod tests {
     use super::*;
     use crate::config::{CcType, CloudTarget, PlatformKind};
     use crate::provider::{CloudProvider, DeployOptions};
-    use crate::state::PersistedAgentEnv;
+    use crate::state::PersistedInitEnv;
     use std::collections::BTreeMap;
 
     fn test_target() -> CloudTarget {
@@ -637,10 +637,9 @@ mod tests {
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            rpc_url: None,
-            session_registry: None,
-            owner_key_file: None,
-            relay_key_file: None,
+            chain: "testnet".to_string(),
+            owner_key: "owner".to_string(),
+            gas_wallet: "gas".to_string(),
         }
     }
 
@@ -655,7 +654,7 @@ mod tests {
             archive_hash: "abc123".into(),
             workload_name: "test-workload".into(),
             workload_version: "v0.0.1".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             metadata: BTreeMap::new(),
             force_image: false,
             skip_init: true,
