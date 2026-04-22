@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-cli"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "alloy-ext",
  "anyhow",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-cloud"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "atakit-core",
@@ -1004,11 +1004,11 @@ dependencies = [
 
 [[package]]
 name = "atakit-core"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "atakit-github"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "atakit-core",
  "futures-util",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-image"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "atakit-core",
  "atakit-github",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-workload"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "atakit-core",
  "atakit-github",
@@ -1055,6 +1055,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "tar",
  "tempfile",
@@ -3582,6 +3583,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3744,6 +3751,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
