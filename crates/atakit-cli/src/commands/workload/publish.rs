@@ -6,36 +6,19 @@ use atakit_workload::cli::PublishArgs;
 use atakit_workload::{WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{apply_chain_data_to_meta, looks_like_store_ref, query_chain_data};
+use super::{apply_chain_data_to_meta, looks_like_store_ref, query_chain_data, resolve_chain, resolve_owner_key};
 use crate::config::Config;
 
 pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
-    // Resolve RPC URL and session registry from args, config, or env
-    let rpc_url = args
-        .rpc_url
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-        ))?;
-
-    let session_registry_str = args
-        .session_registry
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-        ))?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+        chain.session_registry.parse().context("invalid session registry address")?;
 
-    // Resolve private key: CLI arg > key file from config
-    let private_key_raw = match args.owner_key {
-        Some(k) => k,
-        None => match config.publish.owner_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("owner key required: use --owner-key or set publish.owner_key_file in config"),
-        },
-    };
+    // Resolve owner private key from [keys].
+    let private_key_raw = resolve_owner_key(args.owner_key.as_deref(), config)?;
     let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
     let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
         .parse()
@@ -153,25 +136,17 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         }],
     };
 
-    // Resolve relay key: CLI arg > key file from config
-    let relay_key_raw = match args.relay_key {
-        Some(k) => k,
-        None => match config.publish.relay_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("relay key required: use --relay-key or set publish.relay_key_file in config"),
-        },
-    };
-    let relay_key_hex = relay_key_raw.strip_prefix("0x").unwrap_or(&relay_key_raw);
+    // Use owner key as relay key for transaction submission.
     let relay_key = {
-        let bytes: [u8; 32] = hex::decode(relay_key_hex)
-            .context("invalid relay key hex")?
+        let bytes: [u8; 32] = hex::decode(private_key_hex)
+            .context("invalid owner key hex for relay")?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("relay key must be 32 bytes"))?;
+            .map_err(|_| anyhow::anyhow!("owner key must be 32 bytes"))?;
         alloy_ext::core::primitives::B256::from(bytes)
     };
 
     let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
-        rpc_url,
+        rpc_url: rpc_url.clone(),
         relay_key: Some(relay_key),
         session_registry_address,
     };
@@ -251,9 +226,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         }
 
         // Always refresh on-chain data into local store
-        let rpc_url = config.publish.rpc_url.as_deref().unwrap();
-        let session_registry = config.publish.session_registry.as_deref().unwrap();
-        if let Ok(chain) = query_chain_data(workload_id, rpc_url, session_registry).await {
+        if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
             let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
             let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
@@ -261,7 +234,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                     m.workload_id = workload_id_hex.clone();
                     m.sha256 = Some(result.sha256.clone());
                     m.pcr23 = Some(result.pcr23.clone());
-                    apply_chain_data_to_meta(&mut m, &chain);
+                    apply_chain_data_to_meta(&mut m, &chain_data);
                     m.added_at = now;
                     m
                 }
@@ -279,7 +252,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                         repositories: Vec::new(),
                         added_at: now,
                     };
-                    apply_chain_data_to_meta(&mut m, &chain);
+                    apply_chain_data_to_meta(&mut m, &chain_data);
                     m
                 }
             };
@@ -319,9 +292,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     );
 
     // Refresh on-chain data into local store
-    let rpc_url = config.publish.rpc_url.as_deref().unwrap();
-    let session_registry = config.publish.session_registry.as_deref().unwrap();
-    if let Ok(chain) = query_chain_data(workload_id, rpc_url, session_registry).await {
+    if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
         let store = WorkloadStore::new(&env.workload_dir);
         let now = chrono::Local::now().to_rfc3339();
         let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
@@ -329,7 +300,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 m.workload_id = workload_id_hex.clone();
                 m.sha256 = Some(result.sha256.clone());
                 m.pcr23 = Some(result.pcr23.clone());
-                apply_chain_data_to_meta(&mut m, &chain);
+                apply_chain_data_to_meta(&mut m, &chain_data);
                 m.added_at = now;
                 m
             }
@@ -347,7 +318,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                     repositories: Vec::new(),
                     added_at: now,
                 };
-                apply_chain_data_to_meta(&mut m, &chain);
+                apply_chain_data_to_meta(&mut m, &chain_data);
                 m
             }
         };

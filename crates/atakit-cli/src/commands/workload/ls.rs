@@ -284,12 +284,14 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 /// All failure modes (no RPC config, RPC error, workload not registered,
 /// no PCR23 in spec) are silent skips. The function never errors.
 async fn verify_entries_against_chain(entries: &mut [DisplayEntry], config: &Config) {
-    let Some(rpc_url) = config.publish.rpc_url.as_deref() else {
+    let Some(chain_name) = config.publish.chain.as_deref() else {
         return;
     };
-    let Some(session_registry) = config.publish.session_registry.as_deref() else {
+    let Some(chain_config) = config.chains.get(chain_name) else {
         return;
     };
+    let rpc_url = chain_config.rpc_url.as_str();
+    let session_registry = chain_config.session_registry.as_str();
 
     // Pick out entries that we can usefully check: must have an event
     // hash to compare against.

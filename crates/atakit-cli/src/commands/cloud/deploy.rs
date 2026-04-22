@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{self, AgentConfig};
+use atakit_cloud::init::{self, InitConfig, InitChainConfig, InitKeyConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::state::{DeployState, DeployStatus};
@@ -11,8 +11,8 @@ use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{self, Config};
-use super::{AgentEnvBuilder, collect_unmeasured_tar, parse_metadata, resolve_image, resolve_workload, validate_base_image};
+use crate::config::{Config, KeyMode};
+use super::{InitEnvResolver, collect_unmeasured_tar, parse_metadata, resolve_image, resolve_workload, validate_base_image};
 
 pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
 	let image_only = args.image_only;
@@ -119,17 +119,14 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		);
 	}
 
-	// 6. Build agent env.
-	let agent_env_builder = AgentEnvBuilder {
-		cli_rpc_url: args.rpc_url.as_deref(),
-		cli_session_registry: args.session_registry.as_deref(),
+	// 6. Build init env (references into [chains] and [keys]).
+	let init_env_resolver = InitEnvResolver {
+		cli_chain: args.chain.as_deref(),
 		cli_owner_key: args.owner_key.as_deref(),
-		cli_relay_key: args.relay_key.as_deref(),
+		cli_gas_wallet: args.gas_wallet.as_deref(),
 		target: &target,
-		cloud: &config.cloud,
-		publish: &config.publish,
 	};
-	let agent_env = agent_env_builder.build();
+	let init_env = init_env_resolver.build();
 
 	// 7. Parse metadata.
 	let mut metadata = parse_metadata(&args.metadata)?;
@@ -187,7 +184,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		archive_hash: archive_hash.clone(),
 		workload_name: workload_name.clone(),
 		workload_version: workload_version.clone(),
-		agent_env: agent_env.clone(),
+		init_env: init_env.clone(),
 		metadata: metadata.clone(),
 		force_image: args.force_image,
 		skip_init: image_only || args.skip_init,
@@ -313,7 +310,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		image_ref: image_ref.to_string(),
 		archive_path,
 		archive_hash,
-		agent_env: agent_env.clone(),
+		init_env: init_env.clone(),
 		total_steps: plan.steps.len() as u32,
 	});
 	match provider_config.platform {
@@ -355,7 +352,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		}
 
 		match step {
-			DeployStep::WaitForAgent { timeout_secs } => {
+			DeployStep::WaitForPortal { timeout_secs } => {
 				let ip = state
 					.resources
 					.gcp
@@ -364,7 +361,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.or_else(|| state.resources.azure.as_ref().and_then(|a| a.external_ip.as_ref()))
 					.ok_or_else(|| anyhow::anyhow!("no external IP available for agent wait"))?
 					.clone();
-				match init::wait_for_agent(&ip, *timeout_secs).await {
+				match init::wait_for_portal(&ip, *timeout_secs).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());
@@ -393,40 +390,45 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.ok_or_else(|| anyhow::anyhow!("no external IP available for init"))?
 					.clone();
 
-				let rpc_url = agent_env
-					.rpc_url
-					.as_ref()
-					.ok_or_else(|| {
-						anyhow::anyhow!("rpc_url is required for agent initialization")
-					})?
-					.clone();
-				let session_registry = agent_env
-					.session_registry
-					.as_ref()
-					.ok_or_else(|| {
-						anyhow::anyhow!(
-							"session_registry is required for agent initialization"
-						)
-					})?
-					.clone();
-				let owner_key_file = agent_env.owner_key_file.as_ref().ok_or_else(|| {
-					anyhow::anyhow!("owner_key_file is required for agent initialization")
-				})?;
-				let relay_key_file = agent_env.relay_key_file.as_ref().ok_or_else(|| {
-					anyhow::anyhow!("relay_key_file is required for agent initialization")
-				})?;
-				let owner_key = config::read_key_file(owner_key_file)?;
-				let relay_key = config::read_key_file(relay_key_file)?;
+				// Resolve chain config and key specs from the persisted init_env references.
+				let chain_name = &init_env.chain;
+				let chain = config.chains.get(chain_name)
+					.ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
+				let owner_key_name = &init_env.owner_key;
+				let owner_key_spec = config.keys.get(owner_key_name)
+					.ok_or_else(|| anyhow::anyhow!("key '{owner_key_name}' not found in [keys]"))?;
+				let gas_wallet_name = &init_env.gas_wallet;
+				let gas_wallet_spec = config.keys.get(gas_wallet_name)
+					.ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
 
-				let agent_config = AgentConfig {
-					rpc_url,
-					session_registry,
-					owner_private_key: owner_key,
-					relay_private_key: relay_key,
-					expire_offset: agent_env.expire_offset.unwrap_or(3600),
+				let init_config = InitConfig {
+					platform: provider_config.platform,
+					chain: InitChainConfig {
+						rpc_url: chain.rpc_url.clone(),
+						session_registry: chain.session_registry.clone(),
+						workload_registry: chain.workload_registry.clone()
+							.ok_or_else(|| anyhow::anyhow!("workload_registry required in chain '{chain_name}'"))?,
+						base_image_registry: chain.base_image_registry.clone()
+							.ok_or_else(|| anyhow::anyhow!("base_image_registry required in chain '{chain_name}'"))?,
+						session_ttl_seconds: chain.session_ttl_seconds,
+					},
+					owner_key: InitKeyConfig {
+						mode: owner_key_spec.mode.to_string(),
+						key_type: owner_key_spec.key_type.to_string(),
+						private_key: Some(owner_key_spec.resolve(owner_key_name)?),
+					},
+					gas_wallet: InitKeyConfig {
+						mode: gas_wallet_spec.mode.to_string(),
+						key_type: gas_wallet_spec.key_type.to_string(),
+						private_key: if gas_wallet_spec.mode == KeyMode::Provisioned {
+							Some(gas_wallet_spec.resolve(gas_wallet_name)?)
+						} else {
+							None
+						},
+					},
 				};
 
-				match init::post_init(&ip, ap, unmeasured_tar.as_deref(), &agent_config).await {
+				match init::post_portal_init(&ip, ap, unmeasured_tar.as_deref(), &init_config).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());

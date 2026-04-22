@@ -136,6 +136,48 @@ pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(St
     }
 }
 
+/// Resolved chain config for workload on-chain commands.
+/// Extracted from `[chains.<name>]` with precedence: CLI --chain > [publish] chain.
+pub struct ResolvedChain {
+    pub rpc_url: String,
+    pub session_registry: String,
+}
+
+/// Resolve chain config for on-chain workload commands.
+///
+/// Precedence: `cli_chain` > `config.publish.chain`. Looks up the name
+/// in `config.chains` and returns the rpc_url and session_registry.
+pub fn resolve_chain(
+    cli_chain: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<ResolvedChain> {
+    let chain_name = cli_chain
+        .or(config.publish.chain.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("chain required: use --chain or [publish] chain in config"))?;
+    let chain = config.chains.get(chain_name)
+        .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
+    Ok(ResolvedChain {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+    })
+}
+
+/// Resolve owner key for on-chain workload commands.
+///
+/// Precedence: `cli_owner_key` > `config.publish.owner_key`. Looks up
+/// the name in `config.keys` and resolves the private key.
+pub fn resolve_owner_key(
+    cli_owner_key: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let key_name = cli_owner_key
+        .or(config.publish.owner_key.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("owner key required: use --owner-key or [publish] owner_key in config"))?;
+    let key_spec = config.keys.get(key_name)
+        .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
+    key_spec.resolve(key_name)
+}
+
 /// On-chain workload data returned by `query_chain_data`.
 pub struct ChainData {
     pub status: String,

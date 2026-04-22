@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use atakit_cloud::{AzureResourceNames, CloudConfig, CloudTarget, PlatformKind, PersistedAgentEnv, ProcessRunner};
+use atakit_cloud::{AzureResourceNames, CloudTarget, PlatformKind, PersistedInitEnv, ProcessRunner};
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
@@ -25,63 +25,39 @@ use atakit_workload::WorkloadStore;
 
 use owo_colors::OwoColorize;
 
-use crate::config::PublishConfig;
 
-/// Resolve agent env fields with precedence: CLI > target > [cloud] > [publish].
-pub struct AgentEnvBuilder<'a> {
-	pub cli_rpc_url: Option<&'a str>,
-	pub cli_session_registry: Option<&'a str>,
+/// Resolve init env references with precedence: CLI > target config.
+pub struct InitEnvResolver<'a> {
+	pub cli_chain: Option<&'a str>,
 	pub cli_owner_key: Option<&'a str>,
-	pub cli_relay_key: Option<&'a str>,
+	pub cli_gas_wallet: Option<&'a str>,
 	pub target: &'a CloudTarget,
-	pub cloud: &'a CloudConfig,
-	pub publish: &'a PublishConfig,
 }
 
-impl<'a> AgentEnvBuilder<'a> {
-	pub fn rpc_url(&self) -> Option<String> {
-		self.cli_rpc_url
+impl<'a> InitEnvResolver<'a> {
+	pub fn chain(&self) -> String {
+		self.cli_chain
 			.map(String::from)
-			.or_else(|| self.target.rpc_url.clone())
-			.or_else(|| self.cloud.rpc_url.clone())
-			.or_else(|| self.publish.rpc_url.clone())
+			.unwrap_or_else(|| self.target.chain.clone())
 	}
 
-	pub fn session_registry(&self) -> Option<String> {
-		self.cli_session_registry
-			.map(String::from)
-			.or_else(|| self.target.session_registry.clone())
-			.or_else(|| self.cloud.session_registry.clone())
-			.or_else(|| self.publish.session_registry.clone())
-	}
-
-	pub fn owner_key_file(&self) -> Option<String> {
+	pub fn owner_key(&self) -> String {
 		self.cli_owner_key
 			.map(String::from)
-			.or_else(|| self.target.owner_key_file.clone())
-			.or_else(|| self.cloud.owner_key_file.clone())
-			.or_else(|| self.publish.owner_key_file.clone())
+			.unwrap_or_else(|| self.target.owner_key.clone())
 	}
 
-	pub fn relay_key_file(&self) -> Option<String> {
-		self.cli_relay_key
+	pub fn gas_wallet(&self) -> String {
+		self.cli_gas_wallet
 			.map(String::from)
-			.or_else(|| self.target.relay_key_file.clone())
-			.or_else(|| self.cloud.relay_key_file.clone())
-			.or_else(|| self.publish.relay_key_file.clone())
+			.unwrap_or_else(|| self.target.gas_wallet.clone())
 	}
 
-	pub fn expire_offset(&self) -> Option<u64> {
-		self.cloud.expire_offset
-	}
-
-	pub fn build(&self) -> PersistedAgentEnv {
-		PersistedAgentEnv {
-			rpc_url: self.rpc_url(),
-			session_registry: self.session_registry(),
-			owner_key_file: self.owner_key_file(),
-			relay_key_file: self.relay_key_file(),
-			expire_offset: self.expire_offset(),
+	pub fn build(&self) -> PersistedInitEnv {
+		PersistedInitEnv {
+			chain: self.chain(),
+			owner_key: self.owner_key(),
+			gas_wallet: self.gas_wallet(),
 		}
 	}
 }
