@@ -445,7 +445,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     println!("{}", "Pull complete.".green().bold());
     println!("  {:<18}{}:{}", "Workload:", coords.name, coords.version);
     println!("  {:<18}{}", "Size:", format_size(archive_size));
-    println!("  {:<18}{}", "SHA256:", sha256.dimmed());
+    println!("  {:<18}{}", "Manifest SHA256:", sha256.dimmed());
 
     Ok(())
 }

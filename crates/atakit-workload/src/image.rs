@@ -43,6 +43,15 @@ impl ContainerEngine {
     }
 
     /// Build a container image from a build context.
+    ///
+    /// Built reproducibly: `SOURCE_DATE_EPOCH=0` normalises file/config
+    /// timestamps, and engine-specific flags rewrite layer timestamps and
+    /// strip build provenance so the same inputs produce byte-identical
+    /// images.
+    ///
+    /// Note for Docker: `rewrite-timestamp=true` conflicts with the daemon's
+    /// unpack-on-load path, so we build to a tarball first and then
+    /// `docker load` it.
     pub async fn build_image(
         &self,
         context: &Path,
@@ -51,21 +60,61 @@ impl ContainerEngine {
         args: &BTreeMap<String, String>,
         verbose: bool,
     ) -> Result<(), WorkloadError> {
-        let mut cmd = Command::new(self.bin());
-        cmd.arg("build").arg("-t").arg(tag);
+        match self {
+            ContainerEngine::Docker => {
+                let tar = tempfile::Builder::new()
+                    .prefix("atakit-reproducible-build-")
+                    .suffix(".tar")
+                    .tempfile()
+                    .map_err(WorkloadError::Io)?;
 
-        if let Some(cf) = containerfile {
-            let cf_path = context.join(cf);
-            cmd.arg("-f").arg(&cf_path);
+                let mut cmd = Command::new(self.bin());
+                cmd.arg("buildx")
+                    .arg("build")
+                    .arg("--provenance=false")
+                    .arg("--output")
+                    .arg(format!(
+                        "type=docker,name={tag},dest={},rewrite-timestamp=true",
+                        tar.path().display()
+                    ))
+                    .arg("--build-arg")
+                    .arg("SOURCE_DATE_EPOCH=0")
+                    .env("SOURCE_DATE_EPOCH", "0");
+
+                if let Some(cf) = containerfile {
+                    cmd.arg("-f").arg(context.join(cf));
+                }
+                for (k, v) in args {
+                    cmd.arg("--build-arg").arg(format!("{k}={v}"));
+                }
+                cmd.arg(context);
+
+                run_command_streaming(&mut cmd, "docker buildx build", verbose).await?;
+
+                let mut load = Command::new(self.bin());
+                load.arg("load").arg("-i").arg(tar.path());
+                run_command_streaming(&mut load, "docker load", verbose).await
+            }
+            ContainerEngine::Podman => {
+                let mut cmd = Command::new(self.bin());
+                cmd.arg("build")
+                    .arg("-t")
+                    .arg(tag)
+                    .arg("--timestamp")
+                    .arg("0")
+                    .env("SOURCE_DATE_EPOCH", "0");
+
+                if let Some(cf) = containerfile {
+                    cmd.arg("-f").arg(context.join(cf));
+                }
+                for (k, v) in args {
+                    cmd.arg("--build-arg").arg(format!("{k}={v}"));
+                }
+                cmd.arg(context);
+
+                run_command_streaming(&mut cmd, "podman build", verbose).await
+            }
         }
-
-        for (k, v) in args {
-            cmd.arg("--build-arg").arg(format!("{k}={v}"));
-        }
-
-        cmd.arg(context);
-
-        run_command_streaming(&mut cmd, &format!("{} build", self.bin()), verbose).await
     }
 
     /// Pull an image from a registry.

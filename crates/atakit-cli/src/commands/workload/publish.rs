@@ -174,7 +174,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     );
     println!();
     println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
-    println!("  {:<20}{}", "SHA256:".dimmed(), result.sha256);
+    println!("  {:<20}{}", "Manifest SHA256:".dimmed(), result.sha256);
     println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
     println!("  {:<20}{} ({})", "Base Image Mode:".dimmed(), base_image_mode_str, base_image_mode);
     if spec.baseImageIds.is_empty() {

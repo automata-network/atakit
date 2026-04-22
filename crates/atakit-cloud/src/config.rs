@@ -154,8 +154,12 @@ pub struct CloudTarget {
     pub provider: String,
     /// VM machine type.
     pub vmtype: String,
-    /// Base image reference.
-    pub image: String,
+    /// Base image reference. Optional here so that unrelated commands
+    /// (`workload ls`, `image ls`, etc.) can still load the config
+    /// when a target entry omits it. `cloud deploy` enforces that
+    /// either this field or the `--image` flag is set.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Confidential computing type. Optional; inferred from vmtype if absent.
     #[serde(default)]
     pub cc_type: Option<CcType>,
@@ -385,7 +389,7 @@ mod tests {
         CloudTarget {
             provider: "test-provider".to_string(),
             vmtype: vmtype.to_string(),
-            image: "test-image:v1".to_string(),
+            image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
