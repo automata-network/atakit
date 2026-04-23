@@ -101,8 +101,7 @@ impl ContainerEngine {
                     .arg("-t")
                     .arg(tag)
                     .arg("--timestamp")
-                    .arg("0")
-                    .env("SOURCE_DATE_EPOCH", "0");
+                    .arg("0");
 
                 if let Some(cf) = containerfile {
                     cmd.arg("-f").arg(context.join(cf));
