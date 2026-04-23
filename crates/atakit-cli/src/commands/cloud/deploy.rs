@@ -47,11 +47,20 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		base_image_mode = resolved.base_image_mode;
 		base_image_list = resolved.base_image;
 		// Collect unmeasured-data files: --unmeasured-data-dir takes precedence over workload dir.
-		unmeasured_tar = if !resolved.unmeasured_data.is_empty() {
+		unmeasured_tar = if resolved.needs_unmeasured_data {
 			let base_dir = args.unmeasured_data_dir.as_ref()
 				.or(resolved.workload_dir.as_ref());
 			if let Some(dir) = base_dir {
-				collect_unmeasured_tar(&resolved.unmeasured_data, dir)?
+				if resolved.unmeasured_data_paths.is_empty() {
+					eprintln!(
+						"  {}: workload needs unmeasured-data but no path list available; \
+						 provide files in --unmeasured-data-dir",
+						"warning".yellow(),
+					);
+					None
+				} else {
+					collect_unmeasured_tar(&resolved.unmeasured_data_paths, dir)?
+				}
 			} else {
 				eprintln!(
 					"  {}: workload declares unmeasured-data but no source directory available; \
@@ -63,7 +72,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		} else {
 			None
 		};
-		unmeasured_data_paths = resolved.unmeasured_data;
+		unmeasured_data_paths = resolved.unmeasured_data_paths;
 		let ap = resolved.archive_path;
 		let bytes = std::fs::read(&ap)
 			.with_context(|| format!("failed to read archive: {}", ap.display()))?;

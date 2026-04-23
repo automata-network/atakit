@@ -633,7 +633,7 @@ mod tests {
         CloudTarget {
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
-            image: "test-image:v1".to_string(),
+            image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),

@@ -8,6 +8,27 @@
 # Schema version. Must be 2.
 format = 2
 
+# ── package data ────────────────────────────────────────────────
+#
+# Declares which files are bundled into the archive (measured-data) and
+# which operators must provide at deploy time (unmeasured-data). These are
+# workload-level concerns; individual containers opt into mounting them
+# via per-container measured-data / unmeasured-data booleans.
+#
+# measured-data: files included in the archive and integrity-verified via PCR23.
+# Paths must start with "./" and must not contain "..". Files must exist
+# at build time. Mounted read-only at /atakit-portal/measured-data/ in containers
+# that set measured-data = true.
+#
+# unmeasured-data: operator-provided files NOT included in the archive.
+# Not verified by PCR23 -- the operator supplies them at deploy time.
+# Mounted read-only at /atakit-portal/unmeasured-data/ in containers
+# that set unmeasured-data = true.
+#
+# [package]
+# measured-data = ["./config/cert.pem", "./config/settings.json"]
+# unmeasured-data = ["./runtime-data/signing-key.pem"]
+
 [workload]
 # Workload identity. The on-chain workload ID is derived from name + version
 # via keccak256, so changing either produces a new workload.
@@ -31,11 +52,11 @@ base-image-mode = "blacklist"
 # on-chain base image IDs. Override with `--base-image-id` on publish if needed.
 # base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
 
-# ttl: session TTL in seconds. Determines how long a CVM session remains
-# valid after attestation. Default: 0 (contract default, 30 days).
-# Can be overridden per-publish with `--ttl`. The contract computes
+# session-ttl: session TTL in seconds. Determines how long a CVM session
+# remains valid after attestation. Default: 0 (contract default, 30 days).
+# Can be overridden per-publish with `--session-ttl`. The contract computes
 # `block.timestamp + ttl` as uint64, so the value must not cause overflow.
-# ttl = 0
+# session-ttl = 0
 
 # boot-disk-size: minimum boot/OS disk size for cloud deployments.
 # Uses the cloud provider default if omitted. The actual disk may be larger
@@ -98,18 +119,17 @@ image = "{{name}}:latest"
 # Resolution order when a key appears in both: env_file values are loaded
 # first, then [workload.environment] overrides them.
 
-# ── data mounts ──────────────────────────────────────────────────
+# ── data mount booleans ──────────────────────────────────────────
 #
-# measured-data: files included in the archive and verified via PCR23.
-# Paths must start with "./" and must not contain "..". Files must exist
-# at build time. Mounted read-only at /app/measured-data/ in the container.
-# Changing these files changes PCR23, which changes the on-chain measurement.
-# measured-data = ["./config/cert.pem", "./config/settings.json"]
+# measured-data: when true, bind-mount the measured-data/ directory
+# (read-only) into this container at /atakit-portal/measured-data/.
+# Files are defined in the [package] section above.
+# measured-data = true
 #
-# unmeasured-data: operator-provided files NOT included in the archive.
-# Not verified by PCR23 -- the operator supplies them at deploy time.
-# Mounted read-only at /app/unmeasured-data/ in the container.
-# unmeasured-data = ["./runtime-data/signing-key.pem"]
+# unmeasured-data: when true, bind-mount the unmeasured-data/ directory
+# (read-only) into this container at /atakit-portal/unmeasured-data/.
+# Files are defined in the [package] section above.
+# unmeasured-data = true
 
 # ── persistent disk mounts ───────────────────────────────────────
 #

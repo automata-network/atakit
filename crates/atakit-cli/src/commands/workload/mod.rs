@@ -272,7 +272,7 @@ pub async fn query_chain_data(
         .map(|b| format!("0x{}", hex::encode(b)));
 
     let cached = CachedChainSpec {
-        ttl: spec.ttl,
+        session_ttl: spec.ttl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds

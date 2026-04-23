@@ -118,9 +118,10 @@ async fn inspect_dir(
     let temp_dir = tempfile::tempdir().map_err(WorkloadError::Io)?;
     let staging = crate::archive::StagingDir::create(temp_dir.path(), name)?;
 
-    // Stage measured-data
-    if !config.workload.measured_data.is_empty() {
-        staging.stage_measured_data(&config.workload.measured_data, &workload_dir)?;
+    // Stage measured-data (from [package] section)
+    let measured_paths = config.measured_data_paths();
+    if !measured_paths.is_empty() {
+        staging.stage_measured_data(measured_paths, &workload_dir)?;
     }
 
     // We need to stage the image to compute hashes, but for dir mode we need
@@ -293,11 +294,11 @@ mod tests {
                 "restart": "no",
                 "command": null,
                 "entrypoint": null,
-                "ttl": 0,
+                "session-ttl": 0,
                 "atakit-portal": false,
                 "gid-group": "test",
-                "measured-data": [],
-                "unmeasured-data": [],
+                "measured-data": false,
+                "unmeasured-data": false,
                 "environment": {},
                 "disks": {},
                 "dependencies": null,

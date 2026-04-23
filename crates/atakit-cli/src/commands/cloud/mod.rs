@@ -188,9 +188,10 @@ pub(super) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// All unmeasured-data paths from the manifest (workload + dependencies, deduplicated).
-    /// Archive-relative, no ./ prefix.
-    pub unmeasured_data: Vec<String>,
+    /// Whether any container needs unmeasured-data mounted.
+    pub needs_unmeasured_data: bool,
+    /// Unmeasured-data file paths from [package] section (available in dir mode only).
+    pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
 }
@@ -222,7 +223,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
-            let unmeasured = collect_unmeasured_paths(&result.manifest);
+            let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 name,
@@ -232,7 +233,8 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
-                unmeasured_data: unmeasured,
+                needs_unmeasured_data: needs_unmeasured,
+                unmeasured_data_paths: Vec::new(),
                 workload_dir: None,
             });
         }
@@ -255,7 +257,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
-        let unmeasured = collect_unmeasured_paths(&result.manifest);
+        let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
@@ -265,7 +267,8 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
-            unmeasured_data: unmeasured,
+            needs_unmeasured_data: needs_unmeasured,
+            unmeasured_data_paths: Vec::new(),
             workload_dir: None,
         });
     }
@@ -308,7 +311,16 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     let disks = result.manifest.disks.iter()
         .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
         .collect();
-    let unmeasured = collect_unmeasured_paths(&result.manifest);
+    let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
+    // In dir mode, read unmeasured-data paths from the source config.
+    let unmeasured_paths: Vec<String> = if needs_unmeasured {
+        match atakit_workload::config::WorkloadConfig::from_dir(&workload_dir) {
+            Ok(c) => c.unmeasured_data_paths().to_vec(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     Ok(ResolvedWorkload {
         archive_path,
         name: result.manifest.meta.name,
@@ -318,24 +330,25 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
-        unmeasured_data: unmeasured,
+        needs_unmeasured_data: needs_unmeasured,
+        unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
     })
 }
 
-/// Collect all unmeasured-data paths from a manifest (workload + dependencies, deduplicated).
-fn collect_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
-    let mut paths: Vec<String> = m.config.unmeasured_data.clone();
+/// Check whether any container in the manifest needs unmeasured-data.
+fn manifest_needs_unmeasured(m: &atakit_workload::manifest::Manifest) -> bool {
+    if m.config.unmeasured_data {
+        return true;
+    }
     if let Some(ref deps) = m.config.dependencies {
         for dep in deps.values() {
-            for p in &dep.unmeasured_data {
-                if !paths.contains(p) {
-                    paths.push(p.clone());
-                }
+            if dep.unmeasured_data {
+                return true;
             }
         }
     }
-    paths
+    false
 }
 
 /// Walk a workload directory and return the first file newer than `threshold`.

@@ -122,8 +122,8 @@ pub struct PublishArgs {
     #[arg(long, default_value = "300")]
     pub expire_offset: u64,
     /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
-    #[arg(long)]
-    pub ttl: Option<u64>,
+    #[arg(long = "session-ttl")]
+    pub session_ttl: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,

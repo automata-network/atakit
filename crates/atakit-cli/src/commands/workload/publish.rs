@@ -125,7 +125,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let spec = WorkloadSpec {
         name: manifest.meta.name.clone(),
         version: manifest.meta.version.clone(),
-        ttl: args.ttl.unwrap_or(manifest.config.ttl),
+        ttl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
         baseImageMode: base_image_mode,
         baseImageIds: base_image_ids,
         requirements: vec![],

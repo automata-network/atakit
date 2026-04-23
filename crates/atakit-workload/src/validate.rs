@@ -182,12 +182,12 @@ pub fn validate_config(
 
     // ── reserved host ports (CVM agent) ─────────────────
     {
-        const RESERVED_PORTS: &[u16] = &[1024, 8000];
+        const RESERVED_PORTS: &[u16] = &[1024, 2024];
         for spec in &w.ports {
             if let Ok(parsed) = config::parse_port_spec(spec) {
                 if RESERVED_PORTS.contains(&parsed.host) {
                     return Err(WorkloadError::Validation(format!(
-                        "host port {} in workload.ports is reserved for CVM use (ports 1024, 8000)",
+                        "host port {} in workload.ports is reserved for CVM use (ports 1024, 2024)",
                         parsed.host
                     )));
                 }
@@ -198,7 +198,7 @@ pub fn validate_config(
                 if let Ok(parsed) = config::parse_port_spec(spec) {
                     if RESERVED_PORTS.contains(&parsed.host) {
                         return Err(WorkloadError::Validation(format!(
-                            "host port {} in dependencies.{dep_name}.ports is reserved for CVM use (ports 1024, 8000)",
+                            "host port {} in dependencies.{dep_name}.ports is reserved for CVM use (ports 1024, 2024)",
                             parsed.host
                         )));
                     }
@@ -210,29 +210,29 @@ pub fn validate_config(
     // ── image source ──────────────────────────────────────
     validate_image_source(&w.image, workload_dir)?;
 
-    // ── measured-data paths ───────────────────────────────
-    for p in &w.measured_data {
+    // ── package measured-data paths ─────────────────────────
+    for p in config.measured_data_paths() {
         if !p.starts_with("./") {
             return Err(WorkloadError::Validation(format!(
-                "measured-data path must start with \"./\": {p:?}"
+                "package measured-data path must start with \"./\": {p:?}"
             )));
         }
-        ensure_no_traversal(p, "measured-data")?;
+        ensure_no_traversal(p, "package measured-data")?;
         let abs = workload_dir.join(p);
         if !abs.exists() {
             return Err(WorkloadError::MeasuredDataMissing(abs));
         }
-        ensure_within(&abs, workload_dir, "measured-data")?;
+        ensure_within(&abs, workload_dir, "package measured-data")?;
     }
 
-    // ── unmeasured-data paths (format check only, files need not exist) ──
-    for p in &w.unmeasured_data {
+    // ── package unmeasured-data paths (format check only, files need not exist) ──
+    for p in config.unmeasured_data_paths() {
         if !p.starts_with("./") {
             return Err(WorkloadError::Validation(format!(
-                "unmeasured-data path must start with \"./\": {p:?}"
+                "package unmeasured-data path must start with \"./\": {p:?}"
             )));
         }
-        ensure_no_traversal(p, "unmeasured-data")?;
+        ensure_no_traversal(p, "package unmeasured-data")?;
     }
 
     // ── env_file ──────────────────────────────────────────
@@ -432,25 +432,6 @@ pub fn validate_config(
             }
         }
 
-        // measured-data path format.
-        for p in &dep.measured_data {
-            if !p.starts_with("./") {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.measured-data path must start with \"./\": {p:?}"
-                )));
-            }
-            ensure_no_traversal(p, &format!("dependencies.{dep_name}.measured-data"))?;
-        }
-
-        // unmeasured-data path format.
-        for p in &dep.unmeasured_data {
-            if !p.starts_with("./") {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.unmeasured-data path must start with \"./\": {p:?}"
-                )));
-            }
-            ensure_no_traversal(p, &format!("dependencies.{dep_name}.unmeasured-data"))?;
-        }
     }
 
     Ok(warnings)
@@ -666,12 +647,15 @@ image = "x:latest"
         let toml = r#"
 format = 2
 
+[package]
+measured-data = ["./does-not-exist"]
+
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-measured-data = ["./does-not-exist"]
+measured-data = true
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -978,12 +962,14 @@ missing-disk = "/data"
         let toml = r#"
 format = 2
 
+[package]
+measured-data = ["./../etc/passwd"]
+
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-measured-data = ["./../etc/passwd"]
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -996,12 +982,14 @@ measured-data = ["./../etc/passwd"]
         let toml = r#"
 format = 2
 
+[package]
+unmeasured-data = ["./../secrets"]
+
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-unmeasured-data = ["./../secrets"]
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();

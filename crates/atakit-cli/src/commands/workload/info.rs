@@ -169,15 +169,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!();
 
     // --- Data ---
-    let has_data = !m.config.measured_data.is_empty()
-        || !m.config.unmeasured_data.is_empty();
-    if has_data {
+    if m.config.measured_data || m.config.unmeasured_data {
         section_header("Data");
-        if !m.config.measured_data.is_empty() {
-            print_multi("Measured:", &m.config.measured_data);
+        if m.config.measured_data {
+            println!("  {:<20}{}", "Measured:", "enabled (directory mounted)");
         }
-        if !m.config.unmeasured_data.is_empty() {
-            print_multi("Unmeasured:", &m.config.unmeasured_data);
+        if m.config.unmeasured_data {
+            println!("  {:<20}{}", "Unmeasured:", "enabled (directory mounted)");
         }
         println!();
     }
