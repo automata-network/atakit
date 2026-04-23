@@ -169,13 +169,13 @@ pub async fn build_workload(
         }
     }
 
-    // 5. Collect measured-data
-    let measured_file_count = if config.workload.measured_data.is_empty() {
+    // 5. Collect measured-data (from [package] section)
+    let measured_paths = config.measured_data_paths();
+    let measured_file_count = if measured_paths.is_empty() {
         0
     } else {
         let handle = progress.create("Collecting measured-data...", 0);
-        let count =
-            staging.stage_measured_data(&config.workload.measured_data, workload_dir)?;
+        let count = staging.stage_measured_data(measured_paths, workload_dir)?;
         handle.finish();
         count
     };

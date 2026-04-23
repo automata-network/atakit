@@ -117,6 +117,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
     let dependencies = v1.config.dependencies.map(|deps| {
         deps.into_iter()
             .map(|(name, dep)| {
+                let has_measured = !dep.measured_data.is_empty();
+                let has_unmeasured = !dep.unmeasured_data.is_empty();
                 (
                     name,
                     ManifestDependency {
@@ -129,8 +131,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         gid_group: workload_name.clone(),
                         environment: dep.environment,
                         depends_on: dep.depends_on,
-                        measured_data: dep.measured_data,
-                        unmeasured_data: dep.unmeasured_data,
+                        measured_data: has_measured,
+                        unmeasured_data: has_unmeasured,
                         disks: dep.disks,
                     },
                 )
@@ -169,11 +171,11 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             restart: v1.config.restart,
             command: v1.config.command,
             entrypoint: v1.config.entrypoint,
-            ttl: v1.config.ttl,
+            session_ttl: v1.config.ttl,
             atakit_portal: v1.config.cvm_agent,
             gid_group: workload_name,
-            measured_data: v1.config.measured_data,
-            unmeasured_data: v1.config.unmeasured_data,
+            measured_data: !v1.config.measured_data.is_empty(),
+            unmeasured_data: !v1.config.unmeasured_data.is_empty(),
             environment: v1.config.environment,
             disks: v1.config.disks,
             dependencies,
@@ -187,7 +189,6 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                     .collect();
                 for port in [1024, 2024] {
                     open.insert((port, "tcp".to_string()));
-                    open.insert((port, "udp".to_string()));
                 }
                 let mut ports: Vec<ManifestFirewallPort> = open
                     .into_iter()
@@ -249,12 +250,12 @@ mod tests {
             .map(|fp| (fp.port, fp.protocol.as_str()))
             .collect();
 
-        // Portal ports injected even though the v1 manifest had none.
+        // Portal ports injected (TCP only) even though the v1 manifest had none.
         assert!(port_set.contains(&(1024, "tcp")));
-        assert!(port_set.contains(&(1024, "udp")));
         assert!(port_set.contains(&(2024, "tcp")));
-        assert!(port_set.contains(&(2024, "udp")));
-        assert_eq!(manifest.config.firewall_ports.len(), 4);
+        assert!(!port_set.contains(&(1024, "udp")));
+        assert!(!port_set.contains(&(2024, "udp")));
+        assert_eq!(manifest.config.firewall_ports.len(), 2);
         // Sorted by port then protocol.
         let ports: Vec<u16> = manifest.config.firewall_ports.iter().map(|fp| fp.port).collect();
         assert!(ports.windows(2).all(|w| w[0] <= w[1]));

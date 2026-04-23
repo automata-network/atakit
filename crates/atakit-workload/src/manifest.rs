@@ -38,16 +38,16 @@ pub struct ManifestConfig {
     pub command: Option<StringOrArrayOut>,
     #[serde(default)]
     pub entrypoint: Option<StringOrArrayOut>,
-    #[serde(default)]
-    pub ttl: u64,
+    #[serde(default, rename = "session-ttl")]
+    pub session_ttl: u64,
     #[serde(default, rename = "atakit-portal")]
     pub atakit_portal: bool,
     #[serde(rename = "gid-group")]
     pub gid_group: String,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
@@ -123,9 +123,9 @@ pub struct ManifestDependency {
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
 }
@@ -266,20 +266,6 @@ pub fn build_manifest(
 ) -> Manifest {
     let w = &config.workload;
 
-    // Rewrite measured-data paths: strip "./"
-    let measured_data: Vec<String> = w
-        .measured_data
-        .iter()
-        .map(|p| strip_dot_slash(p).to_string())
-        .collect();
-
-    // Rewrite unmeasured-data paths: strip "./"
-    let unmeasured_data: Vec<String> = w
-        .unmeasured_data
-        .iter()
-        .map(|p| strip_dot_slash(p).to_string())
-        .collect();
-
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
     let firewall_ports = {
@@ -307,10 +293,10 @@ pub fn build_manifest(
         }
 
         // Always-allowed portal ports (per spec: 1024 for init, 2024 for
-        // status/measurements). Injected after user allow/deny so they
-        // cannot be denied.
-        insert_port_protos(&mut open, 1024, &None);
-        insert_port_protos(&mut open, 2024, &None);
+        // status/measurements). TCP only. Injected after user allow/deny
+        // so they cannot be denied.
+        insert_port_protos(&mut open, 1024, &Some("tcp".to_string()));
+        insert_port_protos(&mut open, 2024, &Some("tcp".to_string()));
 
         // Sort for deterministic output.
         let mut ports: Vec<ManifestFirewallPort> = open
@@ -347,16 +333,6 @@ pub fn build_manifest(
                     .get(name)
                     .cloned()
                     .unwrap_or_default();
-                let measured = dep
-                    .measured_data
-                    .iter()
-                    .map(|p| strip_dot_slash(p).to_string())
-                    .collect();
-                let unmeasured = dep
-                    .unmeasured_data
-                    .iter()
-                    .map(|p| strip_dot_slash(p).to_string())
-                    .collect();
                 (
                     name.clone(),
                     ManifestDependency {
@@ -369,8 +345,8 @@ pub fn build_manifest(
                         gid_group: dep.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
                         environment: env,
                         depends_on: dep.depends_on.clone(),
-                        measured_data: measured,
-                        unmeasured_data: unmeasured,
+                        measured_data: dep.measured_data,
+                        unmeasured_data: dep.unmeasured_data,
                         disks: dep.disks.clone(),
                     },
                 )
@@ -416,11 +392,11 @@ pub fn build_manifest(
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
             entrypoint: convert_string_or_array(&w.entrypoint),
-            ttl: w.ttl,
+            session_ttl: w.session_ttl,
             atakit_portal: w.atakit_portal,
             gid_group: w.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
-            measured_data,
-            unmeasured_data,
+            measured_data: w.measured_data,
+            unmeasured_data: w.unmeasured_data,
             environment,
             disks: w.disks.clone(),
             dependencies,
@@ -550,6 +526,11 @@ image = "my-app:latest"
         assert!(output.contains("images/my-app.tar"));
         // gid-group defaults to workload name
         assert!(output.contains("\"gid-group\":\"my-app\""));
+        // measured-data and unmeasured-data are booleans
+        assert!(output.contains("\"measured-data\":false"));
+        assert!(output.contains("\"unmeasured-data\":false"));
+        // session-ttl defaults to 0
+        assert!(output.contains("\"session-ttl\":0"));
     }
 
     #[test]

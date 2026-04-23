@@ -18,13 +18,16 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     let config = r#"
 format = 2
 
+[package]
+measured-data = ["./config/cert.pem"]
+
 [workload]
 name = "my-workload"
 version = "v0.1.0"
 base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 ports = ["3000:3000"]
-measured-data = ["./config/cert.pem"]
+measured-data = true
 
 [workload.environment]
 RUST_LOG = "info"

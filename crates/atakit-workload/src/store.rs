@@ -27,7 +27,7 @@ fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
 /// Cached on-chain workload spec data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedChainSpec {
-    pub ttl: u64,
+    pub session_ttl: u64,
     pub base_image_mode: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_image_ids: Vec<String>,

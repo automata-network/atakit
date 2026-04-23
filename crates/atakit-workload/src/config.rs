@@ -11,6 +11,8 @@ const CONFIG_FILENAME: &str = "atakit-workload.toml";
 #[derive(Debug, Deserialize)]
 pub struct WorkloadConfig {
     pub format: u32,
+    #[serde(default)]
+    pub package: Option<PackageSection>,
     pub workload: WorkloadSection,
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySection>,
@@ -20,6 +22,15 @@ pub struct WorkloadConfig {
     pub baby_container: Option<BabyContainerSection>,
     #[serde(default)]
     pub disks: BTreeMap<String, DiskSection>,
+}
+
+/// Package data: file lists for measured-data and unmeasured-data.
+#[derive(Debug, Deserialize)]
+pub struct PackageSection {
+    #[serde(default, rename = "measured-data")]
+    pub measured_data: Vec<String>,
+    #[serde(default, rename = "unmeasured-data")]
+    pub unmeasured_data: Vec<String>,
 }
 
 impl WorkloadConfig {
@@ -41,6 +52,16 @@ impl WorkloadConfig {
             path: CONFIG_FILENAME.into(),
             source: e,
         })
+    }
+
+    /// Get package measured-data file paths (empty if no [package] section).
+    pub fn measured_data_paths(&self) -> &[String] {
+        self.package.as_ref().map_or(&[], |p| &p.measured_data)
+    }
+
+    /// Get package unmeasured-data file paths (empty if no [package] section).
+    pub fn unmeasured_data_paths(&self) -> &[String] {
+        self.package.as_ref().map_or(&[], |p| &p.unmeasured_data)
     }
 
     /// Resolve disk indices: auto-assign starting from 10 for disks without
@@ -94,17 +115,17 @@ pub struct WorkloadSection {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub env_file: Option<StringOrArray>,
-    #[serde(default = "default_ttl")]
-    pub ttl: u64,
+    #[serde(default = "default_session_ttl", rename = "session-ttl")]
+    pub session_ttl: u64,
     #[serde(default, rename = "atakit-portal")]
     pub atakit_portal: bool,
     /// GID sharing group. Default: workload name.
     #[serde(default, rename = "gid-group")]
     pub gid_group: Option<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
     /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
@@ -112,8 +133,8 @@ pub struct WorkloadSection {
     pub boot_disk_size: Option<String>,
 }
 
-/// Default TTL: 0 means contract default (30 days).
-fn default_ttl() -> u64 {
+/// Default session TTL: 0 means contract default (30 days).
+fn default_session_ttl() -> u64 {
     0
 }
 
@@ -242,9 +263,9 @@ pub struct DependencySection {
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
 }
@@ -428,6 +449,26 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                     .into(),
             ));
         }
+        if workload.contains_key("ttl") {
+            return Err(WorkloadError::Validation(
+                "`ttl` has been renamed to `session-ttl` in format 2."
+                    .into(),
+            ));
+        }
+        if workload.get("measured-data").map_or(false, |v| v.is_array()) {
+            return Err(WorkloadError::Validation(
+                "`measured-data` on [workload] must be a boolean in format 2. \
+                 Move file lists to `[package] measured-data`."
+                    .into(),
+            ));
+        }
+        if workload.get("unmeasured-data").map_or(false, |v| v.is_array()) {
+            return Err(WorkloadError::Validation(
+                "`unmeasured-data` on [workload] must be a boolean in format 2. \
+                 Move file lists to `[package] unmeasured-data`."
+                    .into(),
+            ));
+        }
     }
 
     if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
@@ -437,6 +478,18 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `cvm_agent` is no longer supported. \
                          Rename to `atakit-portal`."
+                    )));
+                }
+                if t.get("measured-data").map_or(false, |v| v.is_array()) {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `measured-data` must be a boolean in format 2. \
+                         Move file lists to `[package] measured-data`."
+                    )));
+                }
+                if t.get("unmeasured-data").map_or(false, |v| v.is_array()) {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
+                         Move file lists to `[package] unmeasured-data`."
                     )));
                 }
             }
@@ -534,6 +587,10 @@ image = { file = "./images/app.tar" }
         let toml = r#"
 format = 2
 
+[package]
+measured-data = ["./config/hello", "./config/cert.pem"]
+unmeasured-data = ["./additional-data/signer_key"]
+
 [workload]
 name = "secure-signer"
 version = "v0.0.1"
@@ -544,8 +601,8 @@ ports = ["3000:3000"]
 restart = "unless-stopped"
 atakit-portal = true
 gid-group = "shared"
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/signer_key"]
+measured-data = true
+unmeasured-data = true
 
 [workload.environment]
 RUST_LOG = "info"
@@ -555,6 +612,11 @@ data = "/data"
 
 [dependencies.redis]
 image = "redis:7"
+
+[dependencies.model-server]
+image = { file = "./images/model-server.tar" }
+ports = ["8080:8080"]
+measured-data = true
 
 [firewall]
 allow = [{ port = 4000, protocol = "tcp" }]
@@ -575,8 +637,14 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert_eq!(cfg.workload.ports, vec!["3000:3000"]);
         assert!(cfg.workload.atakit_portal);
         assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
-        assert_eq!(cfg.workload.measured_data.len(), 2);
+        assert!(cfg.workload.measured_data);
+        assert!(cfg.workload.unmeasured_data);
+        let pkg = cfg.package.as_ref().unwrap();
+        assert_eq!(pkg.measured_data.len(), 2);
+        assert_eq!(pkg.unmeasured_data.len(), 1);
         assert!(cfg.dependencies.contains_key("redis"));
+        assert!(cfg.dependencies["model-server"].measured_data);
+        assert!(!cfg.dependencies["model-server"].unmeasured_data);
         assert!(cfg.firewall.is_some());
         assert!(cfg.baby_container.is_some());
         assert!(cfg.disks.contains_key("data"));
@@ -706,5 +774,95 @@ encryption = { enable = true }
 "#;
         let err = check_legacy_fields(toml).unwrap_err();
         assert!(err.to_string().contains("encryption schema"));
+    }
+
+    #[test]
+    fn rejects_old_ttl() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+ttl = 3600
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("session-ttl"));
+    }
+
+    #[test]
+    fn rejects_array_measured_data_on_workload() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+measured-data = ["./config/hello"]
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn rejects_array_measured_data_on_dependency() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[dependencies.redis]
+image = "redis:7"
+measured-data = ["./config/hello"]
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn parses_package_section() {
+        let toml = r#"
+format = 2
+
+[package]
+measured-data = ["./config/hello", "./config/cert.pem"]
+unmeasured-data = ["./additional-data/key"]
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+measured-data = true
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.measured_data_paths(), &["./config/hello", "./config/cert.pem"]);
+        assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
+        assert!(cfg.workload.measured_data);
+        assert!(!cfg.workload.unmeasured_data);
+    }
+
+    #[test]
+    fn parses_session_ttl() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+session-ttl = 3600
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.workload.session_ttl, 3600);
     }
 }

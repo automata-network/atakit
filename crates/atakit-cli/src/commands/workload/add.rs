@@ -137,7 +137,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Build cached chain spec
     let chain_spec = CachedChainSpec {
-        ttl: spec.ttl,
+        session_ttl: spec.ttl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
