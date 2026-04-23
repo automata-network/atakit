@@ -637,9 +637,9 @@ mod tests {
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            chain: "testnet".to_string(),
-            owner_key: "owner".to_string(),
-            gas_wallet: "gas".to_string(),
+            chain: Some("testnet".to_string()),
+            owner_key: Some("owner".to_string()),
+            gas_wallet: Some("gas".to_string()),
         }
     }
 

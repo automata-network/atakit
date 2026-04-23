@@ -136,6 +136,9 @@ pub struct CloudProviderConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct CloudConfig {
+    /// Default values inherited by targets that omit a field.
+    #[serde(default)]
+    pub defaults: CloudTargetDefaults,
     /// Named cloud providers: `[cloud.providers]`.
     #[serde(default)]
     pub providers: BTreeMap<String, CloudProviderConfig>,
@@ -147,6 +150,40 @@ pub struct CloudConfig {
     pub targets: BTreeMap<String, CloudTarget>,
 }
 
+impl CloudConfig {
+    /// Fill target fields from `[cloud.defaults]` where the target omits them.
+    pub fn apply_defaults(&mut self) {
+        let defaults = self.defaults.clone();
+        for target in self.targets.values_mut() {
+            if target.chain.is_none() {
+                target.chain = defaults.chain.clone();
+            }
+            if target.owner_key.is_none() {
+                target.owner_key = defaults.owner_key.clone();
+            }
+            if target.gas_wallet.is_none() {
+                target.gas_wallet = defaults.gas_wallet.clone();
+            }
+            if target.image.is_none() {
+                target.image = defaults.image.clone();
+            }
+        }
+    }
+}
+
+/// Default values for cloud targets: `[cloud.defaults]`.
+///
+/// Any field set here is inherited by targets that omit it.
+/// Target-level values always take precedence.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct CloudTargetDefaults {
+    pub chain: Option<String>,
+    pub owner_key: Option<String>,
+    pub gas_wallet: Option<String>,
+    pub image: Option<String>,
+}
+
 /// A named cloud deployment target (e.g. `[cloud.targets.c3-standard-4]`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudTarget {
@@ -154,10 +191,9 @@ pub struct CloudTarget {
     pub provider: String,
     /// VM machine type.
     pub vmtype: String,
-    /// Base image reference. Optional here so that unrelated commands
-    /// (`workload ls`, `image ls`, etc.) can still load the config
-    /// when a target entry omits it. `cloud deploy` enforces that
-    /// either this field or the `--image` flag is set.
+    /// Base image reference. Falls back to `[cloud.defaults] image`.
+    /// `cloud deploy` enforces that either this, the default, or
+    /// the `--image` flag is set.
     #[serde(default)]
     pub image: Option<String>,
     /// Confidential computing type. Optional; inferred from vmtype if absent.
@@ -169,11 +205,17 @@ pub struct CloudTarget {
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     /// Chain config name (references a key in `[chains]`).
-    pub chain: String,
+    /// Falls back to `[cloud.defaults] chain`.
+    #[serde(default)]
+    pub chain: Option<String>,
     /// Owner key name (references a key in `[keys]`, must be provisioned).
-    pub owner_key: String,
+    /// Falls back to `[cloud.defaults] owner_key`.
+    #[serde(default)]
+    pub owner_key: Option<String>,
     /// Gas wallet key name (references a key in `[keys]`).
-    pub gas_wallet: String,
+    /// Falls back to `[cloud.defaults] gas_wallet`.
+    #[serde(default)]
+    pub gas_wallet: Option<String>,
 }
 
 impl CloudTarget {
@@ -393,9 +435,9 @@ mod tests {
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            chain: "test-chain".to_string(),
-            owner_key: "test-owner".to_string(),
-            gas_wallet: "test-gas".to_string(),
+            chain: Some("test-chain".to_string()),
+            owner_key: Some("test-owner".to_string()),
+            gas_wallet: Some("test-gas".to_string()),
         }
     }
 
