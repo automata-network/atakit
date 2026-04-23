@@ -38,19 +38,22 @@ impl<'a> InitEnvResolver<'a> {
 	pub fn chain(&self) -> String {
 		self.cli_chain
 			.map(String::from)
-			.unwrap_or_else(|| self.target.chain.clone())
+			.or_else(|| self.target.chain.clone())
+			.expect("chain must be set on target or via --chain")
 	}
 
 	pub fn owner_key(&self) -> String {
 		self.cli_owner_key
 			.map(String::from)
-			.unwrap_or_else(|| self.target.owner_key.clone())
+			.or_else(|| self.target.owner_key.clone())
+			.expect("owner_key must be set on target or via --owner-key")
 	}
 
 	pub fn gas_wallet(&self) -> String {
 		self.cli_gas_wallet
 			.map(String::from)
-			.unwrap_or_else(|| self.target.gas_wallet.clone())
+			.or_else(|| self.target.gas_wallet.clone())
+			.expect("gas_wallet must be set on target or via --gas-wallet")
 	}
 
 	pub fn build(&self) -> PersistedInitEnv {

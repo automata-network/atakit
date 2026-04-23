@@ -859,6 +859,7 @@ impl Config {
     pub fn load_from_str(content: &str) -> Result<Self> {
         check_legacy_fields(content)?;
         let mut config: Config = toml::from_str(content).context("failed to parse config")?;
+        config.cloud.apply_defaults();
         config.apply_env_overrides();
         config.validate()?;
         Ok(config)
@@ -981,38 +982,40 @@ impl Config {
         let chain_names: Vec<&str> = self.chains.keys().map(|k| k.as_str()).collect();
         let key_names: Vec<&str> = self.keys.keys().map(|k| k.as_str()).collect();
         for (tname, target) in &self.cloud.targets {
-            if !self.chains.contains_key(&target.chain) {
-                bail!(
-                    "cloud target '{tname}' references unknown chain '{}'; \
-                     defined: [{}]",
-                    target.chain,
-                    chain_names.join(", ")
-                );
-            }
-            if !self.keys.contains_key(&target.owner_key) {
-                bail!(
-                    "cloud target '{tname}' references unknown key '{}' for \
-                     owner_key; defined: [{}]",
-                    target.owner_key,
-                    key_names.join(", ")
-                );
-            }
-            if let Some(ref spec) = self.keys.get(&target.owner_key) {
-                if spec.mode != KeyMode::Provisioned {
+            if let Some(ref chain) = target.chain {
+                if !self.chains.contains_key(chain) {
                     bail!(
-                        "cloud target '{tname}': owner_key '{}' must be \
-                         mode = \"provisioned\"",
-                        target.owner_key
+                        "cloud target '{tname}' references unknown chain '{chain}'; \
+                         defined: [{}]",
+                        chain_names.join(", ")
                     );
                 }
             }
-            if !self.keys.contains_key(&target.gas_wallet) {
-                bail!(
-                    "cloud target '{tname}' references unknown key '{}' for \
-                     gas_wallet; defined: [{}]",
-                    target.gas_wallet,
-                    key_names.join(", ")
-                );
+            if let Some(ref owner) = target.owner_key {
+                if !self.keys.contains_key(owner) {
+                    bail!(
+                        "cloud target '{tname}' references unknown key '{owner}' for \
+                         owner_key; defined: [{}]",
+                        key_names.join(", ")
+                    );
+                }
+                if let Some(ref spec) = self.keys.get(owner) {
+                    if spec.mode != KeyMode::Provisioned {
+                        bail!(
+                            "cloud target '{tname}': owner_key '{owner}' must be \
+                             mode = \"provisioned\""
+                        );
+                    }
+                }
+            }
+            if let Some(ref wallet) = target.gas_wallet {
+                if !self.keys.contains_key(wallet) {
+                    bail!(
+                        "cloud target '{tname}' references unknown key '{wallet}' for \
+                         gas_wallet; defined: [{}]",
+                        key_names.join(", ")
+                    );
+                }
             }
         }
 
