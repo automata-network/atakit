@@ -148,6 +148,7 @@
 # provider = "my-gcp"
 # vmtype = "c3-standard-4"        # cc_type inferred as TDX
 # image = "my-baseimage:v0.1.0"
+# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
 # owner_key = "owner"
 # gas_wallet = "gas"
@@ -156,6 +157,7 @@
 # provider = "my-azure"
 # vmtype = "Standard_DC4as_v5"    # cc_type inferred as SEV_SNP
 # image = "my-baseimage:v0.1.0"
+# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
 # owner_key = "owner"
 # gas_wallet = "gas"

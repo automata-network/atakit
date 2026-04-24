@@ -90,14 +90,18 @@ impl CloudProvider for GcpProvider {
             steps.push(DeployStep::CreateDisks { disks: disks.clone() });
         }
 
-        // Create instance.
+        let metadata: Vec<(String, String)> = opts
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         steps.push(DeployStep::CreateInstance {
             instance_name: names.instance.clone(),
             machine_type: opts.target.vmtype.clone(),
             zone: self.zone.clone(),
             image: names.image.clone(),
             cc_type: opts.target.resolved_cc_type(crate::PlatformKind::Gcp)?,
-            metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            metadata,
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
         });
@@ -313,7 +317,8 @@ impl CloudProvider for GcpProvider {
 
             // Azure steps.
             DestroyStep::DeleteResourceGroup { .. }
-            | DestroyStep::DeleteImageVersion { .. } => {
+            | DestroyStep::DeleteImageVersion { .. }
+            | DestroyStep::DeleteImageDefinition { .. } => {
                 Err(CloudError::State {
                     message: "Azure destroy step executed by GCP provider".to_string(),
                 })

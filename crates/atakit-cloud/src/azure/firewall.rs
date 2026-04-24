@@ -3,6 +3,7 @@ use crate::exec::CommandRunner;
 
 /// Create a Network Security Group.
 pub async fn create_nsg(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -14,6 +15,8 @@ pub async fn create_nsg(
                 "network",
                 "nsg",
                 "create",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -31,6 +34,7 @@ pub async fn create_nsg(
 ///
 /// Each entry in `ports` is `"port/proto"` (e.g. `"1024/tcp"`, `"5353/udp"`).
 pub async fn add_nsg_rules(
+    subscription: &str,
     rg: &str,
     nsg: &str,
     ports: &[String],
@@ -49,6 +53,8 @@ pub async fn add_nsg_rules(
                     "nsg",
                     "rule",
                     "create",
+                    "--subscription",
+                    subscription,
                     "--resource-group",
                     rg,
                     "--nsg-name",
@@ -77,6 +83,7 @@ pub async fn add_nsg_rules(
 
 /// Check if an NSG exists.
 pub async fn check_nsg_exists(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -88,6 +95,8 @@ pub async fn check_nsg_exists(
                 "network",
                 "nsg",
                 "show",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -99,41 +108,6 @@ pub async fn check_nsg_exists(
         Ok(_) => Ok(true),
         Err(CloudError::CommandFailed { .. }) => Ok(false),
         Err(e) => Err(e),
-    }
-}
-
-/// Delete an NSG.
-pub async fn delete_nsg(
-    rg: &str,
-    name: &str,
-    runner: &dyn CommandRunner,
-) -> Result<(), CloudError> {
-    match runner
-        .run_capture(
-            "az",
-            &[
-                "network",
-                "nsg",
-                "delete",
-                "--resource-group",
-                rg,
-                "--name",
-                name,
-            ],
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(CloudError::CommandFailed { stderr, .. })
-            if stderr.contains("not found") || stderr.contains("NotFound") =>
-        {
-            tracing::debug!("NSG '{name}' already deleted");
-            Ok(())
-        }
-        Err(e) => Err(CloudError::DestroyFailed {
-            resource: format!("nsg/{name}"),
-            message: e.to_string(),
-        }),
     }
 }
 

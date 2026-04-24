@@ -122,6 +122,12 @@ pub struct DeployArgs {
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
+
+    /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
+    /// Takes precedence over the target's `boot_disk_size` and the workload
+    /// manifest's minimum. Must be >= the workload minimum.
+    #[arg(long, value_name = "SIZE")]
+    pub boot_disk_size: Option<String>,
 }
 
 /// Arguments for `cloud destroy`.

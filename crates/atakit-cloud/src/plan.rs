@@ -100,6 +100,7 @@ pub enum DeployStep {
         image_definition: String,
         image_version: String,
         source_path: Option<String>,
+        certs_dir: Option<String>,
         cc_types: Vec<CcType>,
         force: bool,
     },
@@ -151,6 +152,11 @@ pub enum DestroyStep {
         gallery: String,
         image_definition: String,
         image_version: String,
+    },
+    DeleteImageDefinition {
+        gallery_rg: String,
+        gallery: String,
+        image_definition: String,
     },
 }
 
@@ -252,6 +258,9 @@ impl fmt::Display for DestroyStep {
                 image_version,
                 ..
             } => write!(f, "Delete image version '{image_definition}:{image_version}'"),
+            DestroyStep::DeleteImageDefinition {
+                image_definition, ..
+            } => write!(f, "Delete image definition '{image_definition}'"),
         }
     }
 }

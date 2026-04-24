@@ -93,6 +93,8 @@ pub(super) struct ResolvedImage {
     /// Local disk image file path for upload. `None` means the image is
     /// assumed to already exist in GCE.
     pub source_path: Option<String>,
+    /// Local secure-boot cert directory from the image store, if available.
+    pub certs_dir: Option<String>,
 }
 
 /// Resolve the `--image` argument into a display name and optional source path.
@@ -141,6 +143,7 @@ pub(super) fn resolve_image(
     Ok(ResolvedImage {
         display_name: image_arg.to_string(),
         source_path: None,
+        certs_dir: None,
     })
 }
 
@@ -174,6 +177,7 @@ fn resolve_store_image(
     Ok(ResolvedImage {
         display_name: image_ref.to_string(),
         source_path: Some(disk_path.display().to_string()),
+        certs_dir: Some(store.certs_dir(image_ref).display().to_string()),
     })
 }
 
@@ -583,7 +587,8 @@ pub(super) fn build_cloud_image_record(
             }
         }
         PlatformKind::Azure => {
-            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
+            // Only gallery/image fields are used here; storage_account isn't.
+            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region, "");
             CloudImage {
                 platform: PlatformKind::Azure,
                 cloud_name: names.image_definition,
@@ -624,14 +629,26 @@ pub(super) async fn ensure_cloud_image(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cloud_provider: Box<dyn CloudProvider> = match provider_config.platform {
-        PlatformKind::Gcp => Box::new(GcpProvider::new(
-            provider_config.project.clone().unwrap(),
-            provider_config.region.clone(),
-        )),
-        PlatformKind::Azure => Box::new(AzureProvider::new(
-            provider_config.subscription.clone().unwrap(),
-            provider_config.region.clone(),
-        )),
+        PlatformKind::Gcp => {
+            let project = provider_config.project.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{provider_name}' is missing 'project' in \
+                     [cloud.providers.{provider_name}]"
+                )
+            })?;
+            Box::new(GcpProvider::new(project, provider_config.region.clone()))
+        }
+        PlatformKind::Azure => {
+            let subscription = provider_config.subscription.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{provider_name}' is missing 'subscription' in \
+                     [cloud.providers.{provider_name}] — set it to the Azure \
+                     subscription ID you intend to deploy into (atakit will pass \
+                     --subscription to every az call)"
+                )
+            })?;
+            Box::new(AzureProvider::new(subscription, provider_config.region.clone()))
+        }
     };
 
     let runner = ProcessRunner::new(verbose);
@@ -649,9 +666,16 @@ pub(super) async fn ensure_cloud_image(
             exists && !force
         }
         PlatformKind::Azure => {
-            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
+            let subscription = provider_config.subscription.as_deref().unwrap();
+            // Image-existence check; storage_account isn't used.
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region, "");
             let exists = atakit_cloud::azure::image::check_image_version_exists(
-                &names.gallery_rg, &names.gallery, &names.image_definition, &names.image_version, &runner,
+                subscription,
+                &names.gallery_rg,
+                &names.gallery,
+                &names.image_definition,
+                &names.image_version,
+                &runner,
             ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
             exists && !force
         }
@@ -679,7 +703,11 @@ pub(super) async fn ensure_cloud_image(
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
         PlatformKind::Azure => {
-            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
+            // Image-upload path: shared `atakitupload` storage account (no
+            // hash) so a follow-up `cloud image upload` of the same image
+            // reuses rather than duplicates. This is a different lifecycle
+            // from per-deploy storage accounts.
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region, "");
             cloud_provider.execute_step(
                 &DeployStep::CreateResourceGroup {
                     name: names.resource_group.clone(),
@@ -696,6 +724,7 @@ pub(super) async fn ensure_cloud_image(
                 image_definition: names.image_definition,
                 image_version: names.image_version,
                 source_path: Some(source_path.to_string()),
+                certs_dir: None,
                 cc_types: cc_types.to_vec(),
                 force,
             };
