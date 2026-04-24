@@ -8,6 +8,7 @@ use crate::exec::CommandRunner;
 /// assignments, so they are not passed here.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_instance(
+    subscription: &str,
     rg: &str,
     name: &str,
     vm_size: &str,
@@ -21,6 +22,8 @@ pub async fn create_instance(
     let mut args = vec![
         "vm",
         "create",
+        "--subscription",
+        subscription,
         "--resource-group",
         rg,
         "--name",
@@ -42,6 +45,10 @@ pub async fn create_instance(
         nsg,
         "--public-ip-sku",
         "Standard",
+        "--admin-username", // Do NOT remove! VM create will fail.
+        "dummyuser",
+        "--admin-password", // Do NOT remove! VM create will fail.
+        "DummyPassword123",
     ];
 
     let os_disk_size_str = boot_disk_size_gb.map(|gb| gb.to_string());
@@ -82,6 +89,7 @@ pub async fn create_instance(
 
 /// Attach a managed disk to an instance with a specific LUN.
 pub async fn attach_disk(
+    subscription: &str,
     rg: &str,
     vm_name: &str,
     disk_name: &str,
@@ -95,6 +103,8 @@ pub async fn attach_disk(
                 "vm",
                 "disk",
                 "attach",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--vm-name",
@@ -114,6 +124,7 @@ pub async fn attach_disk(
 
 /// Get the public IP of a running instance.
 pub async fn get_instance_ip(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -124,6 +135,8 @@ pub async fn get_instance_ip(
             &[
                 "vm",
                 "list-ip-addresses",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -146,6 +159,7 @@ pub async fn get_instance_ip(
 
 /// Delete an instance.
 pub async fn delete_instance(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -156,6 +170,8 @@ pub async fn delete_instance(
             &[
                 "vm",
                 "delete",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -181,6 +197,7 @@ pub async fn delete_instance(
 
 /// Get boot diagnostics log from an instance.
 pub async fn get_boot_log(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -192,6 +209,8 @@ pub async fn get_boot_log(
                 "vm",
                 "boot-diagnostics",
                 "get-boot-log",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -204,13 +223,23 @@ pub async fn get_boot_log(
 
 /// Delete a resource group and all resources within it.
 pub async fn delete_resource_group(
+    subscription: &str,
     name: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), CloudError> {
     match runner
         .run_capture(
             "az",
-            &["group", "delete", "--name", name, "--yes", "--no-wait"],
+            &[
+                "group",
+                "delete",
+                "--subscription",
+                subscription,
+                "--name",
+                name,
+                "--yes",
+                "--no-wait",
+            ],
         )
         .await
     {

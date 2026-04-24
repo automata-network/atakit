@@ -15,6 +15,8 @@ pub struct DeployOptions {
     /// Local disk image file path for upload. `None` means the image is assumed
     /// to already exist in GCE (e.g. a bare GCE image name was passed).
     pub source_image_path: Option<String>,
+    /// Local secure-boot cert directory for the base image, if available.
+    pub source_image_certs_dir: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub workload_name: String,

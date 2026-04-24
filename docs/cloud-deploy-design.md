@@ -839,13 +839,6 @@ If absent: use platform defaults (GCP: no secure boot flags; Azure: `MicrosoftUe
 | `workload-version` | `v0.0.1` | `atakit-workload.toml` |
 | `archive-hash` | SHA-256 of `.atawl` | computed |
 
-### GCP-specific
-
-| Key | Value |
-|---|---|
-| `serial-port-enable` | `1` |
-| `serial-port-logging-enable` | `1` |
-
 ### User-provided
 
 Via `--metadata KEY=VALUE` CLI flags or `metadata` table in target config.

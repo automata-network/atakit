@@ -18,7 +18,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	let image_only = args.image_only;
 
 	// 1. Resolve workload source (unless --image-only).
-	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, boot_disk_size_gb, base_image_mode, base_image_list, unmeasured_tar, unmeasured_data_paths): (_, _, _, _, _, _, _, _, _, _, Vec<String>);
+	// `workload_boot_min` carries the raw workload manifest boot-disk-size string
+	// (if any); the effective size is resolved later once the target is known.
+	let (archive_path, workload_name, workload_version, archive_hash, workload_ports, workload_disks, workload_boot_min, base_image_mode, base_image_list, unmeasured_tar, unmeasured_data_paths): (_, _, _, _, _, _, Option<String>, _, _, _, Vec<String>);
 	if image_only {
 		archive_path = String::new();
 		workload_name = String::new();
@@ -26,7 +28,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		archive_hash = String::new();
 		workload_ports = Vec::new();
 		workload_disks = Vec::new();
-		boot_disk_size_gb = None;
+		workload_boot_min = None;
 		base_image_mode = String::new();
 		base_image_list = Vec::new();
 		unmeasured_tar = None;
@@ -43,7 +45,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				Ok((name.clone(), *index, gb))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		boot_disk_size_gb = resolved.boot_disk_size.as_deref().and_then(parse_size_gb);
+		workload_boot_min = resolved.boot_disk_size.clone();
 		base_image_mode = resolved.base_image_mode;
 		base_image_list = resolved.base_image;
 		// Collect unmeasured-data files: --unmeasured-data-dir takes precedence over workload dir.
@@ -110,6 +112,18 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			}
 		}
 	}
+
+	// 3b. Resolve effective OS boot disk size.
+	// Precedence: CLI --boot-disk-size > target.boot_disk_size > workload
+	// manifest boot-disk-size > DEFAULT_BOOT_DISK_GB. Errors if the operator's
+	// chosen size is below the workload's declared minimum, or below the
+	// absolute floor (MIN_BOOT_DISK_GB). Wrapped in Some() to preserve the
+	// downstream Option<u64> API.
+	let boot_disk_size_gb = Some(resolve_boot_disk_size(
+		args.boot_disk_size.as_deref(),
+		target.boot_disk_size.as_deref(),
+		workload_boot_min.as_deref(),
+	)?);
 
 	// 4. Instance name.
 	let instance_name = match args.name.clone() {
@@ -181,14 +195,28 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
 	// 9. Create provider.
 	let provider: Box<dyn CloudProvider> = match provider_config.platform {
-		PlatformKind::Gcp => Box::new(GcpProvider::new(
-			provider_config.project.clone().unwrap(),
-			provider_config.region.clone(),
-		)),
-		PlatformKind::Azure => Box::new(AzureProvider::new(
-			provider_config.subscription.clone().unwrap(),
-			provider_config.region.clone(),
-		)),
+		PlatformKind::Gcp => {
+			let project = provider_config.project.clone().ok_or_else(|| {
+				anyhow::anyhow!(
+					"provider '{}' is missing 'project' in [cloud.providers.{}]",
+					target.provider,
+					target.provider,
+				)
+			})?;
+			Box::new(GcpProvider::new(project, provider_config.region.clone()))
+		}
+		PlatformKind::Azure => {
+			let subscription = provider_config.subscription.clone().ok_or_else(|| {
+				anyhow::anyhow!(
+					"provider '{}' is missing 'subscription' in [cloud.providers.{}] — \
+					 set it to the Azure subscription ID you intend to deploy into \
+					 (atakit will pass --subscription to every az call)",
+					target.provider,
+					target.provider,
+				)
+			})?;
+			Box::new(AzureProvider::new(subscription, provider_config.region.clone()))
+		}
 	};
 
 	// 10. Generate plan.
@@ -198,6 +226,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		target: target.clone(),
 		image_ref: image_ref.to_string(),
 		source_image_path: resolved_image.source_path.clone(),
+		source_image_certs_dir: resolved_image.certs_dir.clone(),
 		archive_path: archive_path.clone(),
 		archive_hash: archive_hash.clone(),
 		workload_name: workload_name.clone(),
@@ -246,7 +275,14 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("  {:<15}{}", "Firewall:".dimmed(), names.firewall);
 		}
 		PlatformKind::Azure => {
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
+			// Non-storage fields don't depend on the hash — pass "".
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region, "");
+			// storage_account is randomized per deploy; pull the actual name
+			// out of the plan so what we print matches what's created.
+			let storage = plan.steps.iter().find_map(|s| match s {
+				DeployStep::UploadImageAzure { storage_account, .. } => Some(storage_account.clone()),
+				_ => None,
+			}).unwrap_or_else(|| names.storage_account.clone());
 			if let Some(ref sub) = provider_config.subscription {
 				eprintln!("  {:<15}{}", "Subscription:".dimmed(), sub);
 			}
@@ -256,6 +292,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
 			eprintln!("  {:<15}{}", "RG:".dimmed(), names.resource_group);
 			eprintln!("  {:<15}{}/{}", "Gallery:".dimmed(), names.gallery_rg, names.gallery);
+			eprintln!("  {:<15}{}", "Storage:".dimmed(), storage);
 			eprintln!("  {:<15}{}", "NSG:".dimmed(), names.nsg);
 		}
 	}
@@ -574,7 +611,8 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("      gcloud compute ssh {instance_name} --zone={zone} --project={project}");
 		}
 		PlatformKind::Azure => {
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
+			// Post-deploy instructions: only resource_group is used, so no hash needed.
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region, "");
 			eprintln!("    {:<12}{}", "Region:".dimmed(), provider_config.region);
 			eprintln!("    {:<12}{}", "RG:".dimmed(), names.resource_group);
 			eprintln!("    {:<12}{}", "CC type:".dimmed(), resolved_cc);
@@ -613,5 +651,168 @@ fn parse_size_gb(s: &str) -> Option<u64> {
 		"GB" => Some(num),
 		"MB" => Some(num.div_ceil(1024)),
 		_ => None,
+	}
+}
+
+/// Absolute floor for OS boot disk size. The base image is assumed to be
+/// ~1 GB; 2 GB leaves room for an ext4 /data partition on the tail.
+const MIN_BOOT_DISK_GB: u64 = 2;
+
+/// Default OS boot disk size when nothing is specified by the CLI flag,
+/// target config, or workload manifest. Chosen to leave ~3 GB for /data
+/// on a ~1 GB base image.
+const DEFAULT_BOOT_DISK_GB: u64 = 4;
+
+fn parse_source(source: &str, v: Option<&str>) -> Result<Option<u64>> {
+	match v {
+		None => Ok(None),
+		Some(s) => parse_size_gb(s).map(Some).ok_or_else(|| {
+			anyhow::anyhow!("invalid boot disk size {s:?} from {source} (expected e.g. \"100GB\", \"1TB\")")
+		}),
+	}
+}
+
+/// Resolve the effective OS boot disk size from (in precedence order):
+/// CLI > target > workload minimum > [`DEFAULT_BOOT_DISK_GB`]. Errors if
+/// the operator's chosen size (from CLI or target) is smaller than the
+/// workload's declared minimum, or if the resolved size is below
+/// [`MIN_BOOT_DISK_GB`].
+fn resolve_boot_disk_size(
+	cli: Option<&str>,
+	target: Option<&str>,
+	workload_min: Option<&str>,
+) -> Result<u64> {
+	let cli_gb = parse_source("--boot-disk-size", cli)?;
+	let target_gb = parse_source("target.boot_disk_size", target)?;
+	let workload_gb = parse_source("workload boot-disk-size", workload_min)?;
+
+	let effective = cli_gb.or(target_gb).or(workload_gb).unwrap_or(DEFAULT_BOOT_DISK_GB);
+
+	if let Some(m) = workload_gb {
+		if effective < m {
+			let source = if cli_gb == Some(effective) {
+				"--boot-disk-size"
+			} else {
+				"target.boot_disk_size"
+			};
+			bail!(
+				"{source} is {effective}GB but the workload declares a minimum of {m}GB. \
+				 Either raise the boot disk size or lower the workload's boot-disk-size."
+			);
+		}
+	}
+
+	if effective < MIN_BOOT_DISK_GB {
+		bail!(
+			"boot disk size must be >= {MIN_BOOT_DISK_GB}GB (base image is assumed to be ~1GB \
+			 and needs room for /data), got {effective}GB"
+		);
+	}
+
+	Ok(effective)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn cli_wins_over_target_and_workload() {
+		let got = resolve_boot_disk_size(Some("100GB"), Some("50GB"), Some("20GB")).unwrap();
+		assert_eq!(got, 100);
+	}
+
+	#[test]
+	fn target_wins_over_workload() {
+		let got = resolve_boot_disk_size(None, Some("50GB"), Some("20GB")).unwrap();
+		assert_eq!(got, 50);
+	}
+
+	#[test]
+	fn workload_is_the_fallback() {
+		let got = resolve_boot_disk_size(None, None, Some("20GB")).unwrap();
+		assert_eq!(got, 20);
+	}
+
+	#[test]
+	fn all_unset_yields_default() {
+		let got = resolve_boot_disk_size(None, None, None).unwrap();
+		assert_eq!(got, DEFAULT_BOOT_DISK_GB);
+		assert_eq!(got, 4);
+	}
+
+	#[test]
+	fn default_satisfies_the_hard_floor() {
+		assert!(DEFAULT_BOOT_DISK_GB >= MIN_BOOT_DISK_GB);
+	}
+
+	#[test]
+	fn workload_min_above_default_wins_over_default() {
+		// Default is 4 GB, workload asks for 10 GB → workload wins.
+		let got = resolve_boot_disk_size(None, None, Some("10GB")).unwrap();
+		assert_eq!(got, 10);
+	}
+
+	#[test]
+	fn cli_below_workload_minimum_errors() {
+		let err = resolve_boot_disk_size(Some("10GB"), None, Some("50GB")).unwrap_err().to_string();
+		assert!(err.contains("--boot-disk-size"), "{err}");
+		assert!(err.contains("10GB") && err.contains("50GB"), "{err}");
+	}
+
+	#[test]
+	fn target_below_workload_minimum_errors() {
+		let err = resolve_boot_disk_size(None, Some("10GB"), Some("50GB")).unwrap_err().to_string();
+		assert!(err.contains("target.boot_disk_size"), "{err}");
+		assert!(err.contains("10GB") && err.contains("50GB"), "{err}");
+	}
+
+	#[test]
+	fn cli_overrides_target_even_when_target_below_workload() {
+		// CLI=100, target=10 (< workload min 50), workload=50. CLI wins, target < min
+		// does not matter because CLI is the operator's actual choice.
+		let got = resolve_boot_disk_size(Some("100GB"), Some("10GB"), Some("50GB")).unwrap();
+		assert_eq!(got, 100);
+	}
+
+	#[test]
+	fn below_hard_floor_errors_from_cli() {
+		let err = resolve_boot_disk_size(Some("1GB"), None, None).unwrap_err().to_string();
+		assert!(err.contains("2GB"), "{err}");
+	}
+
+	#[test]
+	fn below_hard_floor_errors_from_workload() {
+		let err = resolve_boot_disk_size(None, None, Some("1GB")).unwrap_err().to_string();
+		assert!(err.contains("2GB"), "{err}");
+	}
+
+	#[test]
+	fn image_only_path_still_enforces_floor() {
+		// image-only: workload_min is None. 1 GB from CLI still rejected.
+		let err = resolve_boot_disk_size(Some("1GB"), None, None).unwrap_err().to_string();
+		assert!(err.contains("2GB"), "{err}");
+	}
+
+	#[test]
+	fn bad_format_names_the_source() {
+		let err = resolve_boot_disk_size(Some("garbage"), None, None).unwrap_err().to_string();
+		assert!(err.contains("--boot-disk-size"), "{err}");
+		let err = resolve_boot_disk_size(None, Some("garbage"), None).unwrap_err().to_string();
+		assert!(err.contains("target.boot_disk_size"), "{err}");
+		let err = resolve_boot_disk_size(None, None, Some("garbage")).unwrap_err().to_string();
+		assert!(err.contains("workload boot-disk-size"), "{err}");
+	}
+
+	#[test]
+	fn at_hard_floor_is_ok() {
+		let got = resolve_boot_disk_size(Some("2GB"), None, None).unwrap();
+		assert_eq!(got, 2);
+	}
+
+	#[test]
+	fn equal_to_workload_minimum_is_ok() {
+		let got = resolve_boot_disk_size(Some("50GB"), None, Some("50GB")).unwrap();
+		assert_eq!(got, 50);
 	}
 }
