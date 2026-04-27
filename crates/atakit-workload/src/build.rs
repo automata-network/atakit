@@ -6,7 +6,8 @@ use crate::archive::{self, StagingDir};
 use crate::config::{ImageSource, WorkloadConfig};
 use crate::hash;
 use crate::image::ContainerEngine;
-use crate::manifest;
+use crate::image_meta;
+use crate::manifest::{self, ManifestImage};
 use crate::validate;
 use crate::WorkloadError;
 
@@ -201,9 +202,29 @@ pub async fn build_workload(
     hashes.extend(image_hashes);
     handle.finish();
 
+    // 7b. Extract per-service image IDs (immutable identity for `podman run`).
+    let handle = progress.create("Extracting image IDs...", 0);
+    let mut images = std::collections::BTreeMap::new();
+    images.insert(
+        name.clone(),
+        build_image_meta(&staging, &tar_name)?,
+    );
+    for dep_name in &dep_names {
+        let dep_tar = archive::image_tar_name(dep_name);
+        images.insert((*dep_name).clone(), build_image_meta(&staging, &dep_tar)?);
+    }
+    handle.finish();
+
     // 8. Generate manifest
     let handle = progress.create("Generating manifest.json...", 0);
-    let m = manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
+    let m = manifest::build_manifest(
+        &config,
+        &resolved_image,
+        environment,
+        dep_environments,
+        hashes,
+        images,
+    );
     let manifest_json = manifest::serialize_canonical_json(&m)?;
     staging.write_manifest(&manifest_json)?;
     handle.finish();
@@ -231,6 +252,17 @@ pub async fn build_workload(
         version,
         image_count,
         measured_file_count,
+    })
+}
+
+/// Read the image-id from a staged image tar and bundle it with the
+/// archive-relative path the manifest will reference.
+fn build_image_meta(staging: &StagingDir, tar_name: &str) -> Result<ManifestImage, WorkloadError> {
+    let path = staging.image_tar_path(tar_name);
+    let image_id = image_meta::read_image_id(&path)?;
+    Ok(ManifestImage {
+        archive: format!("images/{tar_name}"),
+        image_id,
     })
 }
 

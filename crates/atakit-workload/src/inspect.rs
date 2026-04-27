@@ -163,6 +163,17 @@ async fn inspect_dir(
     let image_hashes = crate::hash::hash_directory(&staging.root, "images")?;
     hashes.extend(image_hashes);
 
+    // Extract per-service image IDs from the staged tars.
+    let mut images = std::collections::BTreeMap::new();
+    images.insert(
+        name.clone(),
+        build_image_meta(&staging, &tar_name)?,
+    );
+    for dep_name in &dep_names {
+        let dep_tar = crate::archive::image_tar_name(dep_name);
+        images.insert((*dep_name).clone(), build_image_meta(&staging, &dep_tar)?);
+    }
+
     // Resolve environment (workload + dependencies)
     let environment = crate::manifest::resolve_environment(
         &config.workload.env_file,
@@ -181,11 +192,29 @@ async fn inspect_dir(
     }
 
     // Build manifest
-    let manifest =
-        crate::manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
+    let manifest = crate::manifest::build_manifest(
+        &config,
+        &resolved_image,
+        environment,
+        dep_environments,
+        hashes,
+        images,
+    );
     let manifest_raw = crate::manifest::serialize_canonical_json(&manifest)?;
 
     build_result_json(manifest_raw)
+}
+
+fn build_image_meta(
+    staging: &crate::archive::StagingDir,
+    tar_name: &str,
+) -> Result<crate::manifest::ManifestImage, WorkloadError> {
+    let path = staging.image_tar_path(tar_name);
+    let image_id = crate::image_meta::read_image_id(&path)?;
+    Ok(crate::manifest::ManifestImage {
+        archive: format!("images/{tar_name}"),
+        image_id,
+    })
 }
 
 /// Stage a single container image into the staging directory.
