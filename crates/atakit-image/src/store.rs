@@ -312,5 +312,6 @@ fn disk_filename(platform: Platform) -> &'static str {
         Platform::Gcp => "gcp_disk.tar.gz",
         Platform::Aws => "aws_disk.vmdk",
         Platform::Azure => "azure_disk.vhd.zst",
+        Platform::Qemu => "qemu_disk.qcow2",
     }
 }

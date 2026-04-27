@@ -9,7 +9,7 @@ pub enum ImageError {
     #[error("invalid repository '{0}': must not contain '/'")]
     InvalidRepository(String),
 
-    #[error("unsupported platform '{0}', expected: gcp, aws, azure")]
+    #[error("unsupported platform '{0}', expected: gcp, aws, azure, qemu")]
     UnsupportedPlatform(String),
 
     #[error("GitHub API returned {status}: {body}")]
