@@ -322,7 +322,7 @@ impl fmt::Display for PlatformStatus {
 struct ImageRow {
     version: String,
     date: Option<String>,
-    platforms: [PlatformStatus; 3], // GCP, AWS, Azure
+    platforms: [PlatformStatus; 4], // GCP, AWS, Azure, QEMU
     certs: PlatformStatus,
 }
 
@@ -443,7 +443,7 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>, vw: usize) {
         let vh = format!("{:<vw$}", "VERSION");
         let dh = format!("{:10}", "DATE");
         println!(
-            "      {}     {}  GCP  AWS  AZURE  CERTS",
+            "      {}     {}  GCP  AWS  AZURE  QEMU  CERTS",
             vh.dimmed(),
             dh.dimmed(),
         );
@@ -461,10 +461,10 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>, vw: usize) {
             } else {
                 version_padded
             };
-            let [g, a, z] = &row.platforms;
+            let [g, a, z, q] = &row.platforms;
             println!(
-                "{prefix}{}     {:10}  {}    {}    {}      {}",
-                version, date, g, a, z, row.certs,
+                "{prefix}{}     {:10}  {}    {}    {}      {}     {}",
+                version, date, g, a, z, q, row.certs,
             );
         }
     }

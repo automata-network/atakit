@@ -63,16 +63,17 @@ impl fmt::Display for ImageRef {
     }
 }
 
-/// Target cloud platform.
+/// Target platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     Gcp,
     Aws,
     Azure,
+    Qemu,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 3] = [Platform::Gcp, Platform::Aws, Platform::Azure];
+    pub const ALL: [Platform; 4] = [Platform::Gcp, Platform::Aws, Platform::Azure, Platform::Qemu];
 }
 
 impl fmt::Display for Platform {
@@ -81,6 +82,7 @@ impl fmt::Display for Platform {
             Self::Gcp => f.write_str("gcp"),
             Self::Aws => f.write_str("aws"),
             Self::Azure => f.write_str("azure"),
+            Self::Qemu => f.write_str("qemu"),
         }
     }
 }
@@ -93,6 +95,7 @@ impl FromStr for Platform {
             "gcp" => Ok(Platform::Gcp),
             "aws" => Ok(Platform::Aws),
             "azure" => Ok(Platform::Azure),
+            "qemu" => Ok(Platform::Qemu),
             other => Err(ImageError::UnsupportedPlatform(other.to_string())),
         }
     }
@@ -272,6 +275,7 @@ impl Release {
             Platform::Gcp => 0,
             Platform::Aws => 1,
             Platform::Azure => 2,
+            Platform::Qemu => 3,
         });
         platforms
     }
