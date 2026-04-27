@@ -138,6 +138,9 @@ async fn main() -> Result<()> {
             WorkloadCommand::Rm(args) => {
                 commands::workload::rm::run(args, &env)
             }
+            WorkloadCommand::Init(args) => {
+                commands::workload::init::run(args, &env, &config).await
+            }
         },
         Command::Cloud(cmd) => match cmd {
             CloudCommand::Deploy(args) => {

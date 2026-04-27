@@ -31,6 +31,9 @@ pub enum WorkloadCommand {
     Add(AddArgs),
     /// Remove a workload from the local store
     Rm(RmArgs),
+    /// Initialize a CVM portal directly (e.g. local QEMU)
+    #[command(arg_required_else_help = true)]
+    Init(InitArgs),
 }
 
 /// Arguments for `workload create`.
@@ -244,4 +247,51 @@ pub struct RmArgs {
     /// Remove only the archive blob, keep metadata
     #[arg(long)]
     pub blob_only: bool,
+}
+
+/// Arguments for `workload init`.
+#[derive(Args)]
+pub struct InitArgs {
+    /// Portal address: "host" or "host:port" (default port 1024;
+    /// status port = init port + 1000).
+    pub address: String,
+
+    /// Workload source: name:version (store ref) or path to .atawl file
+    pub source: Option<String>,
+
+    /// Workload directory (default: current directory)
+    #[arg(short, long, conflicts_with = "source")]
+    pub dir: Option<PathBuf>,
+
+    /// Platform string sent as `platform.declared` in the init payload
+    #[arg(long, value_parser = ["gcp", "azure", "qemu"], default_value = "qemu")]
+    pub platform: String,
+
+    /// Chain config name override (references [chains.<name>])
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
+    #[arg(long)]
+    pub owner_key: Option<String>,
+
+    /// Gas wallet key name override (references [keys.<name>])
+    #[arg(long)]
+    pub gas_wallet: Option<String>,
+
+    /// Portal wait timeout in seconds
+    #[arg(long, default_value = "300")]
+    pub timeout: u64,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+
+    /// Skip workload freshness check
+    #[arg(long)]
+    pub skip_freshness_check: bool,
+
+    /// Directory containing unmeasured-data files (overrides workload dir)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_dir: Option<PathBuf>,
 }
