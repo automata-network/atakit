@@ -19,7 +19,9 @@ pub struct InitChainConfig {
     pub session_registry: String,
     pub workload_registry: String,
     pub base_image_registry: String,
-    pub session_ttl_seconds: u64,
+    /// Seconds. Validity window of the owner-key-signed `registerCvm`
+    /// message. Sent to the portal as `chain.register_cvm_expire_offset`.
+    pub register_cvm_expire_offset: u64,
 }
 
 /// Key config section of the init payload.
@@ -60,7 +62,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
                 "workload_registry": config.chain.workload_registry,
                 "base_image_registry": config.chain.base_image_registry,
             },
-            "session_ttl_seconds": config.chain.session_ttl_seconds,
+            "register_cvm_expire_offset": config.chain.register_cvm_expire_offset,
         },
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
@@ -207,7 +209,7 @@ mod tests {
                 session_registry: "0xSESS".to_string(),
                 workload_registry: "0xWORK".to_string(),
                 base_image_registry: "0xBASE".to_string(),
-                session_ttl_seconds: 3600,
+                register_cvm_expire_offset: 300,
             },
             owner_key: InitKeyConfig {
                 mode: "provisioned".to_string(),
@@ -229,7 +231,7 @@ mod tests {
         assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
         assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
         assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
-        assert_eq!(json["chain"]["session_ttl_seconds"], 3600);
+        assert_eq!(json["chain"]["register_cvm_expire_offset"], 300);
         assert_eq!(json["owner_key"]["mode"], "provisioned");
         assert_eq!(json["owner_key"]["type"], "es256k");
         assert_eq!(json["owner_key"]["private_key"], "0xOWNER");
