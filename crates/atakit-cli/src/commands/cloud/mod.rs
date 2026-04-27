@@ -182,7 +182,7 @@ fn resolve_store_image(
 }
 
 /// Resolved workload source: archive path + name/version + declared ports + disks.
-pub(super) struct ResolvedWorkload {
+pub(crate) struct ResolvedWorkload {
     pub archive_path: PathBuf,
     pub name: String,
     pub version: String,
@@ -204,7 +204,7 @@ pub(super) struct ResolvedWorkload {
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
-pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env, skip_freshness_check: bool) -> Result<ResolvedWorkload> {
+pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env, skip_freshness_check: bool) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
         // Store reference: name:version
         if crate::commands::workload::looks_like_store_ref(src) {
@@ -465,7 +465,7 @@ pub(super) fn validate_base_image(
 /// `paths` are archive-relative (no `./` prefix, e.g. `"runtime-data/key.pem"`).
 /// Files are resolved under `workload_dir` with a `./` prefix re-added.
 /// Returns `None` if no files are found. Warns about missing files.
-pub(super) fn collect_unmeasured_tar(
+pub(crate) fn collect_unmeasured_tar(
     paths: &[String],
     workload_dir: &std::path::Path,
 ) -> Result<Option<Vec<u8>>> {

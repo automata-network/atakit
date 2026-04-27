@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use crate::config::PlatformKind;
 use crate::error::CloudError;
 
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
 pub struct InitConfig {
-    pub platform: PlatformKind,
+    /// Sent verbatim as `platform.declared` in the init JSON (e.g. "gcp", "azure", "qemu").
+    pub platform: String,
     pub chain: InitChainConfig,
     pub owner_key: InitKeyConfig,
     pub gas_wallet: InitKeyConfig,
@@ -32,11 +32,6 @@ pub struct InitKeyConfig {
 
 /// Build the portal config JSON from an InitConfig.
 fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
-    let platform_str = match config.platform {
-        PlatformKind::Gcp => "gcp",
-        PlatformKind::Azure => "azure",
-    };
-
     let mut owner_key = serde_json::json!({
         "mode": config.owner_key.mode,
         "type": config.owner_key.key_type,
@@ -56,7 +51,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     serde_json::json!({
         "format": 1,
         "platform": {
-            "declared": platform_str,
+            "declared": &config.platform,
         },
         "chain": {
             "rpc_url": config.chain.rpc_url,
@@ -73,8 +68,8 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
 }
 
 /// Poll the portal status endpoint with exponential backoff.
-pub async fn wait_for_portal(ip: &str, timeout_secs: u64) -> Result<(), CloudError> {
-    let url = format!("https://{ip}:2024/status");
+pub async fn wait_for_portal(host: &str, status_port: u16, timeout_secs: u64) -> Result<(), CloudError> {
+    let url = format!("https://{host}:{status_port}/status");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
@@ -90,7 +85,7 @@ pub async fn wait_for_portal(ip: &str, timeout_secs: u64) -> Result<(), CloudErr
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!("portal is ready at {ip}:2024");
+                tracing::info!("portal is ready at {host}:{status_port}");
                 return Ok(());
             }
             Ok(resp) => {
@@ -103,7 +98,7 @@ pub async fn wait_for_portal(ip: &str, timeout_secs: u64) -> Result<(), CloudErr
 
         if tokio::time::Instant::now() + interval > deadline {
             return Err(CloudError::PortalTimeout {
-                address: format!("{ip}:2024"),
+                address: format!("{host}:{status_port}"),
                 timeout_secs,
             });
         }
@@ -118,12 +113,13 @@ pub async fn wait_for_portal(ip: &str, timeout_secs: u64) -> Result<(), CloudErr
 /// Always uses HTTPS. The portal serves a self-signed certificate,
 /// so we always accept invalid certs for the init request.
 pub async fn post_portal_init(
-    ip: &str,
+    host: &str,
+    init_port: u16,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
 ) -> Result<(), CloudError> {
-    let url = format!("https://{ip}:1024/init");
+    let url = format!("https://{host}:{init_port}/init");
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -194,7 +190,7 @@ pub async fn post_portal_init(
         });
     }
 
-    tracing::info!("workload initialized on CVM at {ip}");
+    tracing::info!("workload initialized on CVM at {host}:{init_port}");
     Ok(())
 }
 
@@ -205,7 +201,7 @@ mod tests {
     #[test]
     fn portal_config_json_shape() {
         let config = InitConfig {
-            platform: PlatformKind::Gcp,
+            platform: "gcp".to_string(),
             chain: InitChainConfig {
                 rpc_url: "https://rpc.example.com".to_string(),
                 session_registry: "0xSESS".to_string(),

@@ -5,6 +5,7 @@ pub mod deactivate;
 pub mod export;
 pub mod import;
 pub mod info;
+pub mod init;
 pub mod ls;
 pub mod publish;
 pub mod pull;

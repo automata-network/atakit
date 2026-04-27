@@ -416,7 +416,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.or_else(|| state.resources.azure.as_ref().and_then(|a| a.external_ip.as_ref()))
 					.ok_or_else(|| anyhow::anyhow!("no external IP available for agent wait"))?
 					.clone();
-				match init::wait_for_portal(&ip, *timeout_secs).await {
+				match init::wait_for_portal(&ip, 2024, *timeout_secs).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());
@@ -457,7 +457,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
 
 				let init_config = InitConfig {
-					platform: provider_config.platform,
+					platform: provider_config.platform.to_string(),
 					chain: InitChainConfig {
 						rpc_url: chain.rpc_url.clone(),
 						session_registry: chain.session_registry.clone(),
@@ -483,7 +483,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					},
 				};
 
-				match init::post_portal_init(&ip, ap, unmeasured_tar.as_deref(), &init_config).await {
+				match init::post_portal_init(&ip, 1024, ap, unmeasured_tar.as_deref(), &init_config).await {
 					Ok(()) => eprintln!("{}", "done".green()),
 					Err(e) => {
 						eprintln!("{}", "failed".red());
