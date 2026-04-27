@@ -21,7 +21,7 @@
 # session_registry = "0x..."
 # workload_registry = "0x..."
 # base_image_registry = "0x..."
-# session_ttl_seconds = 3600
+# register_cvm_expire_offset = 300
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #

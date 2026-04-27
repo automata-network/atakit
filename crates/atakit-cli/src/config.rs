@@ -407,7 +407,7 @@ fn resolve_command(
 /// [chains.mainnet]
 /// rpc_url = "https://..."
 /// session_registry = "0x..."
-/// session_ttl_seconds = 3600
+/// register_cvm_expire_offset = 300
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -418,12 +418,14 @@ pub struct ChainConfig {
     pub workload_registry: Option<String>,
     /// Derived from `session_registry` via on-chain call if omitted.
     pub base_image_registry: Option<String>,
-    #[serde(default = "default_session_ttl")]
-    pub session_ttl_seconds: u64,
+    /// How long the owner-key-signed `registerCvm` message remains valid
+    /// before the on-chain registry rejects it. Seconds.
+    #[serde(default = "default_register_cvm_expire_offset")]
+    pub register_cvm_expire_offset: u64,
 }
 
-fn default_session_ttl() -> u64 {
-    3600
+fn default_register_cvm_expire_offset() -> u64 {
+    300
 }
 
 // ── [keys] section ───────────────────────────────────────────────
@@ -1294,7 +1296,7 @@ fn check_legacy_fields(content: &str) -> Result<()> {
         if cloud.contains_key("expire_offset") {
             bail!(
                 "`[cloud] expire_offset` is no longer supported. Use \
-                 `session_ttl_seconds` in `[chains.<name>]` instead."
+                 `register_cvm_expire_offset` in `[chains.<name>]` instead."
             );
         }
         for field in ["owner_key_file", "relay_key_file"] {
@@ -1320,6 +1322,22 @@ fn check_legacy_fields(content: &str) -> Result<()> {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // v0.5.0: `[chains.<name>] session_ttl_seconds` was misnamed; the field
+    // controls registerCvm message validity, not session TTL. Hard-reject so a
+    // value picked under the wrong semantic is not silently aliased through.
+    if let Some(chains) = value.get("chains").and_then(|v| v.as_table()) {
+        for (cname, cval) in chains {
+            if let Some(t) = cval.as_table() {
+                if t.contains_key("session_ttl_seconds") {
+                    bail!(
+                        "`[chains.{cname}] session_ttl_seconds` was renamed to \
+                         `register_cvm_expire_offset`."
+                    );
                 }
             }
         }
@@ -2652,7 +2670,7 @@ mod tests {
             [chains.testnet]
             rpc_url = "https://rpc.test"
             session_registry = "0xABCD"
-            session_ttl_seconds = 7200
+            register_cvm_expire_offset = 7200
 
             [keys.owner]
             type = "es256k"
@@ -2670,7 +2688,7 @@ mod tests {
         let chain = config.chains.get("testnet").unwrap();
         assert_eq!(chain.rpc_url, "https://rpc.test");
         assert_eq!(chain.session_registry, "0xABCD");
-        assert_eq!(chain.session_ttl_seconds, 7200);
+        assert_eq!(chain.register_cvm_expire_offset, 7200);
         assert!(chain.workload_registry.is_none());
 
         assert_eq!(config.keys.len(), 2);
@@ -2865,5 +2883,21 @@ mod tests {
             format!("{err:#}").contains("owner_key_file"),
             "expected migration hint, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn legacy_chains_session_ttl_seconds_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            session_ttl_seconds = 7200
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("session_ttl_seconds"), "expected field name in error: {msg}");
+        assert!(msg.contains("register_cvm_expire_offset"), "expected new name in error: {msg}");
     }
 }
