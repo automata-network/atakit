@@ -2,6 +2,46 @@ use std::io::Read;
 
 use atakit_core::{ArchiveCompression, NullReporter};
 use atakit_workload::{build_workload, inspect_workload, BuildOptions, InspectOptions};
+use sha2::{Digest, Sha256};
+
+/// Build a minimal but valid docker-archive tar containing a single image
+/// with a config blob made unique by `marker`. Returns the tar bytes.
+///
+/// The build pipeline now extracts the image config digest ("image ID")
+/// from each staged image tar; stub byte fixtures no longer parse, so
+/// tests must produce real tar streams.
+fn make_docker_archive_tar(marker: &str) -> Vec<u8> {
+    let config_blob = format!(
+        r#"{{"architecture":"amd64","os":"linux","config":{{}},"rootfs":{{"type":"layers","diff_ids":[]}},"_marker":"{marker}"}}"#
+    );
+    let digest = format!("{:x}", Sha256::digest(config_blob.as_bytes()));
+    let manifest = format!(
+        r#"[{{"Config":"blobs/sha256/{digest}","RepoTags":["{marker}:latest"],"Layers":[]}}]"#
+    );
+
+    let mut buf = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut buf);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(manifest.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, "manifest.json", manifest.as_bytes()).unwrap();
+
+        let mut h = tar::Header::new_gnu();
+        h.set_size(config_blob.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(
+            &mut h,
+            format!("blobs/sha256/{digest}"),
+            config_blob.as_bytes(),
+        )
+        .unwrap();
+        tar.finish().unwrap();
+    }
+    buf
+}
 
 /// Set up a minimal workload directory using `image = { file = "..." }` so the
 /// build pipeline can run without Docker/Podman.
@@ -9,8 +49,9 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     let wl_dir = tmp.join("my-workload");
     std::fs::create_dir_all(wl_dir.join("config")).unwrap();
 
-    // Fake image tar -- content doesn't matter, pipeline just copies it
-    std::fs::write(wl_dir.join("app.tar"), b"fake-image-tar-content").unwrap();
+    // Real (minimal) docker-archive tar so the build pipeline can extract
+    // the image config digest. Content is otherwise unused.
+    std::fs::write(wl_dir.join("app.tar"), make_docker_archive_tar("my-workload")).unwrap();
 
     // Measured-data file
     std::fs::write(wl_dir.join("config/cert.pem"), b"fake-cert").unwrap();
@@ -266,9 +307,10 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     let wl_dir = tmp.join("multi-container");
     std::fs::create_dir_all(&wl_dir).unwrap();
 
-    // Fake image tars
-    std::fs::write(wl_dir.join("app.tar"), b"fake-main-image").unwrap();
-    std::fs::write(wl_dir.join("sidecar.tar"), b"fake-sidecar-image").unwrap();
+    // Real (minimal) docker-archive tars with distinct config blobs so the
+    // build pipeline can extract a different image-id for each.
+    std::fs::write(wl_dir.join("app.tar"), make_docker_archive_tar("multi-app")).unwrap();
+    std::fs::write(wl_dir.join("sidecar.tar"), make_docker_archive_tar("redis-sidecar")).unwrap();
 
     let config = r#"
 format = 2
@@ -353,6 +395,20 @@ async fn build_with_dependency() {
     assert_eq!(redis.ports, vec!["6379:6379"]);
     assert_eq!(redis.restart, "unless-stopped");
     assert_eq!(redis.environment.get("REDIS_MAX_MEMORY").unwrap(), "256mb");
+
+    // The `images` section must hold one entry per service, each with the
+    // archive path and a sha256 image-id extracted from the staged tar.
+    let images = &inspect_result.manifest.images;
+    assert_eq!(images.len(), 2, "expected one image entry per service");
+    let main = images.get("multi-app").expect("primary image-id missing");
+    assert_eq!(main.archive, "images/multi-app.tar");
+    assert!(main.image_id.starts_with("sha256:"));
+    assert_eq!(main.image_id.len(), 7 + 64);
+    let dep = images.get("redis").expect("dependency image-id missing");
+    assert_eq!(dep.archive, "images/redis.tar");
+    assert!(dep.image_id.starts_with("sha256:"));
+    // Distinct config blobs => distinct image-ids.
+    assert_ne!(main.image_id, dep.image_id);
 }
 
 #[tokio::test]

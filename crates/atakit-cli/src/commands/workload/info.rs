@@ -234,6 +234,17 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         println!();
     }
 
+    // --- Images (per-service archive + image-id) ---
+    if !m.images.is_empty() {
+        section_header("Images");
+        let max_svc = m.images.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (svc, img) in &m.images {
+            println!("  {:<width$}  {}", svc, img.archive, width = max_svc);
+            println!("  {:<width$}  {}", "", img.image_id, width = max_svc);
+        }
+        println!();
+    }
+
     // --- Hashes ---
     if !m.hashes.is_empty() {
         section_header("Hashes");

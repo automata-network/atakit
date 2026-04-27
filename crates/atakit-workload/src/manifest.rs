@@ -14,6 +14,25 @@ pub struct Manifest {
     #[serde(default)]
     pub disks: BTreeMap<String, ManifestDisk>,
     pub hashes: BTreeMap<String, String>,
+    /// Per-service image metadata: archive path + immutable image config
+    /// digest ("image ID"). Keyed by service name (workload + each
+    /// dependency). Always serialised; defaults to empty when reading
+    /// archives that pre-date this field.
+    #[serde(default)]
+    pub images: BTreeMap<String, ManifestImage>,
+}
+
+/// Per-service image metadata.
+///
+/// `image-id` is `sha256(<image-config-blob>)` -- the same value
+/// `podman images --no-trunc` reports as IMAGE ID. It pins the loaded
+/// image to its immutable runtime identity so the portal can `podman run`
+/// by digest instead of by mutable tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestImage {
+    pub archive: String,
+    #[serde(rename = "image-id")]
+    pub image_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,6 +274,7 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 ///
 /// `resolved_image` is the canonical `name:tag` string.
 /// `hashes` contains all content hashes computed during staging.
+/// `images` contains per-service image metadata (archive path + image ID).
 /// `environment` is the already-resolved (env_file merged) environment.
 /// `dep_environments` contains resolved environments for each dependency.
 pub fn build_manifest(
@@ -263,6 +283,7 @@ pub fn build_manifest(
     environment: BTreeMap<String, String>,
     dep_environments: BTreeMap<String, BTreeMap<String, String>>,
     hashes: BTreeMap<String, String>,
+    images: BTreeMap<String, ManifestImage>,
 ) -> Manifest {
     let w = &config.workload;
 
@@ -406,6 +427,7 @@ pub fn build_manifest(
         },
         disks,
         hashes,
+        images,
     }
 }
 
@@ -509,12 +531,22 @@ image = "my-app:latest"
         let mut hashes = BTreeMap::new();
         hashes.insert("images/my-app.tar".into(), "sha256:abc123".into());
 
+        let mut images = BTreeMap::new();
+        images.insert(
+            "my-app".into(),
+            ManifestImage {
+                archive: "images/my-app.tar".into(),
+                image_id: "sha256:def456".into(),
+            },
+        );
+
         let manifest = build_manifest(
             &cfg,
             "my-app:latest",
             BTreeMap::new(),
             BTreeMap::new(),
             hashes,
+            images,
         );
 
         let output = serialize_canonical_json(&manifest).unwrap();
@@ -531,6 +563,9 @@ image = "my-app:latest"
         assert!(output.contains("\"unmeasured-data\":false"));
         // session-ttl defaults to 0
         assert!(output.contains("\"session-ttl\":0"));
+        // images section is present and surfaces image-id
+        assert!(output.contains("\"images\":"));
+        assert!(output.contains("\"image-id\":\"sha256:def456\""));
     }
 
     #[test]
@@ -546,12 +581,77 @@ image = "test:latest"
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
         let hashes = BTreeMap::new();
+        let images = BTreeMap::new();
 
-        let m1 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes.clone());
-        let m2 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes);
+        let m1 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes.clone(), images.clone());
+        let m2 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes, images);
 
         let json1 = serialize_canonical_json(&m1).unwrap();
         let json2 = serialize_canonical_json(&m2).unwrap();
         assert_eq!(json1, json2, "canonical JSON must be byte-identical");
+    }
+
+    #[test]
+    fn canonical_json_with_images_is_deterministic() {
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "main"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "main:latest"
+
+[dependencies.redis]
+image = "redis:7"
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+
+        let mut hashes = BTreeMap::new();
+        hashes.insert("images/main.tar".into(), "sha256:aaa".into());
+        hashes.insert("images/redis.tar".into(), "sha256:bbb".into());
+
+        let mut images = BTreeMap::new();
+        images.insert(
+            "main".into(),
+            ManifestImage {
+                archive: "images/main.tar".into(),
+                image_id: "sha256:1111".into(),
+            },
+        );
+        images.insert(
+            "redis".into(),
+            ManifestImage {
+                archive: "images/redis.tar".into(),
+                image_id: "sha256:2222".into(),
+            },
+        );
+
+        let m1 = build_manifest(
+            &cfg,
+            "main:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes.clone(),
+            images.clone(),
+        );
+        let m2 = build_manifest(
+            &cfg,
+            "main:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes,
+            images,
+        );
+
+        let j1 = serialize_canonical_json(&m1).unwrap();
+        let j2 = serialize_canonical_json(&m2).unwrap();
+        assert_eq!(j1, j2);
+        // Sanity: both image-ids surface in the canonical output.
+        assert!(j1.contains("\"image-id\":\"sha256:1111\""));
+        assert!(j1.contains("\"image-id\":\"sha256:2222\""));
+        // And service-name keying.
+        assert!(j1.contains("\"main\":{\"archive\":\"images/main.tar\""));
+        assert!(j1.contains("\"redis\":{\"archive\":\"images/redis.tar\""));
     }
 }
