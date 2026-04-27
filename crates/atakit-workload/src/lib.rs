@@ -6,6 +6,7 @@ pub mod config;
 mod error;
 pub mod hash;
 pub mod image;
+pub mod image_meta;
 pub mod inspect;
 pub mod manifest;
 pub mod manifest_v1;
