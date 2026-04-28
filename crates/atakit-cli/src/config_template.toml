@@ -21,7 +21,11 @@
 # session_registry = "0x..."
 # workload_registry = "0x..."
 # base_image_registry = "0x..."
-# register_cvm_expire_offset = 300
+# expire_offset = 300
+# # ^ default validity window (seconds) for owner-key-signed on-chain
+# # messages: registerCvm in the CVM, plus the operator-side
+# # registerWorkload / deactivateWorkload / registerBaseImage flows.
+# # `--expire-offset` on each CLI command overrides per call.
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #

@@ -134,7 +134,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 				.ok_or_else(|| anyhow::anyhow!("workload_registry required in chain '{chain_name}'"))?,
 			base_image_registry: chain.base_image_registry.clone()
 				.ok_or_else(|| anyhow::anyhow!("base_image_registry required in chain '{chain_name}'"))?,
-			register_cvm_expire_offset: chain.register_cvm_expire_offset,
+			expire_offset: chain.expire_offset,
 		},
 		owner_key: InitKeyConfig {
 			mode: owner_key_spec.mode.to_string(),

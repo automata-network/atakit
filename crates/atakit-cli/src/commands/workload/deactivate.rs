@@ -107,8 +107,9 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     }
 
     println!("Submitting deactivateWorkload transaction...");
+    let expire_offset = args.expire_offset.unwrap_or(chain.expire_offset);
     let tx_hash = registry
-        .deactivate_workload(&signer, workload_id, args.expire_offset)
+        .deactivate_workload(&signer, workload_id, expire_offset)
         .await
         .context("deactivateWorkload failed")?;
 
