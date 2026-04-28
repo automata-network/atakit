@@ -195,7 +195,6 @@ image = "{{name}}:latest"
 # index: device LUN / index. Must be >= 10, unique across all disks.
 #        Auto-assigned from 10 in alphabetical order if omitted.
 # size: disk size with unit suffix. Valid units: MB, GB, TB.
-# bind_fs: use bindfs for UID translation (default: false).
 # encryption.unlock_method: list of unlock methods ("tpm", "passphrase",
 #   "keyfile", "kms"). Empty list means no encryption.
 # encryption.bind: list of PCR bindings ("platform", "baseimage", "workload").
@@ -203,5 +202,4 @@ image = "{{name}}:latest"
 # [disks.my-disk]
 # index = 10
 # size = "10GB"
-# bind_fs = true
 # encryption = { unlock_method = ["tpm"], bind = ["workload"] }

@@ -145,12 +145,14 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
         .into_iter()
         .map(|(name, d)| {
             let encryption = d.encryption.and_then(|e| convert_encryption_v1(&e));
+            // v1 `bind_fs` is dropped: removed in format 2 (manual --uidmap/--gidmap
+            // plus the shared GID scheme makes bindfs redundant).
+            let _ = d.bind_fs;
             (
                 name,
                 ManifestDisk {
                     index: d.index,
                     size: d.size,
-                    bind_fs: d.bind_fs,
                     encryption,
                 },
             )

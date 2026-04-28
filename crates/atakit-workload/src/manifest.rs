@@ -168,8 +168,6 @@ pub struct ManifestDisk {
     pub index: u32,
     pub size: String,
     #[serde(default)]
-    pub bind_fs: bool,
-    #[serde(default)]
     pub encryption: Option<ManifestDiskEncryption>,
 }
 
@@ -392,7 +390,6 @@ pub fn build_manifest(
                 ManifestDisk {
                     index,
                     size: d.size.clone(),
-                    bind_fs: d.bind_fs,
                     encryption: enc,
                 },
             )
