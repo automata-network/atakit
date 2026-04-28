@@ -407,7 +407,7 @@ fn resolve_command(
 /// [chains.mainnet]
 /// rpc_url = "https://..."
 /// session_registry = "0x..."
-/// register_cvm_expire_offset = 300
+/// expire_offset = 300
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -418,13 +418,16 @@ pub struct ChainConfig {
     pub workload_registry: Option<String>,
     /// Derived from `session_registry` via on-chain call if omitted.
     pub base_image_registry: Option<String>,
-    /// How long the owner-key-signed `registerCvm` message remains valid
-    /// before the on-chain registry rejects it. Seconds.
-    #[serde(default = "default_register_cvm_expire_offset")]
-    pub register_cvm_expire_offset: u64,
+    /// Validity window (seconds) for owner-key-signed messages submitted
+    /// to the on-chain registries. Default for the portal's `registerCvm`
+    /// message and for the operator's `workload publish`,
+    /// `workload deactivate`, and `imgbuild publish` signature offsets.
+    /// CLI `--expire-offset` overrides this per call.
+    #[serde(default = "default_expire_offset")]
+    pub expire_offset: u64,
 }
 
-fn default_register_cvm_expire_offset() -> u64 {
+fn default_expire_offset() -> u64 {
     300
 }
 
@@ -1296,7 +1299,7 @@ fn check_legacy_fields(content: &str) -> Result<()> {
         if cloud.contains_key("expire_offset") {
             bail!(
                 "`[cloud] expire_offset` is no longer supported. Use \
-                 `register_cvm_expire_offset` in `[chains.<name>]` instead."
+                 `expire_offset` in `[chains.<name>]` instead."
             );
         }
         for field in ["owner_key_file", "relay_key_file"] {
@@ -1328,15 +1331,29 @@ fn check_legacy_fields(content: &str) -> Result<()> {
     }
 
     // v0.5.0: `[chains.<name>] session_ttl_seconds` was misnamed; the field
-    // controls registerCvm message validity, not session TTL. Hard-reject so a
+    // controls signed-message validity, not session TTL. Hard-reject so a
     // value picked under the wrong semantic is not silently aliased through.
+    //
+    // v0.6.0: `register_cvm_expire_offset` was generalized to `expire_offset`
+    // (now used as the default for both the portal's registerCvm message and
+    // the operator-side publish/deactivate signature offsets).
     if let Some(chains) = value.get("chains").and_then(|v| v.as_table()) {
         for (cname, cval) in chains {
             if let Some(t) = cval.as_table() {
                 if t.contains_key("session_ttl_seconds") {
                     bail!(
                         "`[chains.{cname}] session_ttl_seconds` was renamed to \
-                         `register_cvm_expire_offset`."
+                         `expire_offset`."
+                    );
+                }
+                if t.contains_key("register_cvm_expire_offset") {
+                    bail!(
+                        "`[chains.{cname}] register_cvm_expire_offset` was renamed \
+                         to `expire_offset` (now used as the default validity \
+                         window for the portal's registerCvm message AND for the \
+                         operator's `workload publish` / `workload deactivate` / \
+                         `imgbuild publish` signature offsets; CLI \
+                         `--expire-offset` overrides per call)."
                     );
                 }
             }
@@ -2670,7 +2687,7 @@ mod tests {
             [chains.testnet]
             rpc_url = "https://rpc.test"
             session_registry = "0xABCD"
-            register_cvm_expire_offset = 7200
+            expire_offset = 7200
 
             [keys.owner]
             type = "es256k"
@@ -2688,7 +2705,7 @@ mod tests {
         let chain = config.chains.get("testnet").unwrap();
         assert_eq!(chain.rpc_url, "https://rpc.test");
         assert_eq!(chain.session_registry, "0xABCD");
-        assert_eq!(chain.register_cvm_expire_offset, 7200);
+        assert_eq!(chain.expire_offset, 7200);
         assert!(chain.workload_registry.is_none());
 
         assert_eq!(config.keys.len(), 2);
@@ -2898,6 +2915,25 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("session_ttl_seconds"), "expected field name in error: {msg}");
-        assert!(msg.contains("register_cvm_expire_offset"), "expected new name in error: {msg}");
+        assert!(msg.contains("expire_offset"), "expected new name in error: {msg}");
+    }
+
+    #[test]
+    fn legacy_chains_register_cvm_expire_offset_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            register_cvm_expire_offset = 7200
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("register_cvm_expire_offset"),
+            "expected old field name in error: {msg}"
+        );
+        assert!(msg.contains("expire_offset"), "expected new name in error: {msg}");
     }
 }
