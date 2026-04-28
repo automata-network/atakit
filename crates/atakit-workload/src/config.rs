@@ -403,13 +403,12 @@ fn default_max_count() -> u32 {
 
 /// Persistent disk definition.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskSection {
     /// LUN / device index. Must be >= 10 and unique across all disks.
     /// If omitted, auto-assigned starting from 10 in alphabetical disk name order.
     pub index: Option<u32>,
     pub size: String,
-    #[serde(default)]
-    pub bind_fs: bool,
     #[serde(default)]
     pub encryption: Option<EncryptionSection>,
 }
@@ -512,6 +511,15 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                         "disk {name:?}: encryption schema has changed in format 2. \
                          Replace {{enable, key_security}} with \
                          {{unlock_method, bind}}."
+                    )));
+                }
+            }
+            if let Some(t) = disk.as_table() {
+                if t.contains_key("bind_fs") {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?}: `bind_fs` is no longer supported. \
+                         Manual `--uidmap`/`--gidmap` plus the shared GID scheme \
+                         makes bindfs redundant."
                     )));
                 }
             }
@@ -628,7 +636,6 @@ max_count = 2
 [disks.data]
 index = 10
 size = "10GB"
-bind_fs = true
 encryption = { unlock_method = ["tpm"], bind = ["workload"] }
 
 "#;
@@ -774,6 +781,28 @@ encryption = { enable = true }
 "#;
         let err = check_legacy_fields(toml).unwrap_err();
         assert!(err.to_string().contains("encryption schema"));
+    }
+
+    #[test]
+    fn rejects_disk_bind_fs() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+bind_fs = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bind_fs"), "expected field name in error: {msg}");
+        assert!(msg.contains("uidmap"), "expected migration hint in error: {msg}");
     }
 
     #[test]

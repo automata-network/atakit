@@ -191,9 +191,6 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
                     flags.push("encrypted");
                 }
             }
-            if disk.bind_fs {
-                flags.push("bind_fs");
-            }
             println!("  {:<18}{}  {}", format!("{name}:"), mount, flags.join("  "));
         }
         println!();
