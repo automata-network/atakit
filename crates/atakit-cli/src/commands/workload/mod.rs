@@ -387,4 +387,39 @@ mod tests {
         assert!(compute_final_pcr23("notahex").is_none());
         assert!(compute_final_pcr23("0xdeadbeef").is_none()); // too short
     }
+
+    /// Cross-check vector against atakit-portal's hand-rolled abi.encode + keccak256.
+    /// If this assertion changes, the matching test in atakit-portal must change too,
+    /// or the on-chain workload IDs the portal reports will silently diverge.
+    #[test]
+    fn compute_workload_id_known_vector() {
+        let id = compute_workload_id("test-workload", "v1.0.0");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0xc6025b180ebd852412a9e3490b9759239995d1e0741a9ffd2ada596e1094e608"
+        );
+    }
+
+    /// Real-world vector: a workload published on-chain. Confirms the synthetic
+    /// vector above isn't an artifact of `test-workload`/`v1.0.0` specifically.
+    #[test]
+    fn compute_workload_id_fedora_oci_v0_0_9() {
+        let id = compute_workload_id("fedora-oci", "v0.0.9");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0x45504f5c32f3da742031f059f8aea265a3ed840d19fc27f66aaea0215ae82181"
+        );
+    }
+
+    /// Cross-check vector against atakit-portal's hand-rolled abi.encode + keccak256.
+    /// If this assertion changes, the matching test in atakit-portal must change too,
+    /// or the on-chain base-image IDs the portal reports will silently diverge.
+    #[test]
+    fn compute_base_image_id_known_vector() {
+        let id = compute_base_image_id("test-image", "v1.0.0");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0xe1a0a8f3eb93a84d2c524e46e6604d6dea9f5254e5b2eefb07134fa47f7173a5"
+        );
+    }
 }
