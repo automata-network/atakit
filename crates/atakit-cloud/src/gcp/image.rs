@@ -17,7 +17,10 @@ pub async fn ensure_bucket(
 
     // Check if bucket exists.
     match runner
-        .run_capture("gsutil", &["ls", "-b", &format!("gs://{bucket}")])
+        .run_capture(
+            "gcloud",
+            &["storage", "buckets", "describe", &format!("gs://{bucket}")],
+        )
         .await
     {
         Ok(_) => return Ok(()),
@@ -27,14 +30,16 @@ pub async fn ensure_bucket(
 
     runner
         .run_capture(
-            "gsutil",
+            "gcloud",
             &[
-                "mb",
-                "-p",
-                project,
-                "-l",
-                region,
+                "storage",
+                "buckets",
+                "create",
                 &format!("gs://{bucket}"),
+                "--project",
+                project,
+                "--location",
+                region,
             ],
         )
         .await
@@ -58,17 +63,15 @@ pub async fn upload_image(
         .unwrap_or("image.raw.tar.gz");
     let gcs_uri = format!("gs://{bucket}/{filename}");
 
-    // Always stream stderr so gsutil's native transfer progress is visible.
+    // Use `gcloud storage cp` (Go-native) instead of `gsutil cp` (Python).
+    // gsutil's parallel composite upload mode (triggered for files >150 MB)
+    // spawns Python multiprocessing workers that crash on macOS with the
+    // bundled gcloud SDK Python. `gcloud storage` handles parallel transfer
+    // natively and avoids the issue.
     runner
         .run_stream(
-            "gsutil",
-            &[
-                "-o",
-                "GSUtil:parallel_composite_upload_threshold=150M",
-                "cp",
-                source_path,
-                &gcs_uri,
-            ],
+            "gcloud",
+            &["storage", "cp", source_path, &gcs_uri],
             true,
         )
         .await
@@ -186,13 +189,18 @@ pub async fn delete_image(
 /// Delete a GCS bucket and all contents.
 pub async fn delete_bucket(bucket: &str, runner: &dyn CommandRunner) -> Result<(), CloudError> {
     match runner
-        .run_capture("gsutil", &["rm", "-r", &format!("gs://{bucket}")])
+        .run_capture(
+            "gcloud",
+            &["storage", "rm", "--recursive", &format!("gs://{bucket}")],
+        )
         .await
     {
         Ok(_) => Ok(()),
         Err(CloudError::CommandFailed { stderr, .. })
             if stderr.contains("BucketNotFoundException")
-                || stderr.contains("No URLs matched") =>
+                || stderr.contains("No URLs matched")
+                || stderr.contains("not found")
+                || stderr.contains("does not exist") =>
         {
             tracing::debug!("bucket '{bucket}' already deleted");
             Ok(())
