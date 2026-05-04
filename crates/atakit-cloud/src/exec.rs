@@ -8,7 +8,7 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
-/// Trait for executing shell commands (gcloud, gsutil, az).
+/// Trait for executing shell commands (gcloud, az).
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run a command and capture stdout + stderr.
