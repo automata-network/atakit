@@ -77,6 +77,13 @@ image = "{{name}}:latest"
 # cvm_agent: mount the CVM agent Unix socket into the container.
 # Required for workloads that communicate with the host agent.
 # cvm_agent = true
+#
+# cap-add: Linux capabilities to grant the container. Allowlisted to a small
+# set so attestation surface stays bounded. Currently allowed: "NET_ADMIN",
+# "NET_RAW". Use NET_ADMIN to let the workload manage nftables in its own
+# network namespace (e.g. firewall/egress enforcement that subordinate baby
+# containers inherit via shared-netns).
+# cap-add = ["NET_ADMIN"]
 
 # ── environment variables ────────────────────────────────────────
 #
