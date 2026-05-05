@@ -96,13 +96,15 @@ impl ContainerEngine {
                 run_command_streaming(&mut load, "docker load", verbose).await
             }
             ContainerEngine::Podman => {
+                // Newer podman/buildah (>= 1.40) reject `--timestamp` together
+                // with `SOURCE_DATE_EPOCH`, treating them as ambiguous. Use only
+                // `--timestamp 0` here — it covers both layer and config epochs.
                 let mut cmd = Command::new(self.bin());
                 cmd.arg("build")
                     .arg("-t")
                     .arg(tag)
                     .arg("--timestamp")
-                    .arg("0")
-                    .env("SOURCE_DATE_EPOCH", "0");
+                    .arg("0");
 
                 if let Some(cf) = containerfile {
                     cmd.arg("-f").arg(context.join(cf));
