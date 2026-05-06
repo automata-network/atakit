@@ -79,7 +79,7 @@ pub struct ManifestConfig {
     pub baby_container: Option<ManifestBabyContainer>,
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
-    #[serde(default, rename = "cap-add", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
 }
 
@@ -149,7 +149,7 @@ pub struct ManifestDependency {
     pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
-    #[serde(default, rename = "cap-add", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
 }
 
