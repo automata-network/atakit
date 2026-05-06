@@ -131,6 +131,10 @@ pub struct WorkloadSection {
     /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
+    /// Linux capabilities to add to the container. Allowlisted to a small set
+    /// (currently NET_ADMIN, NET_RAW) so attestation surface stays bounded.
+    #[serde(default, rename = "cap-add")]
+    pub cap_add: Vec<String>,
 }
 
 /// Default session TTL: 0 means contract default (30 days).
@@ -268,6 +272,8 @@ pub struct DependencySection {
     pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default, rename = "cap-add")]
+    pub cap_add: Vec<String>,
 }
 
 /// Parsed port specification: `host[:container][/protocol]`.

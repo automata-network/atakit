@@ -103,6 +103,22 @@ image = "{{name}}:latest"
 # same gid-group share a host GID; services with different values get
 # isolated GIDs. Default: workload name.
 # gid-group = "my-group"
+#
+# cap-add: Linux capabilities to grant on top of the default cap set.
+# Allowlisted to "NET_ADMIN", "NET_RAW" so the attestation surface stays
+# bounded. NET_ADMIN lets the workload manage nftables in its own netns
+# (e.g. firewall/egress enforcement that subordinate baby containers
+# inherit via shared-netns); NET_RAW lets it open raw sockets.
+# Always serialised in manifest.json -- empty [] is a positive commitment
+# bound into PCR23, not noise.
+# cap-add = ["NET_ADMIN"]
+#
+# cap-drop: Linux capabilities to remove from the default cap set as a
+# hardening commitment. Entries must be members of the default set
+# (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE, SETFCAP,
+# SETGID, SETPCAP, SETUID, SYS_CHROOT). Names use canonical uppercase
+# without the CAP_ prefix.
+# cap-drop = ["NET_BIND_SERVICE"]
 
 # ── environment variables ────────────────────────────────────────
 #

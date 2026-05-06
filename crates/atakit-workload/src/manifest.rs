@@ -79,6 +79,8 @@ pub struct ManifestConfig {
     pub baby_container: Option<ManifestBabyContainer>,
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
+    #[serde(default, rename = "cap-add", skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
 }
 
 fn default_restart() -> String {
@@ -147,6 +149,8 @@ pub struct ManifestDependency {
     pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default, rename = "cap-add", skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
 }
 
 /// A resolved firewall port to open: port number + protocol.
@@ -367,6 +371,7 @@ pub fn build_manifest(
                         measured_data: dep.measured_data,
                         unmeasured_data: dep.unmeasured_data,
                         disks: dep.disks.clone(),
+                        cap_add: dep.cap_add.clone(),
                     },
                 )
             })
@@ -421,6 +426,7 @@ pub fn build_manifest(
             firewall_ports,
             baby_container,
             boot_disk_size: w.boot_disk_size.clone(),
+            cap_add: w.cap_add.clone(),
         },
         disks,
         hashes,
