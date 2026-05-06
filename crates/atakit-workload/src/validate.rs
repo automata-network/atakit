@@ -475,6 +475,17 @@ fn validate_caps(
     cap_drop: &[String],
     context: &str,
 ) -> Result<(), WorkloadError> {
+    // Check overlap first. The per-list allowlists below are disjoint by
+    // construction (no cap is both add-able and drop-able), so a same-name
+    // entry in both lists would otherwise surface as a less-clear per-list
+    // failure. Reporting the contradiction directly is more useful.
+    for cap in cap_add {
+        if cap_drop.contains(cap) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: capability {cap:?} appears in both cap-add and cap-drop"
+            )));
+        }
+    }
     for cap in cap_add {
         if !CAP_ADD_ALLOWLIST.contains(&cap.as_str()) {
             return Err(WorkloadError::Validation(format!(
@@ -489,13 +500,6 @@ fn validate_caps(
                 "{context}.cap-drop: capability {cap:?} is not in the default cap set {:?}; \
                  dropping a cap that is not in the default set has no effect",
                 DEFAULT_CAPS
-            )));
-        }
-    }
-    for cap in cap_add {
-        if cap_drop.contains(cap) {
-            return Err(WorkloadError::Validation(format!(
-                "{context}: capability {cap:?} appears in both cap-add and cap-drop"
             )));
         }
     }
@@ -1171,5 +1175,163 @@ env_file = "prod.env"
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         assert!(err.to_string().contains("env_file path must start with"));
+    }
+
+    #[test]
+    fn accepts_allowlisted_cap_add() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-add = ["NET_ADMIN", "NET_RAW"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_cap_add_outside_allowlist() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-add = ["SYS_ADMIN"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("cap-add"));
+        assert!(err.to_string().contains("SYS_ADMIN"));
+    }
+
+    #[test]
+    fn rejects_cap_add_with_cap_prefix() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-add = ["CAP_NET_ADMIN"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_cap_add_lowercase() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-add = ["net_admin"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn accepts_cap_drop_in_default_set() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-drop = ["NET_BIND_SERVICE", "SETUID", "SETGID"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_cap_drop_not_in_default_set() {
+        // NET_ADMIN isn't in podman's default cap set; dropping it would be
+        // a silent no-op.
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-drop = ["NET_ADMIN"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cap-drop"));
+        assert!(msg.contains("NET_ADMIN"));
+    }
+
+    #[test]
+    fn rejects_overlap_between_cap_add_and_cap_drop() {
+        // Same cap in both lists is contradictory.
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+cap-add = ["NET_ADMIN"]
+cap-drop = ["NET_BIND_SERVICE"]
+
+[dependencies.sidecar]
+image = "redis:7"
+cap-add = ["NET_RAW"]
+cap-drop = ["NET_RAW"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dependencies.sidecar"));
+        assert!(msg.contains("NET_RAW"));
+        assert!(msg.contains("both cap-add and cap-drop"));
+    }
+
+    #[test]
+    fn dependency_caps_validated_independently() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+cap-add = ["SYS_PTRACE"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("dependencies.sidecar.cap-add"));
     }
 }

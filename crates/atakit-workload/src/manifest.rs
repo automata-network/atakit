@@ -663,4 +663,121 @@ image = "redis:7"
         assert!(j1.contains("\"main\":{\"archive\":\"images/main.tar\""));
         assert!(j1.contains("\"redis\":{\"archive\":\"images/redis.tar\""));
     }
+
+    #[test]
+    fn cap_fields_always_serialize_when_empty() {
+        // Source TOML omits cap-add and cap-drop. Manifest v2 still serialises
+        // them as empty arrays so PCR23 binds the absence as a positive
+        // commitment rather than as field absence.
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let json = serialize_canonical_json(&manifest).unwrap();
+
+        // Workload-level cap fields present and empty.
+        assert!(json.contains("\"cap-add\":[]"), "expected workload cap-add: [], got: {json}");
+        assert!(json.contains("\"cap-drop\":[]"), "expected workload cap-drop: []");
+
+        // Dependency cap fields present and empty too. Canonical JSON sorts
+        // keys, so within the dependency object cap-add comes before cap-drop.
+        assert!(
+            json.contains("\"sidecar\":{\"atakit-portal\":false,\"cap-add\":[],\"cap-drop\":[]"),
+            "expected dependency to surface both cap fields with empty defaults"
+        );
+    }
+
+    #[test]
+    fn cap_fields_propagate_into_manifest() {
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+cap-add = ["NET_ADMIN"]
+cap-drop = ["NET_BIND_SERVICE"]
+
+[dependencies.sidecar]
+image = "redis:7"
+cap-add = ["NET_RAW"]
+cap-drop = ["KILL"]
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(manifest.config.cap_add, vec!["NET_ADMIN".to_string()]);
+        assert_eq!(manifest.config.cap_drop, vec!["NET_BIND_SERVICE".to_string()]);
+
+        let dep = manifest.config.dependencies.as_ref().unwrap().get("sidecar").unwrap();
+        assert_eq!(dep.cap_add, vec!["NET_RAW".to_string()]);
+        assert_eq!(dep.cap_drop, vec!["KILL".to_string()]);
+
+        let json = serialize_canonical_json(&manifest).unwrap();
+        assert!(json.contains("\"cap-add\":[\"NET_ADMIN\"]"));
+        assert!(json.contains("\"cap-drop\":[\"NET_BIND_SERVICE\"]"));
+        assert!(json.contains("\"cap-add\":[\"NET_RAW\"]"));
+        assert!(json.contains("\"cap-drop\":[\"KILL\"]"));
+    }
+
+    #[test]
+    fn cap_fields_change_canonical_bytes() {
+        // Two configs that differ only in cap-add must produce different
+        // canonical JSON. This is the property that makes PCR23 bind the
+        // capability declaration into attestation.
+        let base_toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+"#;
+        let with_cap_toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+cap-add = ["NET_ADMIN"]
+"#;
+        let cfg_a: WorkloadConfig = toml::from_str(base_toml).unwrap();
+        let cfg_b: WorkloadConfig = toml::from_str(with_cap_toml).unwrap();
+
+        let m_a = build_manifest(&cfg_a, "app:latest", BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let m_b = build_manifest(&cfg_b, "app:latest", BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+
+        let j_a = serialize_canonical_json(&m_a).unwrap();
+        let j_b = serialize_canonical_json(&m_b).unwrap();
+        assert_ne!(j_a, j_b, "cap-add must change the canonical JSON bytes");
+    }
 }
