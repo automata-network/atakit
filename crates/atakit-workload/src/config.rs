@@ -135,6 +135,10 @@ pub struct WorkloadSection {
     /// (currently NET_ADMIN, NET_RAW) so attestation surface stays bounded.
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the default cap set as a hardening
+    /// commitment. Entries must be members of the default set.
+    #[serde(default, rename = "cap-drop")]
+    pub cap_drop: Vec<String>,
 }
 
 /// Default session TTL: 0 means contract default (30 days).
@@ -274,6 +278,8 @@ pub struct DependencySection {
     pub disks: BTreeMap<String, String>,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
+    #[serde(default, rename = "cap-drop")]
+    pub cap_drop: Vec<String>,
 }
 
 /// Parsed port specification: `host[:container][/protocol]`.

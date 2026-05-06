@@ -434,28 +434,68 @@ pub fn validate_config(
 
     }
 
-    // ── cap-add allowlist ─────────────────────────────────
-    // Limit the cap surface to what known workloads need (firewall enforcement
-    // via nftables in the workload's own netns). Expanding this allowlist
-    // changes attestation surface, so additions must be deliberate.
-    validate_cap_add(&w.cap_add, "workload.cap-add")?;
+    // ── capabilities ─────────────────────────────────────
+    // cap-add widens privilege; allowlisted to a small reviewed set.
+    // cap-drop narrows privilege; entries must be members of the default cap
+    // set (otherwise the drop is a silent no-op that misleads operators).
+    // No cap may appear in both lists for the same container.
+    validate_caps(&w.cap_add, &w.cap_drop, "workload")?;
     for (dep_name, dep) in &config.dependencies {
-        validate_cap_add(&dep.cap_add, &format!("dependencies.{dep_name}.cap-add"))?;
+        validate_caps(&dep.cap_add, &dep.cap_drop, &format!("dependencies.{dep_name}"))?;
     }
 
     Ok(warnings)
 }
 
-/// Allowed Linux capabilities for `cap-add`. Names must be the canonical
-/// uppercase form without the `CAP_` prefix (matching podman/docker syntax).
-const ALLOWED_CAPS: &[&str] = &["NET_ADMIN", "NET_RAW"];
+/// Allowlist for `cap-add`. Names use the canonical uppercase form without
+/// the `CAP_` prefix (matching `--cap-add` argv shape). Each entry widens
+/// the workload's attestation surface, so the list is intentionally narrow.
+const CAP_ADD_ALLOWLIST: &[&str] = &["NET_ADMIN", "NET_RAW"];
 
-fn validate_cap_add(caps: &[String], context: &str) -> Result<(), WorkloadError> {
-    for cap in caps {
-        if !ALLOWED_CAPS.contains(&cap.as_str()) {
+/// The runtime's pinned default cap set. `cap-drop` entries must be members
+/// of this list (dropping a cap not in the default set would be a silent
+/// no-op). Pinned in the spec at docs/specs/atakit-workload-toml-spec.md so
+/// a container engine upgrade does not silently shift the attestation surface.
+const DEFAULT_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+];
+
+fn validate_caps(
+    cap_add: &[String],
+    cap_drop: &[String],
+    context: &str,
+) -> Result<(), WorkloadError> {
+    for cap in cap_add {
+        if !CAP_ADD_ALLOWLIST.contains(&cap.as_str()) {
             return Err(WorkloadError::Validation(format!(
-                "{context}: capability {cap:?} is not in the allowlist {:?}",
-                ALLOWED_CAPS
+                "{context}.cap-add: capability {cap:?} is not in the allowlist {:?}",
+                CAP_ADD_ALLOWLIST
+            )));
+        }
+    }
+    for cap in cap_drop {
+        if !DEFAULT_CAPS.contains(&cap.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.cap-drop: capability {cap:?} is not in the default cap set {:?}; \
+                 dropping a cap that is not in the default set has no effect",
+                DEFAULT_CAPS
+            )));
+        }
+    }
+    for cap in cap_add {
+        if cap_drop.contains(cap) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: capability {cap:?} appears in both cap-add and cap-drop"
             )));
         }
     }

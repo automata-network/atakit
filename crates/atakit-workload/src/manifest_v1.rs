@@ -135,6 +135,7 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         unmeasured_data: has_unmeasured,
                         disks: dep.disks,
                         cap_add: Vec::new(),
+                        cap_drop: Vec::new(),
                     },
                 )
             })
@@ -203,6 +204,7 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             baby_container: v1.config.baby_container,
             boot_disk_size: v1.config.boot_disk_size,
             cap_add: Vec::new(),
+            cap_drop: Vec::new(),
         },
         disks,
         hashes: v1.hashes,
