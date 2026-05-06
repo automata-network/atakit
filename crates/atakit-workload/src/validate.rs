@@ -434,7 +434,32 @@ pub fn validate_config(
 
     }
 
+    // ── cap-add allowlist ─────────────────────────────────
+    // Limit the cap surface to what known workloads need (firewall enforcement
+    // via nftables in the workload's own netns). Expanding this allowlist
+    // changes attestation surface, so additions must be deliberate.
+    validate_cap_add(&w.cap_add, "workload.cap-add")?;
+    for (dep_name, dep) in &config.dependencies {
+        validate_cap_add(&dep.cap_add, &format!("dependencies.{dep_name}.cap-add"))?;
+    }
+
     Ok(warnings)
+}
+
+/// Allowed Linux capabilities for `cap-add`. Names must be the canonical
+/// uppercase form without the `CAP_` prefix (matching podman/docker syntax).
+const ALLOWED_CAPS: &[&str] = &["NET_ADMIN", "NET_RAW"];
+
+fn validate_cap_add(caps: &[String], context: &str) -> Result<(), WorkloadError> {
+    for cap in caps {
+        if !ALLOWED_CAPS.contains(&cap.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: capability {cap:?} is not in the allowlist {:?}",
+                ALLOWED_CAPS
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<(), WorkloadError> {
