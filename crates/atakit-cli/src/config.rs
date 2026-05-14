@@ -408,6 +408,9 @@ fn resolve_command(
 /// rpc_url = "https://..."
 /// session_registry = "0x..."
 /// expire_offset = 300
+/// # Optional — controls the portal's on-chain registration policy.
+/// # registration = "required" | "optional" | "off"
+/// # chain_id = 11155111   # only when rpc_url absent (air-gapped)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -425,6 +428,26 @@ pub struct ChainConfig {
     /// CLI `--expire-offset` overrides this per call.
     #[serde(default = "default_expire_offset")]
     pub expire_offset: u64,
+    /// Portal-side chain-registration policy. One of:
+    /// - `"required"` — portal builds calldata, submits via `rpc_url`,
+    ///   gates workload HTTP serving on `isSessionActive` confirmation.
+    /// - `"optional"` — same submission flow but workload serves
+    ///   immediately; `chain.status` advances independently.
+    /// - `"off"` — no chain interaction (workload runs as if there's
+    ///   no on-chain side).
+    ///
+    /// When `None`, the field is omitted from the `/init` JSON; the
+    /// portal applies its "section present, no `registration` field
+    /// → `required`" default. Set explicitly to override.
+    #[serde(default)]
+    pub registration: Option<String>,
+    /// EIP-155 chain id. Only meaningful under air-gapped operation
+    /// (`rpc_url` not set on the portal side, which atakit-ng doesn't
+    /// support yet — every chain entry here has `rpc_url`). Kept for
+    /// forward compat with portal configs that the operator might
+    /// post manually.
+    #[serde(default)]
+    pub chain_id: Option<u64>,
 }
 
 fn default_expire_offset() -> u64 {
