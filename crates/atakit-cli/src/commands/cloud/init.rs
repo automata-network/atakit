@@ -135,6 +135,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 			base_image_registry: chain.base_image_registry.clone()
 				.ok_or_else(|| anyhow::anyhow!("base_image_registry required in chain '{chain_name}'"))?,
 			expire_offset: chain.expire_offset,
+			registration: chain.registration.clone(),
+			chain_id: chain.chain_id,
 		},
 		owner_key: InitKeyConfig {
 			mode: owner_key_spec.mode.to_string(),

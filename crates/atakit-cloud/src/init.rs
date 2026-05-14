@@ -25,6 +25,17 @@ pub struct InitChainConfig {
     /// the publish/deactivate/imgbuild publish signature offsets. Sent to
     /// the portal as `chain.expire_offset`.
     pub expire_offset: u64,
+    /// Portal-side chain-registration policy (`"required"` |
+    /// `"optional"` | `"off"`). `None` ⇒ field omitted from the
+    /// `/init` JSON; the portal falls back to its `"required"`
+    /// default. Operators who want to disable submission while
+    /// debugging chain-side prerequisites should set this to
+    /// `"off"` in their `[chains.<name>]` config.
+    pub registration: Option<String>,
+    /// EIP-155 chain id. Forwarded as `chain.chain_id` when set.
+    /// Only honored by the portal under air-gapped operation (no
+    /// `rpc_url`); ignored with a warning otherwise.
+    pub chain_id: Option<u64>,
 }
 
 /// Key config section of the init payload.
@@ -53,20 +64,33 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         gas_wallet["private_key"] = serde_json::Value::String(pk.clone());
     }
 
+    let mut chain = serde_json::json!({
+        "rpc_url": config.chain.rpc_url,
+        "contracts": {
+            "session_registry": config.chain.session_registry,
+            "workload_registry": config.chain.workload_registry,
+            "base_image_registry": config.chain.base_image_registry,
+        },
+        "expire_offset": config.chain.expire_offset,
+    });
+    // `registration` and `chain_id` are only included when set so
+    // pre-existing configs that don't carry them keep producing the
+    // exact same JSON the portal saw before (and the portal's
+    // "section present, no registration field → required" default
+    // continues to apply).
+    if let Some(ref reg) = config.chain.registration {
+        chain["registration"] = serde_json::Value::String(reg.clone());
+    }
+    if let Some(id) = config.chain.chain_id {
+        chain["chain_id"] = serde_json::Value::Number(id.into());
+    }
+
     serde_json::json!({
         "format": 1,
         "platform": {
             "declared": &config.platform,
         },
-        "chain": {
-            "rpc_url": config.chain.rpc_url,
-            "contracts": {
-                "session_registry": config.chain.session_registry,
-                "workload_registry": config.chain.workload_registry,
-                "base_image_registry": config.chain.base_image_registry,
-            },
-            "expire_offset": config.chain.expire_offset,
-        },
+        "chain": chain,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
     })
@@ -203,9 +227,8 @@ pub async fn post_portal_init(
 mod tests {
     use super::*;
 
-    #[test]
-    fn portal_config_json_shape() {
-        let config = InitConfig {
+    fn sample_config() -> InitConfig {
+        InitConfig {
             platform: "gcp".to_string(),
             chain: InitChainConfig {
                 rpc_url: "https://rpc.example.com".to_string(),
@@ -213,6 +236,8 @@ mod tests {
                 workload_registry: "0xWORK".to_string(),
                 base_image_registry: "0xBASE".to_string(),
                 expire_offset: 300,
+                registration: None,
+                chain_id: None,
             },
             owner_key: InitKeyConfig {
                 mode: "provisioned".to_string(),
@@ -224,9 +249,12 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: None,
             },
-        };
+        }
+    }
 
-        let json = build_portal_config_json(&config);
+    #[test]
+    fn portal_config_json_shape() {
+        let json = build_portal_config_json(&sample_config());
 
         assert_eq!(json["format"], 1);
         assert_eq!(json["platform"]["declared"], "gcp");
@@ -241,5 +269,36 @@ mod tests {
         assert_eq!(json["gas_wallet"]["mode"], "self_generated");
         assert_eq!(json["gas_wallet"]["type"], "es256k");
         assert!(json["gas_wallet"].get("private_key").is_none());
+
+        // registration / chain_id omitted when None — portal's
+        // "section present, no registration → required" default
+        // applies, matching pre-patch behaviour.
+        assert!(json["chain"].get("registration").is_none());
+        assert!(json["chain"].get("chain_id").is_none());
+    }
+
+    /// When the operator sets `registration` and/or `chain_id` in
+    /// their `[chains.<name>]` TOML, those values appear verbatim in
+    /// the /init JSON.
+    #[test]
+    fn portal_config_json_emits_registration_and_chain_id_when_set() {
+        let mut cfg = sample_config();
+        cfg.chain.registration = Some("off".to_string());
+        cfg.chain.chain_id = Some(11155111);
+
+        let json = build_portal_config_json(&cfg);
+        assert_eq!(json["chain"]["registration"], "off");
+        assert_eq!(json["chain"]["chain_id"], 11155111);
+    }
+
+    /// Each policy value round-trips correctly.
+    #[test]
+    fn portal_config_json_emits_each_registration_value() {
+        for value in ["required", "optional", "off"] {
+            let mut cfg = sample_config();
+            cfg.chain.registration = Some(value.to_string());
+            let json = build_portal_config_json(&cfg);
+            assert_eq!(json["chain"]["registration"], value);
+        }
     }
 }
