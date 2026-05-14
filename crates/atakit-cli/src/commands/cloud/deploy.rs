@@ -325,6 +325,29 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	} else {
 		eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
 	}
+
+	// Chain config: surface BEFORE the operator confirms so the
+	// effective registration policy (`required` / `optional` /
+	// `off`) is visible — the portal can't change it after /init,
+	// so a misconfigured deployment caught here saves a CVM cycle.
+	// `init_env.chain` is just a name reference; the lookup /init
+	// performs later (around line 450) is the same.
+	let chain_for_summary = config.chains.get(&init_env.chain)
+		.ok_or_else(|| anyhow::anyhow!(
+			"chain '{}' not found in [chains]", init_env.chain
+		))?;
+	eprintln!("  {:<15}{}", "Chain:".dimmed(), init_env.chain);
+	// `registration` default-when-unset matches the portal: "section
+	// present, registration field absent → required". Surface that
+	// so `off` / `optional` configurations stand out.
+	let registration_label = chain_for_summary
+		.registration
+		.as_deref()
+		.unwrap_or("required (default)");
+	eprintln!("  {:<15}{}", "Submission:".dimmed(), registration_label);
+	eprintln!("  {:<15}{}", "RPC:".dimmed(), chain_for_summary.rpc_url);
+	eprintln!("  {:<15}{}", "Registry:".dimmed(), chain_for_summary.session_registry);
+
 	if !metadata.is_empty() {
 		for (k, v) in &metadata {
 			eprintln!("  {:<15}{}={}", "Metadata:".dimmed(), k, v);
