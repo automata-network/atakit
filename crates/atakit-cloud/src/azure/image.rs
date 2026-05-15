@@ -309,9 +309,10 @@ pub async fn create_image_version(
     version: &str,
     storage_account_id: &str,
     blob_url: &str,
-    certs_dir: Option<&str>,
+    certs_dir: &str,
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
+    let security_profile = load_security_profile(certs_dir)?;
     let mut properties = serde_json::json!({
         "publishingProfile": {
             "targetRegions": [{ "name": region, "regionalReplicaCount": 1 }],
@@ -326,12 +327,7 @@ pub async fn create_image_version(
             },
         },
     });
-
-    if let Some(dir) = certs_dir {
-        if let Some(security_profile) = load_security_profile(dir)? {
-            properties["securityProfile"] = security_profile;
-        }
-    }
+    properties["securityProfile"] = security_profile;
 
     let url = format!(
         "/subscriptions/{subscription}/resourceGroups/{rg}/providers/Microsoft.Compute\
@@ -385,15 +381,41 @@ pub async fn create_image_version(
     Ok(id)
 }
 
-fn load_security_profile(certs_dir: &str) -> Result<Option<serde_json::Value>, CloudError> {
+/// Build the `securityProfile` block for an `az rest` image-version create
+/// request. PK / KEK / db / kernel are all required; missing any of them
+/// is a hard error. Azure images registered by atakit must carry custom
+/// Secure Boot variables — there is no fallback to Azure's default
+/// Microsoft KEK/db.
+fn load_security_profile(certs_dir: &str) -> Result<serde_json::Value, CloudError> {
     let dir = std::path::Path::new(certs_dir);
     let pk_path = dir.join("PK.crt");
     let kek_path = dir.join("KEK.crt");
     let db_path = dir.join("db.crt");
     let kernel_path = dir.join("kernel.crt");
 
-    if !pk_path.exists() && !kek_path.exists() && !db_path.exists() && !kernel_path.exists() {
-        return Ok(None);
+    let mut missing = Vec::new();
+    if !pk_path.exists() {
+        missing.push("PK.crt");
+    }
+    if !kek_path.exists() {
+        missing.push("KEK.crt");
+    }
+    if !db_path.exists() {
+        missing.push("db.crt");
+    }
+    if !kernel_path.exists() {
+        missing.push("kernel.crt");
+    }
+    if !missing.is_empty() {
+        return Err(CloudError::ImageUploadFailed {
+            message: format!(
+                "secure boot certs missing from '{certs_dir}': {} — \
+                 Azure images registered by atakit must carry custom \
+                 PK/KEK/db. Ensure the base image archive (.atabi) was \
+                 imported with its secure_boot_certs/ directory intact.",
+                missing.join(", "),
+            ),
+        });
     }
 
     let pk = read_cert_b64(&pk_path)?;
@@ -401,7 +423,7 @@ fn load_security_profile(certs_dir: &str) -> Result<Option<serde_json::Value>, C
     let db = read_cert_b64(&db_path)?;
     let kernel = read_cert_b64(&kernel_path)?;
 
-    Ok(Some(serde_json::json!({
+    Ok(serde_json::json!({
         "uefiSettings": {
             "signatureTemplateNames": ["NoSignatureTemplate"],
             "additionalSignatures": {
@@ -410,7 +432,7 @@ fn load_security_profile(certs_dir: &str) -> Result<Option<serde_json::Value>, C
                 "db": [{ "type": "x509", "value": [db, kernel] }],
             }
         }
-    })))
+    }))
 }
 
 fn read_cert_b64(path: &std::path::Path) -> Result<String, CloudError> {

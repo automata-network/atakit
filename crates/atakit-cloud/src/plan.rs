@@ -58,6 +58,11 @@ pub enum DeployStep {
         /// Local file to upload. `None` means the image is assumed to already
         /// exist in GCE -- the step verifies existence but skips upload.
         source_path: Option<String>,
+        /// Local secure-boot cert directory (containing PK.crt / KEK.crt /
+        /// db.crt / kernel.crt). When set, the certs are passed to
+        /// `gcloud compute images create` so the resulting image carries
+        /// custom Secure Boot variables instead of GCE's placeholder PK.
+        certs_dir: Option<String>,
         /// CC capabilities to register on the image. Multiple types produce a
         /// GCE image usable with either CC mode.
         cc_types: Vec<CcType>,
