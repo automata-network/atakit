@@ -26,6 +26,18 @@
 # # messages: registerCvm in the CVM, plus the operator-side
 # # registerWorkload / deactivateWorkload / registerBaseImage flows.
 # # `--expire-offset` on each CLI command overrides per call.
+# registration = "required"
+# # ^ does the workload wait for on-chain registration before serving?
+# # "required" — submit registerCvm and block HTTP serving until the
+# #              chain confirms the session is active. Use in production
+# #              when no traffic should reach an unregistered workload.
+# # "optional" — submit registerCvm but serve HTTP immediately; chain
+# #              registration proceeds in the background and `chain.status`
+# #              advances independently. Use when RPC flakiness or slow
+# #              confirmations shouldn't keep the workload offline.
+# # "off"      — skip the on-chain side entirely (no submission). Useful
+# #              for debugging or running fully off-chain.
+# # Omit the field to fall back to the portal default ("required").
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #
