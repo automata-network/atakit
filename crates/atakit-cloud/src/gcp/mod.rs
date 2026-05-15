@@ -58,6 +58,7 @@ impl CloudProvider for GcpProvider {
             bucket: names.bucket.clone(),
             image_name: names.image.clone(),
             source_path: image_source,
+            certs_dir: opts.source_image_certs_dir.clone(),
             cc_types: opts.cc_types.clone(),
             force: opts.force_image,
         });
@@ -135,6 +136,7 @@ impl CloudProvider for GcpProvider {
                 bucket,
                 image_name,
                 source_path,
+                certs_dir,
                 cc_types,
                 force,
             } => {
@@ -148,10 +150,28 @@ impl CloudProvider for GcpProvider {
                 }
                 if !exists || *force {
                     if let Some(src) = source_path {
+                        let certs = certs_dir.as_deref().ok_or_else(|| {
+                            CloudError::ImageUploadFailed {
+                                message: format!(
+                                    "cannot register GCE image '{image_name}': no \
+                                     secure_boot_certs/ directory resolved for the \
+                                     base image. atakit requires Secure Boot to be \
+                                     enabled on every CVM deploy."
+                                ),
+                            }
+                        })?;
                         image::ensure_bucket(&self.project, bucket, &self.zone, runner).await?;
                         let gcs_uri =
                             image::upload_image(bucket, src, runner, verbose).await?;
-                        image::register_image(&self.project, image_name, &gcs_uri, cc_types, runner).await?;
+                        image::register_image(
+                            &self.project,
+                            image_name,
+                            &gcs_uri,
+                            cc_types,
+                            certs,
+                            runner,
+                        )
+                        .await?;
                         updates.bucket = Some(bucket.clone());
                     } else {
                         return Err(CloudError::ImageUploadFailed {

@@ -620,6 +620,7 @@ pub(super) async fn ensure_cloud_image(
     provider_name: &str,
     provider_config: &CloudProviderConfig,
     source_path: &str,
+    certs_dir: Option<&str>,
     cc_types: &[atakit_cloud::CcType],
     force: bool,
     env: &Env,
@@ -697,6 +698,7 @@ pub(super) async fn ensure_cloud_image(
                 bucket: names.bucket.clone(),
                 image_name: names.image.clone(),
                 source_path: Some(source_path.to_string()),
+                certs_dir: certs_dir.map(str::to_string),
                 cc_types: cc_types.to_vec(),
                 force,
             };
@@ -724,7 +726,7 @@ pub(super) async fn ensure_cloud_image(
                 image_definition: names.image_definition,
                 image_version: names.image_version,
                 source_path: Some(source_path.to_string()),
-                certs_dir: None,
+                certs_dir: certs_dir.map(str::to_string),
                 cc_types: cc_types.to_vec(),
                 force,
             };

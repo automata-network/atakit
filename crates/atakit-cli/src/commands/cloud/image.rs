@@ -93,6 +93,7 @@ pub async fn run_upload(
             args.image,
         )
     })?;
+    let certs_dir = resolved.certs_dir.clone();
 
     // 3. Resolve CC types (lookup uses resolved display_name, not raw CLI arg).
     let cc_types: Vec<atakit_cloud::CcType> = if !args.cc_types.is_empty() {
@@ -138,6 +139,7 @@ pub async fn run_upload(
         &args.provider,
         provider_config,
         &source_path,
+        certs_dir.as_deref(),
         &cc_types,
         args.force,
         env,
