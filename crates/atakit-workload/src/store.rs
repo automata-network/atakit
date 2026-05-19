@@ -27,6 +27,10 @@ fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
 /// Cached on-chain workload spec data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedChainSpec {
+    /// Renamed from `ttl` in an earlier schema. The alias keeps pre-rename
+    /// `meta.json` files loadable so `workload ls` doesn't error out on an
+    /// older local cache.
+    #[serde(alias = "ttl")]
     pub session_ttl: u64,
     pub base_image_mode: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
