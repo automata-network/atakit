@@ -514,10 +514,13 @@ impl CloudProvider for AzureProvider {
                 // Handled by CLI layer.
             }
 
-            // GCP steps - should not be executed by Azure provider.
-            DeployStep::UploadImage { .. } | DeployStep::CreateInstance { .. } => {
+            // GCP / AWS steps - should not be executed by Azure provider.
+            DeployStep::UploadImage { .. }
+            | DeployStep::CreateInstance { .. }
+            | DeployStep::UploadImageAws { .. }
+            | DeployStep::CreateInstanceAws { .. } => {
                 return Err(CloudError::State {
-                    message: "GCP step executed by Azure provider".to_string(),
+                    message: "non-Azure step executed by Azure provider".to_string(),
                 });
             }
         }
@@ -642,11 +645,14 @@ impl CloudProvider for AzureProvider {
             DestroyStep::DeleteResourceGroup { name } => {
                 instance::delete_resource_group(&self.subscription, name, runner).await
             }
-            // GCP steps.
+            // GCP / AWS steps.
             DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
-            | DestroyStep::DeleteFirewall { .. } => Err(CloudError::State {
-                message: "GCP destroy step executed by Azure provider".to_string(),
+            | DestroyStep::DeleteFirewall { .. }
+            | DestroyStep::DeleteSecurityGroup { .. }
+            | DestroyStep::DeleteAmi { .. }
+            | DestroyStep::DeleteS3Bucket { .. } => Err(CloudError::State {
+                message: "non-Azure destroy step executed by Azure provider".to_string(),
             }),
         }
     }

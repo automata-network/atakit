@@ -58,6 +58,8 @@ pub struct ResourceSet {
     pub gcp: Option<GcpResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azure: Option<AzureResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsResources>,
 }
 
 /// GCP-specific resource tracking.
@@ -100,6 +102,24 @@ pub struct AzureResources {
     pub nsg: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_ip: Option<String>,
+}
+
+/// AWS-specific resource tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AwsResources {
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ami: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,8 +270,32 @@ impl DeployState {
         // Route to the correct platform resource set.
         if self.resources.azure.is_some() {
             self.apply_azure_resource_updates(updates);
+        } else if self.resources.aws.is_some() {
+            self.apply_aws_resource_updates(updates);
         } else {
             self.apply_gcp_resource_updates(updates);
+        }
+    }
+
+    fn apply_aws_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let aws = self.resources.aws.get_or_insert_with(AwsResources::default);
+        if let Some(ref b) = updates.bucket {
+            aws.bucket = Some(b.clone());
+        }
+        if let Some(ref s) = updates.snapshot {
+            aws.snapshot = Some(s.clone());
+        }
+        if let Some(ref i) = updates.image {
+            aws.ami = Some(i.clone());
+        }
+        if let Some(ref f) = updates.firewall_rule {
+            aws.security_group = Some(f.clone());
+        }
+        if let Some(ref i) = updates.instance {
+            aws.instance = Some(i.clone());
+        }
+        if let Some(ref ip) = updates.external_ip {
+            aws.external_ip = Some(ip.clone());
         }
     }
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::SshArgs;
 use atakit_cloud::gcp::GcpProvider;
@@ -22,6 +23,9 @@ pub fn run(args: SshArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		atakit_cloud::PlatformKind::Azure => {
 			Box::new(AzureProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+		}
+		atakit_cloud::PlatformKind::Aws => {
+			Box::new(AwsProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
 	};
 

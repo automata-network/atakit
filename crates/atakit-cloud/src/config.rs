@@ -10,6 +10,7 @@ use crate::error::CloudError;
 pub enum PlatformKind {
     Gcp,
     Azure,
+    Aws,
 }
 
 impl std::fmt::Display for PlatformKind {
@@ -17,6 +18,7 @@ impl std::fmt::Display for PlatformKind {
         match self {
             PlatformKind::Gcp => write!(f, "gcp"),
             PlatformKind::Azure => write!(f, "azure"),
+            PlatformKind::Aws => write!(f, "aws"),
         }
     }
 }
@@ -266,6 +268,22 @@ pub fn infer_cc_type(platform: PlatformKind, vmtype: &str) -> Result<CcType, Clo
                 })
             }
         }
+        PlatformKind::Aws => {
+            if is_aws_snp_instance(vmtype) {
+                // AWS confidential computing is AMD SEV-SNP only; there is
+                // no TDX offering.
+                Ok(CcType::SevSnp)
+            } else {
+                Err(CloudError::Config {
+                    message: format!(
+                        "cannot infer CC type from instance type '{vmtype}'. \
+                         AWS confidential VMs require an AMD SEV-SNP instance type \
+                         (e.g. 'm6a.large', 'c6a.xlarge', 'r6a.2xlarge'), \
+                         or set cc_type explicitly."
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -298,8 +316,10 @@ const GCP_TDX_ZONES: &[&str] = &[
     "us-central1-c",
 ];
 
-#[allow(dead_code)] // AWS platform not yet implemented
 const AWS_SNP_REGIONS: &[&str] = &["us-east-2", "eu-west-1"];
+
+/// AWS instance type families supporting AMD SEV-SNP.
+const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", "r7a"];
 
 const AZURE_TDX_V6_REGIONS: &[&str] = &["West Europe", "East US", "West US", "West US 3"];
 
@@ -429,8 +449,36 @@ pub fn validate_target(
                 )));
             }
         }
+        PlatformKind::Aws => {
+            if !is_aws_snp_instance(&target.vmtype) {
+                return Err(err(format!(
+                    "unsupported AWS instance type '{}'. \
+                     Use an AMD SEV-SNP instance family: {}. \
+                     Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/sev-snp.html",
+                    target.vmtype,
+                    AWS_SNP_INSTANCE_FAMILIES.join(", ")
+                )));
+            }
+            if !AWS_SNP_REGIONS.contains(&provider.region.as_str()) {
+                return Err(err(format!(
+                    "region '{}' does not support SEV-SNP VMs. Supported regions: {}",
+                    provider.region,
+                    AWS_SNP_REGIONS.join(", ")
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// Match an AWS SEV-SNP-capable instance type (e.g. `m6a.large`).
+fn is_aws_snp_instance(vmtype: &str) -> bool {
+    match vmtype.split_once('.') {
+        Some((family, size)) => {
+            !size.is_empty() && AWS_SNP_INSTANCE_FAMILIES.contains(&family)
+        }
+        None => false,
+    }
 }
 
 /// Match `Standard_DC{2,4,8,16,32,64,96,128}es_v6`.
@@ -730,6 +778,66 @@ mod tests {
         let t = make_target("Standard_DC3es_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("cannot infer CC type"), "{err}");
+    }
+
+    // ── AWS SEV-SNP ─────────────────────────────────────
+
+    #[test]
+    fn aws_snp_valid() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target("m6a.large");
+        assert!(validate_target(&t, &p, "test").is_ok());
+    }
+
+    #[test]
+    fn aws_snp_all_families() {
+        let p = make_provider(PlatformKind::Aws, "eu-west-1");
+        for fam in AWS_SNP_INSTANCE_FAMILIES {
+            let vmtype = format!("{fam}.xlarge");
+            let t = make_target(&vmtype);
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected {vmtype} to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_snp_bad_region() {
+        let p = make_provider(PlatformKind::Aws, "us-west-2");
+        let t = make_target("c6a.xlarge");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP"), "{err}");
+    }
+
+    #[test]
+    fn aws_unsupported_instance_type() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target("m5.large");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("cannot infer CC type"), "{err}");
+    }
+
+    #[test]
+    fn aws_tdx_rejected() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target_with_cc("m6a.large", CcType::Tdx);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn infer_aws_snp() {
+        assert_eq!(
+            infer_cc_type(PlatformKind::Aws, "r6a.2xlarge").unwrap(),
+            CcType::SevSnp
+        );
+    }
+
+    #[test]
+    fn infer_aws_unknown() {
+        assert!(infer_cc_type(PlatformKind::Aws, "t3.micro").is_err());
+        assert!(infer_cc_type(PlatformKind::Aws, "m6a").is_err());
     }
 
     // ── Error messages ──────────────────────────────────

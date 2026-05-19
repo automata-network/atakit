@@ -81,6 +81,9 @@ pub async fn run_upload(
                 );
             }
         }
+        PlatformKind::Aws => {
+            // AWS providers need only a region, which is always present.
+        }
     }
 
     // 2. Resolve image source (before cc_types, so .atabi imports get their resolved ref).

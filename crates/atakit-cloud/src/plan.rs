@@ -122,6 +122,31 @@ pub enum DeployStep {
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
     },
+    // AWS-specific steps.
+    UploadImageAws {
+        bucket: String,
+        /// AMI name registered for the imported snapshot.
+        image_name: String,
+        /// Local VMDK file to upload. `None` means the AMI is assumed to
+        /// already exist -- the step verifies existence but skips upload.
+        source_path: Option<String>,
+        /// Local secure-boot directory containing `aws-uefi-blob.bin`. The
+        /// blob seeds the AMI's UEFI variables via `register-image
+        /// --uefi-data`. atakit requires Secure Boot on every CVM deploy.
+        certs_dir: Option<String>,
+        /// Delete and re-register the AMI even if it already exists.
+        force: bool,
+    },
+    CreateInstanceAws {
+        instance_name: String,
+        instance_type: String,
+        /// AMI name; the AMI id is resolved by name at execution time.
+        image_name: String,
+        security_group: String,
+        metadata: Vec<(String, String)>,
+        disks: Vec<DiskSpec>,
+        boot_disk_size_gb: Option<u64>,
+    },
 }
 
 /// Persistent disk specification.
@@ -163,6 +188,11 @@ pub enum DestroyStep {
         gallery: String,
         image_definition: String,
     },
+    // AWS-specific destroy steps.
+    DeleteSecurityGroup { name: String },
+    /// Deregister the AMI and delete its backing snapshots.
+    DeleteAmi { name: String },
+    DeleteS3Bucket { name: String },
 }
 
 /// Result from executing a deploy step, with resource updates.
@@ -188,6 +218,8 @@ pub struct ResourceUpdates {
     pub image_definition: Option<String>,
     pub image_version: Option<String>,
     pub nsg: Option<String>,
+    // AWS fields.
+    pub snapshot: Option<String>,
 }
 
 impl fmt::Display for DeployStep {
@@ -241,6 +273,20 @@ impl fmt::Display for DeployStep {
             DeployStep::CreateInstanceAzure { instance_name, .. } => {
                 write!(f, "Create VM instance '{instance_name}'")
             }
+            DeployStep::UploadImageAws {
+                image_name,
+                source_path,
+                ..
+            } => {
+                if source_path.is_some() {
+                    write!(f, "Upload base image '{image_name}'")
+                } else {
+                    write!(f, "Verify base image '{image_name}'")
+                }
+            }
+            DeployStep::CreateInstanceAws { instance_name, .. } => {
+                write!(f, "Create VM instance '{instance_name}'")
+            }
         }
     }
 }
@@ -266,6 +312,11 @@ impl fmt::Display for DestroyStep {
             DestroyStep::DeleteImageDefinition {
                 image_definition, ..
             } => write!(f, "Delete image definition '{image_definition}'"),
+            DestroyStep::DeleteSecurityGroup { name } => {
+                write!(f, "Delete security group '{name}'")
+            }
+            DestroyStep::DeleteAmi { name } => write!(f, "Delete AMI '{name}'"),
+            DestroyStep::DeleteS3Bucket { name } => write!(f, "Delete S3 bucket '{name}'"),
         }
     }
 }
