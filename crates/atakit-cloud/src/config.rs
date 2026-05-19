@@ -64,27 +64,15 @@ impl CcType {
     }
 }
 
-/// GCE `--guest-os-features` flag for image registration supporting one or
-/// more CC types. Features are merged and deduplicated.
-pub fn guest_os_features_for(cc_types: &[CcType]) -> String {
-    let mut features = vec!["UEFI_COMPATIBLE"];
-    for cc in cc_types {
-        match cc {
-            CcType::SevSnp => {
-                if !features.contains(&"SEV_SNP_CAPABLE") {
-                    features.push("SEV_SNP_CAPABLE");
-                    features.push("SEV_CAPABLE");
-                }
-            }
-            CcType::Tdx => {
-                if !features.contains(&"TDX_CAPABLE") {
-                    features.push("TDX_CAPABLE");
-                }
-            }
-        }
-    }
-    features.push("GVNIC");
-    format!("--guest-os-features={}", features.join(","))
+/// GCE `--guest-os-features` flag for image registration.
+///
+/// For now every image is registered as dual-capable (SEV-SNP + TDX)
+/// regardless of the configured CC types — GCP accepts both capability
+/// flags on a single image. `SEV_CAPABLE` (plain SEV) is intentionally
+/// omitted: only SEV-SNP is supported.
+pub fn guest_os_features_for(_cc_types: &[CcType]) -> String {
+    "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC,VIRTIO_SCSI_MULTIQUEUE"
+        .to_string()
 }
 
 /// Per-image registration config in `[cloud.images]`.
@@ -986,45 +974,24 @@ mod tests {
 
     // ── guest_os_features_for ───────────────────────────
 
+    const EXPECTED_FEATURES: &str =
+        "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC,VIRTIO_SCSI_MULTIQUEUE";
+
     #[test]
-    fn guest_os_features_sev_snp_only() {
-        let f = guest_os_features_for(&[CcType::SevSnp]);
+    fn guest_os_features_always_dual_capable() {
+        // Every image is dual-capable regardless of configured CC types.
+        assert_eq!(guest_os_features_for(&[CcType::SevSnp]), EXPECTED_FEATURES);
+        assert_eq!(guest_os_features_for(&[CcType::Tdx]), EXPECTED_FEATURES);
         assert_eq!(
-            f,
-            "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC"
+            guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]),
+            EXPECTED_FEATURES
         );
     }
 
     #[test]
-    fn guest_os_features_tdx_only() {
-        let f = guest_os_features_for(&[CcType::Tdx]);
-        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC");
-    }
-
-    #[test]
-    fn guest_os_features_both() {
-        let f = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
-        assert_eq!(
-            f,
-            "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,TDX_CAPABLE,GVNIC"
-        );
-    }
-
-    #[test]
-    fn guest_os_features_both_reversed() {
-        let a = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
-        let b = guest_os_features_for(&[CcType::Tdx, CcType::SevSnp]);
-        // TDX first puts TDX_CAPABLE before SEV fields, so order differs.
-        // Both must contain the same set of features.
-        assert!(a.contains("SEV_SNP_CAPABLE") && a.contains("TDX_CAPABLE"));
-        assert!(b.contains("SEV_SNP_CAPABLE") && b.contains("TDX_CAPABLE"));
-    }
-
-    #[test]
-    fn guest_os_features_dedup() {
-        let single = guest_os_features_for(&[CcType::SevSnp]);
-        let double = guest_os_features_for(&[CcType::SevSnp, CcType::SevSnp]);
-        assert_eq!(single, double);
+    fn guest_os_features_omits_plain_sev() {
+        // Only SEV-SNP is supported; plain SEV must not be advertised.
+        assert!(!guest_os_features_for(&[CcType::SevSnp]).contains("SEV_CAPABLE"));
     }
 
     // ── CcType FromStr ──────────────────────────────────
