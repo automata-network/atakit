@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DestroyArgs;
@@ -14,9 +14,61 @@ use owo_colors::OwoColorize;
 use crate::config::Config;
 use super::resolve_instance;
 
-pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
+/// Multi-instance dispatcher. Single instance → forward to `run_one`. Multiple
+/// instances → fan out into a concurrent destroy (one async future per
+/// instance, joined via `join_all`).
+pub async fn run(mut args: DestroyArgs, env: &Env, config: &Config) -> Result<()> {
+	let instances = std::mem::take(&mut args.instance);
+	match instances.len() {
+		0 => bail!("at least one instance is required"),
+		1 => {
+			args.instance = instances;
+			run_one(args, env, config).await
+		}
+		_ => {
+			// No interactive confirmation in multi mode -- N intermixed prompts
+			// would be unusable.
+			args.yes = true;
+			eprintln!(
+				"{} {} instance(s)...",
+				"Destroying".dimmed(),
+				instances.len().to_string().bold(),
+			);
+			let futures = instances.iter().cloned().map(|i| {
+				let mut single = args.clone();
+				single.instance = vec![i.clone()];
+				async move {
+					let res = run_one(single, env, config).await;
+					(i, res)
+				}
+			});
+			let results = futures_util::future::join_all(futures).await;
+			let n_ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+			let n_err = results.len() - n_ok;
+			eprintln!();
+			eprintln!("{}", "Parallel destroy summary:".bold());
+			for (instance, r) in &results {
+				match r {
+					Ok(()) => eprintln!("  {} {}", "✓".green(), instance),
+					Err(e) => eprintln!("  {} {}: {:#}", "✗".red(), instance, e),
+				}
+			}
+			eprintln!();
+			eprintln!("  {n_ok} ok / {n_err} failed");
+			if n_err > 0 {
+				bail!("{n_err} instance(s) failed to destroy");
+			}
+			Ok(())
+		}
+	}
+}
+
+async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
+	let instance_arg = args.instance.first().map(|s| s.as_str()).ok_or_else(|| {
+		anyhow::anyhow!("at least one instance is required")
+	})?;
 	let (target_name, instance_name) =
-		resolve_instance(&env.data_dir, &args.instance, args.target.as_deref())?;
+		resolve_instance(&env.data_dir, instance_arg, args.target.as_deref())?;
 
 	let mut state = DeployState::load(&env.data_dir, &target_name, &instance_name)
 		.map_err(|e| anyhow::anyhow!("{e}"))?;

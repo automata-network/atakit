@@ -13,9 +13,180 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{Config, KeyMode};
-use super::{InitEnvResolver, collect_unmeasured_tar, parse_metadata, resolve_image, resolve_workload, validate_base_image};
+use super::{InitEnvResolver, collect_unmeasured_tar, ensure_cloud_image, parse_metadata, resolve_image, resolve_workload, validate_base_image};
 
-pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
+/// Multi-target dispatcher. Single target → forward to `run_one`. Multiple
+/// targets → fan out into a concurrent deploy (one async future per target,
+/// joined via `join_all`).
+pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
+	let targets = std::mem::take(&mut args.target);
+	match targets.len() {
+		0 => bail!("--target is required (specify a target from [cloud.targets] in config)"),
+		1 => {
+			args.target = targets;
+			run_one(args, env, config, verbose).await
+		}
+		_ => {
+			if args.name.is_some() {
+				bail!(
+					"--name cannot be combined with multiple --target (instance names \
+					 are auto-generated per target in multi-target mode)"
+				);
+			}
+			// No interactive confirmation in multi mode -- N intermixed prompts
+			// would be unusable.
+			args.yes = true;
+
+			// Phase 1: pre-upload images for unique (provider, image_ref)
+			// pairs SERIALLY. The per-deploy `UploadImage` step is
+			// check-then-act (check_image_exists -> upload+register), so two
+			// concurrent deploys racing the same image both pass the check
+			// and both try to register, and the second register fails. Doing
+			// the upload once up front lets every per-target deploy's
+			// `UploadImage` step short-circuit on existence.
+			let mut upload_pairs: std::collections::BTreeMap<
+				(String, String),
+				(
+					atakit_cloud::config::CloudProviderConfig,
+					String,
+					Option<String>,
+					Vec<atakit_cloud::CcType>,
+				),
+			> = std::collections::BTreeMap::new();
+			for target_name in &targets {
+				let target = config.cloud.targets.get(target_name).ok_or_else(|| {
+					anyhow::anyhow!("target '{target_name}' not found in [cloud.targets]")
+				})?;
+				let provider_config = config.cloud.providers.get(&target.provider).ok_or_else(|| {
+					anyhow::anyhow!(
+						"provider '{}' not found in [cloud.providers]",
+						target.provider
+					)
+				})?;
+				let image_arg = args
+					.image
+					.as_deref()
+					.or(target.image.as_deref())
+					.ok_or_else(|| {
+						anyhow::anyhow!(
+							"target '{target_name}' has no image (set --image or \
+							 `image = \"...\"` on the target)"
+						)
+					})?;
+				let resolved = resolve_image(image_arg, &provider_config.platform, env)?;
+				// If the image ref points at an existing cloud image (no local
+				// source), no upload is needed -- the cloud image already exists
+				// by definition.
+				let Some(source_path) = resolved.source_path else {
+					continue;
+				};
+				let resolved_cc = target.resolved_cc_type(provider_config.platform)?;
+				let cc_types: Vec<atakit_cloud::CcType> = if !args.cc_types.is_empty() {
+					args.cc_types
+						.iter()
+						.map(|s| s.parse::<atakit_cloud::CcType>())
+						.collect::<Result<Vec<_>, _>>()?
+				} else if let Some(entry) = config.cloud.images.get(&resolved.display_name) {
+					entry.cc_types.clone()
+				} else {
+					vec![resolved_cc]
+				};
+				upload_pairs
+					.entry((target.provider.clone(), resolved.display_name.clone()))
+					.or_insert((
+						provider_config.clone(),
+						source_path,
+						resolved.certs_dir,
+						cc_types,
+					));
+			}
+
+			if !upload_pairs.is_empty() {
+				eprintln!(
+					"{} {} unique image/provider pair(s) before fan-out...",
+					"Pre-uploading".dimmed(),
+					upload_pairs.len().to_string().bold(),
+				);
+				for (
+					(provider_name, image_ref),
+					(provider_config, source_path, certs_dir, cc_types),
+				) in &upload_pairs
+				{
+					eprintln!(
+						"  {} {} -> {}",
+						"→".dimmed(),
+						image_ref,
+						provider_name,
+					);
+					ensure_cloud_image(
+						image_ref,
+						provider_name,
+						provider_config,
+						source_path,
+						certs_dir.as_deref(),
+						cc_types,
+						args.force_image,
+						env,
+						verbose,
+					)
+					.await
+					.with_context(|| {
+						format!("pre-upload of image '{image_ref}' to provider '{provider_name}' failed")
+					})?;
+				}
+				// Subsequent per-target deploys must see the cached image; do
+				// not let them attempt a re-upload (they'd just check existence
+				// and skip, but force_image would delete + re-upload N times).
+			}
+			// Phase 2: per-target deploys fan out concurrently. Each one's
+			// UploadImage step will check_image_exists -> true -> skip.
+			eprintln!();
+			eprintln!(
+				"{} {} target(s)...",
+				"Deploying to".dimmed(),
+				targets.len().to_string().bold(),
+			);
+			// force_image was already honored by the pre-upload phase; clear
+			// it for per-target deploys so they don't delete what we just
+			// uploaded.
+			args.force_image = false;
+			let futures = targets.iter().cloned().map(|t| {
+				let mut single = args.clone();
+				single.target = vec![t.clone()];
+				// Image-only requires --name in single-target mode (no
+				// workload-name default). Auto-generate per target here so
+				// multi-target image-only deploys (the measurement workflow)
+				// don't need per-target --name flags.
+				if single.image_only && single.name.is_none() {
+					single.name = Some(format!("measure-{t}"));
+				}
+				async move {
+					let res = run_one(single, env, config, verbose).await;
+					(t, res)
+				}
+			});
+			let results = futures_util::future::join_all(futures).await;
+			let n_ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+			let n_err = results.len() - n_ok;
+			eprintln!();
+			eprintln!("{}", "Parallel deploy summary:".bold());
+			for (target, r) in &results {
+				match r {
+					Ok(()) => eprintln!("  {} {}", "✓".green(), target),
+					Err(e) => eprintln!("  {} {}: {:#}", "✗".red(), target, e),
+				}
+			}
+			eprintln!();
+			eprintln!("  {n_ok} ok / {n_err} failed");
+			if n_err > 0 {
+				bail!("{n_err} target(s) failed to deploy");
+			}
+			Ok(())
+		}
+	}
+}
+
+async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
 	let image_only = args.image_only;
 
 	// 1. Resolve workload source (unless --image-only).
@@ -83,8 +254,8 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		archive_path = ap.display().to_string();
 	}
 
-	// 2. Resolve target.
-	let target_name = args.target.as_deref().ok_or_else(|| {
+	// 2. Resolve target. The dispatcher (`run`) guarantees exactly one entry here.
+	let target_name = args.target.first().map(|s| s.as_str()).ok_or_else(|| {
 		anyhow::anyhow!("--target is required (specify a target from [cloud.targets] in config)")
 	})?;
 	let target = config
