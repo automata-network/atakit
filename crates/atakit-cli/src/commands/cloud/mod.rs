@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use atakit_cloud::{AzureResourceNames, CloudTarget, PlatformKind, PersistedInitEnv, ProcessRunner};
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
@@ -156,6 +157,7 @@ fn resolve_store_image(
     let image_platform = match platform {
         PlatformKind::Gcp => ImagePlatform::Gcp,
         PlatformKind::Azure => ImagePlatform::Azure,
+        PlatformKind::Aws => ImagePlatform::Aws,
     };
 
     let disk_path = store.image_path(image_ref, image_platform);
@@ -600,6 +602,19 @@ pub(super) fn build_cloud_image_record(
                 uploaded_at: chrono::Utc::now(),
             }
         }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws(instance_name, image_ref);
+            CloudImage {
+                platform: PlatformKind::Aws,
+                cloud_name: names.image,
+                bucket: Some(names.bucket),
+                gallery_rg: None,
+                gallery: None,
+                image_version: None,
+                cc_types: cc_types.to_vec(),
+                uploaded_at: chrono::Utc::now(),
+            }
+        }
     }
 }
 
@@ -650,6 +665,9 @@ pub(super) async fn ensure_cloud_image(
             })?;
             Box::new(AzureProvider::new(subscription, provider_config.region.clone()))
         }
+        PlatformKind::Aws => {
+            Box::new(AwsProvider::new(provider_config.region.clone()))
+        }
     };
 
     let runner = ProcessRunner::new(verbose);
@@ -678,6 +696,13 @@ pub(super) async fn ensure_cloud_image(
                 &names.image_version,
                 &runner,
             ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+            exists && !force
+        }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws("upload", image_ref);
+            let exists = atakit_cloud::aws::image::find_ami(
+                &provider_config.region, &names.image, &runner,
+            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?.is_some();
             exists && !force
         }
     };
@@ -728,6 +753,17 @@ pub(super) async fn ensure_cloud_image(
                 source_path: Some(source_path.to_string()),
                 certs_dir: certs_dir.map(str::to_string),
                 cc_types: cc_types.to_vec(),
+                force,
+            };
+            cloud_provider.execute_step(&step, &runner, verbose).await?;
+        }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws("upload", image_ref);
+            let step = DeployStep::UploadImageAws {
+                bucket: names.bucket,
+                image_name: names.image,
+                source_path: Some(source_path.to_string()),
+                certs_dir: certs_dir.map(str::to_string),
                 force,
             };
             cloud_provider.execute_step(&step, &runner, verbose).await?;

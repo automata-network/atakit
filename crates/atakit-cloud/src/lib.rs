@@ -1,3 +1,4 @@
+pub mod aws;
 pub mod azure;
 pub mod cloud_images;
 pub mod config;
@@ -23,6 +24,6 @@ pub use plan::{
 };
 pub use provider::{CloudProvider, DeployOptions, DestroyOptions};
 pub use state::{
-    AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams, PersistedInitEnv,
-    ResourceSet,
+    AwsResources, AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams,
+    PersistedInitEnv, ResourceSet,
 };

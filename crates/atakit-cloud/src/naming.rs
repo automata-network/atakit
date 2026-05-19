@@ -20,6 +20,19 @@ impl ResourceNames {
             instance: sanitize(instance_name, 63),
         }
     }
+
+    /// Derive AWS resource names from instance name and image reference.
+    ///
+    /// `bucket` is the S3 bucket, `image` is the AMI name, `firewall` is the
+    /// security group name.
+    pub fn for_aws(instance_name: &str, image_ref: &str) -> Self {
+        Self {
+            bucket: format!("atakit-{}", sanitize(instance_name, 56)),
+            image: sanitize_image_ref(image_ref),
+            firewall: format!("{}-secgrp", sanitize(instance_name, 56)),
+            instance: sanitize(instance_name, 63),
+        }
+    }
 }
 
 /// Azure resource names for cloud deployments.
@@ -227,6 +240,15 @@ mod tests {
         assert_eq!(names.bucket, "atakit-my-instance");
         assert_eq!(names.image, "automata-linux-v0-1-6");
         assert_eq!(names.firewall, "my-instance-ingress");
+        assert_eq!(names.instance, "my-instance");
+    }
+
+    #[test]
+    fn aws_resource_names() {
+        let names = ResourceNames::for_aws("my-instance", "automata-linux:v0.1.6");
+        assert_eq!(names.bucket, "atakit-my-instance");
+        assert_eq!(names.image, "automata-linux-v0-1-6");
+        assert_eq!(names.firewall, "my-instance-secgrp");
         assert_eq!(names.instance, "my-instance");
     }
 

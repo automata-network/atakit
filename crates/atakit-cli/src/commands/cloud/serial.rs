@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::SerialArgs;
 use atakit_cloud::gcp::GcpProvider;
@@ -23,6 +24,9 @@ pub async fn run(args: SerialArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		atakit_cloud::PlatformKind::Azure => {
 			Box::new(AzureProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+		}
+		atakit_cloud::PlatformKind::Aws => {
+			Box::new(AwsProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
 	};
 

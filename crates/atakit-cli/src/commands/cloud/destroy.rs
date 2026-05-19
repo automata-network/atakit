@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DestroyArgs;
 use atakit_cloud::cloud_images::CloudImages;
@@ -26,6 +27,9 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		atakit_cloud::PlatformKind::Azure => {
 			Box::new(AzureProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+		}
+		atakit_cloud::PlatformKind::Aws => {
+			Box::new(AwsProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
 		}
 	};
 
@@ -107,6 +111,24 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 			eprintln!("  {:<15}{}", "Disks:".dimmed(), az.disks.join(", "));
 		}
 	}
+	if let Some(ref aws) = state.resources.aws {
+		eprintln!("  {:<15}{}", "Region:".dimmed(), aws.region);
+		if let Some(ref name) = aws.instance {
+			eprintln!("  {:<15}{}", "VM:".dimmed(), name);
+		}
+		if let Some(ref ip) = aws.external_ip {
+			eprintln!("  {:<15}{}", "IP:".dimmed(), ip);
+		}
+		if let Some(ref name) = aws.ami {
+			eprintln!("  {:<15}{}", "AMI:".dimmed(), name);
+		}
+		if let Some(ref name) = aws.bucket {
+			eprintln!("  {:<15}{}", "Bucket:".dimmed(), name);
+		}
+		if let Some(ref name) = aws.security_group {
+			eprintln!("  {:<15}{}", "Sec group:".dimmed(), name);
+		}
+	}
 	if !state.workload_name.is_empty() {
 		eprintln!("  {:<15}{}:{}", "Workload:".dimmed(), state.workload_name, state.workload_version);
 	}
@@ -159,7 +181,7 @@ pub async fn run(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 				eprintln!("{}", "done".green());
 				// Remove image from CloudImages tracking when the cloud
 				// image is actually deleted (not preserved).
-				if matches!(step, DestroyStep::DeleteImage { .. } | DestroyStep::DeleteImageVersion { .. })
+				if matches!(step, DestroyStep::DeleteImage { .. } | DestroyStep::DeleteImageVersion { .. } | DestroyStep::DeleteAmi { .. })
 					&& !state.provider_name.is_empty()
 				{
 					match CloudImages::load(&env.data_dir) {

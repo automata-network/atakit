@@ -1,4 +1,5 @@
 use anyhow::Result;
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::StatusArgs;
 use atakit_cloud::gcp::GcpProvider;
@@ -26,6 +27,9 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
 			}
 			atakit_cloud::PlatformKind::Azure => {
 				AzureProvider::from_state(&state).ok().map(|p| Box::new(p) as _)
+			}
+			atakit_cloud::PlatformKind::Aws => {
+				AwsProvider::from_state(&state).ok().map(|p| Box::new(p) as _)
 			}
 		};
 		if let Some(provider) = provider {
@@ -128,6 +132,26 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 		if !az.disks.is_empty() {
 			eprintln!("    Disks:     {}", az.disks.join(", "));
+		}
+	}
+	if let Some(ref aws) = state.resources.aws {
+		eprintln!();
+		eprintln!("  {}", "Resources:".dimmed());
+		eprintln!("    Region:    {}", aws.region);
+		if let Some(ref i) = aws.instance {
+			eprintln!("    Instance:  {i}");
+		}
+		if let Some(ref b) = aws.bucket {
+			eprintln!("    Bucket:    {b}");
+		}
+		if let Some(ref ami) = aws.ami {
+			eprintln!("    AMI:       {ami}");
+		}
+		if let Some(ref snap) = aws.snapshot {
+			eprintln!("    Snapshot:  {snap}");
+		}
+		if let Some(ref sg) = aws.security_group {
+			eprintln!("    Sec group: {sg}");
 		}
 	}
 

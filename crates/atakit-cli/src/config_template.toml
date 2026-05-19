@@ -151,6 +151,10 @@
 # subscription = "your-subscription-id"
 # region = "eastus"
 
+# [cloud.providers.my-aws]
+# platform = "aws"
+# region = "us-east-2"          # SEV-SNP regions: us-east-2, eu-west-1
+
 # Image library: CC capabilities for image registration.
 # Simple form:   "name:tag" = ["SEV_SNP", "TDX"]
 # Extended form:  [cloud.images."name:tag"]
@@ -172,6 +176,15 @@
 # [cloud.targets.my-azure-snp]
 # provider = "my-azure"
 # vmtype = "Standard_DC4as_v5"    # cc_type inferred as SEV_SNP
+# image = "my-baseimage:v0.1.0"
+# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
+# chain = "mainnet"
+# owner_key = "owner"
+# gas_wallet = "gas"
+
+# [cloud.targets.my-aws-snp]
+# provider = "my-aws"
+# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP (AMD SEV-SNP families: m6a/c6a/r6a/m7a/c7a/r7a)
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
@@ -6,7 +7,7 @@ use atakit_cloud::init::{self, InitConfig, InitChainConfig, InitKeyConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::state::{DeployState, DeployStatus};
-use atakit_cloud::{AzureResources, AzureResourceNames, GcpResources, PlatformKind, ProcessRunner};
+use atakit_cloud::{AwsResources, AzureResources, AzureResourceNames, GcpResources, PlatformKind, ProcessRunner};
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
@@ -110,6 +111,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			if provider_config.subscription.is_none() {
 				bail!("Azure target '{target_name}' requires 'subscription' (set in config)");
 			}
+		}
+		PlatformKind::Aws => {
+			// AWS targets need only a region, which is always present.
 		}
 	}
 
@@ -217,6 +221,9 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			})?;
 			Box::new(AzureProvider::new(subscription, provider_config.region.clone()))
 		}
+		PlatformKind::Aws => {
+			Box::new(AwsProvider::new(provider_config.region.clone()))
+		}
 	};
 
 	// 10. Generate plan.
@@ -295,6 +302,18 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!("  {:<15}{}", "Storage:".dimmed(), storage);
 			eprintln!("  {:<15}{}", "NSG:".dimmed(), names.nsg);
 		}
+		PlatformKind::Aws => {
+			let names = atakit_cloud::naming::ResourceNames::for_aws(&instance_name, image_ref);
+			eprintln!("  {:<15}{}", "Region:".dimmed(), provider_config.region);
+			eprintln!("  {:<15}{}", "Instance type:".dimmed(), target.vmtype);
+			eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
+			eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+			eprintln!("  {:<15}{}", "AMI name:".dimmed(), names.image);
+			if resolved_image.source_path.is_some() {
+				eprintln!("  {:<15}{}", "Bucket:".dimmed(), names.bucket);
+			}
+			eprintln!("  {:<15}{}", "Sec group:".dimmed(), names.firewall);
+		}
 	}
 	if let Some(gb) = boot_disk_size_gb {
 		eprintln!("  {:<15}{}GB", "Boot disk:".dimmed(), gb);
@@ -307,6 +326,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		let disk_type = match provider_config.platform {
 			PlatformKind::Gcp => "pd-balanced",
 			PlatformKind::Azure => "Premium_LRS",
+			PlatformKind::Aws => "gp3",
 		};
 		for (i, (name, index, gb)) in workload_disks.iter().enumerate() {
 			let label = if i == 0 {
@@ -406,6 +426,12 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				..Default::default()
 			});
 		}
+		PlatformKind::Aws => {
+			state.resources.aws = Some(AwsResources {
+				region: provider_config.region.clone(),
+				..Default::default()
+			});
+		}
 	}
 	state.save(&env.data_dir)?;
 
@@ -422,6 +448,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			step,
 			DeployStep::UploadImage { source_path: Some(_), .. }
 				| DeployStep::UploadImageAzure { source_path: Some(_), .. }
+				| DeployStep::UploadImageAws { source_path: Some(_), .. }
 		);
 		if streams_output {
 			eprintln!("  [{step_num}/{total}] {step}");
@@ -437,6 +464,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.as_ref()
 					.and_then(|g| g.external_ip.as_ref())
 					.or_else(|| state.resources.azure.as_ref().and_then(|a| a.external_ip.as_ref()))
+					.or_else(|| state.resources.aws.as_ref().and_then(|a| a.external_ip.as_ref()))
 					.ok_or_else(|| anyhow::anyhow!("no external IP available for agent wait"))?
 					.clone();
 				match init::wait_for_portal(&ip, 2024, *timeout_secs).await {
@@ -465,6 +493,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					.as_ref()
 					.and_then(|g| g.external_ip.as_ref())
 					.or_else(|| state.resources.azure.as_ref().and_then(|a| a.external_ip.as_ref()))
+					.or_else(|| state.resources.aws.as_ref().and_then(|a| a.external_ip.as_ref()))
 					.ok_or_else(|| anyhow::anyhow!("no external IP available for init"))?
 					.clone();
 
@@ -560,7 +589,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 					}
 				}
 				// After instance creation, show VM details.
-				if matches!(step, DeployStep::CreateInstance { .. } | DeployStep::CreateInstanceAzure { .. }) {
+				if matches!(step, DeployStep::CreateInstance { .. } | DeployStep::CreateInstanceAzure { .. } | DeployStep::CreateInstanceAws { .. }) {
 					if let Some(ref gcp) = state.resources.gcp {
 						let ip = gcp.external_ip.as_deref().unwrap_or("-");
 						let inst = gcp.instance.as_deref().unwrap_or(&instance_name);
@@ -579,6 +608,15 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 						eprintln!("  {:<12}{}", "IP:".dimmed(), ip);
 						eprintln!("  {:<12}{}", "Region:".dimmed(), az.region.as_str());
 						eprintln!("  {:<12}{}", "RG:".dimmed(), az.resource_group.as_deref().unwrap_or("-"));
+						eprintln!();
+					}
+					if let Some(ref aws) = state.resources.aws {
+						let ip = aws.external_ip.as_deref().unwrap_or("-");
+						let inst = aws.instance.as_deref().unwrap_or(&instance_name);
+						eprintln!();
+						eprintln!("  {:<12}{}", "VM:".dimmed(), inst.bold());
+						eprintln!("  {:<12}{}", "IP:".dimmed(), ip);
+						eprintln!("  {:<12}{}", "Region:".dimmed(), aws.region.as_str());
 						eprintln!();
 					}
 				}
@@ -610,6 +648,7 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		.as_ref()
 		.and_then(|g| g.external_ip.clone())
 		.or_else(|| state.resources.azure.as_ref().and_then(|a| a.external_ip.clone()))
+		.or_else(|| state.resources.aws.as_ref().and_then(|a| a.external_ip.clone()))
 		.unwrap_or_default();
 	state.set_status(DeployStatus::Deployed { ip: ip.clone() }, &env.data_dir)?;
 
@@ -647,6 +686,25 @@ pub async fn run(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 			eprintln!();
 			eprintln!("    {}:", "SSH".dimmed());
 			eprintln!("      az ssh vm --name {instance_name} --resource-group {}", names.resource_group);
+		}
+		PlatformKind::Aws => {
+			let region = &provider_config.region;
+			let names = atakit_cloud::naming::ResourceNames::for_aws(&instance_name, image_ref);
+			let vm_id = state
+				.resources
+				.aws
+				.as_ref()
+				.and_then(|a| a.instance.as_deref())
+				.unwrap_or("<instance-id>");
+			eprintln!("    {:<12}{}", "Region:".dimmed(), region);
+			eprintln!("    {:<12}{}", "AMI:".dimmed(), names.image);
+			eprintln!("    {:<12}{}", "CC type:".dimmed(), resolved_cc);
+			eprintln!();
+			eprintln!("    {}:", "Serial console".dimmed());
+			eprintln!("      aws ec2 get-console-output --region {region} --instance-id {vm_id} --latest");
+			eprintln!();
+			eprintln!("    {}:", "SSH".dimmed());
+			eprintln!("      aws ec2-instance-connect ssh --region {region} --instance-id {vm_id}");
 		}
 	}
 	eprintln!();
