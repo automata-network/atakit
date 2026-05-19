@@ -110,8 +110,11 @@ impl CloudProvider for AzureProvider {
             force: opts.force_image,
         });
 
-        // Firewall - workload_ports are already resolved "port/proto" strings.
-        let mut ports = Vec::new();
+        // Firewall - always open the cvm-agent ports (2024 portal/measurements,
+        // 1024 workload init), plus workload ports. Skipping these breaks
+        // `fetch-platform-measurements` and image-only deploys.
+        // workload_ports are already resolved "port/proto" strings.
+        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
