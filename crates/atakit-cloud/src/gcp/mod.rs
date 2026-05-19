@@ -63,9 +63,12 @@ impl CloudProvider for GcpProvider {
             force: opts.force_image,
         });
 
-        // Firewall - always open agent port 1024 (tcp), plus workload ports.
+        // Firewall - always open the cvm-agent ports (2024 portal/measurements,
+        // 1024 workload init), plus workload ports. Skipping these breaks
+        // `fetch-platform-measurements` and image-only deploys (gcloud
+        // `--rules=` rejects an empty list).
         // workload_ports are already resolved "port/proto" strings from the manifest.
-        let mut ports = Vec::new();
+        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
