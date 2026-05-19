@@ -53,14 +53,17 @@ pub enum CloudProviderCommand {
 }
 
 /// Arguments for `cloud deploy`.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct DeployArgs {
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
 
-    /// Target name from [cloud.targets.<name>]
-    #[arg(long)]
-    pub target: Option<String>,
+    /// Target name(s) from [cloud.targets.<name>]. Repeatable, or comma-separated.
+    /// Passing multiple targets fans out into a concurrent multi-target deploy
+    /// (instance names auto-generated per target; --name and interactive
+    /// confirmation are not supported in multi mode).
+    #[arg(long, value_delimiter = ',')]
+    pub target: Vec<String>,
 
     /// Instance name (default: {workload}-{target})
     #[arg(long)]
@@ -131,12 +134,14 @@ pub struct DeployArgs {
 }
 
 /// Arguments for `cloud destroy`.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct DestroyArgs {
-    /// Instance name (or target/instance)
-    pub instance: String,
+    /// Instance name(s) (or target/instance). Repeatable: multiple instances
+    /// destroy concurrently.
+    #[arg(required = true)]
+    pub instance: Vec<String>,
 
-    /// Target name (for disambiguation)
+    /// Target name (for disambiguation, applied to all listed instances)
     #[arg(long)]
     pub target: Option<String>,
 
