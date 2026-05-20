@@ -269,34 +269,6 @@ async fn deregister_ami(
     ami_id: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), CloudError> {
-    // Collect snapshot ids before the AMI is deregistered.
-    let snapshots: Vec<String> = match runner
-        .run_capture(
-            "aws",
-            &[
-                "ec2",
-                "describe-images",
-                "--region",
-                region,
-                "--image-ids",
-                ami_id,
-                "--query",
-                "Images[0].BlockDeviceMappings[*].Ebs.SnapshotId",
-                "--output",
-                "text",
-            ],
-        )
-        .await
-    {
-        Ok(o) => o
-            .stdout
-            .split_whitespace()
-            .filter(|s| !s.is_empty() && *s != "None")
-            .map(String::from)
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
     match runner
         .run_capture(
             "aws",
@@ -307,59 +279,20 @@ async fn deregister_ami(
                 region,
                 "--image-id",
                 ami_id,
-            ],
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(CloudError::CommandFailed { stderr, .. })
-            if stderr.contains("InvalidAMIID.NotFound") =>
-        {
-            tracing::debug!("AMI '{ami_id}' already deregistered");
-        }
-        Err(e) => {
-            return Err(CloudError::DestroyFailed {
-                resource: format!("ami/{ami_id}"),
-                message: e.to_string(),
-            });
-        }
-    }
-
-    for snapshot in snapshots {
-        delete_snapshot(region, &snapshot, runner).await?;
-    }
-    Ok(())
-}
-
-/// Delete an EBS snapshot. Idempotent.
-async fn delete_snapshot(
-    region: &str,
-    snapshot_id: &str,
-    runner: &dyn CommandRunner,
-) -> Result<(), CloudError> {
-    match runner
-        .run_capture(
-            "aws",
-            &[
-                "ec2",
-                "delete-snapshot",
-                "--region",
-                region,
-                "--snapshot-id",
-                snapshot_id,
+                "--delete-associated-snapshots",
             ],
         )
         .await
     {
         Ok(_) => Ok(()),
         Err(CloudError::CommandFailed { stderr, .. })
-            if stderr.contains("InvalidSnapshot.NotFound") =>
+            if stderr.contains("InvalidAMIID.NotFound") =>
         {
-            tracing::debug!("snapshot '{snapshot_id}' already deleted");
+            tracing::debug!("AMI '{ami_id}' already deregistered");
             Ok(())
         }
         Err(e) => Err(CloudError::DestroyFailed {
-            resource: format!("snapshot/{snapshot_id}"),
+            resource: format!("ami/{ami_id}"),
             message: e.to_string(),
         }),
     }
