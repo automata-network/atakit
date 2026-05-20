@@ -590,7 +590,7 @@ pub(super) fn build_cloud_image_record(
         }
         PlatformKind::Azure => {
             // Only gallery/image fields are used here; storage_account isn't.
-            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region, "");
+            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
             CloudImage {
                 platform: PlatformKind::Azure,
                 cloud_name: names.image_definition,
@@ -687,7 +687,7 @@ pub(super) async fn ensure_cloud_image(
         PlatformKind::Azure => {
             let subscription = provider_config.subscription.as_deref().unwrap();
             // Image-existence check; storage_account isn't used.
-            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region, "");
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
             let exists = atakit_cloud::azure::image::check_image_version_exists(
                 subscription,
                 &names.gallery_rg,
@@ -734,7 +734,7 @@ pub(super) async fn ensure_cloud_image(
             // hash) so a follow-up `cloud image upload` of the same image
             // reuses rather than duplicates. This is a different lifecycle
             // from per-deploy storage accounts.
-            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region, "");
+            let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
             cloud_provider.execute_step(
                 &DeployStep::CreateResourceGroup {
                     name: names.resource_group.clone(),

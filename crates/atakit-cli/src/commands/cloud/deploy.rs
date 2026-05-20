@@ -454,7 +454,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		}
 		PlatformKind::Azure => {
 			// Non-storage fields don't depend on the hash — pass "".
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region, "");
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
 			// storage_account is randomized per deploy; pull the actual name
 			// out of the plan so what we print matches what's created.
 			let storage = plan.steps.iter().find_map(|s| match s {
@@ -847,7 +847,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 		}
 		PlatformKind::Azure => {
 			// Post-deploy instructions: only resource_group is used, so no hash needed.
-			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region, "");
+			let names = AzureResourceNames::for_azure(&instance_name, image_ref, &provider_config.region);
 			eprintln!("    {:<12}{}", "Region:".dimmed(), provider_config.region);
 			eprintln!("    {:<12}{}", "RG:".dimmed(), names.resource_group);
 			eprintln!("    {:<12}{}", "CC type:".dimmed(), resolved_cc);

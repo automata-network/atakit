@@ -762,19 +762,23 @@ Resource names are derived from `instance_name` (which defaults to `{workload}-{
 
 ### Azure
 
-Resource names are derived from `instance_name` via `AzureResourceNames::for_azure(instance, image_ref, region)`:
+Resource names are derived via `AzureResourceNames::for_azure(instance, image_ref, region)`. Storage account, gallery, image definition, and image version are scoped to `(region, image_ref)` so concurrent deploys of the same image share the same uploaded VHD and gallery image version. Only per-instance resources (RG, NSG, VM) include the instance name.
 
-| Resource | Pattern | Example |
-|---|---|---|
-| Resource Group | `{instance}-rg` | `secure-signer-prod-rg` |
-| Storage Account | `atakit{alphanum}` (max 24, lowercase alphanum only) | `atakitsecuresignerprod` |
-| Gallery RG | `atakit-images-{region}` (shared, survives destroy) | `atakit-images-eastus` |
-| Gallery | `atakit_{alphanum}_gallery` (alphanum + underscores) | `atakit_secure_signer_prod_gallery` |
-| Image Definition | `{sanitized-image-ref}` | `automata-linux-v0-1-6` |
-| Image Version | `1.0.0` (fixed) | `1.0.0` |
-| NSG | `{instance}-nsg` | `secure-signer-prod-nsg` |
-| Managed Disk | `{instance}-{disk-name}` | `secure-signer-prod-data` |
-| VM Instance | `{instance}` (sanitized, max 64) | `secure-signer-prod` |
+| Resource | Pattern | Example | Scope |
+|---|---|---|---|
+| Resource Group | `{instance}-rg` | `secure-signer-prod-rg` | per-instance |
+| Storage Account | `atakit{6-hex-of-image-hash}{region}` (max 24, lowercase alphanum) | `atakit3a7f8beastus` | shared per `(region, image_ref)` |
+| Gallery RG | `atakit-images-{region}` | `atakit-images-eastus` | shared per region |
+| Gallery | `atakit_{region}_gallery` | `atakit_eastus_gallery` | shared per region |
+| Image Definition | `{sanitized-image-ref}` | `automata-linux-v0-1-6` | shared per `(region, image_ref)` |
+| Image Version | `1.0.0` (fixed) | `1.0.0` | shared per `(region, image_ref)` |
+| NSG | `{instance}-nsg` | `secure-signer-prod-nsg` | per-instance |
+| Managed Disk | `{instance}-{disk-name}` | `secure-signer-prod-data` | per-instance |
+| VM Instance | `{instance}` (sanitized, max 64) | `secure-signer-prod` | per-instance |
+
+**Implications for `cloud destroy`**: per-instance RG deletion only removes per-instance resources. The shared storage account (in `atakit-images-{region}`), gallery image version, and image definition are NOT touched — they remain available for subsequent deploys of the same image. The `--preserve image` flag is a no-op (kept for backwards compat); shared image artifacts are always preserved. Use `atakit image rm` (or manual `az` commands) to clean up shared artifacts.
+
+**Region IDs**: Azure region values are lowercase ARM IDs (`eastus`, `westus`, `westus3`, `westeurope`, …) as accepted by `az --location`. Display names with spaces (`East US`) are not accepted.
 
 ### Resource Tags/Labels
 

@@ -36,14 +36,21 @@ impl ResourceNames {
 }
 
 /// Azure resource names for cloud deployments.
+///
+/// Storage account, gallery, image definition, and image version are scoped to
+/// `(region, image_ref)` so concurrent deploys of the same image share the same
+/// uploaded VHD and gallery image. Only `resource_group`, `nsg`, and `instance`
+/// are per-instance.
 pub struct AzureResourceNames {
     /// Resource group: `{instance}-rg`.
     pub resource_group: String,
-    /// Storage account: `atakit{alphanum}` (max 24, lowercase alphanum only).
+    /// Storage account holding the uploaded VHD. Shared across all deploys of
+    /// the same `(region, image_ref)`. Format: `atakit{18-hex}` (24 chars).
     pub storage_account: String,
     /// Gallery resource group: `atakit-images-{region}` (shared across deployments).
     pub gallery_rg: String,
-    /// Compute Gallery: `atakit_{alphanum}_gallery` (alphanum + underscores).
+    /// Compute Gallery: `atakit_{region}_gallery` — one per region, shared
+    /// across all image refs.
     pub gallery: String,
     /// Image definition: sanitized image ref.
     pub image_definition: String,
@@ -56,84 +63,47 @@ pub struct AzureResourceNames {
 }
 
 impl AzureResourceNames {
-    /// Derive Azure resource names from instance name, image reference, region,
-    /// and a storage-account hash.
+    /// Derive Azure resource names from instance name, image reference, and
+    /// region.
     ///
-    /// `storage_hash` is inserted immediately after the `atakit` prefix in the
-    /// storage account name to break global-uniqueness collisions (Azure
-    /// storage account names are globally unique across all tenants). Pass
-    /// `""` when the caller doesn't care about the storage account (e.g.
-    /// when only using resource_group / gallery fields) — this preserves the
-    /// pre-hash naming. For deploy flows, generate a fresh value via
-    /// [`random_storage_hash`].
-    pub fn for_azure(
-        instance_name: &str,
-        image_ref: &str,
-        region: &str,
-        storage_hash: &str,
-    ) -> Self {
-        let inst = sanitize(instance_name, 64);
+    /// The storage account is deterministically derived from `(region,
+    /// image_ref)`. Subsequent deploys of the same image discover and reuse
+    /// the same storage account and gallery image version — avoiding redundant
+    /// VHD uploads across instances.
+    pub fn for_azure(instance_name: &str, image_ref: &str, region: &str) -> Self {
         Self {
             resource_group: format!("{}-rg", sanitize(instance_name, 87)),
-            storage_account: azure_storage_account(instance_name, storage_hash),
+            storage_account: azure_shared_storage_account(region, image_ref),
             gallery_rg: format!("atakit-images-{}", sanitize(region, 73)),
-            gallery: format!(
-                "atakit_{}_gallery",
-                sanitize_azure_gallery(instance_name, 55)
-            ),
+            gallery: format!("atakit_{}_gallery", sanitize_azure_gallery(region, 55)),
             image_definition: sanitize(image_ref, 80),
             image_version: "1.0.0".to_string(),
             nsg: format!("{}-nsg", sanitize(instance_name, 76)),
-            instance: inst,
+            instance: sanitize(instance_name, 64),
         }
     }
 }
 
-/// Generate a 6-char lowercase-hex token suitable for use as a storage account
-/// disambiguation hash. Uses SHA-256 over time + pid + a monotonic counter so
-/// repeated calls within the same process never collide.
-pub fn random_storage_hash() -> String {
+/// Deterministic storage account name shared across deploys of the same
+/// `(region, image_ref)`. Format: `atakit{6-hex-of-image-hash}{region}`.
+/// Lowercase alphanum, 24-char max. The hash is over `image_ref` only — so
+/// every region uses the same prefix for the same image and the trailing
+/// region disambiguates regional resources. Region is truncated if needed to
+/// fit the 24-char Azure limit.
+fn azure_shared_storage_account(region: &str, image_ref: &str) -> String {
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-
-    let mut hasher = Sha256::new();
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(counter.to_le_bytes());
-    hasher.update(pid.to_le_bytes());
-    let d = hasher.finalize();
-    format!("{:02x}{:02x}{:02x}", d[0], d[1], d[2])
-}
-
-/// Build an Azure storage account name: `atakit{hash}{instance}`, truncated
-/// from the back of the instance-name portion to fit the 24-char limit.
-/// Lowercase alphanum only (Azure storage account name constraints).
-fn azure_storage_account(instance: &str, hash: &str) -> String {
-    const MAX: usize = 24;
     const PREFIX: &str = "atakit";
-    let hash_budget = MAX.saturating_sub(PREFIX.len());
-    let hash_san: String = lowercase_alphanum(hash).chars().take(hash_budget).collect();
-    let prefix = format!("{PREFIX}{hash_san}");
-    let inst_san = lowercase_alphanum(instance);
-    let remaining = MAX.saturating_sub(prefix.len());
-    let inst_trunc: String = inst_san.chars().take(remaining).collect();
-    format!("{prefix}{inst_trunc}")
-}
-
-/// Lowercase alphanumerics only — strips everything else.
-fn lowercase_alphanum(s: &str) -> String {
-    s.chars()
+    const MAX: usize = 24;
+    let d = Sha256::digest(image_ref.as_bytes());
+    let hash6: String = d.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    let region_san: String = region
+        .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
-        .collect()
+        .collect();
+    let budget = MAX.saturating_sub(PREFIX.len() + hash6.len());
+    let region_trunc: String = region_san.chars().take(budget).collect();
+    format!("{PREFIX}{hash6}{region_trunc}")
 }
 
 /// Sanitize for Azure gallery name: alphanum + underscores.
@@ -253,39 +223,30 @@ mod tests {
     }
 
     #[test]
-    fn azure_storage_no_hash() {
-        // Empty hash → atakit + truncated instance (legacy behavior preserved).
-        assert_eq!(azure_storage_account("my-instance", ""), "atakitmyinstance");
-        // 21-char sanitized instance, 18-char budget after "atakit" prefix.
-        assert_eq!(
-            azure_storage_account("aVeryLongInstanceName", ""),
-            "atakitaverylonginstancen",
-        );
-        assert!(azure_storage_account("aVeryLongInstanceName", "").len() <= 24);
+    fn azure_storage_account_is_image_scoped() {
+        // Same image + same region → same storage account (shared across
+        // every instance of that image). Different instance names must NOT
+        // change the storage account name.
+        let a = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.2", "eastus");
+        let b = AzureResourceNames::for_azure("inst-b", "dev-baseimage:v0.0.2", "eastus");
+        assert_eq!(a.storage_account, b.storage_account);
+        // Different image_ref → different storage account.
+        let c = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.3", "eastus");
+        assert_ne!(a.storage_account, c.storage_account);
+        // Different region → different storage account (regional resource).
+        let d = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.2", "westus");
+        assert_ne!(a.storage_account, d.storage_account);
+        assert!(a.storage_account.starts_with("atakit"));
+        assert!(a.storage_account.ends_with("eastus"));
+        assert!(a.storage_account.len() <= 24);
     }
 
     #[test]
-    fn azure_storage_with_hash() {
-        // 6-char hash: atakit(6) + hash(6) + up to 12 of instance.
-        assert_eq!(
-            azure_storage_account("my-instance", "abc123"),
-            "atakitabc123myinstance",
-        );
-        // Long instance truncated to 12 chars.
-        assert_eq!(
-            azure_storage_account("aVeryLongInstanceName", "abc123"),
-            "atakitabc123averylongins",
-        );
-        assert!(azure_storage_account("aVeryLongInstanceName", "abc123").len() <= 24);
-    }
-
-    #[test]
-    fn azure_storage_oversized_hash() {
-        // A hash longer than the 24-char budget must still yield a legal name:
-        // hash_san is clamped so prefix never exceeds MAX, instance is dropped.
-        let out = azure_storage_account("my-instance", "abcdefghijklmnopqrstuvwxyz");
-        assert_eq!(out, "atakitabcdefghijklmnopqr");
-        assert_eq!(out.len(), 24);
+    fn azure_storage_account_length_for_long_region() {
+        // Region truncates to fit 24-char Azure limit; trailing chars dropped.
+        let n = AzureResourceNames::for_azure("inst", "img:v1", "southeastasia");
+        assert!(n.storage_account.len() <= 24);
+        assert!(n.storage_account.starts_with("atakit"));
     }
 
     #[test]
@@ -296,28 +257,19 @@ mod tests {
 
     #[test]
     fn azure_resource_names() {
-        let names = AzureResourceNames::for_azure(
-            "my-instance",
-            "automata-linux:v0.1.6",
-            "eastus",
-            "abc123",
-        );
+        let names =
+            AzureResourceNames::for_azure("my-instance", "automata-linux:v0.1.6", "eastus");
+        // Per-instance fields.
         assert_eq!(names.resource_group, "my-instance-rg");
-        assert_eq!(names.storage_account, "atakitabc123myinstance");
-        assert_eq!(names.gallery_rg, "atakit-images-eastus");
-        assert_eq!(names.gallery, "atakit_my_instance_gallery");
-        assert_eq!(names.image_definition, "automata-linux-v0-1-6");
-        assert_eq!(names.image_version, "1.0.0");
         assert_eq!(names.nsg, "my-instance-nsg");
         assert_eq!(names.instance, "my-instance");
-    }
-
-    #[test]
-    fn random_hash_shape() {
-        let h = random_storage_hash();
-        assert_eq!(h.len(), 6);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        // Monotonic counter ⇒ consecutive calls differ.
-        assert_ne!(h, random_storage_hash());
+        // Per-image / per-region fields (shared).
+        assert_eq!(names.gallery_rg, "atakit-images-eastus");
+        assert_eq!(names.gallery, "atakit_eastus_gallery");
+        assert_eq!(names.image_definition, "automata-linux-v0-1-6");
+        assert_eq!(names.image_version, "1.0.0");
+        assert!(names.storage_account.starts_with("atakit"));
+        assert!(names.storage_account.ends_with("eastus"));
+        assert!(names.storage_account.len() <= 24);
     }
 }
