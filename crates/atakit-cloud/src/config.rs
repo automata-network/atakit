@@ -309,42 +309,44 @@ const AWS_SNP_REGIONS: &[&str] = &["us-east-2", "eu-west-1"];
 /// AWS instance type families supporting AMD SEV-SNP.
 const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", "r7a"];
 
-const AZURE_TDX_V6_REGIONS: &[&str] = &["West US", "West US 3"];
+// Azure ARM region IDs (lowercase, no spaces). Match the format passed to
+// `az --location`, which is what downstream image.rs / deploy.rs consume.
+const AZURE_TDX_V6_REGIONS: &[&str] = &["westus", "westus3"];
 
 const AZURE_SNP_V5_REGIONS: &[&str] = &[
-    "Central India",
-    "East Asia",
-    "East US",
-    "Germany West Central",
-    "Italy North",
-    "Japan East",
-    "North Europe",
-    "Southeast Asia",
-    "Switzerland North",
-    "UAE North",
-    "West Europe",
-    "West US",
+    "centralindia",
+    "eastasia",
+    "eastus",
+    "germanywestcentral",
+    "italynorth",
+    "japaneast",
+    "northeurope",
+    "southeastasia",
+    "switzerlandnorth",
+    "uaenorth",
+    "westeurope",
+    "westus",
 ];
 
 const AZURE_SNP_V6_REGIONS: &[&str] = &[
-    "Australia East",
-    "Canada Central",
-    "Canada East",
-    "France South",
-    "Germany North",
-    "Germany West Central",
-    "Italy North",
-    "Korea Central",
-    "Norway East",
-    "Norway West",
-    "South Africa North",
-    "South Central US",
-    "Switzerland North",
-    "UAE North",
-    "UK South",
-    "West Europe",
-    "West US",
-    "West US 3",
+    "australiaeast",
+    "canadacentral",
+    "canadaeast",
+    "francesouth",
+    "germanynorth",
+    "germanywestcentral",
+    "italynorth",
+    "koreacentral",
+    "norwayeast",
+    "norwaywest",
+    "southafricanorth",
+    "southcentralus",
+    "switzerlandnorth",
+    "uaenorth",
+    "uksouth",
+    "westeurope",
+    "westus",
+    "westus3",
 ];
 
 /// Valid GCP C3 standard sizes for TDX.
@@ -703,14 +705,14 @@ mod tests {
 
     #[test]
     fn azure_tdx_valid() {
-        let p = make_provider(PlatformKind::Azure, "West US");
+        let p = make_provider(PlatformKind::Azure, "westus");
         let t = make_target("Standard_DC4es_v6");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_tdx_all_sizes() {
-        let p = make_provider(PlatformKind::Azure, "West US 3");
+        let p = make_provider(PlatformKind::Azure, "westus3");
         for size in AZURE_DC_VCPUS {
             let vmtype = format!("Standard_DC{size}es_v6");
             let t = make_target(&vmtype);
@@ -735,7 +737,7 @@ mod tests {
 
     #[test]
     fn azure_tdx_bad_region() {
-        let p = make_provider(PlatformKind::Azure, "Japan East");
+        let p = make_provider(PlatformKind::Azure, "japaneast");
         let t = make_target("Standard_DC4es_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support TDX DCesv6"), "{err}");
@@ -743,7 +745,7 @@ mod tests {
 
     #[test]
     fn azure_tdx_wrong_cc_type() {
-        let p = make_provider(PlatformKind::Azure, "West US");
+        let p = make_provider(PlatformKind::Azure, "westus");
         let t = make_target_with_cc("Standard_DC4es_v6", CcType::SevSnp);
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -753,14 +755,14 @@ mod tests {
 
     #[test]
     fn azure_snp_v5_valid() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_DC4as_v5");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_snp_v6_valid() {
-        let p = make_provider(PlatformKind::Azure, "West Europe");
+        let p = make_provider(PlatformKind::Azure, "westeurope");
         let t = make_target("Standard_DC8as_v6");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
@@ -791,7 +793,7 @@ mod tests {
 
     #[test]
     fn azure_snp_v5_bad_region() {
-        let p = make_provider(PlatformKind::Azure, "Brazil South");
+        let p = make_provider(PlatformKind::Azure, "brazilsouth");
         let t = make_target("Standard_DC4as_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
@@ -799,7 +801,7 @@ mod tests {
 
     #[test]
     fn azure_snp_v6_bad_region() {
-        let p = make_provider(PlatformKind::Azure, "Brazil South");
+        let p = make_provider(PlatformKind::Azure, "brazilsouth");
         let t = make_target("Standard_DC4as_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
@@ -807,7 +809,7 @@ mod tests {
 
     #[test]
     fn azure_snp_v5_region_not_in_v6() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_DC4as_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
@@ -815,7 +817,7 @@ mod tests {
 
     #[test]
     fn azure_snp_v6_region_not_in_v5() {
-        let p = make_provider(PlatformKind::Azure, "South Central US");
+        let p = make_provider(PlatformKind::Azure, "southcentralus");
         let t = make_target("Standard_DC4as_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
@@ -823,7 +825,7 @@ mod tests {
 
     #[test]
     fn azure_snp_wrong_cc_type() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target_with_cc("Standard_DC4as_v5", CcType::Tdx);
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -833,7 +835,7 @@ mod tests {
 
     #[test]
     fn azure_unsupported_vm_size() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_D4s_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("cannot infer CC type"), "{err}");
@@ -841,7 +843,7 @@ mod tests {
 
     #[test]
     fn azure_bad_dc_size_number() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_DC3es_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("cannot infer CC type"), "{err}");

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
-use crate::naming::{random_storage_hash, AzureResourceNames};
+use crate::naming::AzureResourceNames;
 use crate::plan::*;
 use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
@@ -76,18 +76,12 @@ impl CloudProvider for AzureProvider {
     }
 
     async fn plan_deploy(&self, opts: &DeployOptions) -> Result<DeployPlan, CloudError> {
-        // Azure storage account names are globally unique across all tenants;
-        // a 6-char hash after the "atakit" prefix avoids collisions with any
-        // other deploy using the same instance name. Fresh per invocation —
-        // `cloud deploy` bails if state already exists, so we never need to
-        // recover this value across processes.
-        let storage_hash = random_storage_hash();
-        let names = AzureResourceNames::for_azure(
-            &opts.instance_name,
-            &opts.image_ref,
-            &self.region,
-            &storage_hash,
-        );
+        // Storage account, gallery, and image version are derived from
+        // (region, image_ref) — shared across every deploy of the same image.
+        // The first deploy uploads the VHD; subsequent deploys detect the
+        // existing gallery image version and skip the upload.
+        let names =
+            AzureResourceNames::for_azure(&opts.instance_name, &opts.image_ref, &self.region);
         let mut steps = vec![DeployStep::CheckDeps];
 
         // Create deployment resource group.
@@ -189,7 +183,7 @@ impl CloudProvider for AzureProvider {
             }
 
             DeployStep::UploadImageAzure {
-                resource_group,
+                resource_group: _,
                 storage_account,
                 gallery_rg,
                 gallery,
@@ -288,10 +282,13 @@ impl CloudProvider for AzureProvider {
                             .await?;
                         }
 
-                        // Ensure storage infra.
+                        // Ensure storage infra. Storage account lives in the
+                        // shared gallery RG, not the per-instance RG, so it
+                        // survives `cloud destroy` and is reused by future
+                        // deploys of the same image.
                         image::ensure_storage_account(
                             &self.subscription,
-                            resource_group,
+                            gallery_rg,
                             storage_account,
                             &self.region,
                             runner,
@@ -343,10 +340,11 @@ impl CloudProvider for AzureProvider {
                         .await?;
 
                         // Get storage account ID for image version creation.
+                        // The account now lives in the shared gallery RG.
                         let sa_id = image::get_storage_account_id(
                             &self.subscription,
                             storage_account,
-                            resource_group,
+                            gallery_rg,
                             runner,
                         )
                         .await?;
@@ -464,9 +462,7 @@ impl CloudProvider for AzureProvider {
             } => {
                 // The image_id in the step is empty at plan time. Look up the
                 // gallery image version ID using the image_ref for naming.
-                // storage_account isn't used here, so an empty hash is fine.
-                let names =
-                    AzureResourceNames::for_azure(instance_name, image_ref, &self.region, "");
+                let names = AzureResourceNames::for_azure(instance_name, image_ref, &self.region);
                 let image_id = image::get_image_version_id(
                     &self.subscription,
                     &names.gallery_rg,
@@ -562,29 +558,16 @@ impl CloudProvider for AzureProvider {
 
         // The NSG lives in {instance}-rg, which is deleted below — cascade handles it.
 
-        // Delete image version (unless image preserved).
-        if !opts.preserve.contains(&"image".to_string()) {
-            if let (Some(ref grg), Some(ref g), Some(ref def), Some(ref ver)) = (
-                &az.gallery_rg,
-                &az.gallery,
-                &az.image_definition,
-                &az.image_version,
-            ) {
-                steps.push(DestroyStep::DeleteImageVersion {
-                    gallery_rg: grg.clone(),
-                    gallery: g.clone(),
-                    image_definition: def.clone(),
-                    image_version: ver.clone(),
-                });
-                steps.push(DestroyStep::DeleteImageDefinition {
-                    gallery_rg: grg.clone(),
-                    gallery: g.clone(),
-                    image_definition: def.clone(),
-                });
-            }
-        }
+        // The gallery image version + definition + storage account are shared
+        // across every deploy of the same (region, image_ref). Do NOT delete
+        // them on per-instance destroy — sibling instances may still depend on
+        // them, and the next deploy of the same image reuses the upload.
+        // Use `atakit image rm` to clean up shared image artifacts. The
+        // `--preserve image` flag is now a no-op kept for backwards compat.
+        let _ = &opts.preserve; // intentionally unused: image is always preserved on destroy
 
-        // Delete the deployment resource group (cleans up storage account, etc.).
+        // Delete the deployment resource group (per-instance: VM, disks, NSG).
+        // The shared storage account lives in the gallery RG and is untouched.
         if let Some(ref name) = az.resource_group {
             steps.push(DestroyStep::DeleteResourceGroup { name: name.clone() });
         }
