@@ -309,21 +309,42 @@ const AWS_SNP_REGIONS: &[&str] = &["us-east-2", "eu-west-1"];
 /// AWS instance type families supporting AMD SEV-SNP.
 const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", "r7a"];
 
-const AZURE_TDX_V6_REGIONS: &[&str] = &["West Europe", "East US", "West US", "West US 3"];
+const AZURE_TDX_V6_REGIONS: &[&str] = &["West US", "West US 3"];
 
-const AZURE_SNP_REGIONS: &[&str] = &[
-    "East US",
-    "West US",
-    "Switzerland North",
-    "Italy North",
-    "North Europe",
-    "West Europe",
-    "Germany West Central",
-    "UAE North",
-    "Japan East",
+const AZURE_SNP_V5_REGIONS: &[&str] = &[
     "Central India",
     "East Asia",
+    "East US",
+    "Germany West Central",
+    "Italy North",
+    "Japan East",
+    "North Europe",
     "Southeast Asia",
+    "Switzerland North",
+    "UAE North",
+    "West Europe",
+    "West US",
+];
+
+const AZURE_SNP_V6_REGIONS: &[&str] = &[
+    "Australia East",
+    "Canada Central",
+    "Canada East",
+    "France South",
+    "Germany North",
+    "Germany West Central",
+    "Italy North",
+    "Korea Central",
+    "Norway East",
+    "Norway West",
+    "South Africa North",
+    "South Central US",
+    "Switzerland North",
+    "UAE North",
+    "UK South",
+    "West Europe",
+    "West US",
+    "West US 3",
 ];
 
 /// Valid GCP C3 standard sizes for TDX.
@@ -407,7 +428,8 @@ pub fn validate_target(
         }
         PlatformKind::Azure => {
             let is_tdx_v6 = is_azure_dces_v6(&target.vmtype);
-            let is_snp = is_azure_dcas_v5v6(&target.vmtype);
+            let is_snp_v5 = is_azure_dcas_v5(&target.vmtype);
+            let is_snp_v6 = is_azure_dcas_v6(&target.vmtype);
 
             if is_tdx_v6 {
                 if !AZURE_TDX_V6_REGIONS.contains(&provider.region.as_str()) {
@@ -417,12 +439,20 @@ pub fn validate_target(
                         AZURE_TDX_V6_REGIONS.join(", ")
                     )));
                 }
-            } else if is_snp {
-                if !AZURE_SNP_REGIONS.contains(&provider.region.as_str()) {
+            } else if is_snp_v5 {
+                if !AZURE_SNP_V5_REGIONS.contains(&provider.region.as_str()) {
                     return Err(err(format!(
-                        "region '{}' does not support SEV-SNP VMs. Supported regions: {}",
+                        "region '{}' does not support SEV-SNP DCasv5 VMs. Supported regions: {}",
                         provider.region,
-                        AZURE_SNP_REGIONS.join(", ")
+                        AZURE_SNP_V5_REGIONS.join(", ")
+                    )));
+                }
+            } else if is_snp_v6 {
+                if !AZURE_SNP_V6_REGIONS.contains(&provider.region.as_str()) {
+                    return Err(err(format!(
+                        "region '{}' does not support SEV-SNP DCasv6 VMs. Supported regions: {}",
+                        provider.region,
+                        AZURE_SNP_V6_REGIONS.join(", ")
                     )));
                 }
             } else {
@@ -480,18 +510,31 @@ fn is_azure_dces_v6(vmtype: &str) -> bool {
     AZURE_DC_VCPUS.contains(&rest)
 }
 
-/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v{5,6}`.
-fn is_azure_dcas_v5v6(vmtype: &str) -> bool {
+/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v5`.
+fn is_azure_dcas_v5(vmtype: &str) -> bool {
     let Some(rest) = vmtype.strip_prefix("Standard_DC") else {
         return false;
     };
-    let Some(rest) = rest
-        .strip_suffix("as_v5")
-        .or_else(|| rest.strip_suffix("as_v6"))
-    else {
+    let Some(rest) = rest.strip_suffix("as_v5") else {
         return false;
     };
     AZURE_DC_VCPUS.contains(&rest)
+}
+
+/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v6`.
+fn is_azure_dcas_v6(vmtype: &str) -> bool {
+    let Some(rest) = vmtype.strip_prefix("Standard_DC") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix("as_v6") else {
+        return false;
+    };
+    AZURE_DC_VCPUS.contains(&rest)
+}
+
+/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v{5,6}`.
+fn is_azure_dcas_v5v6(vmtype: &str) -> bool {
+    is_azure_dcas_v5(vmtype) || is_azure_dcas_v6(vmtype)
 }
 
 #[cfg(test)]
@@ -660,14 +703,14 @@ mod tests {
 
     #[test]
     fn azure_tdx_valid() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "West US");
         let t = make_target("Standard_DC4es_v6");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_tdx_all_sizes() {
-        let p = make_provider(PlatformKind::Azure, "West Europe");
+        let p = make_provider(PlatformKind::Azure, "West US 3");
         for size in AZURE_DC_VCPUS {
             let vmtype = format!("Standard_DC{size}es_v6");
             let t = make_target(&vmtype);
@@ -700,7 +743,7 @@ mod tests {
 
     #[test]
     fn azure_tdx_wrong_cc_type() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "West US");
         let t = make_target_with_cc("Standard_DC4es_v6", CcType::SevSnp);
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -723,23 +766,59 @@ mod tests {
     }
 
     #[test]
-    fn azure_snp_all_regions() {
-        for region in AZURE_SNP_REGIONS {
+    fn azure_snp_v5_all_regions() {
+        for region in AZURE_SNP_V5_REGIONS {
             let p = make_provider(PlatformKind::Azure, region);
             let t = make_target("Standard_DC2as_v5");
             assert!(
                 validate_target(&t, &p, "test").is_ok(),
-                "expected region {region} to be valid"
+                "expected region {region} to be valid for DCasv5"
             );
         }
     }
 
     #[test]
-    fn azure_snp_bad_region() {
+    fn azure_snp_v6_all_regions() {
+        for region in AZURE_SNP_V6_REGIONS {
+            let p = make_provider(PlatformKind::Azure, region);
+            let t = make_target("Standard_DC2as_v6");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected region {region} to be valid for DCasv6"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_snp_v5_bad_region() {
         let p = make_provider(PlatformKind::Azure, "Brazil South");
         let t = make_target("Standard_DC4as_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
-        assert!(err.contains("does not support SEV-SNP"), "{err}");
+        assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v6_bad_region() {
+        let p = make_provider(PlatformKind::Azure, "Brazil South");
+        let t = make_target("Standard_DC4as_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v5_region_not_in_v6() {
+        let p = make_provider(PlatformKind::Azure, "East US");
+        let t = make_target("Standard_DC4as_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v6_region_not_in_v5() {
+        let p = make_provider(PlatformKind::Azure, "South Central US");
+        let t = make_target("Standard_DC4as_v5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
     }
 
     #[test]
