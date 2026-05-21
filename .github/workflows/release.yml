@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    # Each matrix job publishes its own binary straight to the release. We
+    # deliberately avoid actions/upload-artifact (cross-job hand-off) because
+    # release-asset uploads don't count against the Actions artifact storage
+    # quota, whereas large run artifacts do. max-parallel: 1 so the first job
+    # creates the release and the second appends to it (no create race).
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build atakit
+        run: cargo build --release --locked -p atakit-cli --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/atakit"
+          strip "$bin" || true
+          out="atakit-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          cp "$bin" "dist/${out}"
+          chmod +x "dist/${out}"
+          (cd dist && shasum -a 256 "${out}" > "${out}.sha256")
+          ls -l dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
