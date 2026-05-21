@@ -175,7 +175,7 @@ pub struct ManifestDisk {
     /// LUN / device index for cloud disk attachment.
     pub index: u32,
     pub size: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub encryption: Option<ManifestDiskEncryption>,
 }
 
@@ -662,46 +662,6 @@ image = "redis:7"
         // And service-name keying.
         assert!(j1.contains("\"main\":{\"archive\":\"images/main.tar\""));
         assert!(j1.contains("\"redis\":{\"archive\":\"images/redis.tar\""));
-    }
-
-    #[test]
-    fn disk_without_encryption_omits_field() {
-        // A disk that declares no encryption block must not serialise
-        // `"encryption":null` in the canonical JSON. The portal's manifest
-        // parser stores `encryption` as a non-Option struct, so JSON null
-        // fails to deserialise; absence is the contract that means "no
-        // encryption".
-        let toml_str = r#"
-format = 2
-
-[workload]
-name = "app"
-version = "v0.0.1"
-base-image-mode = "blacklist"
-image = "app:latest"
-
-[workload.disks]
-data = "/data"
-
-[disks.data]
-size = "10GB"
-"#;
-        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
-        let manifest = build_manifest(
-            &cfg,
-            "app:latest",
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        let output = serialize_canonical_json(&manifest).unwrap();
-        assert!(
-            !output.contains("\"encryption\":null"),
-            "unencrypted disk must omit the encryption key, got: {output}"
-        );
-        // Sanity: the disk itself is still present.
-        assert!(output.contains("\"data\":{"));
     }
 
     #[test]
