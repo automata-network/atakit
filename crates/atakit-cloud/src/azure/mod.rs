@@ -624,7 +624,7 @@ impl CloudProvider for AzureProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CcType, CloudTarget, PlatformKind};
+    use crate::config::{CcType, CloudTarget};
     use crate::provider::{CloudProvider, DeployOptions};
     use crate::state::PersistedAgentEnv;
     use std::collections::BTreeMap;
@@ -633,7 +633,7 @@ mod tests {
         CloudTarget {
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
-            image: "test-image:v1".to_string(),
+            image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
