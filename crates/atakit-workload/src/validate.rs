@@ -235,6 +235,45 @@ pub fn validate_config(
         ensure_no_traversal(p, "package unmeasured-data")?;
     }
 
+    // ── package ↔ service opt-in consistency ───────────────
+    // A service setting `measured-data = true` / `unmeasured-data = true`
+    // commits to bind-mounting that data class, but the portal silently
+    // skips the mount when the staged directory is absent. Flag the
+    // inconsistent shape at build time so a no-op opt-in doesn't ship.
+    {
+        let mut measured_offenders: Vec<String> = Vec::new();
+        if w.measured_data {
+            measured_offenders.push("workload".to_string());
+        }
+        for (name, dep) in &config.dependencies {
+            if dep.measured_data {
+                measured_offenders.push(format!("dependencies.{name}"));
+            }
+        }
+        if !measured_offenders.is_empty() && config.measured_data_paths().is_empty() {
+            return Err(WorkloadError::Validation(format!(
+                "measured-data = true on {} but [package].measured-data is empty or missing",
+                measured_offenders.join(", ")
+            )));
+        }
+
+        let mut unmeasured_offenders: Vec<String> = Vec::new();
+        if w.unmeasured_data {
+            unmeasured_offenders.push("workload".to_string());
+        }
+        for (name, dep) in &config.dependencies {
+            if dep.unmeasured_data {
+                unmeasured_offenders.push(format!("dependencies.{name}"));
+            }
+        }
+        if !unmeasured_offenders.is_empty() && config.unmeasured_data_paths().is_empty() {
+            return Err(WorkloadError::Validation(format!(
+                "unmeasured-data = true on {} but [package].unmeasured-data is empty or missing",
+                unmeasured_offenders.join(", ")
+            )));
+        }
+    }
+
     // ── env_file ──────────────────────────────────────────
     if let Some(ref env_files) = w.env_file {
         for ef in env_files.as_vec() {
@@ -752,6 +791,75 @@ image = "redis:7"
         let tmp = tempfile::tempdir().unwrap();
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_measured_data_optin_without_package() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = true
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("measured-data = true") && msg.contains("[package].measured-data"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_dependency_measured_data_optin_without_package() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+measured-data = true
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dependencies.sidecar") && msg.contains("[package].measured-data"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_unmeasured_data_optin_without_package() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-data = true
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unmeasured-data = true") && msg.contains("[package].unmeasured-data"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
