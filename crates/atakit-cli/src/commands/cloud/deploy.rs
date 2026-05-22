@@ -3,7 +3,7 @@ use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{self, InitConfig, InitChainConfig, InitKeyConfig};
+use atakit_cloud::init::{self, InitConfig, InitChainConfig, InitKeyConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::state::{DeployState, DeployStatus};
@@ -610,6 +610,11 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 	let runner = ProcessRunner::new(verbose);
 	let total = plan.steps.len() as u32;
 
+	// Captured from DeployStep::WaitForPortal so the post-init terminal-state
+	// poll can reuse the same timeout. Default mirrors the value pushed by
+	// each provider's plan builder.
+	let mut portal_wait_timeout_secs: u64 = 300;
+
 	for (i, step) in plan.steps.iter().enumerate() {
 		let step_num = (i + 1) as u32;
 		state.advance_step(step_num, &env.data_dir)?;
@@ -629,6 +634,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
 		match step {
 			DeployStep::WaitForPortal { timeout_secs } => {
+				portal_wait_timeout_secs = *timeout_secs;
 				let ip = state
 					.resources
 					.gcp
@@ -709,7 +715,61 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 				};
 
 				match init::post_portal_init(&ip, 1024, ap, unmeasured_tar.as_deref(), &init_config).await {
-					Ok(()) => eprintln!("{}", "done".green()),
+					Ok(()) => {
+						// /init returned 2xx; portal accepted the payload. The
+						// actual chain submission and workload boot happen
+						// async inside the CVM, so poll /status until the
+						// portal reaches a terminal state. "Deployment
+						// complete!" can only be claimed when state=Running.
+						eprintln!();
+						let outcome = init::wait_for_portal_terminal(
+							&ip,
+							2024,
+							portal_wait_timeout_secs,
+							|s| eprintln!("      state: {s}"),
+						)
+						.await;
+						eprint!("  ");
+						match outcome {
+							Ok(PortalTerminalState::Running) => eprintln!("{}", "done".green()),
+							Ok(PortalTerminalState::Failed { detail })
+							| Ok(PortalTerminalState::CleanHalt { detail }) => {
+								let detail = if detail.is_empty() {
+									"portal reached terminal Failed state".to_string()
+								} else {
+									detail
+								};
+								eprintln!("{}", "failed".red());
+								if !args.keep_going {
+									state.set_status(
+										DeployStatus::Failed {
+											step: step.to_string(),
+											message: detail.clone(),
+										},
+										&env.data_dir,
+									)?;
+									return Err(anyhow::anyhow!(
+										"portal terminal failure: {detail}"
+									));
+								}
+								eprintln!("  warning: {detail}");
+							}
+							Err(e) => {
+								eprintln!("{}", "failed".red());
+								if !args.keep_going {
+									state.set_status(
+										DeployStatus::Failed {
+											step: step.to_string(),
+											message: e.to_string(),
+										},
+										&env.data_dir,
+									)?;
+									return Err(e.into());
+								}
+								eprintln!("  warning: {e}");
+							}
+						}
+					}
 					Err(e) => {
 						eprintln!("{}", "failed".red());
 						if !args.keep_going {
