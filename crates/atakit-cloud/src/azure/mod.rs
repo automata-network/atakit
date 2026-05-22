@@ -562,8 +562,9 @@ impl CloudProvider for AzureProvider {
         // across every deploy of the same (region, image_ref). Do NOT delete
         // them on per-instance destroy — sibling instances may still depend on
         // them, and the next deploy of the same image reuses the upload.
-        // Use `atakit image rm` to clean up shared image artifacts. The
-        // `--preserve image` flag is now a no-op kept for backwards compat.
+        // Use `atakit image rm` to clean up shared image artifacts. Azure
+        // therefore ignores both the default-preserved `image` token and the
+        // CLI's `--clean-image` opt-in.
         let _ = &opts.preserve; // intentionally unused: image is always preserved on destroy
 
         // Delete the deployment resource group (per-instance: VM, disks, NSG).

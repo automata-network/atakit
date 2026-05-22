@@ -85,9 +85,16 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		}
 	};
 
-	// Auto-preserve image if any other active deployment uses the same image.
+	// Image preservation: default is to keep the image so future deploys can
+	// reuse it. `--clean-image` opts in to deletion, but we still auto-preserve
+	// when any sibling deployment references the same image.
 	let mut preserve = args.preserve.clone();
-	if !preserve.contains(&"image".to_string()) && !state.image_ref.is_empty() {
+	let image_already_preserved = preserve.iter().any(|p| p == "image");
+	if !args.clean_image {
+		if !image_already_preserved {
+			preserve.push("image".to_string());
+		}
+	} else if !state.image_ref.is_empty() {
 		let all = atakit_cloud::state::list_deployments(&env.data_dir)
 			.map_err(|e| anyhow::anyhow!("cannot scan deployments for shared image check: {e}"))?;
 		let is_self = |o: &DeployState| o.target_name == target_name && o.instance_name == instance_name;
@@ -99,10 +106,12 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
 		});
 		if other_uses_image {
 			eprintln!(
-				"  {}: image '{}' is used by other deployments, preserving",
+				"  {}: image '{}' is used by other deployments, preserving despite --clean-image",
 				"note".dimmed(), state.image_ref,
 			);
-			preserve.push("image".to_string());
+			if !image_already_preserved {
+				preserve.push("image".to_string());
+			}
 		}
 	}
 
