@@ -145,9 +145,17 @@ pub struct DestroyArgs {
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Resources to preserve (comma-separated: image, disks, firewall)
+    /// Resources to preserve (comma-separated: disks, firewall). Images are
+    /// always preserved by default; pass `--clean-image` to opt in to deletion.
     #[arg(long, value_delimiter = ',')]
     pub preserve: Vec<String>,
+
+    /// Delete the base image (and its staging bucket on GCP/AWS) when
+    /// destroying. Default is to preserve the image so it can be reused by
+    /// future deploys. The image is auto-preserved if any other active
+    /// deployment still references it.
+    #[arg(long)]
+    pub clean_image: bool,
 
     /// Skip confirmation prompt
     #[arg(short, long)]

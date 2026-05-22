@@ -38,7 +38,9 @@ pub struct DeployOptions {
 
 /// Options for a destroy operation.
 pub struct DestroyOptions {
-    /// Resources to preserve: "image", "disks", "firewall".
+    /// Resources to preserve. Recognised tokens: "image", "disks", "firewall".
+    /// "image" is added by the CLI by default (preserved unless `--clean-image`
+    /// is passed); "disks" and "firewall" come from `--preserve`.
     pub preserve: Vec<String>,
 }
 
