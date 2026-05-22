@@ -137,6 +137,91 @@ pub async fn wait_for_portal(host: &str, status_port: u16, timeout_secs: u64) ->
     }
 }
 
+/// Terminal state reached by the portal after `/init`.
+#[derive(Debug, Clone)]
+pub enum PortalTerminalState {
+    /// Portal reached the terminal Running state: workload initialised
+    /// and chain registration (when required) completed.
+    Running,
+    /// Portal reached terminal Failed; `detail` is the portal-reported reason.
+    Failed { detail: String },
+    /// Portal reached CleanHalt before Running — workload exited cleanly
+    /// before becoming ready. Unexpected during deploy.
+    CleanHalt { detail: String },
+}
+
+/// Poll the portal `/status` endpoint until it reaches a terminal state
+/// (Running, Failed, or CleanHalt) or `timeout_secs` elapses.
+///
+/// `on_transition` fires once per observed `state` change with the new
+/// state name, so callers can render progress. Library crates can't print
+/// directly; the CLI passes a closure that writes to stderr.
+pub async fn wait_for_portal_terminal(
+    host: &str,
+    status_port: u16,
+    timeout_secs: u64,
+    mut on_transition: impl FnMut(&str),
+) -> Result<PortalTerminalState, CloudError> {
+    let url = format!("https://{host}:{status_port}/status");
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| CloudError::Http {
+            message: e.to_string(),
+        })?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let interval = Duration::from_secs(2);
+    let mut last_state: Option<String> = None;
+
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    let state = body
+                        .get("state")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let detail = body
+                        .get("detail")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if last_state.as_deref() != Some(state.as_str()) && !state.is_empty() {
+                        on_transition(&state);
+                        last_state = Some(state.clone());
+                    }
+                    match state.as_str() {
+                        "Running" => return Ok(PortalTerminalState::Running),
+                        "Failed" => return Ok(PortalTerminalState::Failed { detail }),
+                        "CleanHalt" => return Ok(PortalTerminalState::CleanHalt { detail }),
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("portal status JSON parse failed: {e}");
+                }
+            },
+            Ok(resp) => {
+                tracing::debug!("portal status not ready yet (HTTP {})", resp.status());
+            }
+            Err(e) => {
+                tracing::debug!("portal status not reachable: {e}");
+            }
+        }
+
+        if tokio::time::Instant::now() + interval > deadline {
+            return Err(CloudError::PortalTimeout {
+                address: format!("{host}:{status_port}"),
+                timeout_secs,
+            });
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// POST /init to the portal with workload archive and configuration.
 ///
 /// Always uses HTTPS. The portal serves a self-signed certificate,
