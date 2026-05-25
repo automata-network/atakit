@@ -311,7 +311,7 @@ const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", 
 
 // Azure ARM region IDs (lowercase, no spaces). Match the format passed to
 // `az --location`, which is what downstream image.rs / deploy.rs consume.
-const AZURE_TDX_V6_REGIONS: &[&str] = &["westus", "westus3"];
+const AZURE_TDX_V6_REGIONS: &[&str] = &["eastus", "westus", "westus3"];
 
 const AZURE_SNP_V5_REGIONS: &[&str] = &[
     "centralindia",
