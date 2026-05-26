@@ -333,7 +333,15 @@ mod tests {
                 "dependencies": null,
                 "firewall-ports": [],
                 "baby-container": null,
-                "boot-disk-size": null
+                "boot-disk-size": null,
+                "cap-add": [],
+                "cap-drop": [],
+                "logging": {
+                    "driver": "k8s-file",
+                    "options": {"max-file": "5", "max-size": "50m"},
+                    "log-readers": []
+                },
+                "workload-logs": false
             },
             "disks": {},
             "hashes": {

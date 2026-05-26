@@ -33,6 +33,53 @@ pub struct PackageSection {
     pub unmeasured_data: Vec<String>,
 }
 
+/// Container logging configuration. Selects the podman log driver, its
+/// options, and the manifest-level allowlist of services that may read this
+/// service's logs.
+///
+/// `driver` is restricted to drivers podman accepts natively in the minimal
+/// CVM image (no journald). Remote-shipping drivers (fluentd, syslog, ...)
+/// are NOT supported by podman natively and are intentionally absent --
+/// remote log delivery is implemented as a shipper dependency, not as a log
+/// driver. `log-readers` is the manifest-level allowlist that gates the
+/// portal-emitted bind-mount; access also requires the reader to be in the
+/// same `gid-group` and to opt in with `workload-logs = true`.
+#[derive(Debug, Deserialize)]
+pub struct LoggingSection {
+    #[serde(default = "default_log_driver")]
+    pub driver: String,
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
+    #[serde(default, rename = "log-readers")]
+    pub log_readers: Vec<String>,
+}
+
+fn default_log_driver() -> String {
+    "k8s-file".to_string()
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        Self {
+            driver: default_log_driver(),
+            options: BTreeMap::new(),
+            log_readers: Vec::new(),
+        }
+    }
+}
+
+impl LoggingSection {
+    /// Inject driver-specific option defaults after deserialization. For
+    /// `k8s-file` with empty options, populate {max-size=50m, max-file=5}.
+    /// Other drivers (currently only `none`) have no defaults.
+    pub(crate) fn inject_defaults(&mut self) {
+        if self.driver == "k8s-file" && self.options.is_empty() {
+            self.options.insert("max-size".to_string(), "50m".to_string());
+            self.options.insert("max-file".to_string(), "5".to_string());
+        }
+    }
+}
+
 impl WorkloadConfig {
     /// Read and parse `atakit-workload.toml` from a workload directory.
     pub fn from_dir(workload_dir: &std::path::Path) -> Result<Self, WorkloadError> {
@@ -42,16 +89,30 @@ impl WorkloadConfig {
             source: e,
         })?;
         check_legacy_fields(&content)?;
-        toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })
+        let mut config: Self = toml::from_str(&content)
+            .map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
+        config.inject_defaults();
+        Ok(config)
     }
 
     /// Parse from a TOML string. Runs legacy field checks.
     pub fn load_from_str(content: &str) -> Result<Self, WorkloadError> {
         check_legacy_fields(content)?;
-        toml::from_str(content).map_err(|e| WorkloadError::ParseConfig {
+        let mut config: Self = toml::from_str(content).map_err(|e| WorkloadError::ParseConfig {
             path: CONFIG_FILENAME.into(),
             source: e,
-        })
+        })?;
+        config.inject_defaults();
+        Ok(config)
+    }
+
+    /// Populate defaults that depend on field interactions (currently logging
+    /// driver-specific option defaults). Called after toml deserialization.
+    fn inject_defaults(&mut self) {
+        self.workload.logging.inject_defaults();
+        for dep in self.dependencies.values_mut() {
+            dep.logging.inject_defaults();
+        }
     }
 
     /// Get package measured-data file paths (empty if no [package] section).
@@ -139,6 +200,16 @@ pub struct WorkloadSection {
     /// commitment. Entries must be members of the default set.
     #[serde(default, rename = "cap-drop")]
     pub cap_drop: Vec<String>,
+    /// Container logging: driver + options + log-readers allowlist.
+    #[serde(default)]
+    pub logging: LoggingSection,
+    /// Opt-in to receive a bind-mount of `/atakit-portal/workload/logs/`,
+    /// containing only the producer subdirs that grant access via their
+    /// `logging.log-readers` list. The container also needs GID 0 in its
+    /// process credentials to actually read the files (k8s-file logs are
+    /// 0640 group-owned by the gid-group host GID).
+    #[serde(default, rename = "workload-logs")]
+    pub workload_logs: bool,
 }
 
 /// Default session TTL: 0 means contract default (30 days).
@@ -280,6 +351,10 @@ pub struct DependencySection {
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
     pub cap_drop: Vec<String>,
+    #[serde(default)]
+    pub logging: LoggingSection,
+    #[serde(default, rename = "workload-logs")]
+    pub workload_logs: bool,
 }
 
 /// Parsed port specification: `host[:container][/protocol]`.

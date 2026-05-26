@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 
 use crate::config::{self, ImageSource, WorkloadConfig};
@@ -483,6 +483,25 @@ pub fn validate_config(
         validate_caps(&dep.cap_add, &dep.cap_drop, &format!("dependencies.{dep_name}"))?;
     }
 
+    // ── logging ──────────────────────────────────────────
+    // Driver allowlist, options allowlist, ceilings, log-readers name
+    // resolution. Cross-service consistency (log-readers ↔ workload-logs)
+    // runs once after per-service validation.
+    let mut service_names: HashSet<&str> = HashSet::new();
+    service_names.insert(w.name.as_str());
+    for dep_name in config.dependencies.keys() {
+        service_names.insert(dep_name.as_str());
+    }
+    validate_logging("workload", &w.logging, &service_names)?;
+    for (dep_name, dep) in &config.dependencies {
+        validate_logging(
+            &format!("dependencies.{dep_name}"),
+            &dep.logging,
+            &service_names,
+        )?;
+    }
+    validate_log_grants(config)?;
+
     Ok(warnings)
 }
 
@@ -542,6 +561,221 @@ fn validate_caps(
             )));
         }
     }
+    Ok(())
+}
+
+// ── logging ──────────────────────────────────────────
+//
+// See docs/specs/atakit-workload-toml-spec.md → "Container Logging" and
+// "Validation Rules / Logging" for the authoritative spec.
+
+/// Log-driver allowlist. Restricted to drivers podman accepts natively in
+/// the minimal CVM image. journald is excluded because the image has no
+/// systemd. Remote-shipping drivers (fluentd, syslog, gelf, splunk, awslogs)
+/// are Docker-only -- podman rejects them at container-create with
+/// "Error: running container create option: invalid log driver". Remote
+/// log delivery is done by a shipper dependency, not by a log driver.
+///
+/// MUST stay in sync with atakit-portal-state's mirror constant.
+const LOG_DRIVER_ALLOWLIST: &[&str] = &["k8s-file", "none"];
+
+/// Per-driver allowlist of option keys. `path` is portal-injected and never
+/// user-settable; setting it from the manifest is a hard error.
+fn log_opt_allowlist(driver: &str) -> &'static [&'static str] {
+    match driver {
+        "k8s-file" => &["max-size", "max-file"],
+        _ => &[],
+    }
+}
+
+/// Upper bound on per-container log file size. With max-file = 20 worst-case
+/// disk use is `500m * 20 = 10 GB` per container.
+const LOG_MAX_SIZE_CEILING_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Upper bound on number of rotated log files podman keeps per container.
+const LOG_MAX_FILE_CEILING: u32 = 20;
+
+/// Parse a size suffix like `"50m"`, `"1g"`, `"1024k"`, or a bare integer
+/// (interpreted as bytes). Case-insensitive on the suffix.
+fn parse_size_suffix(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size value".to_string());
+    }
+    let last = s.chars().last().unwrap();
+    let (digits, mult) = if last.is_ascii_alphabetic() {
+        let mult = match last.to_ascii_lowercase() {
+            'k' => 1024u64,
+            'm' => 1024 * 1024,
+            'g' => 1024 * 1024 * 1024,
+            other => {
+                return Err(format!(
+                    "invalid size suffix {other:?} (expected k, m, or g)"
+                ))
+            }
+        };
+        (&s[..s.len() - 1], mult)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid size number {digits:?}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("size overflow for {s:?}"))
+}
+
+/// Per-service validation for `[<service>.logging]`. Implements rules 1-9
+/// from the spec. Cross-service rules 10-11 are in `validate_log_grants`.
+fn validate_logging(
+    context: &str,
+    logging: &config::LoggingSection,
+    valid_service_names: &HashSet<&str>,
+) -> Result<(), WorkloadError> {
+    // 1. driver in allowlist
+    if !LOG_DRIVER_ALLOWLIST.contains(&logging.driver.as_str()) {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.logging.driver: {:?} is not in the allowlist {:?}",
+            logging.driver, LOG_DRIVER_ALLOWLIST
+        )));
+    }
+    // 2. 'path' key rejected (portal-injected)
+    if logging.options.contains_key("path") {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.logging.options: 'path' is portal-injected and not user-settable"
+        )));
+    }
+    // 3. driver == "none" implies empty options
+    if logging.driver == "none" && !logging.options.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.logging: driver = \"none\" must have empty options, got keys {:?}",
+            logging.options.keys().collect::<Vec<_>>()
+        )));
+    }
+    // 4. option keys allowlisted per driver
+    let allowed = log_opt_allowlist(&logging.driver);
+    for key in logging.options.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.options: key {:?} not allowed for driver {:?}; allowed: {:?}",
+                key, logging.driver, allowed
+            )));
+        }
+    }
+    // 5. max-size parses and is within ceiling
+    if let Some(v) = logging.options.get("max-size") {
+        let bytes = parse_size_suffix(v).map_err(|e| {
+            WorkloadError::Validation(format!("{context}.logging.options.max-size: {e}"))
+        })?;
+        if bytes > LOG_MAX_SIZE_CEILING_BYTES {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.options.max-size: {bytes} bytes exceeds ceiling \
+                 {LOG_MAX_SIZE_CEILING_BYTES} bytes (500m)"
+            )));
+        }
+    }
+    // 6. max-file parses as positive u32 within ceiling
+    if let Some(v) = logging.options.get("max-file") {
+        let n: u32 = v.parse().map_err(|_| {
+            WorkloadError::Validation(format!(
+                "{context}.logging.options.max-file: {:?} is not a positive integer",
+                v
+            ))
+        })?;
+        if n == 0 {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.options.max-file: must be positive"
+            )));
+        }
+        if n > LOG_MAX_FILE_CEILING {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.options.max-file: {n} exceeds ceiling {LOG_MAX_FILE_CEILING}"
+            )));
+        }
+    }
+    // 7. driver == "none" implies empty log-readers (nothing to grant)
+    if logging.driver == "none" && !logging.log_readers.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.logging: log-readers is non-empty but driver = \"none\" -- no logs are produced"
+        )));
+    }
+    // 8/9. log-readers: no duplicates, all names resolve
+    let mut seen: HashSet<&str> = HashSet::new();
+    for reader in &logging.log_readers {
+        if !seen.insert(reader.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.log-readers: duplicate entry {:?}",
+                reader
+            )));
+        }
+        if !valid_service_names.contains(reader.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.log-readers: {:?} is not a service in this workload",
+                reader
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Cross-service consistency for log-readers / workload-logs. Implements
+/// rules 10 (P grants R → R.workload-logs must be true) and 11 (R has
+/// workload-logs = true → at least one producer grants R). Both are hard
+/// errors; partial states are rejected so log-shipper wiring lands in a
+/// single manifest.
+fn validate_log_grants(config: &WorkloadConfig) -> Result<(), WorkloadError> {
+    // Collect (producer_name, &LoggingSection) for workload + each dependency.
+    let mut producers: Vec<(&str, &config::LoggingSection)> = Vec::new();
+    producers.push((config.workload.name.as_str(), &config.workload.logging));
+    for (name, dep) in &config.dependencies {
+        producers.push((name.as_str(), &dep.logging));
+    }
+
+    // Build reader -> producers map for rule 11.
+    let mut grants_for: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (p_name, p_logging) in &producers {
+        for r_name in &p_logging.log_readers {
+            grants_for
+                .entry(r_name.as_str())
+                .or_default()
+                .push(p_name);
+        }
+    }
+
+    // workload_logs flag lookup.
+    let workload_logs_for = |name: &str| -> bool {
+        if name == config.workload.name {
+            config.workload.workload_logs
+        } else {
+            config
+                .dependencies
+                .get(name)
+                .map_or(false, |d| d.workload_logs)
+        }
+    };
+
+    // Rule 10: P.log-readers includes R → R.workload-logs must be true.
+    for (p_name, p_logging) in &producers {
+        for r_name in &p_logging.log_readers {
+            if !workload_logs_for(r_name) {
+                return Err(WorkloadError::Validation(format!(
+                    "{p_name}.logging.log-readers grants {:?} access, but {:?} does not \
+                     set workload-logs = true",
+                    r_name, r_name
+                )));
+            }
+        }
+    }
+
+    // Rule 11: R.workload-logs = true → at least one producer grants R.
+    for (s_name, _) in &producers {
+        if workload_logs_for(s_name) && !grants_for.contains_key(s_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{s_name} sets workload-logs = true but no producer grants it access in log-readers"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -1441,5 +1675,329 @@ cap-add = ["SYS_PTRACE"]
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         assert!(err.to_string().contains("dependencies.sidecar.cap-add"));
+    }
+
+    // ── logging ──────────────────────────────────────────
+
+    fn logging_toml(workload_extra: &str, deps: &str) -> String {
+        format!(
+            r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+{workload_extra}
+
+{deps}
+"#
+        )
+    }
+
+    #[test]
+    fn injects_default_k8s_file_options() {
+        let cfg = crate::config::WorkloadConfig::load_from_str(minimal_toml()).unwrap();
+        assert_eq!(cfg.workload.logging.driver, "k8s-file");
+        assert_eq!(
+            cfg.workload.logging.options.get("max-size"),
+            Some(&"50m".to_string())
+        );
+        assert_eq!(
+            cfg.workload.logging.options.get("max-file"),
+            Some(&"5".to_string())
+        );
+        assert!(cfg.workload.logging.log_readers.is_empty());
+        assert!(!cfg.workload.workload_logs);
+    }
+
+    #[test]
+    fn injects_defaults_for_dependency_when_logging_omitted() {
+        let toml = logging_toml(
+            "",
+            r#"
+[dependencies.redis]
+image = "redis:7"
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let redis = cfg.dependencies.get("redis").unwrap();
+        assert_eq!(redis.logging.driver, "k8s-file");
+        assert_eq!(redis.logging.options.get("max-size"), Some(&"50m".to_string()));
+        assert!(!redis.workload_logs);
+    }
+
+    #[test]
+    fn preserves_explicit_options_no_default_injection() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+driver = "k8s-file"
+options = { max-size = "100m", max-file = "10" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        assert_eq!(
+            cfg.workload.logging.options.get("max-size"),
+            Some(&"100m".to_string())
+        );
+        assert_eq!(
+            cfg.workload.logging.options.get("max-file"),
+            Some(&"10".to_string())
+        );
+    }
+
+    #[test]
+    fn none_driver_keeps_empty_options() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+driver = "none"
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        assert_eq!(cfg.workload.logging.driver, "none");
+        assert!(cfg.workload.logging.options.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_log_driver() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+driver = "fluentd"
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workload.logging.driver"), "got: {msg}");
+        assert!(msg.contains("fluentd"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_user_supplied_path() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+options = { path = "/tmp/log.log" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("portal-injected"));
+    }
+
+    #[test]
+    fn rejects_none_driver_with_nonempty_options() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+driver = "none"
+options = { max-size = "50m" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("must have empty options"));
+    }
+
+    #[test]
+    fn rejects_unallowed_option_key_for_k8s_file() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+options = { tag = "myapp" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tag"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_max_size_above_ceiling() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+options = { max-size = "501m", max-file = "5" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("exceeds ceiling"));
+    }
+
+    #[test]
+    fn rejects_max_file_above_ceiling() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+options = { max-size = "50m", max-file = "21" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("max-file"));
+    }
+
+    #[test]
+    fn rejects_max_file_zero() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+options = { max-size = "50m", max-file = "0" }
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("positive"));
+    }
+
+    #[test]
+    fn rejects_none_with_log_readers() {
+        let toml = logging_toml(
+            r#"
+workload-logs = true
+[workload.logging]
+driver = "none"
+log-readers = ["app"]
+"#,
+            r#"
+[dependencies.app]
+image = "x:latest"
+workload-logs = true
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("no logs are produced"));
+    }
+
+    #[test]
+    fn rejects_duplicate_log_readers() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+log-readers = ["app", "app"]
+"#,
+            r#"
+[dependencies.app]
+image = "x:latest"
+workload-logs = true
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn rejects_unknown_service_in_log_readers() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+log-readers = ["nonexistent"]
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("not a service"));
+    }
+
+    #[test]
+    fn accepts_self_grant() {
+        let toml = logging_toml(
+            r#"
+workload-logs = true
+[workload.logging]
+log-readers = ["app"]
+"#,
+            "",
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        validate_config(&cfg, tmp.path()).expect("self-grant should validate");
+    }
+
+    #[test]
+    fn rejects_grant_without_reader_opt_in() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+log-readers = ["shipper"]
+"#,
+            r#"
+[dependencies.shipper]
+image = "x:latest"
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workload-logs = true"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("\"shipper\""), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_opt_in_without_any_grant() {
+        let toml = logging_toml(
+            "",
+            r#"
+[dependencies.shipper]
+image = "x:latest"
+workload-logs = true
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("shipper"), "got: {msg}");
+        assert!(msg.contains("no producer grants"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_matched_grant_and_opt_in() {
+        let toml = logging_toml(
+            r#"
+[workload.logging]
+log-readers = ["shipper"]
+"#,
+            r#"
+[dependencies.shipper]
+image = "x:latest"
+workload-logs = true
+"#,
+        );
+        let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        validate_config(&cfg, tmp.path()).expect("matched grant+opt-in should validate");
     }
 }
