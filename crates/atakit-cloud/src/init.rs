@@ -97,7 +97,11 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
 }
 
 /// Poll the portal status endpoint with exponential backoff.
-pub async fn wait_for_portal(host: &str, status_port: u16, timeout_secs: u64) -> Result<(), CloudError> {
+pub async fn wait_for_portal(
+    host: &str,
+    status_port: u16,
+    timeout_secs: u64,
+) -> Result<(), CloudError> {
     let url = format!("https://{host}:{status_port}/status");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -177,33 +181,35 @@ pub async fn wait_for_portal_terminal(
 
     loop {
         match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let state = body
-                        .get("state")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let detail = body
-                        .get("detail")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if last_state.as_deref() != Some(state.as_str()) && !state.is_empty() {
-                        on_transition(&state);
-                        last_state = Some(state.clone());
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let state = body
+                            .get("state")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let detail = body
+                            .get("detail")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if last_state.as_deref() != Some(state.as_str()) && !state.is_empty() {
+                            on_transition(&state);
+                            last_state = Some(state.clone());
+                        }
+                        match state.as_str() {
+                            "Running" => return Ok(PortalTerminalState::Running),
+                            "Failed" => return Ok(PortalTerminalState::Failed { detail }),
+                            "CleanHalt" => return Ok(PortalTerminalState::CleanHalt { detail }),
+                            _ => {}
+                        }
                     }
-                    match state.as_str() {
-                        "Running" => return Ok(PortalTerminalState::Running),
-                        "Failed" => return Ok(PortalTerminalState::Failed { detail }),
-                        "CleanHalt" => return Ok(PortalTerminalState::CleanHalt { detail }),
-                        _ => {}
+                    Err(e) => {
+                        tracing::debug!("portal status JSON parse failed: {e}");
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("portal status JSON parse failed: {e}");
-                }
-            },
+            }
             Ok(resp) => {
                 tracing::debug!("portal status not ready yet (HTTP {})", resp.status());
             }
@@ -244,12 +250,12 @@ pub async fn post_portal_init(
         })?;
 
     // Read archive file.
-    let archive_bytes = tokio::fs::read(archive_path).await.map_err(|e| {
-        CloudError::IoPath {
+    let archive_bytes = tokio::fs::read(archive_path)
+        .await
+        .map_err(|e| CloudError::IoPath {
             path: archive_path.into(),
             source: e,
-        }
-    })?;
+        })?;
 
     // Build config JSON.
     let config_json = build_portal_config_json(init_config);

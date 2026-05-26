@@ -98,7 +98,13 @@ impl Env {
     /// Returns a list of (path, error) pairs for any directories that could not be created.
     pub fn ensure_dirs(&self) -> Vec<(std::path::PathBuf, std::io::Error)> {
         let mut failures = Vec::new();
-        for dir in [&self.data_dir, &self.config_dir, &self.cache_dir, &self.image_dir, &self.workload_dir] {
+        for dir in [
+            &self.data_dir,
+            &self.config_dir,
+            &self.cache_dir,
+            &self.image_dir,
+            &self.workload_dir,
+        ] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 failures.push((dir.clone(), e));
             }
@@ -164,12 +170,7 @@ mod tests {
     #[test]
     fn resolve_dir_ignores_relative_xdg() {
         let home = PathBuf::from("/home/user");
-        let result = resolve_dir(
-            None,
-            Some(OsString::from("relative/path")),
-            &home,
-            ".cache",
-        );
+        let result = resolve_dir(None, Some(OsString::from("relative/path")), &home, ".cache");
         // Relative XDG paths are invalid per spec, fall back to default
         assert_eq!(result, PathBuf::from("/home/user/.cache/atakit"));
     }

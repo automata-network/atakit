@@ -257,8 +257,7 @@ mod tests {
 
     #[test]
     fn azure_resource_names() {
-        let names =
-            AzureResourceNames::for_azure("my-instance", "automata-linux:v0.1.6", "eastus");
+        let names = AzureResourceNames::for_azure("my-instance", "automata-linux:v0.1.6", "eastus");
         // Per-instance fields.
         assert_eq!(names.resource_group, "my-instance-rg");
         assert_eq!(names.nsg, "my-instance-nsg");

@@ -29,7 +29,9 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // passed, we only consider that one (and go directly to download if
     // the workload is present). Otherwise we fan out across every
     // configured repository.
-    let specs = config.workload.all_repositories(args.repository.as_deref())?;
+    let specs = config
+        .workload
+        .all_repositories(args.repository.as_deref())?;
     let pinned = args.repository.is_some();
     // Strictness keys off fan-out CARDINALITY, not whether
     // --repository was passed. With exactly one target, failures
@@ -148,10 +150,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     enum ProbeResult {
         Hit(WorkloadCoords, RepositoryArchiveMeta),
         Miss,
-        IdMismatch {
-            returned: String,
-            expected: String,
-        },
+        IdMismatch { returned: String, expected: String },
         Error(WorkloadError),
     }
 
@@ -225,9 +224,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
                     // reason the pull can't proceed; don't swallow
                     // it as a warning and pretend "not found in any
                     // configured repository" later.
-                    return Err(anyhow::Error::from(e)).with_context(|| {
-                        format!("repository {display} probe failed")
-                    });
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("repository {display} probe failed"));
                 }
                 eprintln!(
                     "{} {}: {}",
@@ -371,12 +369,11 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         // for the duration of the hash, starving other async work.
         // Move it onto the blocking pool.
         let hash_path = tmp_path.clone();
-        let actual_archive_hash = tokio::task::spawn_blocking(move || {
-            atakit_workload::hash::hash_file(&hash_path)
-        })
-        .await
-        .context("archive hashing task panicked")?
-        .context("failed to hash downloaded archive")?;
+        let actual_archive_hash =
+            tokio::task::spawn_blocking(move || atakit_workload::hash::hash_file(&hash_path))
+                .await
+                .context("archive hashing task panicked")?
+                .context("failed to hash downloaded archive")?;
         if !hex_equal(&probe_meta.archive_hash, &actual_archive_hash) {
             anyhow::bail!(
                 "archive sha256 mismatch between repository metadata and downloaded archive\n\
@@ -543,10 +540,13 @@ async fn verify_pcr23(
     let rpc_url = chain_config.rpc_url.as_str();
     let session_registry_str = chain_config.session_registry.as_str();
 
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+    let session_registry_address: alloy_ext::core::primitives::Address = session_registry_str
+        .parse()
+        .context("invalid session registry address")?;
 
-    let id_hex = workload_id_hex.strip_prefix("0x").unwrap_or(workload_id_hex);
+    let id_hex = workload_id_hex
+        .strip_prefix("0x")
+        .unwrap_or(workload_id_hex);
     let id_bytes: [u8; 32] = hex::decode(id_hex)
         .context("invalid workload ID hex")?
         .try_into()
@@ -565,12 +565,11 @@ async fn verify_pcr23(
             Ok(m) => m,
             Err(e) => {
                 if strict {
-                    return Err(anyhow::anyhow!("failed to connect to WorkloadMeasurement: {e}"));
+                    return Err(anyhow::anyhow!(
+                        "failed to connect to WorkloadMeasurement: {e}"
+                    ));
                 }
-                eprintln!(
-                    "{} on-chain verification skipped: {e}",
-                    "warning:".yellow()
-                );
+                eprintln!("{} on-chain verification skipped: {e}", "warning:".yellow());
                 return Ok(());
             }
         };
@@ -597,9 +596,7 @@ async fn verify_pcr23(
                 if looks_not_registered {
                     anyhow::bail!("workload not registered on-chain (id {workload_id_hex})");
                 }
-                anyhow::bail!(
-                    "failed to query on-chain spec for {workload_id_hex}: {e}"
-                );
+                anyhow::bail!("failed to query on-chain spec for {workload_id_hex}: {e}");
             }
 
             if !looks_not_registered {

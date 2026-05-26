@@ -26,7 +26,8 @@ fn make_docker_archive_tar(marker: &str) -> Vec<u8> {
         h.set_size(manifest.len() as u64);
         h.set_mode(0o644);
         h.set_cksum();
-        tar.append_data(&mut h, "manifest.json", manifest.as_bytes()).unwrap();
+        tar.append_data(&mut h, "manifest.json", manifest.as_bytes())
+            .unwrap();
 
         let mut h = tar::Header::new_gnu();
         h.set_size(config_blob.len() as u64);
@@ -51,7 +52,11 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
 
     // Real (minimal) docker-archive tar so the build pipeline can extract
     // the image config digest. Content is otherwise unused.
-    std::fs::write(wl_dir.join("app.tar"), make_docker_archive_tar("my-workload")).unwrap();
+    std::fs::write(
+        wl_dir.join("app.tar"),
+        make_docker_archive_tar("my-workload"),
+    )
+    .unwrap();
 
     // Measured-data file
     std::fs::write(wl_dir.join("config/cert.pem"), b"fake-cert").unwrap();
@@ -102,7 +107,10 @@ async fn build_produces_valid_archive() {
     assert_eq!(result.image_count, 1);
     assert_eq!(result.measured_file_count, 1);
     assert!(result.archive_path.exists());
-    assert!(result.archive_path.to_string_lossy().ends_with("my-workload-v0.1.0.atawl"));
+    assert!(result
+        .archive_path
+        .to_string_lossy()
+        .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
 
     // Verify archive contents
@@ -143,7 +151,12 @@ async fn build_produces_valid_archive() {
     let mut archive = tar::Archive::new(dec);
     for entry in archive.entries().unwrap() {
         let mut entry = entry.unwrap();
-        if entry.path().unwrap().to_string_lossy().ends_with("manifest.json") {
+        if entry
+            .path()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("manifest.json")
+        {
             let mut content = String::new();
             entry.read_to_string(&mut content).unwrap();
             assert!(content.contains("\"name\":\"my-workload\""));
@@ -257,7 +270,9 @@ async fn inspect_archive_matches_build() {
     assert!(inspect_result.sha256.starts_with("0x"));
     assert!(!inspect_result.manifest_hash.is_empty());
     assert!(inspect_result.manifest_hash.starts_with("sha256:"));
-    assert!(inspect_result.manifest_raw.contains("\"name\":\"my-workload\""));
+    assert!(inspect_result
+        .manifest_raw
+        .contains("\"name\":\"my-workload\""));
 }
 
 #[tokio::test]
@@ -310,7 +325,11 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     // Real (minimal) docker-archive tars with distinct config blobs so the
     // build pipeline can extract a different image-id for each.
     std::fs::write(wl_dir.join("app.tar"), make_docker_archive_tar("multi-app")).unwrap();
-    std::fs::write(wl_dir.join("sidecar.tar"), make_docker_archive_tar("redis-sidecar")).unwrap();
+    std::fs::write(
+        wl_dir.join("sidecar.tar"),
+        make_docker_archive_tar("redis-sidecar"),
+    )
+    .unwrap();
 
     let config = r#"
 format = 2
@@ -369,7 +388,9 @@ async fn build_with_dependency() {
         .collect();
 
     assert!(
-        entry_names.iter().any(|n| n.contains("images/multi-app.tar")),
+        entry_names
+            .iter()
+            .any(|n| n.contains("images/multi-app.tar")),
         "archive must contain main image tar, got: {entry_names:?}"
     );
     assert!(
@@ -387,7 +408,11 @@ async fn build_with_dependency() {
     .await
     .unwrap();
 
-    let deps = inspect_result.manifest.config.dependencies.as_ref()
+    let deps = inspect_result
+        .manifest
+        .config
+        .dependencies
+        .as_ref()
         .expect("manifest should have dependencies");
     assert!(deps.contains_key("redis"));
     let redis = &deps["redis"];
@@ -447,5 +472,8 @@ async fn build_with_dependency_is_deterministic() {
     .await
     .unwrap();
 
-    assert_eq!(r1.archive_hash, r2.archive_hash, "dependency builds must be deterministic");
+    assert_eq!(
+        r1.archive_hash, r2.archive_hash,
+        "dependency builds must be deterministic"
+    );
 }

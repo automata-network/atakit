@@ -96,7 +96,8 @@ impl ImageStore {
 
     /// Expected path of a disk image file (after decompression).
     pub fn image_path(&self, image_ref: &ImageRef, platform: Platform) -> PathBuf {
-        self.disk_images_dir(image_ref).join(disk_filename(platform))
+        self.disk_images_dir(image_ref)
+            .join(disk_filename(platform))
     }
 
     /// Directory containing secure-boot certificates for a tag.
@@ -188,17 +189,19 @@ impl ImageStore {
         platforms: &[Platform],
         progress: &dyn ProgressReporter,
     ) -> Result<Vec<PathBuf>> {
-        let release = client.get_release_by_tag(github_repo, &image_ref.tag).await?;
+        let release = client
+            .get_release_by_tag(github_repo, &image_ref.tag)
+            .await?;
 
         // Collect the unique set of archive assets needed.
         let mut archives_to_download: Vec<&crate::types::Asset> = Vec::new();
         for &platform in platforms {
-            let asset = release
-                .archive_for_platform(platform)
-                .ok_or_else(|| ImageError::MissingPlatformAsset {
+            let asset = release.archive_for_platform(platform).ok_or_else(|| {
+                ImageError::MissingPlatformAsset {
                     image_ref: image_ref.to_string(),
                     platform: platform.to_string(),
-                })?;
+                }
+            })?;
             if !archives_to_download.iter().any(|a| a.name == asset.name) {
                 archives_to_download.push(asset);
             }
@@ -264,11 +267,7 @@ impl ImageStore {
     }
 
     /// Delete only a specific platform's disk image for a tag.
-    pub async fn delete_platform(
-        &self,
-        image_ref: &ImageRef,
-        platform: Platform,
-    ) -> Result<()> {
+    pub async fn delete_platform(&self, image_ref: &ImageRef, platform: Platform) -> Result<()> {
         let path = self.image_path(image_ref, platform);
         if path.exists() {
             tokio::fs::remove_file(&path)

@@ -28,10 +28,7 @@ pub enum ImageError {
     NoPlatformImage { platform: String, count: u32 },
 
     #[error("release {image_ref} has no {platform} disk image")]
-    MissingPlatformAsset {
-        image_ref: String,
-        platform: String,
-    },
+    MissingPlatformAsset { image_ref: String, platform: String },
 
     #[error("download failed with {status}: {body}")]
     DownloadFailed { status: u16, body: String },

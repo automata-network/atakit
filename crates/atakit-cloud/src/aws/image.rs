@@ -323,9 +323,8 @@ pub async fn register_ami(
         });
     }
     let uefi_data = format!("file://{}", blob.display());
-    let block_mapping = format!(
-        "DeviceName=/dev/xvda,Ebs={{SnapshotId={snapshot_id},DeleteOnTermination=true}}"
-    );
+    let block_mapping =
+        format!("DeviceName=/dev/xvda,Ebs={{SnapshotId={snapshot_id},DeleteOnTermination=true}}");
 
     let output = runner
         .run_capture(

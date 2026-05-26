@@ -64,11 +64,7 @@ impl ReleasesClient {
 
     /// Find the most recent release that contains an `.atabi` archive for the
     /// given platform.
-    pub async fn find_latest_release_for(
-        &self,
-        repo: &str,
-        platform: Platform,
-    ) -> Result<Release> {
+    pub async fn find_latest_release_for(&self, repo: &str, platform: Platform) -> Result<Release> {
         debug!(?platform, "scanning recent releases for platform archive");
         let releases = self.list_releases(repo, 20).await?;
 

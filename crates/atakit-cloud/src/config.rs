@@ -494,9 +494,7 @@ pub fn validate_target(
 /// Match an AWS SEV-SNP-capable instance type (e.g. `m6a.large`).
 fn is_aws_snp_instance(vmtype: &str) -> bool {
     match vmtype.split_once('.') {
-        Some((family, size)) => {
-            !size.is_empty() && AWS_SNP_INSTANCE_FAMILIES.contains(&family)
-        }
+        Some((family, size)) => !size.is_empty() && AWS_SNP_INSTANCE_FAMILIES.contains(&family),
         None => false,
     }
 }

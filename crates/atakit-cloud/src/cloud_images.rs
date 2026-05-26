@@ -87,18 +87,17 @@ impl CloudImages {
             message: format!("failed to write {}: {e}", tmp.display()),
         })?;
         std::fs::rename(&tmp, &path).map_err(|e| CloudError::State {
-            message: format!("failed to rename {} -> {}: {e}", tmp.display(), path.display()),
+            message: format!(
+                "failed to rename {} -> {}: {e}",
+                tmp.display(),
+                path.display()
+            ),
         })?;
         Ok(())
     }
 
     /// Record a successful image upload.
-    pub fn record(
-        &mut self,
-        image_ref: &str,
-        provider_name: &str,
-        record: CloudImage,
-    ) {
+    pub fn record(&mut self, image_ref: &str, provider_name: &str, record: CloudImage) {
         self.images
             .entry(image_ref.to_string())
             .or_default()
@@ -106,11 +105,7 @@ impl CloudImages {
     }
 
     /// Remove a specific image+provider entry. Returns the removed record.
-    pub fn remove(
-        &mut self,
-        image_ref: &str,
-        provider_name: &str,
-    ) -> Option<CloudImage> {
+    pub fn remove(&mut self, image_ref: &str, provider_name: &str) -> Option<CloudImage> {
         let providers = self.images.get_mut(image_ref)?;
         let removed = providers.remove(provider_name);
         if providers.is_empty() {

@@ -17,11 +17,9 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
 
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 
@@ -61,7 +59,11 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             result.image_count,
             if result.image_count != 1 { "s" } else { "" },
             result.measured_file_count,
-            if result.measured_file_count != 1 { "s" } else { "" },
+            if result.measured_file_count != 1 {
+                "s"
+            } else {
+                ""
+            },
         )
         .green()
     );
@@ -97,10 +99,16 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                     println!();
                     println!(
                         "{}",
-                        format!("Store already has {name}:{version} with a different measurement.").yellow().bold()
+                        format!("Store already has {name}:{version} with a different measurement.")
+                            .yellow()
+                            .bold()
                     );
                     println!("  {:<22}{}", "Old Manifest SHA256:".dimmed(), old_sha256);
-                    println!("  {:<22}{}", "New Manifest SHA256:".dimmed(), inspect.sha256);
+                    println!(
+                        "  {:<22}{}",
+                        "New Manifest SHA256:".dimmed(),
+                        inspect.sha256
+                    );
                     if let Some(ref spec) = existing.on_chain_spec {
                         println!(
                             "  {:<22}{}",

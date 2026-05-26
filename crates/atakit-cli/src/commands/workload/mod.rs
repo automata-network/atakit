@@ -15,7 +15,7 @@ pub mod spec;
 
 use std::path::{Path, PathBuf};
 
-use alloy_ext::core::primitives::{B256, keccak256};
+use alloy_ext::core::primitives::{keccak256, B256};
 use alloy_ext::core::sol_types::SolValue;
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadStore};
@@ -89,14 +89,12 @@ pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
         Ok(WorkloadRef::Id(s.to_string()))
     } else if let Some((name, version)) = s.split_once(':') {
         if name.is_empty() || version.is_empty() {
-            anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'");
+            anyhow::bail!(
+                "invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'"
+            );
         }
         // Validate name: alphanumeric + hyphens, no leading hyphen
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-            || name.starts_with('-')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || name.starts_with('-') {
             anyhow::bail!(
                 "invalid workload name in reference: must be alphanumeric + hyphens, got '{name}'"
             );
@@ -158,8 +156,12 @@ pub fn resolve_chain(
 ) -> anyhow::Result<ResolvedChain> {
     let chain_name = cli_chain
         .or(config.publish.chain.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("chain required: use --chain or [publish] chain in config"))?;
-    let chain = config.chains.get(chain_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("chain required: use --chain or [publish] chain in config")
+        })?;
+    let chain = config
+        .chains
+        .get(chain_name)
         .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
     Ok(ResolvedChain {
         rpc_url: chain.rpc_url.clone(),
@@ -178,8 +180,12 @@ pub fn resolve_owner_key(
 ) -> anyhow::Result<String> {
     let key_name = cli_owner_key
         .or(config.publish.owner_key.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("owner key required: use --owner-key or [publish] owner_key in config"))?;
-    let key_spec = config.keys.get(key_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("owner key required: use --owner-key or [publish] owner_key in config")
+        })?;
+    let key_spec = config
+        .keys
+        .get(key_name)
         .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
     if key_spec.key_type != crate::config::KeyType::Es256k {
         anyhow::bail!(
@@ -200,8 +206,12 @@ pub fn resolve_relay_key(
 ) -> anyhow::Result<String> {
     let key_name = cli_relay_key
         .or(config.publish.relay_key.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("relay key required: use --relay-key or [publish] relay_key in config"))?;
-    let key_spec = config.keys.get(key_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("relay key required: use --relay-key or [publish] relay_key in config")
+        })?;
+    let key_spec = config
+        .keys
+        .get(key_name)
         .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
     if key_spec.key_type != crate::config::KeyType::Es256k {
         anyhow::bail!(
@@ -232,7 +242,9 @@ pub async fn query_chain_data(
     session_registry: &str,
 ) -> anyhow::Result<ChainData> {
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry.parse().map_err(|_| anyhow::anyhow!("invalid session registry address"))?;
+        session_registry
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid session registry address"))?;
 
     let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
         rpc_url: rpc_url.to_string(),
@@ -291,7 +303,11 @@ pub async fn query_chain_data(
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
                 verify_type: p.verifyType,
-                match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
+                match_data: p
+                    .matchData
+                    .iter()
+                    .map(|b| format!("0x{}", hex::encode(b)))
+                    .collect(),
             })
             .collect(),
     };
@@ -309,10 +325,7 @@ pub async fn query_chain_data(
 
 /// Update WorkloadMeta in the store with on-chain data.
 /// Merges chain data into existing metadata if present, or creates fields on existing.
-pub fn apply_chain_data_to_meta(
-    meta: &mut atakit_workload::WorkloadMeta,
-    chain: &ChainData,
-) {
+pub fn apply_chain_data_to_meta(meta: &mut atakit_workload::WorkloadMeta, chain: &ChainData) {
     meta.revoked = chain.revoked;
     if chain.owner.is_some() {
         meta.owner.clone_from(&chain.owner);
@@ -328,10 +341,7 @@ pub fn apply_chain_data_to_meta(
 /// Check if a string looks like a `name:version` store reference (not a file path).
 pub fn looks_like_store_ref(s: &str) -> bool {
     // Contains a colon and doesn't look like a file path
-    s.contains(':')
-        && !s.starts_with('/')
-        && !s.starts_with('.')
-        && !s.ends_with(".atawl")
+    s.contains(':') && !s.starts_with('/') && !s.starts_with('.') && !s.ends_with(".atawl")
 }
 
 // `hex_equal` now lives in atakit-workload so library code (the
