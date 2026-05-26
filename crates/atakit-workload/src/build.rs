@@ -213,12 +213,18 @@ pub async fn build_workload(
 
     // 8. Generate manifest
     let handle = progress.create("Generating manifest.json...", 0);
+    // unmeasured-data: declared paths are committed to the manifest (and thus
+    // PCR23) but never bundled. Directories present at build time expand to
+    // their member files; files / absent entries are recorded as leaves.
+    let unmeasured_data =
+        manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
     let m = manifest::build_manifest(
         &config,
         &resolved_image,
         environment,
         dep_environments,
         hashes,
+        unmeasured_data,
         images,
     );
     let manifest_json = manifest::serialize_canonical_json(&m)?;

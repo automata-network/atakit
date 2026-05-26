@@ -272,33 +272,34 @@ Gap: no mechanism delivers the actual files to the CVM.
 
 ### Solution
 
-Deploy collects unmeasured-data files from the workload directory and includes them in the init POST. This is only available in dir mode (where the workload source directory is known). Store-ref and file modes warn if the manifest declares unmeasured-data but no workload directory is available.
+Deploy collects the unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the source directory or an explicit `--unmeasured-data-dir`.
 
 **During deploy (atakit-ng side):**
 
-1. Read `atakit-workload.toml` to get `unmeasured-data` paths
-2. Resolve paths relative to the workload directory
-3. If any listed files exist locally, tar them into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`)
-4. Add as `unmeasured` multipart field in the `POST /init` request
-5. If unmeasured-data is listed but files don't exist locally, warn but continue (operator may provide them later via another mechanism)
+1. Read the declared `unmeasured-data` paths from `manifest.json` (strip the `unmeasured-data/` prefix to get deploy-relative paths).
+2. Resolve them under the `--unmeasured-data-dir` (or the workload directory in dir mode).
+3. Verify the directory contains **exactly** that set — error on any missing or extra file. Then tar the declared files into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`).
+4. Add as the `unmeasured-data` multipart field in the `POST /init` request.
 
-**CVM agent side (requires agent change):**
+**Portal side:**
 
-1. Accept optional `unmeasured` multipart field in `POST /init`
-2. Extract to `<WorkloadTempDir>/unmeasured-data/` (bind-mounted into the container at `/atakit-portal/unmeasured-data/`)
-3. Verify the directory structure matches what's declared in `manifest.json`
+1. Accept the optional `unmeasured-data` multipart field in `POST /init`.
+2. Extract to `<WorkloadTempDir>/unmeasured-data/` (bind-mounted into the container at `/atakit-portal/unmeasured-data/`).
+3. Verify the extracted file set equals the manifest's `unmeasured-data` array exactly (no missing, no extra) before the workload runs. Contents are not hashed — only the path set is, via PCR23.
 
 ### Validation at Deploy Time
 
+The path set is committed to PCR23, so it must match exactly on both the CLI and portal sides:
+
 ```
-Validation:
-- manifest declares unmeasured-data: ["./runtime-data/key.pem", "./runtime-data/config.json"]
-- workload dir has:
-  - ./runtime-data/key.pem       -> included in POST
-  - ./runtime-data/config.json   -> MISSING, warn: "unmeasured-data file not found: ./runtime-data/config.json"
+- manifest declares unmeasured-data: ["unmeasured-data/runtime-data/key.pem", "unmeasured-data/runtime-data/config.json"]
+- --unmeasured-data-dir has:
+  - runtime-data/key.pem       -> included in POST
+  - runtime-data/config.json   -> MISSING => deploy errors (must match the manifest exactly)
+  - runtime-data/extra.txt     -> EXTRA   => deploy errors (not declared in the manifest)
 ```
 
-### Alternative: `--unmeasured-data-dir`
+### `--unmeasured-data-dir`
 
 For cases where unmeasured-data lives outside the workload directory (e.g., secrets from a vault):
 
@@ -306,7 +307,7 @@ For cases where unmeasured-data lives outside the workload directory (e.g., secr
 atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-dir /path/to/secrets/
 ```
 
-The `--unmeasured-data-dir` is scanned for files matching the manifest's unmeasured-data paths.
+The `--unmeasured-data-dir` must contain exactly the files the manifest's unmeasured-data paths declare — no more, no less.
 
 ---
 
