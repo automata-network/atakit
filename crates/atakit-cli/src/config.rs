@@ -5,11 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use atakit_cloud::CloudConfig;
-use atakit_workload::{
-    GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository,
-};
+use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -79,9 +77,7 @@ impl ImageConfig {
     /// the full spec -- so callers can read its credential and
     /// `list_limit` override.
     pub fn primary_entry(&self) -> Option<(&str, &ImageRepositorySpec)> {
-        self.repositories
-            .first()
-            .map(|(k, v)| (k.as_str(), v))
+        self.repositories.first().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Find a configured GitHub repository whose local name (portion
@@ -95,10 +91,7 @@ impl ImageConfig {
     /// picking the first match. Matches the "prefer canonical /
     /// accept one non-canonical / error on multiple" pattern used
     /// for release asset lookup in `find_atawl_asset`.
-    pub fn find_by_local_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<(&str, &ImageRepositorySpec)>> {
+    pub fn find_by_local_name(&self, name: &str) -> Result<Option<(&str, &ImageRepositorySpec)>> {
         let matches: Vec<(&str, &ImageRepositorySpec)> = self
             .repositories
             .iter()
@@ -196,14 +189,16 @@ impl CredentialSpec {
     /// 2. `timeout_secs` is only valid with `command`.
     /// 3. `timeout_secs`, when set, must be > 0.
     pub fn validate(&self, name: &str) -> Result<()> {
-        let set_count = [self.file.is_some(), self.command.is_some(), self.env.is_some()]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
+        let set_count = [
+            self.file.is_some(),
+            self.command.is_some(),
+            self.env.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
         match set_count {
-            0 => bail!(
-                "credential '{name}': must set exactly one of `file`, `command`, `env`"
-            ),
+            0 => bail!("credential '{name}': must set exactly one of `file`, `command`, `env`"),
             1 => {}
             _ => bail!(
                 "credential '{name}': sets more than one of `file` / `command` / `env`; pick one"
@@ -275,11 +270,7 @@ impl CredentialSpec {
     }
 }
 
-fn resolve_command(
-    cred_name: &str,
-    argv: &[String],
-    timeout_secs: Option<u64>,
-) -> Result<String> {
+fn resolve_command(cred_name: &str, argv: &[String], timeout_secs: Option<u64>) -> Result<String> {
     let timeout_secs = timeout_secs.unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS);
     let program = argv
         .first()
@@ -291,12 +282,7 @@ fn resolve_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "credential '{cred_name}': failed to spawn `{}`",
-                program,
-            )
-        })?;
+        .with_context(|| format!("credential '{cred_name}': failed to spawn `{}`", program,))?;
 
     // Drain stdout and stderr on background threads CONCURRENTLY
     // with the wait loop. Reading pipes only after the child has
@@ -528,24 +514,26 @@ impl KeySpec {
     /// - `mode = provisioned`: exactly one of file/command/env must be set.
     /// - `mode = self_generated`: all of file/command/env/timeout_secs must be None.
     pub fn validate(&self, name: &str) -> Result<()> {
-        let set_count = [self.file.is_some(), self.command.is_some(), self.env.is_some()]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
+        let set_count = [
+            self.file.is_some(),
+            self.command.is_some(),
+            self.env.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
 
         match self.mode {
-            KeyMode::Provisioned => {
-                match set_count {
-                    0 => bail!(
-                        "key '{name}': mode = \"provisioned\" requires exactly one of \
+            KeyMode::Provisioned => match set_count {
+                0 => bail!(
+                    "key '{name}': mode = \"provisioned\" requires exactly one of \
                          `file`, `command`, `env`"
-                    ),
-                    1 => {}
-                    _ => bail!(
-                        "key '{name}': sets more than one of `file` / `command` / `env`; pick one"
-                    ),
-                }
-            }
+                ),
+                1 => {}
+                _ => bail!(
+                    "key '{name}': sets more than one of `file` / `command` / `env`; pick one"
+                ),
+            },
             KeyMode::SelfGenerated => {
                 if set_count > 0 {
                     bail!(
@@ -554,17 +542,13 @@ impl KeySpec {
                     );
                 }
                 if self.timeout_secs.is_some() {
-                    bail!(
-                        "key '{name}': mode = \"self_generated\" must not set `timeout_secs`"
-                    );
+                    bail!("key '{name}': mode = \"self_generated\" must not set `timeout_secs`");
                 }
             }
         }
 
         if self.timeout_secs.is_some() && self.command.is_none() {
-            bail!(
-                "key '{name}': `timeout_secs` is only valid with `command`"
-            );
+            bail!("key '{name}': `timeout_secs` is only valid with `command`");
         }
         if let Some(0) = self.timeout_secs {
             bail!("key '{name}': `timeout_secs` must be greater than 0");
@@ -590,9 +574,8 @@ impl KeySpec {
             );
         }
         if let Some(ref path) = self.file {
-            return read_key_file(path).with_context(|| {
-                format!("key '{name}': failed to read key from `{path}`")
-            });
+            return read_key_file(path)
+                .with_context(|| format!("key '{name}': failed to read key from `{path}`"));
         }
         if let Some(ref env_name) = self.env {
             return match env::var(env_name) {
@@ -697,10 +680,7 @@ impl WorkloadConfig {
     /// * an `owner/repo` path (treated as a GitHub repository with no credential).
     ///
     /// If `cli_arg` is `None`, the first declared repository is used.
-    pub fn resolve(
-        &self,
-        cli_arg: Option<&str>,
-    ) -> Result<(String, WorkloadRepositorySpec)> {
+    pub fn resolve(&self, cli_arg: Option<&str>) -> Result<(String, WorkloadRepositorySpec)> {
         if let Some(arg) = cli_arg {
             if arg.starts_with("http://") || arg.starts_with("https://") {
                 return Ok((
@@ -790,9 +770,9 @@ impl WorkloadConfig {
             WorkloadRepositorySpec::Http { url } => {
                 WorkloadRepository::Http(HttpWorkloadRepository::new(&url))
             }
-            WorkloadRepositorySpec::Github { repo, .. } => WorkloadRepository::Github(
-                GithubWorkloadRepository::new(repo, resolved_token),
-            ),
+            WorkloadRepositorySpec::Github { repo, .. } => {
+                WorkloadRepository::Github(GithubWorkloadRepository::new(repo, resolved_token))
+            }
         }
     }
 }
@@ -814,9 +794,7 @@ fn inherit_github_credential(
     let matches: Vec<&Option<String>> = repositories
         .values()
         .filter_map(|spec| match spec {
-            WorkloadRepositorySpec::Github { repo, credential } if repo == arg => {
-                Some(credential)
-            }
+            WorkloadRepositorySpec::Github { repo, credential } if repo == arg => Some(credential),
             _ => None,
         })
         .collect();
@@ -873,13 +851,11 @@ impl Config {
                 return Ok(config);
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read {}", path.display()));
+                return Err(e).with_context(|| format!("failed to read {}", path.display()));
             }
         };
 
-        Self::load_from_str(&contents)
-            .with_context(|| format!("failed to load {}", path.display()))
+        Self::load_from_str(&contents).with_context(|| format!("failed to load {}", path.display()))
     }
 
     /// Parse a config from a TOML string, apply env overrides, and
@@ -900,12 +876,8 @@ impl Config {
         match self.github.credentials.get(name) {
             Some(spec) => spec.resolve(name),
             None => {
-                let defined: Vec<&str> = self
-                    .github
-                    .credentials
-                    .keys()
-                    .map(|k| k.as_str())
-                    .collect();
+                let defined: Vec<&str> =
+                    self.github.credentials.keys().map(|k| k.as_str()).collect();
                 bail!(
                     "unknown credential '{name}'; defined: [{}]",
                     defined.join(", ")
@@ -924,10 +896,7 @@ impl Config {
     /// `workload pull` in discovery mode) must use
     /// [`resolve_credentials_best_effort`] instead so one broken
     /// credential doesn't abort discovery for every other repository.
-    pub fn resolve_credentials_for(
-        &self,
-        names: &[&str],
-    ) -> Result<HashMap<String, String>> {
+    pub fn resolve_credentials_for(&self, names: &[&str]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::new();
         for name in names {
             if out.contains_key(*name) {
@@ -1027,7 +996,7 @@ impl Config {
                         key_names.join(", ")
                     );
                 }
-                if let Some(ref spec) = self.keys.get(owner) {
+                if let Some(spec) = self.keys.get(owner) {
                     if spec.mode != KeyMode::Provisioned {
                         bail!(
                             "cloud target '{tname}': owner_key '{owner}' must be \
@@ -1065,7 +1034,7 @@ impl Config {
                     key_names.join(", ")
                 );
             }
-            if let Some(ref spec) = self.keys.get(key) {
+            if let Some(spec) = self.keys.get(key) {
                 if spec.mode != KeyMode::Provisioned {
                     bail!(
                         "[publish]: owner_key '{key}' must be \
@@ -1082,7 +1051,7 @@ impl Config {
                     key_names.join(", ")
                 );
             }
-            if let Some(ref spec) = self.keys.get(key) {
+            if let Some(spec) = self.keys.get(key) {
                 if spec.mode != KeyMode::Provisioned {
                     bail!(
                         "[publish]: relay_key '{key}' must be \
@@ -1094,12 +1063,7 @@ impl Config {
 
         // Every repository `credential` reference must name a defined
         // credential.
-        let defined: Vec<&str> = self
-            .github
-            .credentials
-            .keys()
-            .map(|k| k.as_str())
-            .collect();
+        let defined: Vec<&str> = self.github.credentials.keys().map(|k| k.as_str()).collect();
         for (name, spec) in &self.image.repositories {
             if let Some(ref cred) = spec.credential {
                 if !self.github.credentials.contains_key(cred) {
@@ -1176,9 +1140,7 @@ impl Config {
 
 fn validate_repo_path(section: &str, entry_name: &str, repo: &str) -> Result<()> {
     if repo.is_empty() {
-        bail!(
-            "invalid {section} repository '{entry_name}': `repo` must not be empty"
-        );
+        bail!("invalid {section} repository '{entry_name}': `repo` must not be empty");
     }
     if repo.contains('\\') {
         bail!(
@@ -1339,7 +1301,12 @@ fn check_legacy_fields(content: &str) -> Result<()> {
         if let Some(targets) = cloud.get("targets").and_then(|v| v.as_table()) {
             for (tname, tval) in targets {
                 if let Some(t) = tval.as_table() {
-                    for field in ["rpc_url", "session_registry", "owner_key_file", "relay_key_file"] {
+                    for field in [
+                        "rpc_url",
+                        "session_registry",
+                        "owner_key_file",
+                        "relay_key_file",
+                    ] {
                         if t.contains_key(field) {
                             bail!(
                                 "`[cloud.targets.{tname}] {field}` is no longer supported. \
@@ -1527,13 +1494,11 @@ mod tests {
         assert_eq!(name, "baseimg");
         assert_eq!(spec.repo, "automata-network/dev-baseimage");
 
-        assert!(
-            config
-                .image
-                .find_by_local_name("nonexistent")
-                .unwrap()
-                .is_none()
-        );
+        assert!(config
+            .image
+            .find_by_local_name("nonexistent")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1553,10 +1518,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = config
-            .image
-            .find_by_local_name("debug-linux")
-            .unwrap_err();
+        let err = config.image.find_by_local_name("debug-linux").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("multiple"), "got: {msg}");
         assert!(msg.contains("owner-a"), "got: {msg}");
@@ -1783,7 +1745,10 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("more than one") || msg.contains("pick one"), "got: {msg}");
+        assert!(
+            msg.contains("more than one") || msg.contains("pick one"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -2270,7 +2235,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        let (name, spec) = config.workload.resolve(Some("https://example.com")).unwrap();
+        let (name, spec) = config
+            .workload
+            .resolve(Some("https://example.com"))
+            .unwrap();
         assert_eq!(name, "https://example.com");
         match spec {
             WorkloadRepositorySpec::Http { url } => assert_eq!(url, "https://example.com"),
@@ -2885,8 +2853,14 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("relay_key_file"), "expected field name in error: {msg}");
-        assert!(msg.contains("relay_key"), "expected relay_key hint in error: {msg}");
+        assert!(
+            msg.contains("relay_key_file"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("relay_key"),
+            "expected relay_key hint in error: {msg}"
+        );
     }
 
     #[test]
@@ -2937,8 +2911,14 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("session_ttl_seconds"), "expected field name in error: {msg}");
-        assert!(msg.contains("expire_offset"), "expected new name in error: {msg}");
+        assert!(
+            msg.contains("session_ttl_seconds"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("expire_offset"),
+            "expected new name in error: {msg}"
+        );
     }
 
     #[test]
@@ -2957,6 +2937,9 @@ mod tests {
             msg.contains("register_cvm_expire_offset"),
             "expected old field name in error: {msg}"
         );
-        assert!(msg.contains("expire_offset"), "expected new name in error: {msg}");
+        assert!(
+            msg.contains("expire_offset"),
+            "expected new name in error: {msg}"
+        );
     }
 }

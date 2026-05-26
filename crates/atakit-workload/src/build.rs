@@ -190,8 +190,7 @@ pub async fn build_workload(
     let mut dep_environments = std::collections::BTreeMap::new();
     for dep_name in &dep_names {
         let dep = &config.dependencies[*dep_name];
-        let dep_env =
-            manifest::resolve_environment(&dep.env_file, &dep.environment, workload_dir)?;
+        let dep_env = manifest::resolve_environment(&dep.env_file, &dep.environment, workload_dir)?;
         dep_environments.insert((*dep_name).clone(), dep_env);
     }
 
@@ -205,10 +204,7 @@ pub async fn build_workload(
     // 7b. Extract per-service image IDs (immutable identity for `podman run`).
     let handle = progress.create("Extracting image IDs...", 0);
     let mut images = std::collections::BTreeMap::new();
-    images.insert(
-        name.clone(),
-        build_image_meta(&staging, &tar_name)?,
-    );
+    images.insert(name.clone(), build_image_meta(&staging, &tar_name)?);
     for dep_name in &dep_names {
         let dep_tar = archive::image_tar_name(dep_name);
         images.insert((*dep_name).clone(), build_image_meta(&staging, &dep_tar)?);
@@ -239,7 +235,14 @@ pub async fn build_workload(
         ),
         total_bytes,
     );
-    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir, handle.as_ref(), opts.compression)?;
+    let archive_path = archive::create_archive(
+        &staging.root,
+        &name,
+        &version,
+        output_dir,
+        handle.as_ref(),
+        opts.compression,
+    )?;
     handle.finish();
 
     // 10. Hash archive

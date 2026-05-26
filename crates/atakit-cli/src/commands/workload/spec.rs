@@ -11,8 +11,10 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
     let chain = resolve_chain(args.chain.as_deref(), config)?;
     let rpc_url = chain.rpc_url;
 
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        chain.session_registry.parse().context("invalid session registry address")?;
+    let session_registry_address: alloy_ext::core::primitives::Address = chain
+        .session_registry
+        .parse()
+        .context("invalid session registry address")?;
 
     // Parse workload ID from hex
     let id_hex = args.id.strip_prefix("0x").unwrap_or(&args.id);
@@ -66,18 +68,21 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
     } else {
         "active".green().bold().to_string()
     };
-    println!(
-        "{} {} [{}]",
-        spec.name.green().bold(),
-        spec.version,
-        status,
-    );
+    println!("{} {} [{}]", spec.name.green().bold(), spec.version, status,);
     println!();
 
     // Workload ID and owner
-    println!("  {:<20}{}", "Workload ID:", format!("0x{}", hex::encode(workload_id)).dimmed());
+    println!(
+        "  {:<20}{}",
+        "Workload ID:",
+        format!("0x{}", hex::encode(workload_id)).dimmed()
+    );
     if let Some(owner_fp) = owner {
-        println!("  {:<20}{}", "Owner:", format!("0x{}", hex::encode(owner_fp)).dimmed());
+        println!(
+            "  {:<20}{}",
+            "Owner:",
+            format!("0x{}", hex::encode(owner_fp)).dimmed()
+        );
     }
     println!("  {:<20}{}", "TTL:", format_ttl(spec.ttl));
 
@@ -88,13 +93,20 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
         2 => "whitelist",
         _ => "unknown",
     };
-    println!("  {:<20}{} ({})", "Base Image Mode:", mode_name, spec.baseImageMode);
+    println!(
+        "  {:<20}{} ({})",
+        "Base Image Mode:", mode_name, spec.baseImageMode
+    );
     if spec.baseImageIds.is_empty() {
         println!("  {:<20}{}", "Base Image IDs:", "none".dimmed());
     } else {
         for (i, id) in spec.baseImageIds.iter().enumerate() {
             let label = if i == 0 { "Base Image IDs:" } else { "" };
-            println!("  {:<20}{}", label, format!("0x{}", hex::encode(id)).dimmed());
+            println!(
+                "  {:<20}{}",
+                label,
+                format!("0x{}", hex::encode(id)).dimmed()
+            );
         }
     }
     println!();
@@ -121,7 +133,10 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
                 // STATIC: matchData[0] is the expected final PCR value.
                 0 => {
                     if let Some(expected) = pcr.matchData.first() {
-                        println!("      value  {}", format!("0x{}", hex::encode(expected)).green());
+                        println!(
+                            "      value  {}",
+                            format!("0x{}", hex::encode(expected)).green()
+                        );
                     }
                 }
                 // DYNAMIC: matchData contains event hashes.
@@ -134,9 +149,15 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
                         hasher.update(pcr_value);
                         hasher.update(data.as_slice());
                         pcr_value = hasher.finalize().into();
-                        println!("      event  {}", format!("0x{}", hex::encode(data)).dimmed());
+                        println!(
+                            "      event  {}",
+                            format!("0x{}", hex::encode(data)).dimmed()
+                        );
                     }
-                    println!("      value  {}", format!("0x{}", hex::encode(pcr_value)).green());
+                    println!(
+                        "      value  {}",
+                        format!("0x{}", hex::encode(pcr_value)).green()
+                    );
                 }
             }
         }
@@ -149,7 +170,10 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
         println!("    {}", "none".dimmed());
     } else {
         for req in &spec.requirements {
-            println!("    Key: {}", format!("0x{}", hex::encode(req.key)).dimmed());
+            println!(
+                "    Key: {}",
+                format!("0x{}", hex::encode(req.key)).dimmed()
+            );
             for val in &req.allowedValues {
                 println!("      {}", format!("0x{}", hex::encode(val)).dimmed());
             }

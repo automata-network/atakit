@@ -1,6 +1,6 @@
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 /// Ensure the resource group exists.
 pub async fn ensure_resource_group(
@@ -731,7 +731,9 @@ pub async fn delete_image_definition(
         )
         .await
     {
-        Ok(_) => wait_for_image_definition_deleted(subscription, rg, gallery, definition, runner).await,
+        Ok(_) => {
+            wait_for_image_definition_deleted(subscription, rg, gallery, definition, runner).await
+        }
         Err(CloudError::CommandFailed { stderr, .. })
             if stderr.contains("not found") || stderr.contains("NotFound") =>
         {

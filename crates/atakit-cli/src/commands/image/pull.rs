@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use atakit_core::Env;
 use atakit_image::{ImageRef, ImageStore, Platform, PullArgs, ReleasesClient};
 
-use crate::config::{Config, ImageRepositorySpec, repo_local_name};
+use crate::config::{repo_local_name, Config, ImageRepositorySpec};
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {

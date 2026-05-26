@@ -14,31 +14,29 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     let chain = resolve_chain(args.chain.as_deref(), config)?;
     let rpc_url = chain.rpc_url;
 
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        chain.session_registry.parse().context("invalid session registry address")?;
+    let session_registry_address: alloy_ext::core::primitives::Address = chain
+        .session_registry
+        .parse()
+        .context("invalid session registry address")?;
 
     // Resolve owner private key from [keys].
     let private_key_raw = resolve_owner_key(args.owner_key.as_deref(), config)?;
-    let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
-    let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
-        .parse()
-        .context("invalid private key")?;
+    let private_key_hex = private_key_raw
+        .strip_prefix("0x")
+        .unwrap_or(&private_key_raw);
+    let signer: alloy_ext::signers::local::PrivateKeySigner =
+        private_key_hex.parse().context("invalid private key")?;
 
     let signer_address = signer.address();
     println!("Signer: {}", format!("{signer_address}").dimmed());
 
     // Resolve workload identity: name+version or workload ID
-    let (name, version, workload_id) = resolve_workload_identity(
-        &args, env, config, verbose,
-    ).await?;
+    let (name, version, workload_id) =
+        resolve_workload_identity(&args, env, config, verbose).await?;
 
     let workload_id_hex = format!("0x{}", hex::encode(workload_id));
 
-    println!(
-        "Workload: {} {}",
-        name.green().bold(),
-        version,
-    );
+    println!("Workload: {} {}", name.green().bold(), version,);
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
     // Resolve relay key for transaction submission.
@@ -59,11 +57,10 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     };
 
     println!("Connecting to registry...");
-    let measurement = automata_tee_workload_measurement::WorkloadMeasurement::new(
-        measurement_config,
-    )
-    .await
-    .context("failed to connect to WorkloadMeasurement")?;
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .context("failed to connect to WorkloadMeasurement")?;
 
     let registry = measurement.workload_registry();
 
@@ -79,10 +76,7 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
             }
         }
         println!();
-        println!(
-            "{}",
-            "Workload is already deactivated.".yellow().bold()
-        );
+        println!("{}", "Workload is already deactivated.".yellow().bold());
         println!("  {:<18}{}", "Workload ID:", workload_id_hex);
         return Ok(());
     }
@@ -114,15 +108,8 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
         .context("deactivateWorkload failed")?;
 
     println!();
-    println!(
-        "{}",
-        "Workload deactivated successfully.".green().bold()
-    );
-    println!(
-        "  {:<18}0x{}",
-        "Tx hash:",
-        hex::encode(tx_hash),
-    );
+    println!("{}", "Workload deactivated successfully.".green().bold());
+    println!("  {:<18}0x{}", "Tx hash:", hex::encode(tx_hash),);
 
     // Mark as revoked in the local store if entry exists
     let store = WorkloadStore::new(&env.workload_dir);
@@ -196,11 +183,9 @@ async fn resolve_from_archive(
 ) -> Result<(String, String, alloy_ext::core::primitives::B256)> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 

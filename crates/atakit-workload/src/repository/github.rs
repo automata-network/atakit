@@ -19,9 +19,8 @@ use std::path::Path;
 
 use atakit_core::ProgressReporter;
 use atakit_github::{
-    download_asset_bytes, download_asset_to_path, upload_release_asset,
-    upload_release_asset_bytes, Asset as GhAsset, CreateReleaseRequest, Release,
-    ReleasesClient,
+    download_asset_bytes, download_asset_to_path, upload_release_asset, upload_release_asset_bytes,
+    Asset as GhAsset, CreateReleaseRequest, Release, ReleasesClient,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -367,10 +366,7 @@ impl GithubWorkloadRepository {
         {
             Some(r) => Ok(r),
             None => Err(WorkloadError::Repository {
-                message: format!(
-                    "no release tagged {tag} in github://{}",
-                    self.repo
-                ),
+                message: format!("no release tagged {tag} in github://{}", self.repo),
             }),
         }
     }
@@ -395,9 +391,7 @@ impl GithubWorkloadRepository {
         coords: &WorkloadCoords,
     ) -> Result<RepositoryArchiveMeta, WorkloadError> {
         let asset = find_atawl_asset(release, coords)?;
-        Ok(self
-            .build_meta(release, coords, asset.size, asset.id)
-            .await)
+        Ok(self.build_meta(release, coords, asset.size, asset.id).await)
     }
 
     /// Build a metadata record for a release.
@@ -472,8 +466,8 @@ impl GithubWorkloadRepository {
 
         // Sidecar missing or rejected: derive what we can.
         let body = release.body.as_deref().unwrap_or("");
-        let workload_id = parse_body_field(body, "Workload ID")
-            .unwrap_or_else(|| coords.workload_id.clone());
+        let workload_id =
+            parse_body_field(body, "Workload ID").unwrap_or_else(|| coords.workload_id.clone());
         let sha256 = parse_body_field(body, "Manifest SHA256").unwrap_or_default();
         let uploaded_at = release.published_at.clone().unwrap_or_default();
 
@@ -579,7 +573,9 @@ fn sidecar_matches_coords(
         return false;
     }
     if !coords.workload_id.is_empty()
-        && !sidecar.workload_id.eq_ignore_ascii_case(&coords.workload_id)
+        && !sidecar
+            .workload_id
+            .eq_ignore_ascii_case(&coords.workload_id)
     {
         return false;
     }
@@ -649,10 +645,7 @@ fn find_atawl_asset<'a>(
         .collect();
     match atawl_assets.len() {
         0 => Err(WorkloadError::Repository {
-            message: format!(
-                "release {tag} has no .atawl asset",
-                tag = release.tag_name
-            ),
+            message: format!("release {tag} has no .atawl asset", tag = release.tag_name),
         }),
         1 => Ok(atawl_assets[0]),
         n => {
@@ -680,10 +673,13 @@ async fn hash_archive_file(path: &Path) -> Result<(u64, String), WorkloadError> 
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
-        let n = file.read(&mut buf).await.map_err(|e| WorkloadError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| WorkloadError::ReadFile {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
         if n == 0 {
             break;
         }
@@ -743,7 +739,8 @@ mod tests {
 
     #[test]
     fn parse_body_field_extracts_value() {
-        let body = "secure-signer v0.0.1\n\nWorkload ID: 0xabc\nManifest SHA256: 0xdef\nPCR23: 0xfeed\n";
+        let body =
+            "secure-signer v0.0.1\n\nWorkload ID: 0xabc\nManifest SHA256: 0xdef\nPCR23: 0xfeed\n";
         assert_eq!(
             parse_body_field(body, "Workload ID"),
             Some("0xabc".to_string())
@@ -811,10 +808,7 @@ mod tests {
 
     #[test]
     fn find_atawl_asset_rejects_ambiguous() {
-        let release = fake_release(
-            "secure-signer/v0.0.1",
-            &["one.atawl", "two.atawl"],
-        );
+        let release = fake_release("secure-signer/v0.0.1", &["one.atawl", "two.atawl"]);
         let err = find_atawl_asset(&release, &coords()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("2 .atawl assets"), "got: {msg}");

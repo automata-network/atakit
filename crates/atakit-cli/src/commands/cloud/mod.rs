@@ -11,8 +11,7 @@ pub mod status;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-use atakit_cloud::{AzureResourceNames, CloudTarget, PlatformKind, PersistedInitEnv, ProcessRunner};
+use anyhow::{bail, Context, Result};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
@@ -20,71 +19,73 @@ use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
+use atakit_cloud::{
+    AzureResourceNames, CloudTarget, PersistedInitEnv, PlatformKind, ProcessRunner,
+};
 use atakit_core::Env;
-use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
+use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
 
 use owo_colors::OwoColorize;
 
-
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
-	pub cli_chain: Option<&'a str>,
-	pub cli_owner_key: Option<&'a str>,
-	pub cli_gas_wallet: Option<&'a str>,
-	pub target: &'a CloudTarget,
+    pub cli_chain: Option<&'a str>,
+    pub cli_owner_key: Option<&'a str>,
+    pub cli_gas_wallet: Option<&'a str>,
+    pub target: &'a CloudTarget,
 }
 
 impl<'a> InitEnvResolver<'a> {
-	pub fn chain(&self) -> String {
-		self.cli_chain
-			.map(String::from)
-			.or_else(|| self.target.chain.clone())
-			.expect("chain must be set on target or via --chain")
-	}
+    pub fn chain(&self) -> String {
+        self.cli_chain
+            .map(String::from)
+            .or_else(|| self.target.chain.clone())
+            .expect("chain must be set on target or via --chain")
+    }
 
-	pub fn owner_key(&self) -> String {
-		self.cli_owner_key
-			.map(String::from)
-			.or_else(|| self.target.owner_key.clone())
-			.expect("owner_key must be set on target or via --owner-key")
-	}
+    pub fn owner_key(&self) -> String {
+        self.cli_owner_key
+            .map(String::from)
+            .or_else(|| self.target.owner_key.clone())
+            .expect("owner_key must be set on target or via --owner-key")
+    }
 
-	pub fn gas_wallet(&self) -> String {
-		self.cli_gas_wallet
-			.map(String::from)
-			.or_else(|| self.target.gas_wallet.clone())
-			.expect("gas_wallet must be set on target or via --gas-wallet")
-	}
+    pub fn gas_wallet(&self) -> String {
+        self.cli_gas_wallet
+            .map(String::from)
+            .or_else(|| self.target.gas_wallet.clone())
+            .expect("gas_wallet must be set on target or via --gas-wallet")
+    }
 
-	pub fn build(&self) -> PersistedInitEnv {
-		PersistedInitEnv {
-			chain: self.chain(),
-			owner_key: self.owner_key(),
-			gas_wallet: self.gas_wallet(),
-		}
-	}
+    pub fn build(&self) -> PersistedInitEnv {
+        PersistedInitEnv {
+            chain: self.chain(),
+            owner_key: self.owner_key(),
+            gas_wallet: self.gas_wallet(),
+        }
+    }
 }
 
 /// Parse instance reference: "target/instance" or just "instance".
 pub fn parse_instance_ref(s: &str) -> (Option<&str>, &str) {
-	if let Some((target, instance)) = s.split_once('/') {
-		(Some(target), instance)
-	} else {
-		(None, s)
-	}
+    if let Some((target, instance)) = s.split_once('/') {
+        (Some(target), instance)
+    } else {
+        (None, s)
+    }
 }
 
 /// Resolve an instance reference to (target_name, instance_name) using the state store.
 pub fn resolve_instance(
-	data_dir: &std::path::Path,
-	instance: &str,
-	target_filter: Option<&str>,
+    data_dir: &std::path::Path,
+    instance: &str,
+    target_filter: Option<&str>,
 ) -> Result<(String, String)> {
-	let (embedded_target, instance_name) = parse_instance_ref(instance);
-	let target = target_filter.or(embedded_target);
-	atakit_cloud::state::find_instance(data_dir, instance_name, target)
-		.map_err(|e| anyhow::anyhow!("{e}"))
+    let (embedded_target, instance_name) = parse_instance_ref(instance);
+    let target = target_filter.or(embedded_target);
+    atakit_cloud::state::find_instance(data_dir, instance_name, target)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Resolved base image: display name for the plan + optional local file path.
@@ -127,7 +128,8 @@ pub(super) fn resolve_image(
 
     if image_arg.contains(':') {
         // Parse as ImageRef (repository:tag).
-        let image_ref: ImageRef = image_arg.parse()
+        let image_ref: ImageRef = image_arg
+            .parse()
             .with_context(|| format!("invalid image reference: {image_arg}"))?;
         if store.exists(&image_ref) {
             return resolve_store_image(&store, &image_ref, platform);
@@ -206,7 +208,12 @@ pub(crate) struct ResolvedWorkload {
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
-pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env, skip_freshness_check: bool) -> Result<ResolvedWorkload> {
+pub(crate) fn resolve_workload(
+    source: &Option<String>,
+    dir: &Option<PathBuf>,
+    env: &Env,
+    skip_freshness_check: bool,
+) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
         // Store reference: name:version
         if crate::commands::workload::looks_like_store_ref(src) {
@@ -226,9 +233,14 @@ pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 verbose: false,
             };
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-            }).context("failed to inspect store archive")?;
-            let disks = result.manifest.disks.iter()
+                tokio::runtime::Handle::current()
+                    .block_on(atakit_workload::inspect_workload(&inspect_opts))
+            })
+            .context("failed to inspect store archive")?;
+            let disks = result
+                .manifest
+                .disks
+                .iter()
                 .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
@@ -261,8 +273,12 @@ pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         };
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
-        }).context("failed to inspect archive")?;
-        let disks = result.manifest.disks.iter()
+        })
+        .context("failed to inspect archive")?;
+        let disks = result
+            .manifest
+            .disks
+            .iter()
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
@@ -283,7 +299,9 @@ pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     }
 
     // Dir mode: read atakit-workload.toml, find versioned archive.
-    let workload_dir = dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workload_dir = dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
     if !workload_dir.join("atakit-workload.toml").exists() {
         bail!(
             "no workload source specified and no atakit-workload.toml found in {}",
@@ -315,9 +333,13 @@ pub(crate) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     };
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-    }).context("failed to inspect archive")?;
+    })
+    .context("failed to inspect archive")?;
     let ports = collect_firewall_ports(&result.manifest);
-    let disks = result.manifest.disks.iter()
+    let disks = result
+        .manifest
+        .disks
+        .iter()
         .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
         .collect();
     let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
@@ -371,7 +393,11 @@ fn find_newer_source(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == ".git" || name_str == "target" || name_str == ".claude" || name_str == ".codex" {
+        if name_str == ".git"
+            || name_str == "target"
+            || name_str == ".claude"
+            || name_str == ".codex"
+        {
             continue;
         }
         if name_str.ends_with(".atawl") {
@@ -541,11 +567,7 @@ fn append_dir_recursive<W: std::io::Write>(
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
         let child_src = entry.path();
-        let child_name = child_src
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let child_name = child_src.file_name().unwrap().to_string_lossy().to_string();
         let child_archive = format!("{archive_prefix}/{child_name}");
         let ft = entry.file_type()?;
 
@@ -590,7 +612,8 @@ pub(super) fn build_cloud_image_record(
         }
         PlatformKind::Azure => {
             // Only gallery/image fields are used here; storage_account isn't.
-            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
+            let names =
+                AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
             CloudImage {
                 platform: PlatformKind::Azure,
                 cloud_name: names.image_definition,
@@ -641,8 +664,7 @@ pub(super) async fn ensure_cloud_image(
     env: &Env,
     verbose: bool,
 ) -> Result<UploadResult> {
-    let mut cloud_imgs = CloudImages::load(&env.data_dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cloud_imgs = CloudImages::load(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cloud_provider: Box<dyn CloudProvider> = match provider_config.platform {
         PlatformKind::Gcp => {
@@ -663,25 +685,32 @@ pub(super) async fn ensure_cloud_image(
                      --subscription to every az call)"
                 )
             })?;
-            Box::new(AzureProvider::new(subscription, provider_config.region.clone()))
+            Box::new(AzureProvider::new(
+                subscription,
+                provider_config.region.clone(),
+            ))
         }
-        PlatformKind::Aws => {
-            Box::new(AwsProvider::new(provider_config.region.clone()))
-        }
+        PlatformKind::Aws => Box::new(AwsProvider::new(provider_config.region.clone())),
     };
 
     let runner = ProcessRunner::new(verbose);
 
     // Check deps.
-    cloud_provider.execute_step(&DeployStep::CheckDeps, &runner, verbose).await?;
+    cloud_provider
+        .execute_step(&DeployStep::CheckDeps, &runner, verbose)
+        .await?;
 
     // Check existence before uploading so we can report accurately.
     let already_exists = match provider_config.platform {
         PlatformKind::Gcp => {
             let names = atakit_cloud::naming::ResourceNames::for_gcp("upload", image_ref);
             let exists = atakit_cloud::gcp::image::check_image_exists(
-                provider_config.project.as_deref().unwrap(), &names.image, &runner,
-            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+                provider_config.project.as_deref().unwrap(),
+                &names.image,
+                &runner,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
             exists && !force
         }
         PlatformKind::Azure => {
@@ -695,14 +724,18 @@ pub(super) async fn ensure_cloud_image(
                 &names.image_definition,
                 &names.image_version,
                 &runner,
-            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
             exists && !force
         }
         PlatformKind::Aws => {
             let names = atakit_cloud::naming::ResourceNames::for_aws("upload", image_ref);
-            let exists = atakit_cloud::aws::image::find_ami(
-                &provider_config.region, &names.image, &runner,
-            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?.is_some();
+            let exists =
+                atakit_cloud::aws::image::find_ami(&provider_config.region, &names.image, &runner)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?
+                    .is_some();
             exists && !force
         }
     };
@@ -711,7 +744,9 @@ pub(super) async fn ensure_cloud_image(
         // Record in tracking (may be missing if uploaded before tracking existed).
         let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
         cloud_imgs.record(image_ref, provider_name, record);
-        cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        cloud_imgs
+            .save(&env.data_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok(UploadResult { uploaded: false });
     }
 
@@ -735,14 +770,16 @@ pub(super) async fn ensure_cloud_image(
             // reuses rather than duplicates. This is a different lifecycle
             // from per-deploy storage accounts.
             let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
-            cloud_provider.execute_step(
-                &DeployStep::CreateResourceGroup {
-                    name: names.resource_group.clone(),
-                    region: provider_config.region.clone(),
-                },
-                &runner,
-                verbose,
-            ).await?;
+            cloud_provider
+                .execute_step(
+                    &DeployStep::CreateResourceGroup {
+                        name: names.resource_group.clone(),
+                        region: provider_config.region.clone(),
+                    },
+                    &runner,
+                    verbose,
+                )
+                .await?;
             let step = DeployStep::UploadImageAzure {
                 resource_group: names.resource_group,
                 storage_account: names.storage_account,
@@ -772,22 +809,24 @@ pub(super) async fn ensure_cloud_image(
 
     let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
     cloud_imgs.record(image_ref, provider_name, record);
-    cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cloud_imgs
+        .save(&env.data_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(UploadResult { uploaded: true })
 }
 
 /// Parse metadata key=value strings into a map.
 pub fn parse_metadata(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-	let mut map = std::collections::BTreeMap::new();
-	for item in items {
-		let (key, value) = item.split_once('=').ok_or_else(|| {
-			anyhow::anyhow!("invalid metadata format: expected KEY=VALUE, got '{item}'")
-		})?;
-		if key.is_empty() {
-			bail!("metadata key cannot be empty in '{item}'");
-		}
-		map.insert(key.to_string(), value.to_string());
-	}
-	Ok(map)
+    let mut map = std::collections::BTreeMap::new();
+    for item in items {
+        let (key, value) = item.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid metadata format: expected KEY=VALUE, got '{item}'")
+        })?;
+        if key.is_empty() {
+            bail!("metadata key cannot be empty in '{item}'");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
 }

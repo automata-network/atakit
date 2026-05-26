@@ -73,7 +73,12 @@ pub enum Platform {
 }
 
 impl Platform {
-    pub const ALL: [Platform; 4] = [Platform::Gcp, Platform::Aws, Platform::Azure, Platform::Qemu];
+    pub const ALL: [Platform; 4] = [
+        Platform::Gcp,
+        Platform::Aws,
+        Platform::Azure,
+        Platform::Qemu,
+    ];
 }
 
 impl fmt::Display for Platform {
@@ -229,7 +234,6 @@ impl Asset {
         AssetKind::ImageArchive(platforms)
     }
 }
-
 
 impl Release {
     /// Find an `.atabi` archive asset that contains the given platform.

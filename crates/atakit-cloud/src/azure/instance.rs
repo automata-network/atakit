@@ -58,10 +58,7 @@ pub async fn create_instance(
     }
 
     // Tags (Azure equivalent of GCP labels/metadata).
-    let tags_str: Vec<String> = metadata
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let tags_str: Vec<String> = metadata.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let tags_flag;
     if !tags_str.is_empty() {
         tags_flag = tags_str.join(" ");

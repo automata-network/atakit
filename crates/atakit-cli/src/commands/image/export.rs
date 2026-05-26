@@ -1,6 +1,6 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use atakit_core::{ArchiveCompression, Env};
-use atakit_image::{ExportArgs, ImageStore, create_image_archive};
+use atakit_image::{create_image_archive, ExportArgs, ImageStore};
 use owo_colors::OwoColorize;
 
 use crate::progress::IndicatifReporter;
@@ -9,10 +9,7 @@ pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
     let store = ImageStore::new(&env.image_dir);
 
     if !store.exists(&args.image) {
-        bail!(
-            "no local content for {} in image store",
-            args.image,
-        );
+        bail!("no local content for {} in image store", args.image,);
     }
 
     let platforms = store.local_platforms(&args.image);
@@ -31,8 +28,14 @@ pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
     };
 
     let progress = IndicatifReporter;
-    let archive_path =
-        create_image_archive(&tag_dir, &args.image, &platforms, &output_dir, &progress, compression)?;
+    let archive_path = create_image_archive(
+        &tag_dir,
+        &args.image,
+        &platforms,
+        &output_dir,
+        &progress,
+        compression,
+    )?;
 
     println!("{}", "Exported.".green().bold());
     println!("  {}", archive_path.display());

@@ -47,14 +47,14 @@ impl HttpWorkloadRepository {
     /// Health check the repository service.
     pub async fn health(&self) -> Result<(), WorkloadError> {
         let url = format!("{}/v1/health", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| WorkloadError::RepositoryRequest {
-                reason: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| WorkloadError::RepositoryRequest {
+                    reason: e.to_string(),
+                })?;
         if !resp.status().is_success() {
             return Err(WorkloadError::Repository {
                 message: format!("health check failed: HTTP {}", resp.status()),
@@ -90,22 +90,24 @@ impl HttpWorkloadRepository {
         workload_id: &str,
     ) -> Result<Option<RepositoryArchiveMeta>, WorkloadError> {
         let url = format!("{}/v1/workloads/{}/meta", self.base_url, workload_id);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| WorkloadError::RepositoryRequest {
-                reason: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| WorkloadError::RepositoryRequest {
+                    reason: e.to_string(),
+                })?;
 
         let Some(resp) = check_response_optional(resp).await? else {
             return Ok(None);
         };
         let meta: RepositoryArchiveMeta =
-            resp.json().await.map_err(|e| WorkloadError::RepositoryRequest {
-                reason: format!("failed to parse metadata response: {e}"),
-            })?;
+            resp.json()
+                .await
+                .map_err(|e| WorkloadError::RepositoryRequest {
+                    reason: format!("failed to parse metadata response: {e}"),
+                })?;
 
         // Trust-but-verify: a repository must return metadata for the
         // exact workload ID we asked for. A server that returns a
@@ -137,14 +139,14 @@ impl HttpWorkloadRepository {
         use tokio::io::AsyncWriteExt;
 
         let url = format!("{}/v1/workloads/{}", self.base_url, coords.workload_id);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| WorkloadError::RepositoryRequest {
-                reason: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| WorkloadError::RepositoryRequest {
+                    reason: e.to_string(),
+                })?;
         let resp = check_response(resp).await?;
 
         // Use Content-Length when present so the bar shows ETA. 0 means
@@ -153,12 +155,13 @@ impl HttpWorkloadRepository {
         let label = format!("{}-{}.atawl", coords.name, coords.version);
         let handle = progress.create(&label, total);
 
-        let mut file = tokio::fs::File::create(dest)
-            .await
-            .map_err(|e| WorkloadError::WriteFile {
-                path: dest.to_path_buf(),
-                source: e,
-            })?;
+        let mut file =
+            tokio::fs::File::create(dest)
+                .await
+                .map_err(|e| WorkloadError::WriteFile {
+                    path: dest.to_path_buf(),
+                    source: e,
+                })?;
 
         let mut size: u64 = 0;
         let mut stream = resp.bytes_stream();
@@ -166,10 +169,12 @@ impl HttpWorkloadRepository {
             let chunk = chunk.map_err(|e| WorkloadError::RepositoryRequest {
                 reason: format!("failed to read download stream: {e}"),
             })?;
-            file.write_all(&chunk).await.map_err(|e| WorkloadError::WriteFile {
-                path: dest.to_path_buf(),
-                source: e,
-            })?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| WorkloadError::WriteFile {
+                    path: dest.to_path_buf(),
+                    source: e,
+                })?;
             size += chunk.len() as u64;
             handle.inc(chunk.len() as u64);
         }
@@ -211,11 +216,12 @@ impl HttpWorkloadRepository {
             })?;
         let resp = check_response(resp).await?;
 
-        let body: ListResponse = resp.json().await.map_err(|e| {
-            WorkloadError::RepositoryRequest {
-                reason: format!("failed to parse list response: {e}"),
-            }
-        })?;
+        let body: ListResponse =
+            resp.json()
+                .await
+                .map_err(|e| WorkloadError::RepositoryRequest {
+                    reason: format!("failed to parse list response: {e}"),
+                })?;
         Ok(body.workloads)
     }
 
@@ -223,12 +229,13 @@ impl HttpWorkloadRepository {
         &self,
         ctx: &UploadContext<'_>,
     ) -> Result<RepositoryArchiveMeta, WorkloadError> {
-        let file = tokio::fs::File::open(ctx.archive_path)
-            .await
-            .map_err(|e| WorkloadError::ReadFile {
-                path: ctx.archive_path.to_path_buf(),
-                source: e,
-            })?;
+        let file =
+            tokio::fs::File::open(ctx.archive_path)
+                .await
+                .map_err(|e| WorkloadError::ReadFile {
+                    path: ctx.archive_path.to_path_buf(),
+                    source: e,
+                })?;
 
         let url = format!("{}/v1/workloads/{}", self.base_url, ctx.coords.workload_id);
         let resp = self
@@ -243,9 +250,11 @@ impl HttpWorkloadRepository {
             })?;
         let resp = check_response(resp).await?;
 
-        resp.json().await.map_err(|e| WorkloadError::RepositoryRequest {
-            reason: format!("failed to parse upload response: {e}"),
-        })
+        resp.json()
+            .await
+            .map_err(|e| WorkloadError::RepositoryRequest {
+                reason: format!("failed to parse upload response: {e}"),
+            })
     }
 }
 

@@ -122,16 +122,18 @@ impl ContainerEngine {
     /// Pull an image from a registry.
     pub async fn pull_image(&self, reference: &str) -> Result<(), WorkloadError> {
         let mut cmd = Command::new(self.bin());
-        cmd.arg("pull").arg(reference);
+        // Workloads always run on linux/amd64 in the CVM. Force the platform
+        // here so a build host on linux/arm64 (Apple Silicon) doesn't fetch
+        // the wrong manifest variant from a multi-arch index.
+        cmd.arg("pull")
+            .arg("--platform")
+            .arg("linux/amd64")
+            .arg(reference);
         run_command(&mut cmd, &format!("{} pull", self.bin())).await
     }
 
     /// Save (export) an image to an OCI tar archive.
-    pub async fn save_image(
-        &self,
-        reference: &str,
-        dest: &Path,
-    ) -> Result<(), WorkloadError> {
+    pub async fn save_image(&self, reference: &str, dest: &Path) -> Result<(), WorkloadError> {
         let mut cmd = Command::new(self.bin());
         cmd.arg("save").arg("-o").arg(dest).arg(reference);
         run_command(&mut cmd, &format!("{} save", self.bin())).await
@@ -205,7 +207,10 @@ async fn run_command_streaming(
             let raw = &output.stderr;
             let stderr = if raw.len() > MAX_STDERR {
                 let truncated = String::from_utf8_lossy(&raw[raw.len() - MAX_STDERR..]);
-                format!("... ({} bytes truncated)\n{truncated}", raw.len() - MAX_STDERR)
+                format!(
+                    "... ({} bytes truncated)\n{truncated}",
+                    raw.len() - MAX_STDERR
+                )
             } else {
                 String::from_utf8_lossy(raw).to_string()
             };

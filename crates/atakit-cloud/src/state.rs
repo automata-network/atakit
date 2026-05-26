@@ -179,7 +179,10 @@ impl DeployState {
             platform: params.platform,
             created_at: now,
             updated_at: now,
-            status: DeployStatus::Deploying { step: 0, total: params.total_steps },
+            status: DeployStatus::Deploying {
+                step: 0,
+                total: params.total_steps,
+            },
             image_ref: params.image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
@@ -300,10 +303,7 @@ impl DeployState {
     }
 
     fn apply_gcp_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
-        let gcp = self
-            .resources
-            .gcp
-            .get_or_insert_with(GcpResources::default);
+        let gcp = self.resources.gcp.get_or_insert_with(GcpResources::default);
         if let Some(ref b) = updates.bucket {
             gcp.bucket = Some(b.clone());
         }
@@ -404,7 +404,7 @@ pub fn list_deployments(data_dir: &Path) -> Result<Vec<DeployState>, CloudError>
             }
         }
     }
-    states.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    states.sort_by_key(|a| a.created_at);
     Ok(states)
 }
 
@@ -453,10 +453,7 @@ pub fn find_instance(
         1 => Ok((matches.into_iter().next().unwrap(), instance.to_string())),
         _ => Err(CloudError::AmbiguousInstance {
             instance: instance.to_string(),
-            matches: matches
-                .iter()
-                .map(|t| format!("{t}/{instance}"))
-                .collect(),
+            matches: matches.iter().map(|t| format!("{t}/{instance}")).collect(),
         }),
     }
 }
