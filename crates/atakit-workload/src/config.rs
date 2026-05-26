@@ -74,7 +74,8 @@ impl LoggingSection {
     /// Other drivers (currently only `none`) have no defaults.
     pub(crate) fn inject_defaults(&mut self) {
         if self.driver == "k8s-file" && self.options.is_empty() {
-            self.options.insert("max-size".to_string(), "50m".to_string());
+            self.options
+                .insert("max-size".to_string(), "50m".to_string());
             self.options.insert("max-file".to_string(), "5".to_string());
         }
     }
@@ -89,8 +90,8 @@ impl WorkloadConfig {
             source: e,
         })?;
         check_legacy_fields(&content)?;
-        let mut config: Self = toml::from_str(&content)
-            .map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
+        let mut config: Self =
+            toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
         config.inject_defaults();
         Ok(config)
     }
