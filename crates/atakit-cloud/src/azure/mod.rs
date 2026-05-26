@@ -757,7 +757,7 @@ impl CloudProvider for AzureProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CcType, CloudTarget, PlatformKind};
+    use crate::config::{CcType, CloudTarget};
     use crate::provider::{CloudProvider, DeployOptions};
     use crate::state::PersistedInitEnv;
     use std::collections::BTreeMap;
