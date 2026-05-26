@@ -743,10 +743,7 @@ fn validate_log_grants(config: &WorkloadConfig) -> Result<(), WorkloadError> {
     let mut grants_for: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (p_name, p_logging) in &producers {
         for r_name in &p_logging.log_readers {
-            grants_for
-                .entry(r_name.as_str())
-                .or_default()
-                .push(p_name);
+            grants_for.entry(r_name.as_str()).or_default().push(p_name);
         }
     }
 
@@ -758,7 +755,7 @@ fn validate_log_grants(config: &WorkloadConfig) -> Result<(), WorkloadError> {
             config
                 .dependencies
                 .get(name)
-                .map_or(false, |d| d.workload_logs)
+                .is_some_and(|d| d.workload_logs)
         }
     };
 
@@ -1731,7 +1728,10 @@ image = "redis:7"
         let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
         let redis = cfg.dependencies.get("redis").unwrap();
         assert_eq!(redis.logging.driver, "k8s-file");
-        assert_eq!(redis.logging.options.get("max-size"), Some(&"50m".to_string()));
+        assert_eq!(
+            redis.logging.options.get("max-size"),
+            Some(&"50m".to_string())
+        );
         assert!(!redis.workload_logs);
     }
 
@@ -1965,10 +1965,7 @@ image = "x:latest"
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("workload-logs = true"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("workload-logs = true"), "got: {msg}");
         assert!(msg.contains("\"shipper\""), "got: {msg}");
     }
 
