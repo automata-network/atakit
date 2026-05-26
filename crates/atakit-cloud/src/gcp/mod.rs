@@ -93,6 +93,7 @@ impl CloudProvider for GcpProvider {
         if !disks.is_empty() {
             steps.push(DeployStep::CreateDisks {
                 disks: disks.clone(),
+                resource_group: None,
             });
         }
 
@@ -201,7 +202,7 @@ impl CloudProvider for GcpProvider {
                 updates.firewall_rule = Some(firewall_rule.clone());
             }
 
-            DeployStep::CreateDisks { disks } => {
+            DeployStep::CreateDisks { disks, .. } => {
                 for spec in disks {
                     if disk::check_disk_exists(&self.project, &self.zone, &spec.name, runner)
                         .await?
@@ -291,6 +292,7 @@ impl CloudProvider for GcpProvider {
         if !opts.preserve.contains(&"disks".to_string()) && !gcp.disks.is_empty() {
             steps.push(DestroyStep::DeleteDisks {
                 names: gcp.disks.clone(),
+                resource_group: None,
             });
         }
 
@@ -328,7 +330,7 @@ impl CloudProvider for GcpProvider {
             DestroyStep::DeleteInstance { name } => {
                 instance::delete_instance(&self.project, &self.zone, name, runner).await
             }
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks { names, .. } => {
                 for name in names {
                     disk::delete_disk(&self.project, &self.zone, name, runner).await?;
                 }

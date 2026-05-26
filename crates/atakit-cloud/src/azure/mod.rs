@@ -133,6 +133,7 @@ impl CloudProvider for AzureProvider {
         if !disks.is_empty() {
             steps.push(DeployStep::CreateDisks {
                 disks: disks.clone(),
+                resource_group: Some(names.resource_group.clone()),
             });
         }
 
@@ -422,28 +423,21 @@ impl CloudProvider for AzureProvider {
                 updates.firewall_rule = Some(firewall_rule.clone());
             }
 
-            DeployStep::CreateDisks { disks } => {
-                // Derive RG from first disk name pattern.
-                let rg_name = if let Some(first) = disks.first() {
-                    let base = first
-                        .name
-                        .rsplit_once('-')
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(&first.name);
-                    format!("{base}-rg")
-                } else {
-                    return Ok(StepResult {
-                        resource_updates: updates,
-                    });
-                };
+            DeployStep::CreateDisks {
+                disks,
+                resource_group,
+            } => {
+                let rg_name = resource_group.as_deref().ok_or_else(|| CloudError::State {
+                    message: "Azure CreateDisks step is missing its resource group".to_string(),
+                })?;
 
                 for spec in disks {
-                    if disk::check_disk_exists(&self.subscription, &rg_name, &spec.name, runner)
+                    if disk::check_disk_exists(&self.subscription, rg_name, &spec.name, runner)
                         .await?
                     {
                         tracing::info!("disk '{}' already exists", spec.name);
                     } else {
-                        disk::create_disk(&self.subscription, &rg_name, spec, runner).await?;
+                        disk::create_disk(&self.subscription, rg_name, spec, runner).await?;
                     }
                     updates.disks.push(spec.name.clone());
                 }
@@ -554,6 +548,7 @@ impl CloudProvider for AzureProvider {
         if !opts.preserve.contains(&"disks".to_string()) && !az.disks.is_empty() {
             steps.push(DestroyStep::DeleteDisks {
                 names: az.disks.clone(),
+                resource_group: az.resource_group.clone(),
             });
         }
 
@@ -588,15 +583,15 @@ impl CloudProvider for AzureProvider {
                 let rg = format!("{name}-rg");
                 instance::delete_instance(&self.subscription, &rg, name, runner).await
             }
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks {
+                names,
+                resource_group,
+            } => {
+                let rg = resource_group.as_deref().ok_or_else(|| CloudError::State {
+                    message: "Azure DeleteDisks step is missing its resource group".to_string(),
+                })?;
                 for name in names {
-                    // Derive RG from disk name: {instance}-{disk} -> instance -> {instance}-rg.
-                    let base = name
-                        .rsplit_once('-')
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(name);
-                    let rg = format!("{base}-rg");
-                    disk::delete_disk(&self.subscription, &rg, name, runner).await?;
+                    disk::delete_disk(&self.subscription, rg, name, runner).await?;
                 }
                 Ok(())
             }
@@ -822,6 +817,40 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_disks_carry_the_created_resource_group() {
+        // Regression: disk steps used to re-derive the RG from the disk name
+        // via rsplit_once('-'), which broke when the instance name and disk
+        // name both contained hyphens (e.g. instance
+        // "multi-container-example-azure-tdx" + disk "shared-data" produced
+        // a bogus "...-shared-rg" instead of "...-rg"). The RG must now match
+        // the one the CreateResourceGroup step actually creates.
+        let provider = AzureProvider::new("sub-123".into(), "eastus".into());
+        let mut opts = test_deploy_opts("test-baseimage:v0.0.5");
+        opts.instance_name = "multi-container-example-azure-tdx".into();
+        opts.workload_disks = vec![("shared-data".to_string(), 10, 10)];
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+
+        let created_rg = plan.steps.iter().find_map(|s| match s {
+            DeployStep::CreateResourceGroup { name, .. } => Some(name.clone()),
+            _ => None,
+        });
+        let disk_rg = plan.steps.iter().find_map(|s| match s {
+            DeployStep::CreateDisks { resource_group, .. } => Some(resource_group.clone()),
+            _ => None,
+        });
+
+        let created_rg = created_rg.expect("plan must create a resource group");
+        let disk_rg = disk_rg
+            .expect("plan must contain CreateDisks")
+            .expect("Azure CreateDisks must carry a resource group");
+        assert_eq!(
+            disk_rg, created_rg,
+            "disk RG must match the resource group that is actually created"
+        );
     }
 
     #[tokio::test]
