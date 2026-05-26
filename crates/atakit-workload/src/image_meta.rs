@@ -53,7 +53,10 @@ struct DockerArchiveEntry {
     config: String,
 }
 
-fn read_image_id_docker_archive(tar_path: &Path, manifest_json: &str) -> Result<String, WorkloadError> {
+fn read_image_id_docker_archive(
+    tar_path: &Path,
+    manifest_json: &str,
+) -> Result<String, WorkloadError> {
     let entries: Vec<DockerArchiveEntry> = serde_json::from_str(manifest_json).map_err(|e| {
         WorkloadError::Validation(format!(
             "image tar {}: failed to parse manifest.json: {e}",
@@ -241,7 +244,9 @@ fn read_top_level_file(tar_path: &Path, name: &str) -> Result<Option<String>, Wo
         let path_str = path.to_string_lossy();
         if path_str == name || path_str == format!("./{name}") {
             let mut content = String::new();
-            entry.read_to_string(&mut content).map_err(WorkloadError::Io)?;
+            entry
+                .read_to_string(&mut content)
+                .map_err(WorkloadError::Io)?;
             return Ok(Some(content));
         }
     }
@@ -334,9 +339,8 @@ mod tests {
     fn docker_archive_blobs_style() {
         let blob = config_blob();
         let hex = config_hex(&blob);
-        let manifest = format!(
-            r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#
-        );
+        let manifest =
+            format!(r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#);
         let tar = build_tar(&[
             ("manifest.json", manifest.as_bytes()),
             (&format!("blobs/sha256/{hex}"), &blob),
@@ -350,9 +354,8 @@ mod tests {
     fn docker_archive_legacy_json_style() {
         let blob = config_blob();
         let hex = config_hex(&blob);
-        let manifest = format!(
-            r#"[{{"Config":"{hex}.json","RepoTags":["x:latest"],"Layers":[]}}]"#
-        );
+        let manifest =
+            format!(r#"[{{"Config":"{hex}.json","RepoTags":["x:latest"],"Layers":[]}}]"#);
         let tar = build_tar(&[
             ("manifest.json", manifest.as_bytes()),
             (&format!("{hex}.json"), &blob),
@@ -386,9 +389,8 @@ mod tests {
         let blob = config_blob();
         let hex = config_hex(&blob);
         let tampered = b"this is not the config you are looking for";
-        let manifest = format!(
-            r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#
-        );
+        let manifest =
+            format!(r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#);
         let tar = build_tar(&[
             ("manifest.json", manifest.as_bytes()),
             (&format!("blobs/sha256/{hex}"), tampered),
@@ -402,9 +404,8 @@ mod tests {
     #[test]
     fn rejects_missing_config_blob() {
         let hex = "f".repeat(64);
-        let manifest = format!(
-            r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#
-        );
+        let manifest =
+            format!(r#"[{{"Config":"blobs/sha256/{hex}","RepoTags":["x:latest"],"Layers":[]}}]"#);
         let tar = build_tar(&[("manifest.json", manifest.as_bytes())]);
         let f = write_tmp_tar(&tar);
         let err = read_image_id(f.path()).unwrap_err();

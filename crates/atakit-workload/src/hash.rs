@@ -55,9 +55,7 @@ fn collect_hashes(
         if path.is_dir() {
             collect_hashes(&path, base_dir, hashes)?;
         } else {
-            let rel_path = path
-                .strip_prefix(base_dir)
-                .expect("path is under base_dir");
+            let rel_path = path.strip_prefix(base_dir).expect("path is under base_dir");
             let rel = rel_path
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())

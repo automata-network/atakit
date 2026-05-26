@@ -34,9 +34,7 @@ pub struct InspectResult {
 }
 
 /// Inspect a workload from an `.atawl` archive or a source directory.
-pub async fn inspect_workload(
-    opts: &InspectOptions,
-) -> Result<InspectResult, WorkloadError> {
+pub async fn inspect_workload(opts: &InspectOptions) -> Result<InspectResult, WorkloadError> {
     if let Some(ref archive_path) = opts.archive {
         inspect_archive(archive_path)
     } else if let Some(ref workload_dir) = opts.workload_dir {
@@ -66,12 +64,16 @@ fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, Work
         if let Some(filename) = path.file_name() {
             if filename == "manifest.json" {
                 let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(WorkloadError::Io)?;
+                entry
+                    .read_to_string(&mut content)
+                    .map_err(WorkloadError::Io)?;
                 manifest_json = Some(content);
                 break; // v2 found, stop scanning
             } else if filename == "manifest.toml" {
                 let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(WorkloadError::Io)?;
+                entry
+                    .read_to_string(&mut content)
+                    .map_err(WorkloadError::Io)?;
                 manifest_toml = Some(content);
                 // Don't break: keep scanning in case manifest.json appears
                 // later in the tar. For real v1 archives this scans the
@@ -111,8 +113,7 @@ async fn inspect_dir(
 
     let name = &config.workload.name;
     let version = &config.workload.version;
-    let resolved_image =
-        crate::manifest::resolve_image_ref(&config.workload.image, name, version);
+    let resolved_image = crate::manifest::resolve_image_ref(&config.workload.image, name, version);
 
     // Stage measured-data files into a temp dir for hashing
     let temp_dir = tempfile::tempdir().map_err(WorkloadError::Io)?;
@@ -143,8 +144,7 @@ async fn inspect_dir(
     dep_names.sort();
     for dep_name in &dep_names {
         let dep = &config.dependencies[*dep_name];
-        let dep_resolved =
-            crate::manifest::resolve_image_ref(&dep.image, dep_name, version);
+        let dep_resolved = crate::manifest::resolve_image_ref(&dep.image, dep_name, version);
         let dep_tar = crate::archive::image_tar_name(dep_name);
         stage_image(
             &dep.image,
@@ -165,10 +165,7 @@ async fn inspect_dir(
 
     // Extract per-service image IDs from the staged tars.
     let mut images = std::collections::BTreeMap::new();
-    images.insert(
-        name.clone(),
-        build_image_meta(&staging, &tar_name)?,
-    );
+    images.insert(name.clone(), build_image_meta(&staging, &tar_name)?);
     for dep_name in &dep_names {
         let dep_tar = crate::archive::image_tar_name(dep_name);
         images.insert((*dep_name).clone(), build_image_meta(&staging, &dep_tar)?);
@@ -183,11 +180,8 @@ async fn inspect_dir(
     let mut dep_environments = std::collections::BTreeMap::new();
     for dep_name in &dep_names {
         let dep = &config.dependencies[*dep_name];
-        let dep_env = crate::manifest::resolve_environment(
-            &dep.env_file,
-            &dep.environment,
-            &workload_dir,
-        )?;
+        let dep_env =
+            crate::manifest::resolve_environment(&dep.env_file, &dep.environment, &workload_dir)?;
         dep_environments.insert((*dep_name).clone(), dep_env);
     }
 
@@ -253,7 +247,13 @@ async fn stage_image(
             };
             let context = workload_dir.join(build);
             engine
-                .build_image(&context, containerfile.as_deref(), resolved_ref, args, verbose)
+                .build_image(
+                    &context,
+                    containerfile.as_deref(),
+                    resolved_ref,
+                    args,
+                    verbose,
+                )
                 .await?;
             engine
                 .save_image(resolved_ref, &staging.image_tar_path(tar_name))
@@ -282,7 +282,10 @@ fn build_result_toml(manifest_raw: String) -> Result<InspectResult, WorkloadErro
 }
 
 /// Shared PCR23 computation from raw manifest bytes.
-fn compute_pcr_result(manifest: Manifest, manifest_raw: String) -> Result<InspectResult, WorkloadError> {
+fn compute_pcr_result(
+    manifest: Manifest,
+    manifest_raw: String,
+) -> Result<InspectResult, WorkloadError> {
     let mut hasher = Sha256::new();
     hasher.update(manifest_raw.as_bytes());
     let event_hash = hasher.finalize();

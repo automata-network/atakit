@@ -1,12 +1,15 @@
 use std::io::Write;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use atakit_core::Env;
 use atakit_workload::cli::PublishArgs;
 use atakit_workload::{WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{apply_chain_data_to_meta, looks_like_store_ref, query_chain_data, resolve_chain, resolve_owner_key};
+use super::{
+    apply_chain_data_to_meta, looks_like_store_ref, query_chain_data, resolve_chain,
+    resolve_owner_key,
+};
 use crate::config::Config;
 
 pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
@@ -14,15 +17,18 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let chain = resolve_chain(args.chain.as_deref(), config)?;
     let rpc_url = chain.rpc_url;
 
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        chain.session_registry.parse().context("invalid session registry address")?;
+    let session_registry_address: alloy_ext::core::primitives::Address = chain
+        .session_registry
+        .parse()
+        .context("invalid session registry address")?;
 
     // Resolve owner private key from [keys].
     let private_key_raw = resolve_owner_key(args.owner_key.as_deref(), config)?;
-    let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
-    let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
-        .parse()
-        .context("invalid private key")?;
+    let private_key_hex = private_key_raw
+        .strip_prefix("0x")
+        .unwrap_or(&private_key_raw);
+    let signer: alloy_ext::signers::local::PrivateKeySigner =
+        private_key_hex.parse().context("invalid private key")?;
 
     let signer_address = signer.address();
     println!("Signer: {}", format!("{signer_address}").dimmed());
@@ -30,11 +36,9 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // Inspect workload to get PCR23 and manifest
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 
@@ -154,11 +158,10 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     };
 
     println!("Connecting to registry...");
-    let measurement = automata_tee_workload_measurement::WorkloadMeasurement::new(
-        measurement_config,
-    )
-    .await
-    .context("failed to connect to WorkloadMeasurement")?;
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .context("failed to connect to WorkloadMeasurement")?;
 
     let registry = measurement.workload_registry();
 
@@ -176,7 +179,12 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
     println!("  {:<20}{}", "Manifest SHA256:".dimmed(), result.sha256);
     println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
-    println!("  {:<20}{} ({})", "Base Image Mode:".dimmed(), base_image_mode_str, base_image_mode);
+    println!(
+        "  {:<20}{} ({})",
+        "Base Image Mode:".dimmed(),
+        base_image_mode_str,
+        base_image_mode
+    );
     if spec.baseImageIds.is_empty() {
         println!("  {:<20}{}", "Base Image IDs:".dimmed(), "none".dimmed());
     } else {
@@ -184,51 +192,88 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             let id_hex = format!("0x{}", hex::encode(id));
             // Show source entry alongside hex ID when derived from manifest.
             let source = if args.base_image_id.is_empty() {
-                manifest.config.base_image.get(i).map(|s| format!(" ({s})")).unwrap_or_default()
+                manifest
+                    .config
+                    .base_image
+                    .get(i)
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
             if i == 0 {
-                println!("  {:<20}{}{}", "Base Image IDs:".dimmed(), id_hex, source.dimmed());
+                println!(
+                    "  {:<20}{}{}",
+                    "Base Image IDs:".dimmed(),
+                    id_hex,
+                    source.dimmed()
+                );
             } else {
                 println!("  {:<20}{}{}", "", id_hex, source.dimmed());
             }
         }
     }
-    println!("  {:<20}{}", "TTL:".dimmed(), if spec.ttl == 0 {
-        "contract default (30 days)".to_string()
-    } else {
-        format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
-    });
+    println!(
+        "  {:<20}{}",
+        "TTL:".dimmed(),
+        if spec.ttl == 0 {
+            "contract default (30 days)".to_string()
+        } else {
+            format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
+        }
+    );
     println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {
-        let is_revoked = registry.is_workload_revoked(workload_id).await.unwrap_or(false);
+        let is_revoked = registry
+            .is_workload_revoked(workload_id)
+            .await
+            .unwrap_or(false);
         println!();
         if is_revoked {
             println!(
                 "{}",
-                "Workload version was previously deactivated.".yellow().bold()
+                "Workload version was previously deactivated."
+                    .yellow()
+                    .bold()
             );
             println!("  {:<18}{}", "Workload ID:", workload_id_hex);
-            println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
+            println!(
+                "  {:<18}{} {}",
+                "Registered as:", existing.name, existing.version
+            );
             println!();
-            println!("{}", "A deactivated version cannot be re-registered. Please use a new version tag.".yellow());
-            println!("  {}", "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow());
-        } else {
             println!(
                 "{}",
-                "Workload already registered.".yellow().bold()
+                "A deactivated version cannot be re-registered. Please use a new version tag."
+                    .yellow()
             );
+            println!(
+                "  {}",
+                "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow()
+            );
+        } else {
+            println!("{}", "Workload already registered.".yellow().bold());
             println!("  {:<18}{}", "Workload ID:", workload_id_hex);
-            println!("  {:<18}{} {}", "Registered as:", existing.name, existing.version);
+            println!(
+                "  {:<18}{} {}",
+                "Registered as:", existing.name, existing.version
+            );
             println!();
-            println!("{}", "To publish updated measurements, use a new version tag.".yellow());
-            println!("  {}", "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow());
+            println!(
+                "{}",
+                "To publish updated measurements, use a new version tag.".yellow()
+            );
+            println!(
+                "  {}",
+                "Example: update 'version' in workload.toml to a new value (e.g. v0.0.2)".yellow()
+            );
         }
 
         // Always refresh on-chain data into local store
-        if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
+        if let Ok(chain_data) =
+            query_chain_data(workload_id, &rpc_url, &chain.session_registry).await
+        {
             let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
             let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
@@ -284,15 +329,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         .context("registerWorkload failed")?;
 
     println!();
-    println!(
-        "{}",
-        "Workload published successfully.".green().bold()
-    );
-    println!(
-        "  {:<18}0x{}",
-        "Workload ID:",
-        hex::encode(result_id),
-    );
+    println!("{}", "Workload published successfully.".green().bold());
+    println!("  {:<18}0x{}", "Workload ID:", hex::encode(result_id),);
 
     // Refresh on-chain data into local store
     if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {

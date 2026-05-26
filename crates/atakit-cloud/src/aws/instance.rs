@@ -4,10 +4,7 @@ use crate::plan::DiskSpec;
 
 /// Find a subnet to launch into, preferring a default-for-AZ subnet so the
 /// instance receives an auto-assigned public IP.
-pub async fn find_subnet(
-    region: &str,
-    runner: &dyn CommandRunner,
-) -> Result<String, CloudError> {
+pub async fn find_subnet(region: &str, runner: &dyn CommandRunner) -> Result<String, CloudError> {
     let default = runner
         .run_capture(
             "aws",
@@ -125,12 +122,13 @@ pub async fn create_instance(
     }
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = runner
-        .run_capture("aws", &arg_refs)
-        .await
-        .map_err(|e| CloudError::InstanceError {
-            message: format!("failed to create instance: {e}"),
-        })?;
+    let output =
+        runner
+            .run_capture("aws", &arg_refs)
+            .await
+            .map_err(|e| CloudError::InstanceError {
+                message: format!("failed to create instance: {e}"),
+            })?;
 
     let parsed: serde_json::Value = serde_json::from_str(&output.stdout)?;
     let instance_id = parsed

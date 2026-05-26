@@ -133,38 +133,36 @@ impl CloudProvider for AwsProvider {
                 }
 
                 if existing.is_none() || *force {
-                    let src = source_path.as_deref().ok_or_else(|| {
-                        CloudError::ImageUploadFailed {
-                            message: format!(
+                    let src =
+                        source_path
+                            .as_deref()
+                            .ok_or_else(|| CloudError::ImageUploadFailed {
+                                message: format!(
                                 "AMI '{image_name}' does not exist and no source file was provided"
                             ),
-                        }
-                    })?;
-                    let certs = certs_dir.as_deref().ok_or_else(|| {
-                        CloudError::ImageUploadFailed {
-                            message: format!(
-                                "cannot register AMI '{image_name}': no secure-boot \
+                            })?;
+                    let certs =
+                        certs_dir
+                            .as_deref()
+                            .ok_or_else(|| CloudError::ImageUploadFailed {
+                                message: format!(
+                                    "cannot register AMI '{image_name}': no secure-boot \
                                  directory resolved for the base image. atakit \
                                  requires Secure Boot on every CVM deploy."
-                            ),
-                        }
-                    })?;
+                                ),
+                            })?;
 
                     image::ensure_bucket(&self.region, bucket, runner).await?;
                     let key = image::upload_vmdk(bucket, src, runner, verbose).await?;
-                    let task_id = image::import_snapshot(&self.region, bucket, &key, runner).await?;
+                    let task_id =
+                        image::import_snapshot(&self.region, bucket, &key, runner).await?;
                     let snapshot_id =
                         image::wait_for_snapshot(&self.region, &task_id, runner).await?;
                     // Drop any stale same-name AMI before registering.
                     image::deregister_ami_by_name(&self.region, image_name, runner).await?;
-                    let ami_id = image::register_ami(
-                        &self.region,
-                        image_name,
-                        &snapshot_id,
-                        certs,
-                        runner,
-                    )
-                    .await?;
+                    let ami_id =
+                        image::register_ami(&self.region, image_name, &snapshot_id, certs, runner)
+                            .await?;
                     tracing::info!("registered AMI {ami_id}");
                     updates.bucket = Some(bucket.clone());
                     updates.snapshot = Some(snapshot_id);
@@ -289,7 +287,9 @@ impl CloudProvider for AwsProvider {
                 steps.push(DestroyStep::DeleteAmi { name: ami.clone() });
             }
             if let Some(ref bucket) = aws.bucket {
-                steps.push(DestroyStep::DeleteS3Bucket { name: bucket.clone() });
+                steps.push(DestroyStep::DeleteS3Bucket {
+                    name: bucket.clone(),
+                });
             }
         }
 

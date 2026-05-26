@@ -187,7 +187,9 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                 // Inject always-allowed portal ports so v1 manifests
                 // get the same firewall behavior as v2 manifests.
                 use std::collections::HashSet;
-                let mut open: HashSet<(u16, String)> = v1.config.firewall_ports
+                let mut open: HashSet<(u16, String)> = v1
+                    .config
+                    .firewall_ports
                     .iter()
                     .map(|fp| (fp.port, fp.protocol.clone()))
                     .collect();
@@ -198,7 +200,11 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                     .into_iter()
                     .map(|(port, protocol)| ManifestFirewallPort { port, protocol })
                     .collect();
-                ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+                ports.sort_by(|a, b| {
+                    a.port
+                        .cmp(&b.port)
+                        .then_with(|| a.protocol.cmp(&b.protocol))
+                });
                 ports
             },
             baby_container: v1.config.baby_container,
@@ -268,7 +274,12 @@ mod tests {
         assert!(!port_set.contains(&(2024, "udp")));
         assert_eq!(manifest.config.firewall_ports.len(), 2);
         // Sorted by port then protocol.
-        let ports: Vec<u16> = manifest.config.firewall_ports.iter().map(|fp| fp.port).collect();
+        let ports: Vec<u16> = manifest
+            .config
+            .firewall_ports
+            .iter()
+            .map(|fp| fp.port)
+            .collect();
         assert!(ports.windows(2).all(|w| w[0] <= w[1]));
     }
 }

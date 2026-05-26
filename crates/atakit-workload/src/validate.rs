@@ -61,7 +61,8 @@ pub fn validate_config(
     if config.format > crate::FORMAT_VERSION {
         return Err(WorkloadError::Validation(format!(
             "atakit-workload.toml format version {} is newer than supported ({}); upgrade atakit",
-            config.format, crate::FORMAT_VERSION
+            config.format,
+            crate::FORMAT_VERSION
         )));
     }
 
@@ -458,7 +459,11 @@ pub fn validate_config(
                 if !abs.exists() {
                     return Err(WorkloadError::EnvFileMissing(abs));
                 }
-                ensure_within(&abs, workload_dir, &format!("dependencies.{dep_name}.env_file"))?;
+                ensure_within(
+                    &abs,
+                    workload_dir,
+                    &format!("dependencies.{dep_name}.env_file"),
+                )?;
             }
         }
 
@@ -470,7 +475,6 @@ pub fn validate_config(
                 )));
             }
         }
-
     }
 
     // ── capabilities ─────────────────────────────────────
@@ -480,7 +484,11 @@ pub fn validate_config(
     // No cap may appear in both lists for the same container.
     validate_caps(&w.cap_add, &w.cap_drop, "workload")?;
     for (dep_name, dep) in &config.dependencies {
-        validate_caps(&dep.cap_add, &dep.cap_drop, &format!("dependencies.{dep_name}"))?;
+        validate_caps(
+            &dep.cap_add,
+            &dep.cap_drop,
+            &format!("dependencies.{dep_name}"),
+        )?;
     }
 
     Ok(warnings)
@@ -586,9 +594,8 @@ fn validate_image_source(source: &ImageSource, workload_dir: &Path) -> Result<()
 ///
 /// Uses the shared `parse_port_spec` and enforces that `container` is present.
 fn validate_container_port(spec: &str, context: &str) -> Result<(), WorkloadError> {
-    let parsed = config::parse_port_spec(spec).map_err(|e| {
-        WorkloadError::Validation(format!("{context}: {e} in {spec:?}"))
-    })?;
+    let parsed = config::parse_port_spec(spec)
+        .map_err(|e| WorkloadError::Validation(format!("{context}: {e} in {spec:?}")))?;
     if parsed.container.is_none() {
         return Err(WorkloadError::Validation(format!(
             "{context}: container port is required, got {spec:?}"
@@ -642,8 +649,12 @@ fn collect_auto_derived_ports(config: &WorkloadConfig) -> HashSet<(u16, &'static
     for spec in all_specs {
         if let Ok(parsed) = config::parse_port_spec(spec) {
             match parsed.protocol.as_deref() {
-                Some("tcp") => { ports.insert((parsed.host, "tcp")); }
-                Some("udp") => { ports.insert((parsed.host, "udp")); }
+                Some("tcp") => {
+                    ports.insert((parsed.host, "tcp"));
+                }
+                Some("udp") => {
+                    ports.insert((parsed.host, "udp"));
+                }
                 _ => {
                     ports.insert((parsed.host, "tcp"));
                     ports.insert((parsed.host, "udp"));
@@ -657,15 +668,11 @@ fn collect_auto_derived_ports(config: &WorkloadConfig) -> HashSet<(u16, &'static
 /// Check whether a `FirewallEntry` matches any auto-derived port.
 ///
 /// An entry with no protocol matches if either tcp or udp is auto-derived.
-fn entry_matches_auto(
-    auto_ports: &HashSet<(u16, &str)>,
-    entry: &config::FirewallEntry,
-) -> bool {
+fn entry_matches_auto(auto_ports: &HashSet<(u16, &str)>, entry: &config::FirewallEntry) -> bool {
     match &entry.protocol {
         Some(proto) => auto_ports.contains(&(entry.port, proto.as_str())),
         None => {
-            auto_ports.contains(&(entry.port, "tcp"))
-                || auto_ports.contains(&(entry.port, "udp"))
+            auto_ports.contains(&(entry.port, "tcp")) || auto_ports.contains(&(entry.port, "udp"))
         }
     }
 }

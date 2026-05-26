@@ -5,17 +5,17 @@ use atakit_workload::manifest::{Manifest, ManifestFirewallPort};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
-use super::{apply_chain_data_to_meta, find_archive, looks_like_store_ref, query_chain_data, ChainData};
+use super::{
+    apply_chain_data_to_meta, find_archive, looks_like_store_ref, query_chain_data, ChainData,
+};
 use crate::config::Config;
 
 pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 
@@ -78,17 +78,17 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     // Check on-chain status if RPC is configured
     let chain_data = refresh_chain(name, version, env, config).await;
 
-    print_info(&result.manifest, &result.sha256, &result.pcr23, chain_data.as_ref());
+    print_info(
+        &result.manifest,
+        &result.sha256,
+        &result.pcr23,
+        chain_data.as_ref(),
+    );
     Ok(())
 }
 
 /// Query on-chain data and update local store. Returns None if chain not configured.
-async fn refresh_chain(
-    name: &str,
-    version: &str,
-    env: &Env,
-    config: &Config,
-) -> Option<ChainData> {
+async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) -> Option<ChainData> {
     // Best-effort: resolve publish chain, skip if not configured.
     let chain_name = config.publish.chain.as_deref()?;
     let chain_config = config.chains.get(chain_name)?;
@@ -157,7 +157,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         println!("  {:<18}{}", "Entrypoint:", format_string_or_array(ep));
     }
     if !m.config.environment.is_empty() {
-        let max_key = m.config.environment.keys().map(|k| k.len()).max().unwrap_or(0);
+        let max_key = m
+            .config
+            .environment
+            .keys()
+            .map(|k| k.len())
+            .max()
+            .unwrap_or(0);
         let items: Vec<String> = m
             .config
             .environment
@@ -172,10 +178,10 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if m.config.measured_data || m.config.unmeasured_data {
         section_header("Data");
         if m.config.measured_data {
-            println!("  {:<20}{}", "Measured:", "enabled (directory mounted)");
+            println!("  {:<20}enabled (directory mounted)", "Measured:");
         }
         if m.config.unmeasured_data {
-            println!("  {:<20}{}", "Unmeasured:", "enabled (directory mounted)");
+            println!("  {:<20}enabled (directory mounted)", "Unmeasured:");
         }
         println!();
     }
@@ -191,7 +197,12 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
                     flags.push("encrypted");
                 }
             }
-            println!("  {:<18}{}  {}", format!("{name}:"), mount, flags.join("  "));
+            println!(
+                "  {:<18}{}  {}",
+                format!("{name}:"),
+                mount,
+                flags.join("  ")
+            );
         }
         println!();
     }
@@ -272,7 +283,11 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     // Compute workload ID: keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))
     // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
     let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
-    println!("  {:<18}{}", "Workload ID:", format!("0x{}", hex::encode(workload_id)).dimmed());
+    println!(
+        "  {:<18}{}",
+        "Workload ID:",
+        format!("0x{}", hex::encode(workload_id)).dimmed()
+    );
     match chain_info {
         Some(info) => match info.status.as_str() {
             "active" => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
@@ -304,4 +319,3 @@ fn format_string_or_array(s: &atakit_workload::manifest::StringOrArrayOut) -> St
 fn format_fw_port(p: &ManifestFirewallPort) -> String {
     format!("{}/{}", p.port, p.protocol)
 }
-

@@ -8,7 +8,7 @@ use atakit_image::{
 };
 use owo_colors::OwoColorize;
 
-use crate::config::{Config, ImageRepositorySpec, repo_local_name};
+use crate::config::{repo_local_name, Config, ImageRepositorySpec};
 
 pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     // Resolve the set of (entry name, spec) pairs to visit. When
@@ -17,12 +17,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     // matches we synthesize an anonymous spec so raw `owner/repo`
     // arguments still work.
     let targets: Vec<(String, ImageRepositorySpec)> = if let Some(ref r) = args.repo {
-        if let Some((name, spec)) = config
-            .image
-            .repositories
-            .iter()
-            .find(|(_, s)| s.repo == *r)
-        {
+        if let Some((name, spec)) = config.image.repositories.iter().find(|(_, s)| s.repo == *r) {
             vec![(name.clone(), spec.clone())]
         } else {
             vec![(

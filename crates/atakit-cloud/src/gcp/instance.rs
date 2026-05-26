@@ -85,12 +85,13 @@ pub async fn create_instance(
 
     args.push("--format=json");
 
-    let output = runner
-        .run_capture("gcloud", &args)
-        .await
-        .map_err(|e| CloudError::InstanceError {
-            message: format!("failed to create instance: {e}"),
-        })?;
+    let output =
+        runner
+            .run_capture("gcloud", &args)
+            .await
+            .map_err(|e| CloudError::InstanceError {
+                message: format!("failed to create instance: {e}"),
+            })?;
 
     // Parse the external IP from JSON output.
     let ip = parse_external_ip(&output.stdout).unwrap_or_default();

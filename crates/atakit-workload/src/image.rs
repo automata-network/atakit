@@ -127,11 +127,7 @@ impl ContainerEngine {
     }
 
     /// Save (export) an image to an OCI tar archive.
-    pub async fn save_image(
-        &self,
-        reference: &str,
-        dest: &Path,
-    ) -> Result<(), WorkloadError> {
+    pub async fn save_image(&self, reference: &str, dest: &Path) -> Result<(), WorkloadError> {
         let mut cmd = Command::new(self.bin());
         cmd.arg("save").arg("-o").arg(dest).arg(reference);
         run_command(&mut cmd, &format!("{} save", self.bin())).await
@@ -205,7 +201,10 @@ async fn run_command_streaming(
             let raw = &output.stderr;
             let stderr = if raw.len() > MAX_STDERR {
                 let truncated = String::from_utf8_lossy(&raw[raw.len() - MAX_STDERR..]);
-                format!("... ({} bytes truncated)\n{truncated}", raw.len() - MAX_STDERR)
+                format!(
+                    "... ({} bytes truncated)\n{truncated}",
+                    raw.len() - MAX_STDERR
+                )
             } else {
                 String::from_utf8_lossy(raw).to_string()
             };

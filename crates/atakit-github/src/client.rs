@@ -54,11 +54,7 @@ impl ReleasesClient {
     }
 
     /// Try to fetch a release by tag, returning `None` on 404.
-    pub async fn try_get_release_by_tag(
-        &self,
-        repo: &str,
-        tag: &str,
-    ) -> Result<Option<Release>> {
+    pub async fn try_get_release_by_tag(&self, repo: &str, tag: &str) -> Result<Option<Release>> {
         match self.get_release_by_tag(repo, tag).await {
             Ok(r) => Ok(Some(r)),
             Err(GithubError::Api { status: 404, .. }) => Ok(None),
@@ -76,11 +72,7 @@ impl ReleasesClient {
     // ── writes ─────────────────────────────────────────────
 
     /// Create a new release. Requires a token with `contents: write`.
-    pub async fn create_release(
-        &self,
-        repo: &str,
-        req: &CreateReleaseRequest,
-    ) -> Result<Release> {
+    pub async fn create_release(&self, repo: &str, req: &CreateReleaseRequest) -> Result<Release> {
         validate_repo(repo)?;
         let url = format!("https://api.github.com/repos/{}/releases", repo);
         debug!(%url, tag = %req.tag_name, "creating GitHub release");
@@ -290,10 +282,7 @@ mod tests {
 
     #[test]
     fn urlencode_path_segment_keeps_unreserved() {
-        assert_eq!(
-            urlencode_path_segment("abc-123_v0.0.1"),
-            "abc-123_v0.0.1"
-        );
+        assert_eq!(urlencode_path_segment("abc-123_v0.0.1"), "abc-123_v0.0.1");
     }
 
     #[test]

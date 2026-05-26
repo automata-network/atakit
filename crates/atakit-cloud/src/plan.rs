@@ -170,13 +170,25 @@ pub struct DestroyPlan {
 /// Individual destroy step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DestroyStep {
-    DeleteInstance { name: String },
-    DeleteDisks { names: Vec<String> },
-    DeleteFirewall { name: String },
-    DeleteImage { name: String },
-    DeleteBucket { name: String },
+    DeleteInstance {
+        name: String,
+    },
+    DeleteDisks {
+        names: Vec<String>,
+    },
+    DeleteFirewall {
+        name: String,
+    },
+    DeleteImage {
+        name: String,
+    },
+    DeleteBucket {
+        name: String,
+    },
     // Azure-specific destroy steps.
-    DeleteResourceGroup { name: String },
+    DeleteResourceGroup {
+        name: String,
+    },
     DeleteImageVersion {
         gallery_rg: String,
         gallery: String,
@@ -189,10 +201,16 @@ pub enum DestroyStep {
         image_definition: String,
     },
     // AWS-specific destroy steps.
-    DeleteSecurityGroup { name: String },
+    DeleteSecurityGroup {
+        name: String,
+    },
     /// Deregister the AMI and delete its backing snapshots.
-    DeleteAmi { name: String },
-    DeleteS3Bucket { name: String },
+    DeleteAmi {
+        name: String,
+    },
+    DeleteS3Bucket {
+        name: String,
+    },
 }
 
 /// Result from executing a deploy step, with resource updates.
@@ -241,7 +259,11 @@ impl fmt::Display for DeployStep {
                 firewall_rule,
                 ports,
             } => {
-                write!(f, "Open ports {} (rule: {firewall_rule})", format_ports_inline(ports))
+                write!(
+                    f,
+                    "Open ports {} (rule: {firewall_rule})",
+                    format_ports_inline(ports)
+                )
             }
             DeployStep::CreateDisks { disks } => {
                 let names: Vec<_> = disks.iter().map(|d| d.name.as_str()).collect();
@@ -308,7 +330,10 @@ impl fmt::Display for DestroyStep {
                 image_definition,
                 image_version,
                 ..
-            } => write!(f, "Delete image version '{image_definition}:{image_version}'"),
+            } => write!(
+                f,
+                "Delete image version '{image_definition}:{image_version}'"
+            ),
             DestroyStep::DeleteImageDefinition {
                 image_definition, ..
             } => write!(f, "Delete image definition '{image_definition}'"),

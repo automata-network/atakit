@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::io;
+use std::path::{Path, PathBuf};
 
 use atakit_core::{ArchiveCompression, ProgressHandle};
 
@@ -7,8 +7,8 @@ use crate::WorkloadError;
 
 /// Staging directory layout for a workload archive.
 pub struct StagingDir {
-    pub root: PathBuf,        // staging/{name}
-    pub images_dir: PathBuf,  // staging/{name}/images
+    pub root: PathBuf,         // staging/{name}
+    pub images_dir: PathBuf,   // staging/{name}/images
     pub measured_dir: PathBuf, // staging/{name}/measured-data
 }
 
@@ -45,7 +45,10 @@ impl StagingDir {
         for p in paths {
             let rel = p.strip_prefix("./").unwrap_or(p);
             // Defense-in-depth: reject any ".." components before joining
-            if Path::new(rel).components().any(|c| c == std::path::Component::ParentDir) {
+            if Path::new(rel)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
                 return Err(WorkloadError::Validation(format!(
                     "measured-data path must not contain \"..\": {p:?}"
                 )));
@@ -58,11 +61,7 @@ impl StagingDir {
     }
 
     /// Copy or link a pre-existing image tar file into `images/`.
-    pub fn stage_image_file(
-        &self,
-        src: &Path,
-        tar_name: &str,
-    ) -> Result<(), WorkloadError> {
+    pub fn stage_image_file(&self, src: &Path, tar_name: &str) -> Result<(), WorkloadError> {
         let dest = self.images_dir.join(tar_name);
         copy_file(src, &dest)
     }
@@ -75,10 +74,7 @@ impl StagingDir {
     /// Write manifest.json to the staging directory.
     pub fn write_manifest(&self, content: &str) -> Result<(), WorkloadError> {
         let path = self.root.join("manifest.json");
-        std::fs::write(&path, content).map_err(|e| WorkloadError::WriteFile {
-            path,
-            source: e,
-        })
+        std::fs::write(&path, content).map_err(|e| WorkloadError::WriteFile { path, source: e })
     }
 }
 
@@ -103,7 +99,10 @@ pub fn create_archive(
     match compression {
         ArchiveCompression::Zstd => {
             let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
-            let counting = ProgressWriter { inner: enc, progress };
+            let counting = ProgressWriter {
+                inner: enc,
+                progress,
+            };
             let mut tar = tar::Builder::new(counting);
             append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
             tar.into_inner()
@@ -116,7 +115,10 @@ pub fn create_archive(
             let enc = flate2::GzBuilder::new()
                 .mtime(0)
                 .write(file, flate2::Compression::default());
-            let counting = ProgressWriter { inner: enc, progress };
+            let counting = ProgressWriter {
+                inner: enc,
+                progress,
+            };
             let mut tar = tar::Builder::new(counting);
             append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
             tar.into_inner()
@@ -224,7 +226,9 @@ fn append_dir_deterministic<W: std::io::Write>(
     entries.sort_by(|a, b| {
         let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let b_is_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        a_is_dir.cmp(&b_is_dir).then_with(|| a.file_name().cmp(&b.file_name()))
+        a_is_dir
+            .cmp(&b_is_dir)
+            .then_with(|| a.file_name().cmp(&b.file_name()))
     });
 
     for entry in entries {
@@ -284,9 +288,10 @@ fn copy_recursive(src: &Path, dest: &Path) -> Result<usize, WorkloadError> {
 
     if file_type.is_symlink() {
         // Reject symlinks to avoid traversing or copying paths outside the workload.
-        let err = io::Error::other(
-            format!("symlinks are not allowed in measured data: {}", src.display()),
-        );
+        let err = io::Error::other(format!(
+            "symlinks are not allowed in measured data: {}",
+            src.display()
+        ));
         return Err(WorkloadError::Io(err));
     }
 
@@ -310,9 +315,7 @@ fn copy_recursive(src: &Path, dest: &Path) -> Result<usize, WorkloadError> {
 
         for entry in entries {
             let child_src = entry.path();
-            let child_name = child_src
-                .file_name()
-                .expect("entry has a filename");
+            let child_name = child_src.file_name().expect("entry has a filename");
             let child_dest = dest.join(child_name);
             count += copy_recursive(&child_src, &child_dest)?;
         }
@@ -363,7 +366,15 @@ mod tests {
         let out_dir = tempfile::tempdir().unwrap();
         let null = atakit_core::NullReporter;
         let handle = null.create("test", 0);
-        let archive = create_archive(&staging.root, "test-app", "0.1.0", out_dir.path(), handle.as_ref(), ArchiveCompression::default()).unwrap();
+        let archive = create_archive(
+            &staging.root,
+            "test-app",
+            "0.1.0",
+            out_dir.path(),
+            handle.as_ref(),
+            ArchiveCompression::default(),
+        )
+        .unwrap();
         assert!(archive.exists());
         assert!(archive.to_string_lossy().ends_with("test-app-0.1.0.atawl"));
     }
