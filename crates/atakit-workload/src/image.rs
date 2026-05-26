@@ -125,7 +125,10 @@ impl ContainerEngine {
         // Workloads always run on linux/amd64 in the CVM. Force the platform
         // here so a build host on linux/arm64 (Apple Silicon) doesn't fetch
         // the wrong manifest variant from a multi-arch index.
-        cmd.arg("pull").arg("--platform").arg("linux/amd64").arg(reference);
+        cmd.arg("pull")
+            .arg("--platform")
+            .arg("linux/amd64")
+            .arg(reference);
         run_command(&mut cmd, &format!("{} pull", self.bin())).await
     }
 
