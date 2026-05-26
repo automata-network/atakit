@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use atakit_core::Env;
-use atakit_image::{ImportArgs, ImageStore, import_image_archive, read_manifest};
+use atakit_image::{import_image_archive, read_manifest, ImageStore, ImportArgs};
 use owo_colors::OwoColorize;
 
 pub fn run(args: ImportArgs, env: &Env) -> Result<()> {
@@ -17,9 +17,7 @@ pub fn run(args: ImportArgs, env: &Env) -> Result<()> {
         tag: manifest.meta.version.clone(),
     }) && !args.force
     {
-        println!(
-            "Image {ref_str} already in store (use --force to overwrite)."
-        );
+        println!("Image {ref_str} already in store (use --force to overwrite).");
         return Ok(());
     }
 

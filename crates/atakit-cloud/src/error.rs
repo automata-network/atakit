@@ -35,10 +35,7 @@ pub enum CloudError {
     CommandNotFound { program: String },
 
     #[error("missing dependency: {tool} ({install_hint})")]
-    DependencyMissing {
-        tool: String,
-        install_hint: String,
-    },
+    DependencyMissing { tool: String, install_hint: String },
 
     #[error("image upload failed: {message}")]
     ImageUploadFailed { message: String },
@@ -53,10 +50,7 @@ pub enum CloudError {
     InstanceError { message: String },
 
     #[error("portal at {address} did not respond within {timeout_secs}s")]
-    PortalTimeout {
-        address: String,
-        timeout_secs: u64,
-    },
+    PortalTimeout { address: String, timeout_secs: u64 },
 
     #[error("portal initialization failed: {message}")]
     PortalInitFailed { message: String },

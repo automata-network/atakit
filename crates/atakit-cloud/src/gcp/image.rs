@@ -1,4 +1,4 @@
-use crate::config::{CcType, guest_os_features_for};
+use crate::config::{guest_os_features_for, CcType};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 
@@ -69,11 +69,7 @@ pub async fn upload_image(
     // bundled gcloud SDK Python. `gcloud storage` handles parallel transfer
     // natively and avoids the issue.
     runner
-        .run_stream(
-            "gcloud",
-            &["storage", "cp", source_path, &gcs_uri],
-            true,
-        )
+        .run_stream("gcloud", &["storage", "cp", source_path, &gcs_uri], true)
         .await
         .map_err(|e| CloudError::ImageUploadFailed {
             message: format!("failed to upload image: {e}"),
@@ -121,9 +117,7 @@ pub async fn register_image(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match runner.run_capture("gcloud", &arg_refs).await {
         Ok(_) => Ok(true),
-        Err(CloudError::CommandFailed { stderr, .. })
-            if stderr.contains("already exists") =>
-        {
+        Err(CloudError::CommandFailed { stderr, .. }) if stderr.contains("already exists") => {
             tracing::info!("image '{image_name}' already exists, skipping registration");
             Ok(false)
         }

@@ -260,17 +260,18 @@ impl CloudProvider for AzureProvider {
 
                 if !exists || *force {
                     if let Some(src) = source_path {
-                        let certs = certs_dir.as_deref().ok_or_else(|| {
-                            CloudError::ImageUploadFailed {
-                                message: format!(
-                                    "cannot register Azure image version \
+                        let certs =
+                            certs_dir
+                                .as_deref()
+                                .ok_or_else(|| CloudError::ImageUploadFailed {
+                                    message: format!(
+                                        "cannot register Azure image version \
                                      '{image_definition}:{image_version}': no \
                                      secure_boot_certs/ directory resolved for \
                                      the base image. atakit requires Secure \
                                      Boot to be enabled on every CVM deploy."
-                                ),
-                            }
-                        })?;
+                                    ),
+                                })?;
                         if !exists {
                             image::delete_image_definition(
                                 &self.subscription,

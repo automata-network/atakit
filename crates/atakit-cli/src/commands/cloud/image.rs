@@ -1,16 +1,17 @@
-use anyhow::{Result, bail};
-use atakit_cloud::cli::{CloudImageGcArgs, CloudImageLsArgs, CloudImageRmArgs, CloudImageUploadArgs};
+use anyhow::{bail, Result};
+use atakit_cloud::cli::{
+    CloudImageGcArgs, CloudImageLsArgs, CloudImageRmArgs, CloudImageUploadArgs,
+};
 use atakit_cloud::cloud_images::CloudImages;
 use atakit_cloud::PlatformKind;
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 
-use crate::config::Config;
 use super::resolve_image;
+use crate::config::Config;
 
 pub fn run_ls(args: CloudImageLsArgs, env: &Env) -> Result<()> {
-    let cloud_images = CloudImages::load(&env.data_dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cloud_images = CloudImages::load(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let entries = cloud_images.entries();
     if entries.is_empty() {
@@ -53,32 +54,22 @@ pub async fn run_upload(
     verbose: bool,
 ) -> Result<()> {
     // 1. Resolve provider.
-    let provider_config = config
-        .cloud
-        .providers
-        .get(&args.provider)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "provider '{}' not found in [cloud.providers]",
-                args.provider
-            )
-        })?;
+    let provider_config = config.cloud.providers.get(&args.provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider '{}' not found in [cloud.providers]",
+            args.provider
+        )
+    })?;
 
     match provider_config.platform {
         PlatformKind::Gcp => {
             if provider_config.project.is_none() {
-                bail!(
-                    "GCP provider '{}' requires 'project'",
-                    args.provider,
-                );
+                bail!("GCP provider '{}' requires 'project'", args.provider,);
             }
         }
         PlatformKind::Azure => {
             if provider_config.subscription.is_none() {
-                bail!(
-                    "Azure provider '{}' requires 'subscription'",
-                    args.provider,
-                );
+                bail!("Azure provider '{}' requires 'subscription'", args.provider,);
             }
         }
         PlatformKind::Aws => {
@@ -117,7 +108,12 @@ pub async fn run_upload(
     let cc_display: Vec<String> = cc_types.iter().map(|c| c.to_string()).collect();
     eprintln!("{}", "Configuration:".dimmed());
     eprintln!("  {:<15}{}", "Provider:".dimmed(), args.provider);
-    eprintln!("  {:<15}{} {}", "Platform:".dimmed(), provider_config.platform, provider_config.region);
+    eprintln!(
+        "  {:<15}{} {}",
+        "Platform:".dimmed(),
+        provider_config.platform,
+        provider_config.region
+    );
     eprintln!("  {:<15}{}", "CC types:".dimmed(), cc_display.join(", "));
     eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
     eprintln!("  {:<15}{}", "Disk image:".dimmed(), source_path);
@@ -147,7 +143,8 @@ pub async fn run_upload(
         args.force,
         env,
         verbose,
-    ).await?;
+    )
+    .await?;
 
     if result.uploaded {
         eprintln!();

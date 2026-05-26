@@ -433,7 +433,6 @@ pub struct EncryptionSection {
     pub bind: Vec<String>,
 }
 
-
 /// Reject deprecated format-1 fields before serde parsing, with migration hints.
 fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     let value: toml::Value = match toml::from_str(content) {
@@ -462,18 +461,20 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
         }
         if workload.contains_key("ttl") {
             return Err(WorkloadError::Validation(
-                "`ttl` has been renamed to `session-ttl` in format 2."
-                    .into(),
+                "`ttl` has been renamed to `session-ttl` in format 2.".into(),
             ));
         }
-        if workload.get("measured-data").map_or(false, |v| v.is_array()) {
+        if workload.get("measured-data").is_some_and(|v| v.is_array()) {
             return Err(WorkloadError::Validation(
                 "`measured-data` on [workload] must be a boolean in format 2. \
                  Move file lists to `[package] measured-data`."
                     .into(),
             ));
         }
-        if workload.get("unmeasured-data").map_or(false, |v| v.is_array()) {
+        if workload
+            .get("unmeasured-data")
+            .is_some_and(|v| v.is_array())
+        {
             return Err(WorkloadError::Validation(
                 "`unmeasured-data` on [workload] must be a boolean in format 2. \
                  Move file lists to `[package] unmeasured-data`."
@@ -491,13 +492,13 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                          Rename to `atakit-portal`."
                     )));
                 }
-                if t.get("measured-data").map_or(false, |v| v.is_array()) {
+                if t.get("measured-data").is_some_and(|v| v.is_array()) {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `measured-data` must be a boolean in format 2. \
                          Move file lists to `[package] measured-data`."
                     )));
                 }
-                if t.get("unmeasured-data").map_or(false, |v| v.is_array()) {
+                if t.get("unmeasured-data").is_some_and(|v| v.is_array()) {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
                          Move file lists to `[package] unmeasured-data`."
@@ -599,7 +600,9 @@ base-image-mode = "blacklist"
 image = { file = "./images/app.tar" }
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.workload.image, ImageSource::File { ref file } if file == "./images/app.tar"));
+        assert!(
+            matches!(cfg.workload.image, ImageSource::File { ref file } if file == "./images/app.tar")
+        );
     }
 
     #[test]
@@ -813,8 +816,14 @@ bind_fs = true
 "#;
         let err = check_legacy_fields(toml).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bind_fs"), "expected field name in error: {msg}");
-        assert!(msg.contains("uidmap"), "expected migration hint in error: {msg}");
+        assert!(
+            msg.contains("bind_fs"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("uidmap"),
+            "expected migration hint in error: {msg}"
+        );
     }
 
     #[test]
@@ -885,7 +894,10 @@ image = "test:latest"
 measured-data = true
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.measured_data_paths(), &["./config/hello", "./config/cert.pem"]);
+        assert_eq!(
+            cfg.measured_data_paths(),
+            &["./config/hello", "./config/cert.pem"]
+        );
         assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
         assert!(cfg.workload.measured_data);
         assert!(!cfg.workload.unmeasured_data);

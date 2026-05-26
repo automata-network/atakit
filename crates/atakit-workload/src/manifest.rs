@@ -187,8 +187,7 @@ pub struct ManifestDiskEncryption {
 
 /// Serialize a Manifest to RFC 8785 canonical JSON.
 pub fn serialize_canonical_json(manifest: &Manifest) -> Result<String, WorkloadError> {
-    serde_json_canonicalizer::to_string(manifest)
-        .map_err(|e| WorkloadError::Json(e.to_string()))
+    serde_json_canonicalizer::to_string(manifest).map_err(|e| WorkloadError::Json(e.to_string()))
 }
 
 // ── env_file resolution ──────────────────────────────────────
@@ -197,10 +196,7 @@ pub fn serialize_canonical_json(manifest: &Manifest) -> Result<String, WorkloadE
 ///
 /// Blank lines and lines starting with `#` are skipped.
 /// Format: `KEY=VALUE` (no quoting needed for values).
-pub fn parse_env_file(
-    path: &Path,
-    content: &str,
-) -> Result<Vec<(String, String)>, WorkloadError> {
+pub fn parse_env_file(path: &Path, content: &str) -> Result<Vec<(String, String)>, WorkloadError> {
     let mut pairs = Vec::new();
     for (i, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -231,11 +227,10 @@ pub fn resolve_environment(
     if let Some(ref files) = env_file {
         for ef_path in files.as_vec() {
             let abs = workload_dir.join(&ef_path);
-            let content =
-                std::fs::read_to_string(&abs).map_err(|e| WorkloadError::ReadFile {
-                    path: abs.clone(),
-                    source: e,
-                })?;
+            let content = std::fs::read_to_string(&abs).map_err(|e| WorkloadError::ReadFile {
+                path: abs.clone(),
+                source: e,
+            })?;
             for (k, v) in parse_env_file(&abs, &content)? {
                 merged.insert(k, v);
             }
@@ -256,11 +251,7 @@ pub fn strip_dot_slash(p: &str) -> &str {
 }
 
 /// Resolve the image reference to a `name:tag` string for the manifest.
-pub fn resolve_image_ref(
-    source: &ImageSource,
-    name: &str,
-    version: &str,
-) -> String {
+pub fn resolve_image_ref(source: &ImageSource, name: &str, version: &str) -> String {
     match source {
         ImageSource::Registry(s) => s.clone(),
         ImageSource::Build { .. } | ImageSource::File { .. } => {
@@ -330,7 +321,11 @@ pub fn build_manifest(
             .into_iter()
             .map(|(port, protocol)| ManifestFirewallPort { port, protocol })
             .collect();
-        ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+        ports.sort_by(|a, b| {
+            a.port
+                .cmp(&b.port)
+                .then_with(|| a.protocol.cmp(&b.protocol))
+        });
         ports
     };
 
@@ -356,10 +351,7 @@ pub fn build_manifest(
             .iter()
             .map(|(name, dep)| {
                 let image = resolve_image_ref(&dep.image, name, version);
-                let env = dep_environments
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default();
+                let env = dep_environments.get(name).cloned().unwrap_or_default();
                 (
                     name.clone(),
                     ManifestDependency {
@@ -369,7 +361,10 @@ pub fn build_manifest(
                         command: convert_string_or_array(&dep.command),
                         entrypoint: convert_string_or_array(&dep.entrypoint),
                         atakit_portal: dep.atakit_portal,
-                        gid_group: dep.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
+                        gid_group: dep
+                            .gid_group
+                            .clone()
+                            .unwrap_or_else(|| default_gid_group.clone()),
                         environment: env,
                         depends_on: dep.depends_on.clone(),
                         measured_data: dep.measured_data,
@@ -422,7 +417,10 @@ pub fn build_manifest(
             entrypoint: convert_string_or_array(&w.entrypoint),
             session_ttl: w.session_ttl,
             atakit_portal: w.atakit_portal,
-            gid_group: w.gid_group.clone().unwrap_or_else(|| default_gid_group.clone()),
+            gid_group: w
+                .gid_group
+                .clone()
+                .unwrap_or_else(|| default_gid_group.clone()),
             measured_data: w.measured_data,
             unmeasured_data: w.unmeasured_data,
             environment,
@@ -443,7 +441,9 @@ pub fn build_manifest(
 /// Insert port with protocol(s) into the open set. `None` means both tcp+udp.
 fn insert_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &Option<String>) {
     match protocol {
-        Some(p) => { open.insert((port, p.clone())); }
+        Some(p) => {
+            open.insert((port, p.clone()));
+        }
         None => {
             open.insert((port, "tcp".to_string()));
             open.insert((port, "udp".to_string()));
@@ -454,7 +454,9 @@ fn insert_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &O
 /// Remove port with protocol(s) from the open set. `None` means both tcp+udp.
 fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &Option<String>) {
     match protocol {
-        Some(p) => { open.remove(&(port, p.clone())); }
+        Some(p) => {
+            open.remove(&(port, p.clone()));
+        }
         None => {
             open.remove(&(port, "tcp".to_string()));
             open.remove(&(port, "udp".to_string()));
@@ -478,10 +480,10 @@ mod tests {
         let content = "FOO=bar\n# comment\n\nBAZ=qux\n";
         let path = Path::new("test.env");
         let pairs = parse_env_file(path, content).unwrap();
-        assert_eq!(pairs, vec![
-            ("FOO".into(), "bar".into()),
-            ("BAZ".into(), "qux".into()),
-        ]);
+        assert_eq!(
+            pairs,
+            vec![("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into()),]
+        );
     }
 
     #[test]
@@ -592,8 +594,22 @@ image = "test:latest"
         let hashes = BTreeMap::new();
         let images = BTreeMap::new();
 
-        let m1 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes.clone(), images.clone());
-        let m2 = build_manifest(&cfg, "test:latest", BTreeMap::new(), BTreeMap::new(), hashes, images);
+        let m1 = build_manifest(
+            &cfg,
+            "test:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes.clone(),
+            images.clone(),
+        );
+        let m2 = build_manifest(
+            &cfg,
+            "test:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes,
+            images,
+        );
 
         let json1 = serialize_canonical_json(&m1).unwrap();
         let json2 = serialize_canonical_json(&m2).unwrap();
@@ -693,8 +709,14 @@ image = "redis:7"
         let json = serialize_canonical_json(&manifest).unwrap();
 
         // Workload-level cap fields present and empty.
-        assert!(json.contains("\"cap-add\":[]"), "expected workload cap-add: [], got: {json}");
-        assert!(json.contains("\"cap-drop\":[]"), "expected workload cap-drop: []");
+        assert!(
+            json.contains("\"cap-add\":[]"),
+            "expected workload cap-add: [], got: {json}"
+        );
+        assert!(
+            json.contains("\"cap-drop\":[]"),
+            "expected workload cap-drop: []"
+        );
 
         // Dependency cap fields present and empty too. Canonical JSON sorts
         // keys, so within the dependency object cap-add comes before cap-drop.
@@ -733,9 +755,18 @@ cap-drop = ["KILL"]
         );
 
         assert_eq!(manifest.config.cap_add, vec!["NET_ADMIN".to_string()]);
-        assert_eq!(manifest.config.cap_drop, vec!["NET_BIND_SERVICE".to_string()]);
+        assert_eq!(
+            manifest.config.cap_drop,
+            vec!["NET_BIND_SERVICE".to_string()]
+        );
 
-        let dep = manifest.config.dependencies.as_ref().unwrap().get("sidecar").unwrap();
+        let dep = manifest
+            .config
+            .dependencies
+            .as_ref()
+            .unwrap()
+            .get("sidecar")
+            .unwrap();
         assert_eq!(dep.cap_add, vec!["NET_RAW".to_string()]);
         assert_eq!(dep.cap_drop, vec!["KILL".to_string()]);
 
@@ -773,8 +804,22 @@ cap-add = ["NET_ADMIN"]
         let cfg_a: WorkloadConfig = toml::from_str(base_toml).unwrap();
         let cfg_b: WorkloadConfig = toml::from_str(with_cap_toml).unwrap();
 
-        let m_a = build_manifest(&cfg_a, "app:latest", BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-        let m_b = build_manifest(&cfg_b, "app:latest", BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let m_a = build_manifest(
+            &cfg_a,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let m_b = build_manifest(
+            &cfg_b,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
 
         let j_a = serialize_canonical_json(&m_a).unwrap();
         let j_b = serialize_canonical_json(&m_b).unwrap();

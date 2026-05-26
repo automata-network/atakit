@@ -215,10 +215,7 @@ pub async fn download_asset_bytes(
     // Stream with running cap. Content-Length can be absent or lie
     // (claims small, sends big), so we enforce the cap on actual
     // bytes received regardless.
-    let hint = resp
-        .content_length()
-        .unwrap_or(0)
-        .min(max_bytes) as usize;
+    let hint = resp.content_length().unwrap_or(0).min(max_bytes) as usize;
     let mut buf = Vec::with_capacity(hint);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {

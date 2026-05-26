@@ -9,8 +9,8 @@ mod types;
 mod cli;
 
 pub use archive::{
-    ImageManifest, ImageManifestMeta, IMAGE_FORMAT_VERSION,
-    create_image_archive, import_image_archive, read_manifest,
+    create_image_archive, import_image_archive, read_manifest, ImageManifest, ImageManifestMeta,
+    IMAGE_FORMAT_VERSION,
 };
 pub use client::ReleasesClient;
 pub use download::{download_asset, DownloadOptions};
@@ -19,4 +19,4 @@ pub use store::{ImageStore, ReleaseStatus};
 pub use types::{Asset, AssetKind, ImageRef, Platform, Release, VersionSelector};
 
 #[cfg(feature = "cli")]
-pub use cli::{ImageCommand, LsArgs, PullArgs, RmArgs, ExportArgs, ImportArgs};
+pub use cli::{ExportArgs, ImageCommand, ImportArgs, LsArgs, PullArgs, RmArgs};

@@ -97,7 +97,11 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         name.green().bold(),
         version.green().bold(),
     );
-    println!("  {:<18}{}", "Archive:", archive_path.display().to_string().dimmed());
+    println!(
+        "  {:<18}{}",
+        "Archive:",
+        archive_path.display().to_string().dimmed()
+    );
     println!("  {:<18}{}", "Size:", format_size(archive_size));
     println!("  {:<18}{}", "Manifest SHA256:", result.sha256.dimmed());
     println!("  {:<18}{}", "PCR23:", result.pcr23.dimmed());
