@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,20 @@ pub struct Manifest {
     #[serde(default)]
     pub disks: BTreeMap<String, ManifestDisk>,
     pub hashes: BTreeMap<String, String>,
+    /// Declared `unmeasured-data` paths (operator-provided at deploy time).
+    ///
+    /// Each entry is archive-relative and `unmeasured-data/`-prefixed, mirroring
+    /// the `measured-data/` keys in `hashes`. Unlike `hashes`, there is no
+    /// content hash: the files are never bundled into the archive -- only the
+    /// declared path *set* is committed to the manifest (and thus PCR23). The
+    /// portal verifies the operator-supplied tar matches this set exactly at
+    /// `/init`; contents stay unverified. A `BTreeSet` because this is a path
+    /// *set* with no associated value (unlike `hashes`): it serialises to a
+    /// JSON array, sorted + deduped, so canonical JSON is byte-deterministic.
+    /// Always serialised (empty `[]` is a positive commitment that the workload
+    /// declares no operator-provided files).
+    #[serde(default, rename = "unmeasured-data")]
+    pub unmeasured_data: BTreeSet<String>,
     /// Per-service image metadata: archive path + immutable image config
     /// digest ("image ID"). Keyed by service name (workload + each
     /// dependency). Always serialised; defaults to empty when reading
@@ -266,6 +280,46 @@ pub fn strip_dot_slash(p: &str) -> &str {
     p.strip_prefix("./").unwrap_or(p)
 }
 
+/// Normalize declared `[package] unmeasured-data` entries into the sorted,
+/// deduped, `unmeasured-data/`-prefixed path list recorded in the manifest.
+///
+/// An entry that resolves to an existing directory under `workload_dir` is
+/// enumerated into its member file paths (so declaring `./config` yields the
+/// same set as declaring each `./config/<file>`). A file, or an entry absent at
+/// build time, is recorded as a single leaf path -- operator-provided secrets
+/// need not exist on the author's machine.
+pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for entry in paths {
+        let rel = strip_dot_slash(entry);
+        let abs = workload_dir.join(rel);
+        if abs.is_dir() {
+            collect_member_files(&abs, rel, &mut out);
+        } else {
+            out.insert(format!("unmeasured-data/{rel}"));
+        }
+    }
+    out
+}
+
+/// Recursively collect files under `dir` as `unmeasured-data/<rel_prefix>/<...>`
+/// paths into the set.
+fn collect_member_files(dir: &Path, rel_prefix: &str, out: &mut BTreeSet<String>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child_rel = format!("{rel_prefix}/{name}");
+        if path.is_dir() {
+            collect_member_files(&path, &child_rel, out);
+        } else {
+            out.insert(format!("unmeasured-data/{child_rel}"));
+        }
+    }
+}
+
 /// Resolve the image reference to a `name:tag` string for the manifest.
 pub fn resolve_image_ref(source: &ImageSource, name: &str, version: &str) -> String {
     match source {
@@ -287,6 +341,8 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 ///
 /// `resolved_image` is the canonical `name:tag` string.
 /// `hashes` contains all content hashes computed during staging.
+/// `unmeasured_data` is the normalized, sorted declared unmeasured-data path
+/// list (see `normalize_unmeasured_data`).
 /// `images` contains per-service image metadata (archive path + image ID).
 /// `environment` is the already-resolved (env_file merged) environment.
 /// `dep_environments` contains resolved environments for each dependency.
@@ -296,6 +352,7 @@ pub fn build_manifest(
     environment: BTreeMap<String, String>,
     dep_environments: BTreeMap<String, BTreeMap<String, String>>,
     hashes: BTreeMap<String, String>,
+    unmeasured_data: BTreeSet<String>,
     images: BTreeMap<String, ManifestImage>,
 ) -> Manifest {
     let w = &config.workload;
@@ -454,6 +511,7 @@ pub fn build_manifest(
         },
         disks,
         hashes,
+        unmeasured_data,
         images,
     }
 }
@@ -585,6 +643,7 @@ image = "my-app:latest"
             BTreeMap::new(),
             BTreeMap::new(),
             hashes,
+            BTreeSet::new(),
             images,
         );
 
@@ -600,6 +659,8 @@ image = "my-app:latest"
         // measured-data and unmeasured-data are booleans
         assert!(output.contains("\"measured-data\":false"));
         assert!(output.contains("\"unmeasured-data\":false"));
+        // top-level unmeasured-data path list is always emitted (empty here)
+        assert!(output.contains("\"unmeasured-data\":[]"));
         // session-ttl defaults to 0
         assert!(output.contains("\"session-ttl\":0"));
         // images section is present and surfaces image-id
@@ -628,6 +689,7 @@ image = "test:latest"
             BTreeMap::new(),
             BTreeMap::new(),
             hashes.clone(),
+            BTreeSet::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -636,6 +698,7 @@ image = "test:latest"
             BTreeMap::new(),
             BTreeMap::new(),
             hashes,
+            BTreeSet::new(),
             images,
         );
 
@@ -686,6 +749,7 @@ image = "redis:7"
             BTreeMap::new(),
             BTreeMap::new(),
             hashes.clone(),
+            BTreeSet::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -694,6 +758,7 @@ image = "redis:7"
             BTreeMap::new(),
             BTreeMap::new(),
             hashes,
+            BTreeSet::new(),
             images,
         );
 
@@ -732,6 +797,7 @@ image = "redis:7"
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeSet::new(),
             BTreeMap::new(),
         );
         let json = serialize_canonical_json(&manifest).unwrap();
@@ -779,6 +845,7 @@ cap-drop = ["KILL"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeSet::new(),
             BTreeMap::new(),
         );
 
@@ -838,6 +905,7 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeSet::new(),
             BTreeMap::new(),
         );
         let m_b = build_manifest(
@@ -846,11 +914,63 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeSet::new(),
             BTreeMap::new(),
         );
 
         let j_a = serialize_canonical_json(&m_a).unwrap();
         let j_b = serialize_canonical_json(&m_b).unwrap();
         assert_ne!(j_a, j_b, "cap-add must change the canonical JSON bytes");
+    }
+
+    #[test]
+    fn unmeasured_data_leaf_and_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A file that exists, plus a path that does not exist at build time.
+        std::fs::write(tmp.path().join("present.bin"), "x").unwrap();
+        let paths = vec!["./present.bin".to_string(), "./secrets/api_key".to_string()];
+        let out: Vec<String> = normalize_unmeasured_data(&paths, tmp.path())
+            .into_iter()
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                "unmeasured-data/present.bin".to_string(),
+                "unmeasured-data/secrets/api_key".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmeasured_data_directory_expands_to_member_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("b"), "b").unwrap();
+        std::fs::write(dir.join("a"), "a").unwrap();
+        std::fs::write(dir.join("nested/c"), "c").unwrap();
+
+        // Declaring the directory expands to its sorted member files...
+        let from_dir = normalize_unmeasured_data(&["./config".to_string()], tmp.path());
+        assert_eq!(
+            from_dir.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "unmeasured-data/config/a".to_string(),
+                "unmeasured-data/config/b".to_string(),
+                "unmeasured-data/config/nested/c".to_string(),
+            ]
+        );
+
+        // ...and declaring the member files explicitly yields the identical set
+        // (the determinism property the boolean refactor lost).
+        let from_files = normalize_unmeasured_data(
+            &[
+                "./config/nested/c".to_string(),
+                "./config/a".to_string(),
+                "./config/b".to_string(),
+            ],
+            tmp.path(),
+        );
+        assert_eq!(from_dir, from_files);
     }
 }

@@ -6,7 +6,7 @@ use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
-use super::{collect_unmeasured_tar, resolve_instance, resolve_workload, InitEnvResolver};
+use super::{resolve_instance, resolve_unmeasured_tar, resolve_workload, InitEnvResolver};
 use crate::config::{Config, KeyMode};
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
@@ -46,34 +46,13 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let workload_name = resolved.name;
     let workload_version = resolved.version;
 
-    // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over workload dir.
-    let unmeasured_tar = if resolved.needs_unmeasured_data {
-        let base_dir = args
-            .unmeasured_data_dir
-            .as_ref()
-            .or(resolved.workload_dir.as_ref());
-        if let Some(dir) = base_dir {
-            if resolved.unmeasured_data_paths.is_empty() {
-                eprintln!(
-                    "  {}: workload needs unmeasured-data but no path list available; \
-					 provide files in --unmeasured-data-dir",
-                    "warning".yellow(),
-                );
-                None
-            } else {
-                collect_unmeasured_tar(&resolved.unmeasured_data_paths, dir)?
-            }
-        } else {
-            eprintln!(
-                "  {}: workload declares unmeasured-data but no source directory available; \
-				 use --unmeasured-data-dir to provide one",
-                "warning".yellow(),
-            );
-            None
-        }
-    } else {
-        None
-    };
+    // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over
+    // workload dir. Errors if the manifest declares paths but none are available.
+    let unmeasured_tar = resolve_unmeasured_tar(
+        &resolved.unmeasured_data_paths,
+        args.unmeasured_data_dir.as_ref(),
+        resolved.workload_dir.as_ref(),
+    )?;
 
     // 4. Compute archive hash.
     let bytes = std::fs::read(&archive_path)

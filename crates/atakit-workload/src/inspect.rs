@@ -186,12 +186,15 @@ async fn inspect_dir(
     }
 
     // Build manifest
+    let unmeasured_data =
+        crate::manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), &workload_dir);
     let manifest = crate::manifest::build_manifest(
         &config,
         &resolved_image,
         environment,
         dep_environments,
         hashes,
+        unmeasured_data,
         images,
     );
     let manifest_raw = crate::manifest::serialize_canonical_json(&manifest)?;

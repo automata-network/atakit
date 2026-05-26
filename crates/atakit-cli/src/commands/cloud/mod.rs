@@ -8,7 +8,7 @@ pub mod serial;
 pub mod ssh;
 pub mod status;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -25,8 +25,6 @@ use atakit_cloud::{
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
-
-use owo_colors::OwoColorize;
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -199,9 +197,9 @@ pub(crate) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// Whether any container needs unmeasured-data mounted.
-    pub needs_unmeasured_data: bool,
-    /// Unmeasured-data file paths from [package] section (available in dir mode only).
+    /// Declared unmeasured-data file paths from the manifest, as deploy-relative
+    /// paths (the `unmeasured-data/` prefix stripped). The operator must supply
+    /// exactly this set at `/init`.
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
@@ -244,7 +242,7 @@ pub(crate) fn resolve_workload(
                 .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
-            let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
+            let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 name,
@@ -254,8 +252,7 @@ pub(crate) fn resolve_workload(
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
-                needs_unmeasured_data: needs_unmeasured,
-                unmeasured_data_paths: Vec::new(),
+                unmeasured_data_paths: unmeasured_paths,
                 workload_dir: None,
             });
         }
@@ -282,7 +279,7 @@ pub(crate) fn resolve_workload(
             .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
-        let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
+        let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
@@ -292,8 +289,7 @@ pub(crate) fn resolve_workload(
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
-            needs_unmeasured_data: needs_unmeasured,
-            unmeasured_data_paths: Vec::new(),
+            unmeasured_data_paths: unmeasured_paths,
             workload_dir: None,
         });
     }
@@ -342,16 +338,9 @@ pub(crate) fn resolve_workload(
         .iter()
         .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
         .collect();
-    let needs_unmeasured = manifest_needs_unmeasured(&result.manifest);
-    // In dir mode, read unmeasured-data paths from the source config.
-    let unmeasured_paths: Vec<String> = if needs_unmeasured {
-        match atakit_workload::config::WorkloadConfig::from_dir(&workload_dir) {
-            Ok(c) => c.unmeasured_data_paths().to_vec(),
-            Err(_) => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+    // The declared unmeasured-data set comes from the manifest (committed to
+    // PCR23), not the source TOML, so every deploy mode resolves the same set.
+    let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
     Ok(ResolvedWorkload {
         archive_path,
         name: result.manifest.meta.name,
@@ -361,25 +350,20 @@ pub(crate) fn resolve_workload(
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
-        needs_unmeasured_data: needs_unmeasured,
         unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
     })
 }
 
-/// Check whether any container in the manifest needs unmeasured-data.
-fn manifest_needs_unmeasured(m: &atakit_workload::manifest::Manifest) -> bool {
-    if m.config.unmeasured_data {
-        return true;
-    }
-    if let Some(ref deps) = m.config.dependencies {
-        for dep in deps.values() {
-            if dep.unmeasured_data {
-                return true;
-            }
-        }
-    }
-    false
+/// The declared unmeasured-data file paths from the manifest, as deploy-relative
+/// paths (the `unmeasured-data/` prefix stripped). This is the authoritative set
+/// the operator must supply at `/init`; reading it from the manifest (rather than
+/// the source TOML) means it works for archive/store deploys, not just dir mode.
+fn manifest_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
+    m.unmeasured_data
+        .iter()
+        .map(|p| p.strip_prefix("unmeasured-data/").unwrap_or(p).to_string())
+        .collect()
 }
 
 /// Walk a workload directory and return the first file newer than `threshold`.
@@ -488,69 +472,106 @@ pub(super) fn validate_base_image(
     Ok(())
 }
 
-/// Collect unmeasured-data files from a workload directory into a gzipped tar.
+/// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
+/// given the manifest's declared path set.
 ///
-/// `paths` are archive-relative (no `./` prefix, e.g. `"runtime-data/key.pem"`).
-/// Files are resolved under `workload_dir` with a `./` prefix re-added.
-/// Returns `None` if no files are found. Warns about missing files.
-pub(crate) fn collect_unmeasured_tar(
-    paths: &[String],
-    workload_dir: &std::path::Path,
+/// Gated on the **declared path set** (not the per-container mount boolean),
+/// because the portal verifies the uploaded set against the manifest's
+/// `unmeasured-data` array unconditionally. When the manifest declares paths but
+/// no `--unmeasured-data-dir` (and no workload source dir) is available, this is
+/// a hard **error**, not a warning: the portal would reject `/init` for the
+/// missing set, and failing here avoids provisioning a VM that can never init.
+pub(crate) fn resolve_unmeasured_tar(
+    declared_paths: &[String],
+    unmeasured_data_dir: Option<&PathBuf>,
+    workload_dir: Option<&PathBuf>,
 ) -> Result<Option<Vec<u8>>> {
-    if paths.is_empty() {
+    if declared_paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(dir) = unmeasured_data_dir.or(workload_dir) else {
+        bail!(
+            "workload declares {} unmeasured-data file(s) but no source directory is available; \
+             pass --unmeasured-data-dir with the declared files (the portal requires exactly the \
+             declared set at /init)",
+            declared_paths.len(),
+        );
+    };
+    collect_unmeasured_tar(declared_paths, dir)
+}
+
+/// Collect the operator-provided unmeasured-data files into a gzipped tar,
+/// after verifying the directory contains *exactly* the set the manifest
+/// declares.
+///
+/// `declared` are deploy-relative file paths (no `./` prefix, e.g.
+/// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
+/// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
+/// `--unmeasured-data-dir`. Bails if any declared file is missing, or if the
+/// directory holds files the manifest does not declare: the set is committed to
+/// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
+pub(crate) fn collect_unmeasured_tar(
+    declared: &[String],
+    data_dir: &std::path::Path,
+) -> Result<Option<Vec<u8>>> {
+    if declared.is_empty() {
         return Ok(None);
     }
 
-    let mut found_any = false;
+    let canon_base = data_dir
+        .canonicalize()
+        .with_context(|| format!("--unmeasured-data-dir not found: {}", data_dir.display()))?;
+
+    // Enumerate what's actually present, then diff against the declared set.
+    let mut actual: BTreeSet<String> = BTreeSet::new();
+    enumerate_files(&canon_base, &canon_base, &mut actual)?;
+    let declared_set: BTreeSet<String> = declared.iter().cloned().collect();
+
+    let missing: Vec<&str> = declared_set
+        .difference(&actual)
+        .map(String::as_str)
+        .collect();
+    let extra: Vec<&str> = actual
+        .difference(&declared_set)
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        let mut msg = format!(
+            "unmeasured-data in {} does not match the manifest's declared set",
+            data_dir.display()
+        );
+        if !missing.is_empty() {
+            msg.push_str(&format!(
+                "\n  missing (declared in manifest, not found): {}",
+                missing.join(", ")
+            ));
+        }
+        if !extra.is_empty() {
+            msg.push_str(&format!(
+                "\n  extra (present but not declared in manifest): {}",
+                extra.join(", ")
+            ));
+        }
+        bail!(msg);
+    }
+
+    // Set matches: build the tar from exactly the declared files.
     let buf = Vec::new();
     let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(encoder);
-
-    let canon_base = workload_dir.canonicalize()?;
-
-    for rel_path in paths {
-        // Manifest stores paths without ./ prefix. The source files live at
-        // workload_dir/./path (the original config used ./ relative paths).
-        let src = workload_dir.join(rel_path);
-        if !src.exists() {
-            eprintln!(
-                "  {}: unmeasured-data file not found: {}",
-                "warning".yellow(),
-                src.display(),
-            );
-            continue;
-        }
-
-        // Resolve symlinks and verify the real path stays within the workload dir.
-        let canon_src = src.canonicalize()?;
-        if !canon_src.starts_with(&canon_base) {
-            bail!(
-                "unmeasured-data path '{}' resolves outside workload directory: {}",
-                rel_path,
-                canon_src.display(),
-            );
-        }
-
-        if src.is_file() {
-            let metadata = std::fs::metadata(&src)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mtime(0);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            let file = std::fs::File::open(&src)?;
-            tar.append_data(&mut header, rel_path, file)?;
-            found_any = true;
-        } else if src.is_dir() {
-            append_dir_recursive(&mut tar, &src, rel_path)?;
-            found_any = true;
-        }
-    }
-
-    if !found_any {
-        return Ok(None);
+    for rel_path in declared {
+        let src = canon_base.join(rel_path);
+        let metadata = std::fs::metadata(&src)
+            .with_context(|| format!("read unmeasured-data file {rel_path}"))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(metadata.len());
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let file = std::fs::File::open(&src)?;
+        tar.append_data(&mut header, rel_path, file)?;
     }
 
     let encoder = tar.into_inner()?;
@@ -558,32 +579,34 @@ pub(crate) fn collect_unmeasured_tar(
     Ok(Some(bytes))
 }
 
-/// Recursively append a directory to a tar archive.
-fn append_dir_recursive<W: std::io::Write>(
-    tar: &mut tar::Builder<W>,
-    src_dir: &std::path::Path,
-    archive_prefix: &str,
+/// Recursively collect file paths under `dir`, relative to `base`, joined with
+/// `/`. Symlinked files are resolved and verified to stay within `base`.
+fn enumerate_files(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(src_dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let child_src = entry.path();
-        let child_name = child_src.file_name().unwrap().to_string_lossy().to_string();
-        let child_archive = format!("{archive_prefix}/{child_name}");
-        let ft = entry.file_type()?;
-
-        if ft.is_file() {
-            let metadata = std::fs::metadata(&child_src)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mtime(0);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            let file = std::fs::File::open(&child_src)?;
-            tar.append_data(&mut header, &child_archive, file)?;
-        } else if ft.is_dir() {
-            append_dir_recursive(tar, &child_src, &child_archive)?;
+        let path = entry.path();
+        if path.is_dir() {
+            enumerate_files(&path, base, out)?;
+        } else if path.is_file() {
+            let canon = path.canonicalize()?;
+            if !canon.starts_with(base) {
+                bail!(
+                    "unmeasured-data file resolves outside the data directory: {}",
+                    path.display(),
+                );
+            }
+            let rel = path
+                .strip_prefix(base)
+                .expect("path is under base")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.insert(rel);
         }
     }
     Ok(())
