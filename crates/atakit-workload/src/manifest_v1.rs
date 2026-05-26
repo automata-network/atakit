@@ -9,8 +9,23 @@ use serde::Deserialize;
 
 use crate::manifest::{
     Manifest, ManifestBabyContainer, ManifestConfig, ManifestDependency, ManifestDisk,
-    ManifestDiskEncryption, ManifestFirewallPort, ManifestMeta, StringOrArrayOut,
+    ManifestDiskEncryption, ManifestFirewallPort, ManifestLogging, ManifestMeta, StringOrArrayOut,
 };
+
+/// Default `ManifestLogging` for v1-migrated manifests: k8s-file driver
+/// with the same defaults that format-2 default-injection produces. v1
+/// manifests had no logging schema, so every v1 service migrates with the
+/// portal's default policy and `log-readers = []` (no log sharing).
+fn default_logging_v1() -> ManifestLogging {
+    let mut options = BTreeMap::new();
+    options.insert("max-size".to_string(), "50m".to_string());
+    options.insert("max-file".to_string(), "5".to_string());
+    ManifestLogging {
+        driver: "k8s-file".to_string(),
+        options,
+        log_readers: Vec::new(),
+    }
+}
 
 fn default_restart_v1() -> String {
     "no".to_string()
@@ -136,6 +151,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         disks: dep.disks,
                         cap_add: Vec::new(),
                         cap_drop: Vec::new(),
+                        logging: default_logging_v1(),
+                        workload_logs: false,
                     },
                 )
             })
@@ -205,6 +222,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             boot_disk_size: v1.config.boot_disk_size,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),
+            logging: default_logging_v1(),
+            workload_logs: false,
         },
         disks,
         hashes: v1.hashes,

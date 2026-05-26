@@ -83,6 +83,19 @@ pub struct ManifestConfig {
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
     pub cap_drop: Vec<String>,
+    pub logging: ManifestLogging,
+    #[serde(rename = "workload-logs")]
+    pub workload_logs: bool,
+}
+
+/// Container logging configuration emitted into manifest.json. All fields
+/// always serialise (no `skip_serializing_if`) so PCR23 binds concrete values.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestLogging {
+    pub driver: String,
+    pub options: BTreeMap<String, String>,
+    #[serde(rename = "log-readers")]
+    pub log_readers: Vec<String>,
 }
 
 fn default_restart() -> String {
@@ -155,6 +168,9 @@ pub struct ManifestDependency {
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
     pub cap_drop: Vec<String>,
+    pub logging: ManifestLogging,
+    #[serde(rename = "workload-logs")]
+    pub workload_logs: bool,
 }
 
 /// A resolved firewall port to open: port number + protocol.
@@ -377,6 +393,8 @@ pub fn build_manifest(
                         disks: dep.disks.clone(),
                         cap_add: dep.cap_add.clone(),
                         cap_drop: dep.cap_drop.clone(),
+                        logging: convert_logging(&dep.logging),
+                        workload_logs: dep.workload_logs,
                     },
                 )
             })
@@ -433,10 +451,20 @@ pub fn build_manifest(
             boot_disk_size: w.boot_disk_size.clone(),
             cap_add: w.cap_add.clone(),
             cap_drop: w.cap_drop.clone(),
+            logging: convert_logging(&w.logging),
+            workload_logs: w.workload_logs,
         },
         disks,
         hashes,
         images,
+    }
+}
+
+fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
+    ManifestLogging {
+        driver: logging.driver.clone(),
+        options: logging.options.clone(),
+        log_readers: logging.log_readers.clone(),
     }
 }
 
