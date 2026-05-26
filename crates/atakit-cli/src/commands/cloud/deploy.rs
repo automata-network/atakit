@@ -20,6 +20,16 @@ use super::{
 };
 use crate::config::{Config, KeyMode};
 
+/// Per-(provider, image_ref) upload metadata kept while fanning out
+/// multi-target deploys. Boxed under a type alias so clippy does not flag
+/// the inline expression as a `type_complexity` violation.
+type UploadEntry = (
+    atakit_cloud::config::CloudProviderConfig,
+    String,
+    Option<String>,
+    Vec<atakit_cloud::CcType>,
+);
+
 /// Multi-target dispatcher. Single target → forward to `run_one`. Multiple
 /// targets → fan out into a concurrent deploy (one async future per target,
 /// joined via `join_all`).
@@ -49,15 +59,8 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
             // and both try to register, and the second register fails. Doing
             // the upload once up front lets every per-target deploy's
             // `UploadImage` step short-circuit on existence.
-            let mut upload_pairs: std::collections::BTreeMap<
-                (String, String),
-                (
-                    atakit_cloud::config::CloudProviderConfig,
-                    String,
-                    Option<String>,
-                    Vec<atakit_cloud::CcType>,
-                ),
-            > = std::collections::BTreeMap::new();
+            let mut upload_pairs: std::collections::BTreeMap<(String, String), UploadEntry> =
+                std::collections::BTreeMap::new();
             for target_name in &targets {
                 let target = config.cloud.targets.get(target_name).ok_or_else(|| {
                     anyhow::anyhow!("target '{target_name}' not found in [cloud.targets]")
@@ -1213,7 +1216,7 @@ mod tests {
 
     #[test]
     fn default_satisfies_the_hard_floor() {
-        assert!(DEFAULT_BOOT_DISK_GB >= MIN_BOOT_DISK_GB);
+        const _: () = assert!(DEFAULT_BOOT_DISK_GB >= MIN_BOOT_DISK_GB);
     }
 
     #[test]

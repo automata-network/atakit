@@ -999,6 +999,7 @@ mod tests {
         "#;
         #[derive(Deserialize)]
         struct W {
+            #[allow(dead_code)]
             images: BTreeMap<String, CloudImageEntry>,
         }
         let w: W = toml::from_str(toml).unwrap();
@@ -1014,6 +1015,7 @@ mod tests {
         "#;
         #[derive(Deserialize)]
         struct W {
+            #[allow(dead_code)]
             images: BTreeMap<String, CloudImageEntry>,
         }
         let w: W = toml::from_str(toml).unwrap();
@@ -1029,6 +1031,7 @@ mod tests {
         "#;
         #[derive(Deserialize)]
         struct W {
+            #[allow(dead_code)]
             images: BTreeMap<String, CloudImageEntry>,
         }
         assert!(toml::from_str::<W>(toml).is_err());
@@ -1044,6 +1047,7 @@ mod tests {
         "#;
         #[derive(Deserialize)]
         struct W {
+            #[allow(dead_code)]
             images: BTreeMap<String, CloudImageEntry>,
         }
         let w: W = toml::from_str(toml).unwrap();
