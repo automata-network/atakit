@@ -75,6 +75,9 @@ pub enum DeployStep {
     },
     CreateDisks {
         disks: Vec<DiskSpec>,
+        /// Resource group the disks live in. `None` for providers without
+        /// resource groups (GCP); `Some` for Azure.
+        resource_group: Option<String>,
     },
     CreateInstance {
         instance_name: String,
@@ -175,6 +178,9 @@ pub enum DestroyStep {
     },
     DeleteDisks {
         names: Vec<String>,
+        /// Resource group the disks live in. `None` for providers without
+        /// resource groups (GCP); `Some` for Azure.
+        resource_group: Option<String>,
     },
     DeleteFirewall {
         name: String,
@@ -265,7 +271,7 @@ impl fmt::Display for DeployStep {
                     format_ports_inline(ports)
                 )
             }
-            DeployStep::CreateDisks { disks } => {
+            DeployStep::CreateDisks { disks, .. } => {
                 let names: Vec<_> = disks.iter().map(|d| d.name.as_str()).collect();
                 write!(f, "Create persistent disks: {}", names.join(", "))
             }
@@ -317,7 +323,7 @@ impl fmt::Display for DestroyStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DestroyStep::DeleteInstance { name } => write!(f, "Delete VM instance '{name}'"),
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks { names, .. } => {
                 write!(f, "Delete disks: {}", names.join(", "))
             }
             DestroyStep::DeleteFirewall { name } => write!(f, "Delete firewall rule '{name}'"),
