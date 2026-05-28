@@ -574,16 +574,14 @@ mod tests {
     fn parse_disk_passphrases_accepts_tpm_passphrase_combo() {
         // tpm+passphrase disk: the passphrase keyslot must still be supplied.
         let declared = declared(&[("appdata", &["tpm", "passphrase"])]);
-        let parsed =
-            parse_disk_passphrases(&["appdata=x".to_string()], &declared).unwrap();
+        let parsed = parse_disk_passphrases(&["appdata=x".to_string()], &declared).unwrap();
         assert_eq!(parsed.get("appdata").map(String::as_str), Some("x"));
     }
 
     #[test]
     fn parse_disk_passphrases_value_may_contain_equals() {
         let declared = declared(&[("secrets", &["passphrase"])]);
-        let parsed =
-            parse_disk_passphrases(&["secrets=a=b=c".to_string()], &declared).unwrap();
+        let parsed = parse_disk_passphrases(&["secrets=a=b=c".to_string()], &declared).unwrap();
         assert_eq!(parsed.get("secrets").map(String::as_str), Some("a=b=c"));
     }
 
