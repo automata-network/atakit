@@ -1720,8 +1720,14 @@ encryption = { unlock_method = ["keyfile"], bind = [] }
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("keyfile"), "expected method name in error: {msg}");
-        assert!(msg.contains("not implemented yet"), "expected 'not implemented yet' wording: {msg}");
+        assert!(
+            msg.contains("keyfile"),
+            "expected method name in error: {msg}"
+        );
+        assert!(
+            msg.contains("not implemented yet"),
+            "expected 'not implemented yet' wording: {msg}"
+        );
     }
 
     #[test]
@@ -1809,7 +1815,10 @@ encryption = { unlock_method = ["tpm"], bind = [] }
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bind is empty"), "expected empty-bind wording: {msg}");
+        assert!(
+            msg.contains("bind is empty"),
+            "expected empty-bind wording: {msg}"
+        );
         // The error lists the available bind options.
         assert!(
             msg.contains("platform") && msg.contains("baseimage") && msg.contains("workload"),

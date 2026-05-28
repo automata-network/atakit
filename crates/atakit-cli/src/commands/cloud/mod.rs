@@ -242,11 +242,11 @@ pub(crate) fn resolve_workload(
                 .disks
                 .iter()
                 .map(|(k, v)| {
-                (
-                    k.clone(),
-                    (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
-                )
-            })
+                    (
+                        k.clone(),
+                        (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+                    )
+                })
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
             let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
