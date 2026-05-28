@@ -126,6 +126,13 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
+    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
+    /// disk declared in the workload manifest with `passphrase` in its
+    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
+    /// deploy time rather than persisting in config.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub disk_passphrase: Vec<String>,
+
     /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
     /// Takes precedence over the target's `boot_disk_size` and the workload
     /// manifest's minimum. Must be >= the workload minimum.
@@ -295,6 +302,13 @@ pub struct InitArgs {
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
+
+    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
+    /// disk declared in the workload manifest with `passphrase` in its
+    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
+    /// init time rather than persisting in config.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub disk_passphrase: Vec<String>,
 }
 
 /// Arguments for `cloud serial`.

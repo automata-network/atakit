@@ -497,11 +497,15 @@ pub struct DiskSection {
     /// If omitted, auto-assigned starting from 10 in alphabetical disk name order.
     pub index: Option<u32>,
     pub size: String,
-    #[serde(default)]
-    pub encryption: Option<EncryptionSection>,
+    /// Required: a disk declaration must always carry an `encryption` block.
+    /// Empty arrays (`unlock_method = []`, `bind = []`) are the explicit
+    /// "no encryption" commitment. Omitting the block is a parse error so
+    /// that the absence of encryption is always a deliberate choice.
+    pub encryption: EncryptionSection,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionSection {
     #[serde(default)]
     pub unlock_method: Vec<String>,
@@ -747,7 +751,7 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert!(cfg.baby_container.is_some());
         assert!(cfg.disks.contains_key("data"));
         assert_eq!(cfg.disks["data"].index, Some(10));
-        let enc = cfg.disks["data"].encryption.as_ref().unwrap();
+        let enc = &cfg.disks["data"].encryption;
         assert_eq!(enc.unlock_method, vec!["tpm"]);
         assert_eq!(enc.bind, vec!["workload"]);
     }

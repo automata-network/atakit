@@ -205,11 +205,14 @@ pub struct ManifestDisk {
     /// LUN / device index for cloud disk attachment.
     pub index: u32,
     pub size: String,
-    #[serde(default)]
-    pub encryption: Option<ManifestDiskEncryption>,
+    /// Always serialised, even when both lists are empty. An empty
+    /// `unlock_method` is itself a positive commitment that the disk
+    /// runs without encryption — same "Empty as commitment" rule as
+    /// `cap-add`/`cap-drop`.
+    pub encryption: ManifestDiskEncryption,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ManifestDiskEncryption {
     pub unlock_method: Vec<String>,
     pub bind: Vec<String>,
@@ -460,10 +463,10 @@ pub fn build_manifest(
         .disks
         .iter()
         .map(|(name, d)| {
-            let enc = d.encryption.as_ref().map(|e| ManifestDiskEncryption {
-                unlock_method: e.unlock_method.clone(),
-                bind: e.bind.clone(),
-            });
+            let enc = ManifestDiskEncryption {
+                unlock_method: d.encryption.unlock_method.clone(),
+                bind: d.encryption.bind.clone(),
+            };
             let index = resolved_indices.get(name).copied().unwrap_or(10);
             (
                 name.clone(),
@@ -870,6 +873,68 @@ cap-drop = ["KILL"]
         assert!(json.contains("\"cap-drop\":[\"NET_BIND_SERVICE\"]"));
         assert!(json.contains("\"cap-add\":[\"NET_RAW\"]"));
         assert!(json.contains("\"cap-drop\":[\"KILL\"]"));
+    }
+
+    #[test]
+    fn disk_encryption_empty_arrays_serialize_to_canonical_shape() {
+        // A disk with an explicit empty encryption block must serialise as
+        // `{"bind":[],"unlock_method":[]}` — the "no encryption" commitment
+        // that contributes to PCR23.
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "app:latest",
+            BTreeMap::new(), // environment
+            BTreeMap::new(), // dep_environments
+            BTreeMap::new(), // hashes
+            BTreeSet::new(), // unmeasured_data
+            BTreeMap::new(), // images
+        );
+        let json = serialize_canonical_json(&manifest).unwrap();
+        assert!(
+            json.contains("\"encryption\":{\"bind\":[],\"unlock_method\":[]}"),
+            "expected empty encryption block in canonical JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn disk_without_encryption_block_is_rejected_at_parse() {
+        // Omitting the `encryption` block on a declared disk must be a
+        // parse error. Absence of encryption must always be an explicit
+        // `encryption = { unlock_method = [], bind = [] }`.
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+"#;
+        let err = toml::from_str::<WorkloadConfig>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("encryption"),
+            "expected missing-field error mentioning encryption, got: {msg}"
+        );
     }
 
     #[test]

@@ -189,8 +189,10 @@ pub(crate) struct ResolvedWorkload {
     pub name: String,
     pub version: String,
     pub ports: Vec<String>,
-    /// Disk name -> (index, size string e.g. "10GB").
-    pub disks: BTreeMap<String, (u32, String)>,
+    /// Disk name -> (index, size string e.g. "10GB", declared unlock_method).
+    /// The unlock_method list is carried so deploy/init can validate
+    /// `--disk-passphrase` against what each disk actually requires.
+    pub disks: BTreeMap<String, (u32, String, Vec<String>)>,
     /// Minimum boot/OS disk size (e.g. "50GB"). None = cloud default.
     pub boot_disk_size: Option<String>,
     /// Base image access control mode: "any", "whitelist", or "blacklist".
@@ -239,7 +241,12 @@ pub(crate) fn resolve_workload(
                 .manifest
                 .disks
                 .iter()
-                .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+                .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+                )
+            })
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
             let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
@@ -276,7 +283,12 @@ pub(crate) fn resolve_workload(
             .manifest
             .disks
             .iter()
-            .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+                )
+            })
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
@@ -336,7 +348,12 @@ pub(crate) fn resolve_workload(
         .manifest
         .disks
         .iter()
-        .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+            )
+        })
         .collect();
     // The declared unmeasured-data set comes from the manifest (committed to
     // PCR23), not the source TOML, so every deploy mode resolves the same set.

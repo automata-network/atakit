@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig};
 use atakit_core::Env;
@@ -75,6 +77,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .get(&gas_wallet_name)
         .ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
 
+    // Validate operator-supplied disk passphrases against what the workload
+    // manifest declares (unknown / orphan / missing disks).
+    let declared: BTreeMap<String, Vec<String>> = resolved
+        .disks
+        .iter()
+        .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
+        .collect();
+    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+
     let init_config = InitConfig {
         platform: args.platform.clone(),
         chain: InitChainConfig {
@@ -104,6 +115,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 None
             },
         },
+        disks: disk_passphrases,
     };
 
     // 5. Show plan and confirm.

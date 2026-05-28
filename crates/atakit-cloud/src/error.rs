@@ -46,6 +46,9 @@ pub enum CloudError {
     #[error("disk error: {message}")]
     DiskError { message: String },
 
+    #[error("invalid --disk-passphrase: {message}")]
+    InvalidDiskPassphrase { message: String },
+
     #[error("instance error: {message}")]
     InstanceError { message: String },
 
