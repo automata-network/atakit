@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context, Result};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
@@ -212,7 +214,21 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         base_image_list,
         unmeasured_tar,
         unmeasured_data_paths,
-    ): (_, _, _, _, _, _, Option<String>, _, _, _, Vec<String>);
+        disk_passphrases,
+    ): (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        Option<String>,
+        _,
+        _,
+        _,
+        Vec<String>,
+        BTreeMap<String, String>,
+    );
     if image_only {
         archive_path = String::new();
         workload_name = String::new();
@@ -225,6 +241,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         base_image_list = Vec::new();
         unmeasured_tar = None;
         unmeasured_data_paths = Vec::<String>::new();
+        // No workload in image-only mode; reject any stray --disk-passphrase.
+        disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &BTreeMap::new())?;
     } else {
         let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
         workload_name = resolved.name;
@@ -233,13 +251,21 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_disks = resolved
             .disks
             .iter()
-            .map(|(name, (index, size))| {
+            .map(|(name, (index, size, _unlock))| {
                 let gb = parse_size_gb(size).ok_or_else(|| {
                     anyhow::anyhow!("invalid disk size '{size}' for disk '{name}'")
                 })?;
                 Ok((name.clone(), *index, gb))
             })
             .collect::<Result<Vec<_>>>()?;
+        // Validate --disk-passphrase against the manifest's declared disks
+        // (unknown / orphan / missing) up front, before provisioning anything.
+        let declared: BTreeMap<String, Vec<String>> = resolved
+            .disks
+            .iter()
+            .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
+            .collect();
+        disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
         workload_boot_min = resolved.boot_disk_size.clone();
         base_image_mode = resolved.base_image_mode;
         base_image_list = resolved.base_image;
@@ -799,6 +825,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                             None
                         },
                     },
+                    disks: disk_passphrases.clone(),
                 };
 
                 match init::post_portal_init(&ip, 1024, ap, unmeasured_tar.as_deref(), &init_config)

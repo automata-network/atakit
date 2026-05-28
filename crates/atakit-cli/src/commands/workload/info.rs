@@ -192,10 +192,8 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         for (name, disk) in &m.disks {
             let mount = m.config.disks.get(name).map(|s| s.as_str()).unwrap_or("-");
             let mut flags = vec![&disk.size[..]];
-            if let Some(ref enc) = disk.encryption {
-                if !enc.unlock_method.is_empty() {
-                    flags.push("encrypted");
-                }
+            if !disk.encryption.unlock_method.is_empty() {
+                flags.push("encrypted");
             }
             println!(
                 "  {:<18}{}  {}",

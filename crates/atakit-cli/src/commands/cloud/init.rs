@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use atakit_cloud::cli::InitArgs;
 use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig};
@@ -141,6 +143,16 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             )
         })?;
 
+    // Validate operator-supplied disk passphrases against what the workload
+    // manifest declares (unknown / orphan / missing disks) before touching
+    // the portal.
+    let declared: BTreeMap<String, Vec<String>> = resolved
+        .disks
+        .iter()
+        .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
+        .collect();
+    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+
     let init_config = InitConfig {
         platform: provider_config.platform.to_string(),
         chain: InitChainConfig {
@@ -170,6 +182,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 None
             },
         },
+        disks: disk_passphrases,
     };
 
     // 6. Show plan and confirm.

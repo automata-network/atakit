@@ -370,23 +370,55 @@ pub fn validate_config(
                     )));
                 }
             }
-            if let Some(ref enc) = disk.encryption {
-                let valid_unlock = ["tpm", "passphrase", "keyfile", "kms"];
+            let enc = &disk.encryption;
+            const SUPPORTED_METHODS: &[&str] = &["tpm", "passphrase"];
+            const NOT_YET_IMPLEMENTED_METHODS: &[&str] = &["keyfile", "kms"];
+            for method in &enc.unlock_method {
+                let m = method.as_str();
+                if SUPPORTED_METHODS.contains(&m) {
+                    continue;
+                }
+                if NOT_YET_IMPLEMENTED_METHODS.contains(&m) {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?} encryption.unlock_method {method:?} is not implemented yet; \
+                         supported methods are {SUPPORTED_METHODS:?}"
+                    )));
+                }
+                return Err(WorkloadError::Validation(format!(
+                    "disk {name:?} encryption.unlock_method contains unknown method: {method:?}; \
+                     supported methods are {SUPPORTED_METHODS:?}"
+                )));
+            }
+            {
+                let mut seen = std::collections::HashSet::new();
                 for method in &enc.unlock_method {
-                    if !valid_unlock.contains(&method.as_str()) {
+                    if !seen.insert(method.as_str()) {
                         return Err(WorkloadError::Validation(format!(
-                            "disk {name:?} encryption.unlock_method contains unknown method: {method:?}"
+                            "disk {name:?} encryption.unlock_method has duplicate entry {method:?}"
                         )));
                     }
                 }
-                let valid_bind = ["platform", "baseimage", "workload"];
-                for b in &enc.bind {
-                    if !valid_bind.contains(&b.as_str()) {
-                        return Err(WorkloadError::Validation(format!(
-                            "disk {name:?} encryption.bind contains unknown binding: {b:?}"
-                        )));
-                    }
+            }
+            let valid_bind = ["platform", "baseimage", "workload"];
+            for b in &enc.bind {
+                if !valid_bind.contains(&b.as_str()) {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?} encryption.bind contains unknown binding: {b:?}; \
+                         valid bindings are {valid_bind:?}"
+                    )));
                 }
+            }
+            // tpm seals the disk key under a TPM2 PCR policy, so it must say
+            // which measurements to bind to; an empty bind would seal to no
+            // PCRs and give no protection. passphrase unlock ignores bind,
+            // so this only applies when tpm is one of the methods.
+            if enc.unlock_method.iter().any(|m| m == "tpm") && enc.bind.is_empty() {
+                return Err(WorkloadError::Validation(format!(
+                    "disk {name:?} uses tpm unlock but encryption.bind is empty; \
+                     tpm seals the disk key under a PCR policy and must bind to at \
+                     least one of {valid_bind:?} (platform = firmware PCRs 0-7, \
+                     baseimage = base image PCR 11, workload = manifest PCR 23)"
+                )));
             }
         }
     }
@@ -1180,6 +1212,7 @@ image = "x:latest"
 [disks.data]
 index = 10
 size = "big"
+encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1201,14 +1234,17 @@ image = "x:latest"
 [disks.a]
 index = 10
 size = "10GB"
+encryption = { unlock_method = [], bind = [] }
 
 [disks.b]
 index = 11
 size = "20GB"
+encryption = { unlock_method = [], bind = [] }
 
 [disks.c]
 index = 12
 size = "1TB"
+encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1229,6 +1265,7 @@ image = "x:latest"
 [disks.data]
 index = 5
 size = "10GB"
+encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1250,10 +1287,12 @@ image = "x:latest"
 [disks.a]
 index = 10
 size = "10GB"
+encryption = { unlock_method = [], bind = [] }
 
 [disks.b]
 index = 10
 size = "5GB"
+encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1284,6 +1323,7 @@ shared = "/cache"
 [disks.shared]
 index = 10
 size = "10GB"
+encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1658,6 +1698,144 @@ cap-drop = ["NET_RAW"]
         assert!(msg.contains("dependencies.sidecar"));
         assert!(msg.contains("NET_RAW"));
         assert!(msg.contains("both cap-add and cap-drop"));
+    }
+
+    #[test]
+    fn rejects_reserved_unlock_method_keyfile() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["keyfile"], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("keyfile"), "expected method name in error: {msg}");
+        assert!(msg.contains("not implemented yet"), "expected 'not implemented yet' wording: {msg}");
+    }
+
+    #[test]
+    fn rejects_reserved_unlock_method_kms() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["kms"], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("kms"));
+    }
+
+    #[test]
+    fn rejects_duplicate_unlock_method() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["tpm", "tpm"], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn accepts_tpm_and_passphrase() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["tpm", "passphrase"], bind = ["workload"] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_tpm_unlock_with_empty_bind() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["tpm"], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bind is empty"), "expected empty-bind wording: {msg}");
+        // The error lists the available bind options.
+        assert!(
+            msg.contains("platform") && msg.contains("baseimage") && msg.contains("workload"),
+            "expected bind options in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_tpm_unlock_with_bind() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = ["tpm"], bind = ["platform"] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
     }
 
     #[test]

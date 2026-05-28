@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::error::CloudError;
@@ -10,6 +11,106 @@ pub struct InitConfig {
     pub chain: InitChainConfig,
     pub owner_key: InitKeyConfig,
     pub gas_wallet: InitKeyConfig,
+    /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
+    /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
+    /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
+    /// the common no-encryption / TPM-only case (then the `disks` field is
+    /// omitted from the JSON entirely). Passphrases are per-VM secrets, so
+    /// they come from the `--disk-passphrase NAME=VALUE` CLI flag rather
+    /// than persisted config. Validate names against the declared disks
+    /// with [`parse_disk_passphrases`] before populating this.
+    pub disks: BTreeMap<String, String>,
+}
+
+/// Parse `--disk-passphrase NAME=VALUE` entries into a name→passphrase map,
+/// validating each NAME against the disks the workload manifest declares.
+///
+/// `declared` maps each declared disk name to its `unlock_method` list (from
+/// the manifest). The checks — which the portal would otherwise apply later
+/// (at `/init`, or worse at disk-create time mid-boot) — are done here so the
+/// operator gets a fast, clear error before anything is uploaded:
+///
+/// - **Unknown disk** — a `NAME` not in `declared` (operator typo).
+/// - **Orphan passphrase** — `NAME` is declared but its `unlock_method` does
+///   not include `"passphrase"`, so the passphrase would be ignored.
+/// - **Missing passphrase** — a declared disk lists `"passphrase"` in its
+///   `unlock_method` but no `--disk-passphrase` was supplied for it (the
+///   common "I forgot the passphrase" mistake).
+/// - Malformed entries, empty names, empty values, and duplicate names.
+///
+/// The passphrase value is taken verbatim after the first `=` (so it may
+/// contain `=`); only the name is trimmed.
+pub fn parse_disk_passphrases(
+    raw: &[String],
+    declared: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, String>, CloudError> {
+    let uses_passphrase = |methods: &[String]| methods.iter().any(|m| m == "passphrase");
+
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for entry in raw {
+        let (name, value) =
+            entry
+                .split_once('=')
+                .ok_or_else(|| CloudError::InvalidDiskPassphrase {
+                    message: format!("expected NAME=VALUE, got {entry:?}"),
+                })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!("empty disk name in {entry:?}"),
+            });
+        }
+        if value.is_empty() {
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!("empty passphrase for disk '{name}'"),
+            });
+        }
+        let Some(methods) = declared.get(name) else {
+            let mut names: Vec<&str> = declared.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            let names = if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(", ")
+            };
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!(
+                    "disk '{name}' is not declared in the workload manifest; \
+                     declared disks: {names}"
+                ),
+            });
+        };
+        if !uses_passphrase(methods) {
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!(
+                    "disk '{name}' does not use passphrase unlock \
+                     (unlock_method = {methods:?}); --disk-passphrase only \
+                     applies to disks with \"passphrase\" in their unlock_method"
+                ),
+            });
+        }
+        if out.insert(name.to_string(), value.to_string()).is_some() {
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!("duplicate --disk-passphrase for disk '{name}'"),
+            });
+        }
+    }
+
+    // Reverse check: every disk that declares passphrase unlock must have
+    // been given one — the common "operator forgot --disk-passphrase" case.
+    for (name, methods) in declared {
+        if uses_passphrase(methods) && !out.contains_key(name) {
+            return Err(CloudError::InvalidDiskPassphrase {
+                message: format!(
+                    "disk '{name}' requires a passphrase (its unlock_method \
+                     includes \"passphrase\") but none was supplied; \
+                     pass --disk-passphrase {name}=<value>"
+                ),
+            });
+        }
+    }
+
+    Ok(out)
 }
 
 /// Chain config section of the init payload.
@@ -85,7 +186,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         chain["chain_id"] = serde_json::Value::Number(id.into());
     }
 
-    serde_json::json!({
+    let mut portal_config = serde_json::json!({
         "format": 1,
         "platform": {
             "declared": &config.platform,
@@ -93,7 +194,27 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         "chain": chain,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
-    })
+    });
+
+    // Only emit `disks` when there is at least one passphrase, so the
+    // common no-encryption / TPM-only deploy produces the exact JSON the
+    // portal saw before this field existed (the portal defaults `disks`
+    // to empty when the key is absent).
+    if !config.disks.is_empty() {
+        let disks: serde_json::Map<String, serde_json::Value> = config
+            .disks
+            .iter()
+            .map(|(name, passphrase)| {
+                (
+                    name.clone(),
+                    serde_json::json!({ "passphrase": passphrase }),
+                )
+            })
+            .collect();
+        portal_config["disks"] = serde_json::Value::Object(disks);
+    }
+
+    portal_config
 }
 
 /// Poll the portal status endpoint with exponential backoff.
@@ -340,7 +461,22 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: None,
             },
+            disks: BTreeMap::new(),
         }
+    }
+
+    /// Build a declared-disk map: each `(name, &[methods])` becomes
+    /// `name -> unlock_method`.
+    fn declared(disks: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        disks
+            .iter()
+            .map(|(name, methods)| {
+                (
+                    name.to_string(),
+                    methods.iter().map(|m| m.to_string()).collect(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -366,6 +502,113 @@ mod tests {
         // applies, matching pre-patch behaviour.
         assert!(json["chain"].get("registration").is_none());
         assert!(json["chain"].get("chain_id").is_none());
+
+        // No disk passphrases → no `disks` key at all (pre-field JSON).
+        assert!(json.get("disks").is_none());
+    }
+
+    #[test]
+    fn portal_config_json_emits_disk_passphrases_when_present() {
+        let mut cfg = sample_config();
+        cfg.disks
+            .insert("secrets".to_string(), "hunter2".to_string());
+        cfg.disks
+            .insert("appdata".to_string(), "correct horse".to_string());
+
+        let json = build_portal_config_json(&cfg);
+        assert_eq!(json["disks"]["secrets"]["passphrase"], "hunter2");
+        assert_eq!(json["disks"]["appdata"]["passphrase"], "correct horse");
+        // Exactly the per-disk passphrase object, nothing else.
+        assert_eq!(json["disks"]["secrets"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_disk_passphrases_accepts_declared_names() {
+        let declared = declared(&[("secrets", &["passphrase"]), ("appdata", &["passphrase"])]);
+        let raw = vec![
+            "secrets=hunter2".to_string(),
+            "appdata=correct horse".to_string(),
+        ];
+        let parsed = parse_disk_passphrases(&raw, &declared).unwrap();
+        assert_eq!(parsed.get("secrets").map(String::as_str), Some("hunter2"));
+        assert_eq!(
+            parsed.get("appdata").map(String::as_str),
+            Some("correct horse")
+        );
+    }
+
+    #[test]
+    fn parse_disk_passphrases_rejects_undeclared_disk() {
+        let declared = declared(&[("data", &["tpm"])]);
+        let err = parse_disk_passphrases(&["typo=x".to_string()], &declared).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("typo"), "got: {msg}");
+        assert!(msg.contains("not declared"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_disk_passphrases_rejects_orphan_passphrase() {
+        // A passphrase for a disk that doesn't use passphrase unlock.
+        let declared = declared(&[("data", &["tpm"])]);
+        let err = parse_disk_passphrases(&["data=x".to_string()], &declared).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("data"), "got: {msg}");
+        assert!(msg.contains("does not use passphrase"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_disk_passphrases_rejects_missing_passphrase() {
+        // A disk declares passphrase unlock but the operator supplied none.
+        let declared = declared(&[("secrets", &["passphrase"])]);
+        let err = parse_disk_passphrases(&[], &declared).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("secrets"), "got: {msg}");
+        assert!(msg.contains("requires a passphrase"), "got: {msg}");
+        assert!(
+            msg.contains("--disk-passphrase secrets="),
+            "expected the fix hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_disk_passphrases_accepts_tpm_passphrase_combo() {
+        // tpm+passphrase disk: the passphrase keyslot must still be supplied.
+        let declared = declared(&[("appdata", &["tpm", "passphrase"])]);
+        let parsed =
+            parse_disk_passphrases(&["appdata=x".to_string()], &declared).unwrap();
+        assert_eq!(parsed.get("appdata").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn parse_disk_passphrases_value_may_contain_equals() {
+        let declared = declared(&[("secrets", &["passphrase"])]);
+        let parsed =
+            parse_disk_passphrases(&["secrets=a=b=c".to_string()], &declared).unwrap();
+        assert_eq!(parsed.get("secrets").map(String::as_str), Some("a=b=c"));
+    }
+
+    #[test]
+    fn parse_disk_passphrases_rejects_malformed_empty_and_duplicate() {
+        let declared = declared(&[("secrets", &["passphrase"])]);
+        // No '='.
+        assert!(parse_disk_passphrases(&["secrets".to_string()], &declared).is_err());
+        // Empty value.
+        assert!(parse_disk_passphrases(&["secrets=".to_string()], &declared).is_err());
+        // Empty name.
+        assert!(parse_disk_passphrases(&["=x".to_string()], &declared).is_err());
+        // Duplicate name.
+        assert!(parse_disk_passphrases(
+            &["secrets=a".to_string(), "secrets=b".to_string()],
+            &declared
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_disk_passphrases_empty_input_is_empty_map() {
+        // No passphrase-requiring disks → empty input is valid.
+        let declared = declared(&[("scratch", &["tpm"])]);
+        assert!(parse_disk_passphrases(&[], &declared).unwrap().is_empty());
     }
 
     /// When the operator sets `registration` and/or `chain_id` in
