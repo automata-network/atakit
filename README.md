@@ -75,9 +75,9 @@ automata = { repo = "automata-network/automata-linux" }
 # Hoodi testnet deployment.
 [chains.hoodi]
 rpc_url             = "https://1rpc.io/hoodi"
-session_registry    = "0xD1860020870ffEd23a644d0CD4CA9E7b3Ff53D6c"
-workload_registry   = "0xFA8Eb822594d7aA7221aBE3Cd7F3F17c3F16bA9E"
-base_image_registry = "0x15A8F7A012b2dBad3fAD6020a0dF1F81E86F6171"
+session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
+workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
+base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 registration        = "optional"
 expire_offset       = 3600
 
@@ -236,9 +236,9 @@ once and shared. The example below covers the common sections:
 # session_registry on-chain when omitted.
 [chains.hoodi]
 rpc_url             = "https://1rpc.io/hoodi"
-session_registry    = "0xD1860020870ffEd23a644d0CD4CA9E7b3Ff53D6c"
-workload_registry   = "0xFA8Eb822594d7aA7221aBE3Cd7F3F17c3F16bA9E"
-base_image_registry = "0x15A8F7A012b2dBad3fAD6020a0dF1F81E86F6171"
+session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
+workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
+base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 registration        = "optional"   # "required" | "optional" | "off"
 expire_offset       = 3600
 
