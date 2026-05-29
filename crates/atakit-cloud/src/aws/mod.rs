@@ -242,7 +242,8 @@ impl CloudProvider for AwsProvider {
             | DeployStep::CreateDisks { .. }
             | DeployStep::CreateResourceGroup { .. }
             | DeployStep::UploadImageAzure { .. }
-            | DeployStep::CreateInstanceAzure { .. } => {
+            | DeployStep::CreateInstanceAzure { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
                     message: "non-AWS step executed by AWS provider".to_string(),
                 });
@@ -314,14 +315,16 @@ impl CloudProvider for AwsProvider {
             }
             DestroyStep::DeleteS3Bucket { name } => image::delete_bucket(name, runner).await,
 
-            // GCP / Azure steps.
+            // GCP / Azure / QEMU steps.
             DestroyStep::DeleteDisks { .. }
             | DestroyStep::DeleteFirewall { .. }
             | DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
             | DestroyStep::DeleteResourceGroup { .. }
             | DestroyStep::DeleteImageVersion { .. }
-            | DestroyStep::DeleteImageDefinition { .. } => Err(CloudError::State {
+            | DestroyStep::DeleteImageDefinition { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
                 message: "non-AWS destroy step executed by AWS provider".to_string(),
             }),
         }

@@ -150,6 +150,25 @@ pub enum DeployStep {
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
     },
+    // QEMU-specific steps.
+    /// Provision a local QEMU instance: create the boot-disk qcow2 overlay,
+    /// create one qcow2 per data disk, start swtpm with `--terminate`,
+    /// allocate free host ports for the portal forwards (+ optional ssh), and
+    /// spawn `qemu-system-x86_64` detached. Returns external_ip = 127.0.0.1
+    /// plus the recorded pid, instance dir, and host-port mapping.
+    StartLocalVm {
+        instance_dir: String,
+        base_disk: String,
+        boot_overlay: String,
+        boot_disk_size_gb: Option<u64>,
+        ovmf_path: String,
+        data_disks: Vec<DiskSpec>,
+        metadata: Vec<(String, String)>,
+        /// Workload-declared `"port/proto"` entries. TCP entries are forwarded
+        /// guest→same-host-port for predictability; non-tcp entries are
+        /// ignored (qemu user-mode networking has no UDP hostfwd in practice).
+        workload_ports: Vec<String>,
+    },
 }
 
 /// Persistent disk specification.
@@ -217,6 +236,16 @@ pub enum DestroyStep {
     DeleteS3Bucket {
         name: String,
     },
+    // QEMU-specific destroy steps.
+    /// Stop the running qemu process (SIGTERM, then SIGKILL on grace timeout).
+    /// swtpm self-terminates with the VM when launched with `--terminate`.
+    StopLocalVm {
+        pid: u32,
+    },
+    /// Remove the per-instance directory (overlays + serial log + swtpm state).
+    RemoveLocalInstanceDir {
+        path: String,
+    },
 }
 
 /// Result from executing a deploy step, with resource updates.
@@ -244,6 +273,18 @@ pub struct ResourceUpdates {
     pub nsg: Option<String>,
     // AWS fields.
     pub snapshot: Option<String>,
+    // QEMU fields.
+    pub qemu_pid: Option<u32>,
+    pub qemu_instance_dir: Option<String>,
+    pub qemu_base_disk: Option<String>,
+    pub qemu_boot_overlay: Option<String>,
+    pub qemu_host_status_port: Option<u16>,
+    pub qemu_host_init_port: Option<u16>,
+    /// Path to the unix-socket chardev that `-serial chardev:ser` is wired to.
+    /// `cloud ssh` socats into this for an interactive console.
+    pub qemu_serial_sock: Option<String>,
+    /// Guest port → host port for workload-declared TCP ports.
+    pub qemu_workload_port_map: BTreeMap<u16, u16>,
 }
 
 impl fmt::Display for DeployStep {
@@ -315,6 +356,13 @@ impl fmt::Display for DeployStep {
             DeployStep::CreateInstanceAws { instance_name, .. } => {
                 write!(f, "Create VM instance '{instance_name}'")
             }
+            DeployStep::StartLocalVm { data_disks, .. } => {
+                if data_disks.is_empty() {
+                    write!(f, "Start local QEMU VM")
+                } else {
+                    write!(f, "Start local QEMU VM ({} data disk(s))", data_disks.len())
+                }
+            }
         }
     }
 }
@@ -348,6 +396,10 @@ impl fmt::Display for DestroyStep {
             }
             DestroyStep::DeleteAmi { name } => write!(f, "Delete AMI '{name}'"),
             DestroyStep::DeleteS3Bucket { name } => write!(f, "Delete S3 bucket '{name}'"),
+            DestroyStep::StopLocalVm { pid } => write!(f, "Stop local QEMU VM (pid {pid})"),
+            DestroyStep::RemoveLocalInstanceDir { path } => {
+                write!(f, "Remove instance directory '{path}'")
+            }
         }
     }
 }

@@ -63,6 +63,30 @@ impl<'a> InitEnvResolver<'a> {
             gas_wallet: self.gas_wallet(),
         }
     }
+
+    /// Like `build`, but never panics on missing fields. Used for the qemu
+    /// platform, where zero-config deploys are supported: unset chain/owner/
+    /// gas come through as empty strings, and the InitializeWorkload arm
+    /// synthesizes an implicit local chain + self-generated keys.
+    pub fn build_optional(&self) -> PersistedInitEnv {
+        PersistedInitEnv {
+            chain: self
+                .cli_chain
+                .map(String::from)
+                .or_else(|| self.target.chain.clone())
+                .unwrap_or_default(),
+            owner_key: self
+                .cli_owner_key
+                .map(String::from)
+                .or_else(|| self.target.owner_key.clone())
+                .unwrap_or_default(),
+            gas_wallet: self
+                .cli_gas_wallet
+                .map(String::from)
+                .or_else(|| self.target.gas_wallet.clone())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Parse instance reference: "target/instance" or just "instance".
@@ -158,6 +182,7 @@ fn resolve_store_image(
         PlatformKind::Gcp => ImagePlatform::Gcp,
         PlatformKind::Azure => ImagePlatform::Azure,
         PlatformKind::Aws => ImagePlatform::Aws,
+        PlatformKind::Qemu => ImagePlatform::Qemu,
     };
 
     let disk_path = store.image_path(image_ref, image_platform);
@@ -678,6 +703,10 @@ pub(super) fn build_cloud_image_record(
                 uploaded_at: chrono::Utc::now(),
             }
         }
+        PlatformKind::Qemu => unreachable!(
+            "build_cloud_image_record called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     }
 }
 
@@ -731,6 +760,10 @@ pub(super) async fn ensure_cloud_image(
             ))
         }
         PlatformKind::Aws => Box::new(AwsProvider::new(provider_config.region.clone())),
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image called for qemu — qemu has no cloud-side \
+             image and is filtered out upstream"
+        ),
     };
 
     let runner = ProcessRunner::new(verbose);
@@ -778,6 +811,10 @@ pub(super) async fn ensure_cloud_image(
                     .is_some();
             exists && !force
         }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image existence-check called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     if already_exists {
@@ -845,6 +882,10 @@ pub(super) async fn ensure_cloud_image(
             };
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image upload step called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);

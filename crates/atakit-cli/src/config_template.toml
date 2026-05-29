@@ -155,6 +155,18 @@
 # platform = "aws"
 # region = "us-east-2"          # SEV-SNP regions: us-east-2, eu-west-1
 
+# Local QEMU functional harness (not a real TEE). Boot is measured into
+# swtpm and the portal /init flow runs end-to-end against localhost, but
+# there is no genuine TDX/SEV quote. On-chain registration defaults to
+# "off" when the qemu target has no chain configured.
+# `uefi` is the path to a TPM-measuring OVMF firmware blob. Stock distro
+# OVMF lacks the right build; see the project README for the download.
+# Override per-target with `[cloud.targets.<name>] uefi = "..."`, or
+# per-run with `ATAKIT_QEMU_UEFI`.
+# [cloud.providers.qemu]
+# platform = "qemu"
+# uefi = "~/.local/share/atakit/firmware/ovmf.fd"
+
 # Image library: CC capabilities for image registration.
 # Simple form:   "name:tag" = ["SEV_SNP", "TDX"]
 # Extended form:  [cloud.images."name:tag"]
@@ -190,3 +202,11 @@
 # chain = "mainnet"
 # owner_key = "owner"
 # gas_wallet = "gas"
+
+# [cloud.targets.qemu-local]
+# provider = "qemu"               # vmtype is ignored (fixed 2 vCPU / 4 GiB)
+# image = "my-baseimage:v0.1.0"   # consumes qemu_disk.qcow2 from the image store
+# boot_disk_size = "10GB"         # OS disk overlay size (default 4GB)
+# uefi = "~/.local/share/atakit/firmware/ovmf.fd"  # optional override of [cloud.providers.qemu].uefi
+# chain/owner_key/gas_wallet may be omitted — qemu deploys with no chain
+# configured synthesize a local-only init payload with registration="off".

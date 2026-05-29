@@ -11,6 +11,10 @@ pub enum PlatformKind {
     Gcp,
     Azure,
     Aws,
+    /// Local QEMU functional harness. Not a real TEE — boot is measured into
+    /// a software TPM (swtpm), but there is no genuine TDX/SEV quote. Used
+    /// for offline workload-init iteration.
+    Qemu,
 }
 
 impl std::fmt::Display for PlatformKind {
@@ -19,7 +23,16 @@ impl std::fmt::Display for PlatformKind {
             PlatformKind::Gcp => write!(f, "gcp"),
             PlatformKind::Azure => write!(f, "azure"),
             PlatformKind::Aws => write!(f, "aws"),
+            PlatformKind::Qemu => write!(f, "qemu"),
         }
+    }
+}
+
+impl PlatformKind {
+    /// True for platforms that run the VM on the operator's machine. Used to
+    /// branch around steps that are cloud-only (image upload, firewall, etc.).
+    pub fn is_local(self) -> bool {
+        matches!(self, PlatformKind::Qemu)
     }
 }
 
@@ -118,8 +131,15 @@ pub struct CloudProviderConfig {
     pub project: Option<String>,
     /// Azure subscription ID.
     pub subscription: Option<String>,
-    /// Cloud region or zone.
+    /// Cloud region or zone. Empty for the qemu platform (no region).
+    #[serde(default)]
     pub region: String,
+    /// QEMU UEFI/OVMF firmware path. Only meaningful when `platform = "qemu"`.
+    /// Shared by every target that references this provider; can be overridden
+    /// per-target with `[cloud.targets.<name>] uefi = "..."`, or per-run via
+    /// `ATAKIT_QEMU_UEFI`.
+    #[serde(default)]
+    pub uefi: Option<String>,
 }
 
 /// Top-level `[cloud]` configuration section.
@@ -179,8 +199,16 @@ pub struct CloudTargetDefaults {
 pub struct CloudTarget {
     /// Provider name (references a key in `[cloud.providers]`).
     pub provider: String,
-    /// VM machine type.
+    /// VM machine type. Optional for `qemu` (ignored — local VMs use a fixed
+    /// 2 vCPU / 4 GiB shape). Required for cloud providers; `validate_target`
+    /// enforces this.
+    #[serde(default)]
     pub vmtype: String,
+    /// Override the provider-level QEMU UEFI firmware path. Only meaningful
+    /// when the target's provider is `platform = "qemu"`. Wins over
+    /// `[cloud.providers.<name>] uefi`; `ATAKIT_QEMU_UEFI` wins over both.
+    #[serde(default)]
+    pub uefi: Option<String>,
     /// Base image reference. Falls back to `[cloud.defaults] image`.
     /// `cloud deploy` enforces that either this, the default, or
     /// the `--image` flag is set.
@@ -272,6 +300,10 @@ pub fn infer_cc_type(platform: PlatformKind, vmtype: &str) -> Result<CcType, Clo
                 })
             }
         }
+        // Local qemu has no TEE; cc_type is nominal and never consumed by
+        // qemu steps. Return a stable default so callers that expect a
+        // total mapping (validation, display) keep working.
+        PlatformKind::Qemu => Ok(CcType::Tdx),
     }
 }
 
@@ -371,6 +403,12 @@ pub fn validate_target(
     let err = |msg: String| CloudError::Config {
         message: format!("target '{target_name}': {msg}"),
     };
+
+    // Local qemu skips zone/region/size validation entirely — there is no
+    // cloud-side compatibility matrix to enforce, and vmtype is ignored.
+    if matches!(provider.platform, PlatformKind::Qemu) {
+        return Ok(());
+    }
 
     // Validate explicit cc_type matches inferred.
     let inferred =
@@ -487,6 +525,8 @@ pub fn validate_target(
                 )));
             }
         }
+        // Qemu was short-circuited at the top of the function.
+        PlatformKind::Qemu => unreachable!("qemu validation handled by early return"),
     }
     Ok(())
 }
@@ -547,6 +587,7 @@ mod tests {
             project: None,
             subscription: None,
             region: region.to_string(),
+            uefi: None,
         }
     }
 
@@ -554,6 +595,7 @@ mod tests {
         CloudTarget {
             provider: "test-provider".to_string(),
             vmtype: vmtype.to_string(),
+            uefi: None,
             image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
@@ -1075,6 +1117,31 @@ mod tests {
     fn guest_os_features_omits_plain_sev() {
         // Only SEV-SNP is supported; plain SEV must not be advertised.
         assert!(!guest_os_features_for(&[CcType::SevSnp]).contains("SEV_CAPABLE"));
+    }
+
+    // ── Qemu ────────────────────────────────────────────
+
+    #[test]
+    fn qemu_skips_size_and_region_checks() {
+        let p = make_provider(PlatformKind::Qemu, ""); // no region
+        let mut t = make_target(""); // no vmtype
+        t.image = None;
+        assert!(validate_target(&t, &p, "qemu-local").is_ok());
+    }
+
+    #[test]
+    fn qemu_infer_cc_is_total() {
+        // Any vmtype (including empty) is fine; cc_type is nominal.
+        assert!(infer_cc_type(PlatformKind::Qemu, "").is_ok());
+        assert!(infer_cc_type(PlatformKind::Qemu, "anything").is_ok());
+    }
+
+    #[test]
+    fn qemu_is_local() {
+        assert!(PlatformKind::Qemu.is_local());
+        assert!(!PlatformKind::Gcp.is_local());
+        assert!(!PlatformKind::Azure.is_local());
+        assert!(!PlatformKind::Aws.is_local());
     }
 
     // ── CcType FromStr ──────────────────────────────────

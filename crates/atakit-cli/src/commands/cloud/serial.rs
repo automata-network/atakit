@@ -4,6 +4,7 @@ use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::SerialArgs;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::provider::CloudProvider;
+use atakit_cloud::qemu::QemuProvider;
 use atakit_cloud::state::DeployState;
 use atakit_cloud::ProcessRunner;
 use atakit_core::Env;
@@ -27,6 +28,9 @@ pub async fn run(args: SerialArgs, env: &Env, _config: &Config) -> Result<()> {
         }
         atakit_cloud::PlatformKind::Aws => {
             Box::new(AwsProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        atakit_cloud::PlatformKind::Qemu => {
+            Box::new(QemuProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
     };
 

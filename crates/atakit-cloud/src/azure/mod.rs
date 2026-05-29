@@ -508,11 +508,12 @@ impl CloudProvider for AzureProvider {
                 // Handled by CLI layer.
             }
 
-            // GCP / AWS steps - should not be executed by Azure provider.
+            // GCP / AWS / QEMU steps - should not be executed by Azure provider.
             DeployStep::UploadImage { .. }
             | DeployStep::CreateInstance { .. }
             | DeployStep::UploadImageAws { .. }
-            | DeployStep::CreateInstanceAws { .. } => {
+            | DeployStep::CreateInstanceAws { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
                     message: "non-Azure step executed by Azure provider".to_string(),
                 });
@@ -628,13 +629,15 @@ impl CloudProvider for AzureProvider {
             DestroyStep::DeleteResourceGroup { name } => {
                 instance::delete_resource_group(&self.subscription, name, runner).await
             }
-            // GCP / AWS steps.
+            // GCP / AWS / QEMU steps.
             DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
             | DestroyStep::DeleteFirewall { .. }
             | DestroyStep::DeleteSecurityGroup { .. }
             | DestroyStep::DeleteAmi { .. }
-            | DestroyStep::DeleteS3Bucket { .. } => Err(CloudError::State {
+            | DestroyStep::DeleteS3Bucket { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
                 message: "non-Azure destroy step executed by Azure provider".to_string(),
             }),
         }
@@ -761,6 +764,7 @@ mod tests {
         CloudTarget {
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
+            uefi: None,
             image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,

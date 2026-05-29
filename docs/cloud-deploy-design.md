@@ -1007,15 +1007,56 @@ Agent:      reachable (port 1024)
 
 A future agent `/status` endpoint would enable richer output (workload running/failed, uptime, resource usage). This is a CVM agent feature request, not an atakit-ng concern for now.
 
-### 11. QEMU (Deferred to v2)
+### 11. QEMU (Implemented)
 
-The `CloudProvider` trait supports it. When added:
-- No cloud CLI dependency (uses `qemu-system-x86_64`, `qemu-img`, `swtpm`)
-- No image upload (extract disk.raw locally)
-- No firewall (hostfwd rules in QEMU command)
-- Metadata via SMBIOS `type=11` entries
-- State tracks instance dir and PID
-- Init via localhost:1024
+Local functional harness reusing the `CloudProvider` trait, exposed as the
+`qemu` platform under `[cloud.providers.<name>]` / `[cloud.targets.<name>]`.
+Not a real TEE — boot is measured into swtpm vTPM, not a genuine TDX/SEV
+quote — so this is for offline `workload build → deploy → init → destroy`
+iteration, not attestation testing.
+
+Concrete shape of the implementation:
+
+- **No cloud CLI dependency** — shells out to `qemu-system-x86_64`,
+  `qemu-img`, `swtpm`. `/dev/kvm` is required.
+- **No image upload** — `atakit image pull <ref> qemu` drops
+  `qemu_disk.qcow2` into the local image store; `StartLocalVm` creates a
+  per-instance qcow2 overlay backed by it (sized to `boot_disk_size`).
+- **No firewall** — qemu user-mode networking with `hostfwd`. Portal
+  status/init ports are forwarded to ephemeral host ports allocated at
+  boot; workload-declared TCP ports are forwarded guest→same host port for
+  predictable `curl`. A best-effort guest-22→host-port forward backs
+  `cloud ssh`.
+- **Data disks** — each workload-manifest disk becomes a per-instance
+  qcow2 file attached via virtio-blk with `serial=<device_name>`, matching
+  the cloud agent's `/dev/disk/by-id/virtio-<name>` discovery convention.
+- **Metadata** via SMBIOS `type=11` OEM strings (`-smbios
+  type=11,value=<k>=<v>`). Whether the portal reads these on the qemu
+  platform is a portal-side concern; passing them is a no-op if unused.
+- **State** tracks `instance_dir`, `pid`, the host-port mapping, base disk
+  and overlay paths. `cloud serial` is `tail -f
+  <instance_dir>/serial.log`; `cloud destroy` SIGTERMs the pid then removes
+  the instance dir.
+- **swtpm** is launched with `--terminate` so it exits when qemu
+  disconnects.
+- **Init via localhost:<ephemeral>** — `deploy.rs`'s `WaitForPortal` /
+  `InitializeWorkload` arms read endpoints from
+  `portal_endpoints(state)`: cloud platforms keep using the deployment's
+  external IP + `2024`/`1024`; qemu uses `127.0.0.1` + the recorded host
+  ports.
+- **Zero-config chain/keys** — when a qemu target has no `chain`
+  configured, an implicit local chain is synthesized at `/init` time with
+  placeholder registry addresses and `registration = "off"`; unset
+  `owner_key` / `gas_wallet` fall back to `self_generated` so the portal
+  never needs a private key for a registration-off deploy.
+- **Firmware (OVMF)** is path-driven, not bundled: `ATAKIT_QEMU_UEFI` >
+  `[cloud.targets.<n>] uefi` > `[cloud.providers.<n>] uefi`. Stock distro
+  OVMF lacks the TPM-measuring build; it needs to be separately built.
+
+Open items (functional harness limits, not blockers): portal handling of
+SMBIOS metadata on the qemu platform, and whether `/init` accepts
+`self_generated` owner/gas under `registration="off"` (the deploy falls
+back to requiring real keys if not).
 
 ---
 

@@ -6,6 +6,7 @@ use atakit_cloud::cloud_images::CloudImages;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::plan::DestroyStep;
 use atakit_cloud::provider::CloudProvider;
+use atakit_cloud::qemu::QemuProvider;
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::ProcessRunner;
 use atakit_core::Env;
@@ -84,6 +85,9 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
         }
         atakit_cloud::PlatformKind::Aws => {
             Box::new(AwsProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        atakit_cloud::PlatformKind::Qemu => {
+            Box::new(QemuProvider::from_state(&state).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
     };
 
@@ -190,6 +194,16 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
         }
         if let Some(ref name) = aws.security_group {
             eprintln!("  {:<15}{}", "Sec group:".dimmed(), name);
+        }
+    }
+    if let Some(ref q) = state.resources.qemu {
+        eprintln!("  {:<15}local (qemu)", "Mode:".dimmed());
+        eprintln!("  {:<15}{}", "PID:".dimmed(), q.pid);
+        if !q.instance_dir.is_empty() {
+            eprintln!("  {:<15}{}", "Dir:".dimmed(), q.instance_dir);
+        }
+        if !q.data_disks.is_empty() {
+            eprintln!("  {:<15}{}", "Disks:".dimmed(), q.data_disks.len());
         }
     }
     if !state.workload_name.is_empty() {

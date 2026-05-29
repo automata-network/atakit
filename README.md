@@ -218,6 +218,57 @@ atakit cloud serial my-instance --target my-gcp
 atakit cloud destroy my-instance --target my-gcp
 ```
 
+### Local (QEMU) deploy
+
+For offline iteration, `atakit cloud deploy` can target a local QEMU VM via
+the `qemu` platform. This is a **functional harness**, not a real TEE: boot
+is measured into a software TPM (swtpm) and the portal `/init` → workload
+flow runs end-to-end against `localhost`, but there is no genuine TDX/SEV
+quote — so on-chain registration defaults to `off` when the qemu target has
+no chain configured.
+
+Requirements on the host:
+
+- `qemu-system-x86_64`, `qemu-img`, `swtpm` on `PATH`
+- `/dev/kvm` accessible
+- A TPM-enabled OVMF (ie, compiled with `TPM2_ENABLE=TRUE` and `TPM2_CONFIG_ENABLE=TRUE`)
+- `socat` (only needed for `atakit cloud ssh` to attach to the serial console)
+
+Minimal config:
+
+```toml
+[cloud.providers.qemu]
+platform = "qemu"
+uefi     = "~/.local/share/atakit/firmware/ovmf.fd"
+
+[cloud.targets.qemu-local]
+provider = "qemu"
+image    = "automata-linux:v0.1.6"   # uses qemu_disk.qcow2 from the image store
+```
+
+Then:
+
+```sh
+atakit image pull automata-linux:v0.1.6 qemu
+atakit cloud deploy my-service:v0.0.1 --target qemu-local
+
+atakit cloud ls                              # qemu deployments listed alongside cloud
+atakit cloud serial my-service-qemu-local    # tails serial.log (read-only)
+atakit cloud ssh    my-service-qemu-local    # interactive serial console (Ctrl-] to detach)
+atakit cloud destroy my-service-qemu-local   # stops qemu, removes overlays
+```
+
+`vmtype` is ignored for qemu (fixed 2 vCPU / 4 GiB). Data disks declared in
+the workload manifest become per-instance qcow2 overlays attached via virtio
+with `serial=<device_name>`, matching the cloud agent's discovery convention.
+Workload ports are forwarded guest→same host port (so `curl localhost:<port>`
+just works); the portal status/init ports are forwarded to ephemeral host
+ports to avoid collisions between instances.
+
+`cloud ssh` on qemu doesn't run a real ssh client — there's no sshd in the
+guest — it `socat`s into a unix socket wired to the VM's serial chardev for
+an interactive console.
+
 ## Configuration
 
 ### Operator config (`config.toml`)
