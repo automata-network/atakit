@@ -1047,8 +1047,11 @@ Concrete shape of the implementation:
 - **Zero-config chain/keys** — when a qemu target has no `chain`
   configured, an implicit local chain is synthesized at `/init` time with
   placeholder registry addresses and `registration = "off"`; unset
-  `owner_key` / `gas_wallet` fall back to `self_generated` so the portal
-  never needs a private key for a registration-off deploy.
+  `owner_key` / `gas_wallet` / `sp1_payer` fall back to `self_generated` so
+  the portal never needs a private key for a registration-off deploy.
+  (`sp1_payer`, the SP1 prover-network signing key threaded through `/init`
+  alongside `gas_wallet`, defaults to the gas-wallet key when no separate
+  one is configured.)
 - **Firmware (OVMF)** is path-driven, not bundled: `ATAKIT_QEMU_UEFI` >
   `[cloud.targets.<n>] uefi` > `[cloud.providers.<n>] uefi`. Stock distro
   OVMF lacks the TPM-measuring build; it needs to be separately built.
