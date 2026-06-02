@@ -11,6 +11,11 @@ pub struct InitConfig {
     pub chain: InitChainConfig,
     pub owner_key: InitKeyConfig,
     pub gas_wallet: InitKeyConfig,
+    /// Es256k key the SP1 prover-network client signs with (the "sp1 payer").
+    /// Same shape as `gas_wallet` — always sent. The operator may point it at
+    /// the same `[keys.<name>]` as `gas_wallet` (and it defaults to the gas
+    /// key name when unset), but it is always a concrete key on the wire.
+    pub sp1_payer: InitKeyConfig,
     /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
     /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
     /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
@@ -194,6 +199,15 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         chain["proving_strategy"] = serde_json::Value::String(ps.clone());
     }
 
+    // Separate SP1 prover-network key, always sent (same shape as gas_wallet).
+    let mut sp1_payer = serde_json::json!({
+        "mode": config.sp1_payer.mode,
+        "type": config.sp1_payer.key_type,
+    });
+    if let Some(ref pk) = config.sp1_payer.private_key {
+        sp1_payer["private_key"] = serde_json::Value::String(pk.clone());
+    }
+
     let mut portal_config = serde_json::json!({
         "format": 1,
         "platform": {
@@ -202,6 +216,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         "chain": chain,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
+        "sp1_payer": sp1_payer,
     });
 
     // Only emit `disks` when there is at least one passphrase, so the
@@ -470,6 +485,11 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: None,
             },
+            sp1_payer: InitKeyConfig {
+                mode: "provisioned".to_string(),
+                key_type: "es256k".to_string(),
+                private_key: Some("0xSP1".to_string()),
+            },
             disks: BTreeMap::new(),
         }
     }
@@ -505,6 +525,10 @@ mod tests {
         assert_eq!(json["gas_wallet"]["mode"], "self_generated");
         assert_eq!(json["gas_wallet"]["type"], "es256k");
         assert!(json["gas_wallet"].get("private_key").is_none());
+        // sp1_payer is always emitted (same shape as gas_wallet).
+        assert_eq!(json["sp1_payer"]["mode"], "provisioned");
+        assert_eq!(json["sp1_payer"]["type"], "es256k");
+        assert_eq!(json["sp1_payer"]["private_key"], "0xSP1");
 
         // registration / chain_id / proving_strategy omitted when None —
         // portal's "section present, no registration → required" and

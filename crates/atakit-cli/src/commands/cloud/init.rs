@@ -130,6 +130,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .keys
         .get(&gas_wallet_name)
         .ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
+    // SP1 prover-network key: state override > target config > default to the
+    // gas-wallet key. Same shape as gas_wallet; always a concrete key.
+    let sp1_payer_name = state
+        .init_env
+        .sp1_payer
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| resolver.sp1_payer())
+        .unwrap_or_else(|| gas_wallet_name.clone());
+    let sp1_payer_spec = config
+        .keys
+        .get(&sp1_payer_name)
+        .ok_or_else(|| anyhow::anyhow!("key '{sp1_payer_name}' not found in [keys]"))?;
 
     // Resolve provider platform for the InitConfig.
     let provider_config = config
@@ -179,6 +192,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             key_type: gas_wallet_spec.key_type.to_string(),
             private_key: if gas_wallet_spec.mode == KeyMode::Provisioned {
                 Some(gas_wallet_spec.resolve(&gas_wallet_name)?)
+            } else {
+                None
+            },
+        },
+        sp1_payer: InitKeyConfig {
+            mode: sp1_payer_spec.mode.to_string(),
+            key_type: sp1_payer_spec.key_type.to_string(),
+            private_key: if sp1_payer_spec.mode == KeyMode::Provisioned {
+                Some(sp1_payer_spec.resolve(&sp1_payer_name)?)
             } else {
                 None
             },
@@ -248,6 +270,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         chain: chain_name,
         owner_key: owner_key_name,
         gas_wallet: gas_wallet_name,
+        sp1_payer: Some(sp1_payer_name),
     };
     state
         .save(&env.data_dir)

@@ -56,11 +56,19 @@ impl<'a> InitEnvResolver<'a> {
             .expect("gas_wallet must be set on target or via --gas-wallet")
     }
 
+    /// Optional SP1 prover-network key name. Read from the target (already
+    /// merged with `[cloud.defaults] sp1_payer` via `apply_defaults`); `None`
+    /// when no separate SP1 key is configured (portal reuses gas_wallet).
+    pub fn sp1_payer(&self) -> Option<String> {
+        self.target.sp1_payer.clone()
+    }
+
     pub fn build(&self) -> PersistedInitEnv {
         PersistedInitEnv {
             chain: self.chain(),
             owner_key: self.owner_key(),
             gas_wallet: self.gas_wallet(),
+            sp1_payer: self.sp1_payer(),
         }
     }
 
@@ -85,6 +93,7 @@ impl<'a> InitEnvResolver<'a> {
                 .map(String::from)
                 .or_else(|| self.target.gas_wallet.clone())
                 .unwrap_or_default(),
+            sp1_payer: self.sp1_payer(),
         }
     }
 }

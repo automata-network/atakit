@@ -174,6 +174,9 @@ impl CloudConfig {
             if target.gas_wallet.is_none() {
                 target.gas_wallet = defaults.gas_wallet.clone();
             }
+            if target.sp1_payer.is_none() {
+                target.sp1_payer = defaults.sp1_payer.clone();
+            }
             if target.image.is_none() {
                 target.image = defaults.image.clone();
             }
@@ -191,6 +194,9 @@ pub struct CloudTargetDefaults {
     pub chain: Option<String>,
     pub owner_key: Option<String>,
     pub gas_wallet: Option<String>,
+    /// Default SP1 prover-network key name (references `[keys.<name>]`),
+    /// inherited by targets that omit `sp1_payer`. Optional.
+    pub sp1_payer: Option<String>,
     pub image: Option<String>,
 }
 
@@ -239,6 +245,11 @@ pub struct CloudTarget {
     /// Falls back to `[cloud.defaults] gas_wallet`.
     #[serde(default)]
     pub gas_wallet: Option<String>,
+    /// Optional SP1 prover-network key name (references a key in `[keys]`).
+    /// Falls back to `[cloud.defaults] sp1_payer`. When unset, the portal
+    /// reuses the gas wallet for SP1 signing. Only relevant for SNP CVMs.
+    #[serde(default)]
+    pub sp1_payer: Option<String>,
 }
 
 impl CloudTarget {
@@ -604,6 +615,7 @@ mod tests {
             chain: Some("test-chain".to_string()),
             owner_key: Some("test-owner".to_string()),
             gas_wallet: Some("test-gas".to_string()),
+            sp1_payer: None,
         }
     }
 

@@ -50,6 +50,10 @@ pub struct PersistedInitEnv {
     pub chain: String,
     pub owner_key: String,
     pub gas_wallet: String,
+    /// Optional SP1 prover-network key name. `#[serde(default)]` so deploy
+    /// states written before this field existed still load (as `None`).
+    #[serde(default)]
+    pub sp1_payer: Option<String>,
 }
 
 /// Cloud provider resources tracked in state.

@@ -773,6 +773,7 @@ mod tests {
             chain: Some("testnet".to_string()),
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
+            sp1_payer: None,
         }
     }
 

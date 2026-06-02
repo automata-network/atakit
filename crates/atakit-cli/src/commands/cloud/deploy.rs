@@ -871,11 +871,30 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     None => bail!("key '{gas_wallet_name}' not found in [keys]"),
                 };
 
+                // SP1 prover-network key (same shape as gas_wallet). Defaults
+                // to the gas-wallet key when no separate sp1_payer is
+                // configured; qemu falls back to a self-generated key.
+                let sp1_payer_name = init_env.sp1_payer.as_deref().unwrap_or(gas_wallet_name);
+                let sp1_init = match config.keys.get(sp1_payer_name) {
+                    Some(spec) => InitKeyConfig {
+                        mode: spec.mode.to_string(),
+                        key_type: spec.key_type.to_string(),
+                        private_key: if spec.mode == KeyMode::Provisioned {
+                            Some(spec.resolve(sp1_payer_name)?)
+                        } else {
+                            None
+                        },
+                    },
+                    None if is_qemu => synthesize_self_generated_key(),
+                    None => bail!("key '{sp1_payer_name}' not found in [keys]"),
+                };
+
                 let init_config = InitConfig {
                     platform: provider_config.platform.to_string(),
                     chain: init_chain,
                     owner_key: owner_init,
                     gas_wallet: gas_init,
+                    sp1_payer: sp1_init,
                     disks: disk_passphrases.clone(),
                 };
 
@@ -1277,6 +1296,7 @@ fn synthesize_local_init_chain() -> InitChainConfig {
         expire_offset: 3600,
         registration: Some("off".to_string()),
         chain_id: None,
+        proving_strategy: None,
     }
 }
 
