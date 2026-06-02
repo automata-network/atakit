@@ -137,6 +137,11 @@ pub struct InitChainConfig {
     /// Only honored by the portal under air-gapped operation (no
     /// `rpc_url`); ignored with a warning otherwise.
     pub chain_id: Option<u64>,
+    /// Portal-side SNP ZK prover selection (`"network"` | `"local"` |
+    /// `"dev"`). `None` ⇒ field omitted from the `/init` JSON; the
+    /// portal falls back to its `"network"` default. Only consulted for
+    /// AMD SEV-SNP CVMs (TDX ignores it). Sent as `chain.proving_strategy`.
+    pub proving_strategy: Option<String>,
 }
 
 /// Key config section of the init payload.
@@ -184,6 +189,9 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     }
     if let Some(id) = config.chain.chain_id {
         chain["chain_id"] = serde_json::Value::Number(id.into());
+    }
+    if let Some(ref ps) = config.chain.proving_strategy {
+        chain["proving_strategy"] = serde_json::Value::String(ps.clone());
     }
 
     let mut portal_config = serde_json::json!({
@@ -450,6 +458,7 @@ mod tests {
                 expire_offset: 300,
                 registration: None,
                 chain_id: None,
+                proving_strategy: None,
             },
             owner_key: InitKeyConfig {
                 mode: "provisioned".to_string(),
@@ -497,11 +506,13 @@ mod tests {
         assert_eq!(json["gas_wallet"]["type"], "es256k");
         assert!(json["gas_wallet"].get("private_key").is_none());
 
-        // registration / chain_id omitted when None — portal's
-        // "section present, no registration → required" default
-        // applies, matching pre-patch behaviour.
+        // registration / chain_id / proving_strategy omitted when None —
+        // portal's "section present, no registration → required" and
+        // "proving_strategy → network" defaults apply, matching pre-patch
+        // behaviour.
         assert!(json["chain"].get("registration").is_none());
         assert!(json["chain"].get("chain_id").is_none());
+        assert!(json["chain"].get("proving_strategy").is_none());
 
         // No disk passphrases → no `disks` key at all (pre-field JSON).
         assert!(json.get("disks").is_none());
@@ -631,6 +642,18 @@ mod tests {
             cfg.chain.registration = Some(value.to_string());
             let json = build_portal_config_json(&cfg);
             assert_eq!(json["chain"]["registration"], value);
+        }
+    }
+
+    /// When the operator sets `proving_strategy`, each value appears
+    /// verbatim under `chain.proving_strategy` for the portal to parse.
+    #[test]
+    fn portal_config_json_emits_each_proving_strategy_value() {
+        for value in ["network", "local", "dev"] {
+            let mut cfg = sample_config();
+            cfg.chain.proving_strategy = Some(value.to_string());
+            let json = build_portal_config_json(&cfg);
+            assert_eq!(json["chain"]["proving_strategy"], value);
         }
     }
 }

@@ -397,6 +397,7 @@ fn resolve_command(cred_name: &str, argv: &[String], timeout_secs: Option<u64>) 
 /// # Optional — controls the portal's on-chain registration policy.
 /// # registration = "required" | "optional" | "off"
 /// # chain_id = 11155111   # only when rpc_url absent (air-gapped)
+/// # proving_strategy = "network" | "local" | "dev"   # SNP CVMs only
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -434,6 +435,19 @@ pub struct ChainConfig {
     /// post manually.
     #[serde(default)]
     pub chain_id: Option<u64>,
+    /// Portal-side SNP ZK prover selection. One of:
+    /// - `"network"` — remote proving on the Succinct network (reuses
+    ///   the `gas_wallet` key); the validated path.
+    /// - `"local"` — on-device CPU proving (needs a proving-capable
+    ///   image; heavyweight).
+    /// - `"dev"` — mock proof; will not verify on-chain (testing only).
+    ///
+    /// Only consulted for AMD SEV-SNP CVMs — TDX uses the on-chain
+    /// Solidity/DCAP path and ignores this. When `None`, the field is
+    /// omitted from the `/init` JSON and the portal applies its
+    /// `"network"` default.
+    #[serde(default)]
+    pub proving_strategy: Option<String>,
 }
 
 fn default_expire_offset() -> u64 {

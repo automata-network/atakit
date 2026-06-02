@@ -167,6 +167,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             expire_offset: chain.expire_offset,
             registration: chain.registration.clone(),
             chain_id: chain.chain_id,
+            proving_strategy: chain.proving_strategy.clone(),
         },
         owner_key: InitKeyConfig {
             mode: owner_key_spec.mode.to_string(),

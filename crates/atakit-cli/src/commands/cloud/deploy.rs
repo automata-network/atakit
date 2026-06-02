@@ -838,6 +838,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                             chain.registration.clone()
                         },
                         chain_id: chain.chain_id,
+                        proving_strategy: chain.proving_strategy.clone(),
                     },
                     None if is_qemu => synthesize_local_init_chain(),
                     None => bail!("chain '{chain_name}' not found in [chains]"),
