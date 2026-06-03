@@ -851,21 +851,15 @@ pub(super) async fn ensure_cloud_image(
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
         PlatformKind::Azure => {
-            // Image-upload path: shared `atakitupload` storage account (no
-            // hash) so a follow-up `cloud image upload` of the same image
-            // reuses rather than duplicates. This is a different lifecycle
-            // from per-deploy storage accounts.
+            // Image-upload path. The VHD staging storage account lives in the
+            // shared, region-scoped gallery RG (`atakit-images-<region>`), which
+            // the UploadImageAzure executor ensures itself (it creates the
+            // storage account in `gallery_rg` and ignores the step's
+            // `resource_group` field). There is intentionally NO separate staging
+            // RG: a previous `CreateResourceGroup { upload-rg }` here was dead
+            // (nothing consumed it) and broke multi-region uploads, because the
+            // fixed `upload-rg` name cannot exist in two regions at once.
             let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
-            cloud_provider
-                .execute_step(
-                    &DeployStep::CreateResourceGroup {
-                        name: names.resource_group.clone(),
-                        region: provider_config.region.clone(),
-                    },
-                    &runner,
-                    verbose,
-                )
-                .await?;
             let step = DeployStep::UploadImageAzure {
                 resource_group: names.resource_group,
                 storage_account: names.storage_account,
