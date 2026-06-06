@@ -199,8 +199,18 @@ image = "{{name}}:latest"
 # they are created dynamically by the main workload container.
 #
 # [baby-container]
-# allow = true
-# max_count = 2                         # max concurrent baby containers (default: 1)
+# enabled = true
+# max-instances = 2
+#
+# [baby-container.slots.analysis-job]
+# parent-service = "{{name}}"           # service whose portal UDS may manage this slot
+# image-selection = "single"            # or "multiple"
+#
+# [baby-container.slots.analysis-job.lifecycle]
+# image-retention = "session"           # or "disk"
+# instance-retention = "ephemeral"      # or "session" / "disk"
+# restart = "manual"                    # or "on-workload-start"
+# rootfs = "read-only"
 
 # ── persistent disks ─────────────────────────────────────────────
 #

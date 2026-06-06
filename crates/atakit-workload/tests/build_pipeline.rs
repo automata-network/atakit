@@ -82,6 +82,86 @@ RUST_LOG = "info"
     wl_dir
 }
 
+fn setup_baby_container_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
+    let wl_dir = tmp.join("baby-workload");
+    std::fs::create_dir_all(&wl_dir).unwrap();
+    std::fs::write(
+        wl_dir.join("app.tar"),
+        make_docker_archive_tar("baby-workload"),
+    )
+    .unwrap();
+
+    let config = r#"
+format = 2
+
+[workload]
+name = "baby-workload"
+version = "v0.1.0"
+base-image-mode = "blacklist"
+image = { file = "./app.tar" }
+atakit-portal = true
+gid-group = "app"
+
+[workload.disks]
+data = "/data"
+
+[baby-container]
+enabled = true
+max-instances = 2
+
+[baby-container.slots.analysis-job]
+parent-service = "baby-workload"
+image-selection = "single"
+max-instances = 1
+trust-policy = "user-helper-image"
+
+[baby-container.slots.analysis-job.lifecycle]
+image-retention = "disk"
+instance-retention = "ephemeral"
+restart = "manual"
+rootfs = "read-only"
+
+[baby-container.slots.analysis-job.storage.workspace]
+disk = "data"
+base-path = "/analysis-job/instances"
+mount-path = "/workspace"
+retention = "disk"
+scope = "instance"
+read-only = false
+
+[baby-container.slots.analysis-job.storage.workspace.permissions]
+baby = "rw"
+parent = "ro"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+    std::fs::write(wl_dir.join("atakit-workload.toml"), config).unwrap();
+    wl_dir
+}
+
+fn read_manifest_json(archive_path: &std::path::Path) -> serde_json::Value {
+    let file = std::fs::File::open(archive_path).unwrap();
+    let dec = zstd::Decoder::new(file).unwrap();
+    let mut archive = tar::Archive::new(dec);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry
+            .path()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("manifest.json")
+        {
+            let mut content = String::new();
+            entry.read_to_string(&mut content).unwrap();
+            return serde_json::from_str(&content).unwrap();
+        }
+    }
+    panic!("archive did not contain manifest.json");
+}
+
 #[tokio::test]
 async fn build_produces_valid_archive() {
     let tmp = tempfile::tempdir().unwrap();
@@ -166,6 +246,58 @@ async fn build_produces_valid_archive() {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn build_materializes_baby_container_slots_in_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wl_dir = setup_baby_container_workload_dir(tmp.path());
+    let out_dir = tmp.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let result = build_workload(
+        &BuildOptions {
+            workload_dir: wl_dir,
+            output_dir: Some(out_dir),
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::default(),
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let manifest = read_manifest_json(&result.archive_path);
+    let baby = &manifest["config"]["baby-container"];
+    assert_eq!(baby["enabled"], true);
+    assert_eq!(baby["max_instances"], 2);
+    assert_eq!(
+        baby["slots"]["analysis-job"]["parent_service"],
+        "baby-workload"
+    );
+    assert_eq!(baby["slots"]["analysis-job"]["gid_group"], "app");
+    assert_eq!(baby["slots"]["analysis-job"]["image_selection"], "single");
+    assert_eq!(
+        baby["slots"]["analysis-job"]["lifecycle"]["image_retention"],
+        "disk"
+    );
+    assert_eq!(
+        baby["slots"]["analysis-job"]["lifecycle"]["rootfs"],
+        "read_only"
+    );
+    assert_eq!(
+        baby["slots"]["analysis-job"]["storage"]["workspace"]["base_path"],
+        "/analysis-job/instances"
+    );
+    assert_eq!(
+        baby["slots"]["analysis-job"]["storage"]["workspace"]["permissions"]["parent"],
+        "ro"
+    );
+    assert_eq!(
+        baby["slots"]["analysis-job"]["trust_policy"],
+        "user-helper-image"
+    );
 }
 
 #[tokio::test]

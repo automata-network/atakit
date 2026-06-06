@@ -79,7 +79,7 @@ pub struct ManifestConfigV1 {
     #[serde(default, rename = "firewall-ports")]
     pub firewall_ports: Vec<ManifestFirewallPort>,
     #[serde(default, rename = "baby-container")]
-    pub baby_container: Option<ManifestBabyContainer>,
+    pub baby_container: Option<ManifestBabyContainerV1>,
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
 }
@@ -105,6 +105,14 @@ pub struct ManifestDependencyV1 {
     pub unmeasured_data: Vec<String>,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManifestBabyContainerV1 {
+    #[serde(default)]
+    pub allow: bool,
+    #[serde(default)]
+    pub max_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,7 +235,11 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                 });
                 ports
             },
-            baby_container: v1.config.baby_container,
+            baby_container: ManifestBabyContainer {
+                enabled: false,
+                max_instances: 0,
+                slots: BTreeMap::new(),
+            },
             boot_disk_size: v1.config.boot_disk_size,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),

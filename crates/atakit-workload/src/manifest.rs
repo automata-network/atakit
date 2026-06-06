@@ -89,8 +89,12 @@ pub struct ManifestConfig {
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
     #[serde(default, rename = "firewall-ports")]
     pub firewall_ports: Vec<ManifestFirewallPort>,
-    #[serde(default, rename = "baby-container")]
-    pub baby_container: Option<ManifestBabyContainer>,
+    #[serde(
+        default,
+        rename = "baby-container",
+        deserialize_with = "deserialize_manifest_baby_container"
+    )]
+    pub baby_container: ManifestBabyContainer,
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
     #[serde(default, rename = "cap-add")]
@@ -194,10 +198,57 @@ pub struct ManifestFirewallPort {
     pub protocol: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ManifestBabyContainer {
-    pub allow: bool,
-    pub max_count: u32,
+    pub enabled: bool,
+    pub max_instances: u32,
+    pub slots: BTreeMap<String, ManifestBabyContainerSlot>,
+}
+
+fn deserialize_manifest_baby_container<'de, D>(
+    deserializer: D,
+) -> Result<ManifestBabyContainer, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<ManifestBabyContainer>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestBabyContainerSlot {
+    pub parent_service: String,
+    pub gid_group: String,
+    pub image_selection: String,
+    pub max_instances: u32,
+    pub lifecycle: ManifestBabyContainerLifecycle,
+    pub storage: BTreeMap<String, ManifestBabyContainerStorage>,
+    pub logging: ManifestLogging,
+    pub trust_policy: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestBabyContainerLifecycle {
+    pub image_retention: String,
+    pub instance_retention: String,
+    pub restart: String,
+    pub rootfs: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestBabyContainerStorage {
+    pub disk: String,
+    pub base_path: String,
+    pub mount_path: String,
+    pub read_only: bool,
+    pub retention: String,
+    pub scope: String,
+    pub permissions: ManifestBabyContainerStoragePermissions,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestBabyContainerStoragePermissions {
+    pub baby: String,
+    pub parent: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -406,14 +457,6 @@ pub fn build_manifest(
     };
 
     // Baby container
-    let baby_container = config
-        .baby_container
-        .as_ref()
-        .map(|bc| ManifestBabyContainer {
-            allow: bc.allow,
-            max_count: bc.max_count,
-        });
-
     // Default gid-group: workload name.
     let default_gid_group = w.name.clone();
 
@@ -455,6 +498,90 @@ pub fn build_manifest(
             })
             .collect();
         Some(deps)
+    };
+
+    let gid_group_for_service = |service_name: &str| -> String {
+        if service_name == w.name {
+            w.gid_group
+                .clone()
+                .unwrap_or_else(|| default_gid_group.clone())
+        } else {
+            config
+                .dependencies
+                .get(service_name)
+                .and_then(|dep| dep.gid_group.clone())
+                .unwrap_or_else(|| default_gid_group.clone())
+        }
+    };
+
+    let baby_container = if let Some(bc) = &config.baby_container {
+        if bc.enabled {
+            let slots = bc
+                .slots
+                .iter()
+                .map(|(slot_name, slot)| {
+                    let storage = slot
+                        .storage
+                        .iter()
+                        .map(|(storage_name, storage)| {
+                            (
+                                storage_name.clone(),
+                                ManifestBabyContainerStorage {
+                                    disk: storage.disk.clone(),
+                                    base_path: storage.base_path.clone(),
+                                    mount_path: storage.mount_path.clone(),
+                                    read_only: storage.read_only,
+                                    retention: storage.retention.clone(),
+                                    scope: storage.scope.clone(),
+                                    permissions: ManifestBabyContainerStoragePermissions {
+                                        baby: storage.permissions.baby.clone(),
+                                        parent: storage.permissions.parent.clone(),
+                                    },
+                                },
+                            )
+                        })
+                        .collect();
+                    (
+                        slot_name.clone(),
+                        ManifestBabyContainerSlot {
+                            parent_service: slot.parent_service.clone(),
+                            gid_group: slot
+                                .gid_group
+                                .clone()
+                                .unwrap_or_else(|| gid_group_for_service(&slot.parent_service)),
+                            image_selection: slot.image_selection.clone(),
+                            max_instances: slot.max_instances,
+                            lifecycle: ManifestBabyContainerLifecycle {
+                                image_retention: slot.lifecycle.image_retention.clone(),
+                                instance_retention: slot.lifecycle.instance_retention.clone(),
+                                restart: slot.lifecycle.restart.clone(),
+                                rootfs: slot.lifecycle.rootfs.replace('-', "_"),
+                            },
+                            storage,
+                            logging: convert_logging(&slot.logging),
+                            trust_policy: slot.trust_policy.clone(),
+                        },
+                    )
+                })
+                .collect();
+            ManifestBabyContainer {
+                enabled: true,
+                max_instances: bc.max_instances.unwrap_or(1),
+                slots,
+            }
+        } else {
+            ManifestBabyContainer {
+                enabled: false,
+                max_instances: 0,
+                slots: BTreeMap::new(),
+            }
+        }
+    } else {
+        ManifestBabyContainer {
+            enabled: false,
+            max_instances: 0,
+            slots: BTreeMap::new(),
+        }
     };
 
     // Disks (top-level) - resolve auto-assigned indices.

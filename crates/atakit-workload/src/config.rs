@@ -480,13 +480,135 @@ impl<'de> serde::Deserialize<'de> for FirewallEntry {
 #[derive(Debug, Deserialize)]
 pub struct BabyContainerSection {
     #[serde(default)]
-    pub allow: bool,
-    #[serde(default = "default_max_count")]
-    pub max_count: u32,
+    pub enabled: bool,
+    #[serde(default, rename = "max-instances")]
+    pub max_instances: Option<u32>,
+    #[serde(default)]
+    pub slots: BTreeMap<String, BabyContainerSlotSection>,
 }
 
-fn default_max_count() -> u32 {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerSlotSection {
+    #[serde(rename = "parent-service")]
+    pub parent_service: String,
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
+    #[serde(default = "default_baby_image_selection", rename = "image-selection")]
+    pub image_selection: String,
+    #[serde(default = "default_baby_slot_max_instances", rename = "max-instances")]
+    pub max_instances: u32,
+    #[serde(default, rename = "trust-policy")]
+    pub trust_policy: Option<String>,
+    #[serde(default)]
+    pub lifecycle: BabyContainerLifecycleSection,
+    #[serde(default)]
+    pub storage: BTreeMap<String, BabyContainerStorageSection>,
+    #[serde(default)]
+    pub logging: LoggingSection,
+}
+
+fn default_baby_image_selection() -> String {
+    "single".to_string()
+}
+
+fn default_baby_slot_max_instances() -> u32 {
     1
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerLifecycleSection {
+    #[serde(default = "default_baby_image_retention", rename = "image-retention")]
+    pub image_retention: String,
+    #[serde(
+        default = "default_baby_instance_retention",
+        rename = "instance-retention"
+    )]
+    pub instance_retention: String,
+    #[serde(default = "default_baby_restart")]
+    pub restart: String,
+    #[serde(default = "default_baby_rootfs")]
+    pub rootfs: String,
+}
+
+impl Default for BabyContainerLifecycleSection {
+    fn default() -> Self {
+        Self {
+            image_retention: default_baby_image_retention(),
+            instance_retention: default_baby_instance_retention(),
+            restart: default_baby_restart(),
+            rootfs: default_baby_rootfs(),
+        }
+    }
+}
+
+fn default_baby_image_retention() -> String {
+    "session".to_string()
+}
+
+fn default_baby_instance_retention() -> String {
+    "ephemeral".to_string()
+}
+
+fn default_baby_restart() -> String {
+    "manual".to_string()
+}
+
+fn default_baby_rootfs() -> String {
+    "read-only".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerStorageSection {
+    pub disk: String,
+    #[serde(rename = "base-path")]
+    pub base_path: String,
+    #[serde(rename = "mount-path")]
+    pub mount_path: String,
+    #[serde(default = "default_baby_storage_retention")]
+    pub retention: String,
+    #[serde(default = "default_baby_storage_scope")]
+    pub scope: String,
+    #[serde(default, rename = "read-only")]
+    pub read_only: bool,
+    #[serde(default)]
+    pub permissions: BabyContainerStoragePermissionsSection,
+}
+
+fn default_baby_storage_retention() -> String {
+    "session".to_string()
+}
+
+fn default_baby_storage_scope() -> String {
+    "instance".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerStoragePermissionsSection {
+    #[serde(default = "default_baby_permission_rw")]
+    pub baby: String,
+    #[serde(default = "default_baby_permission_none")]
+    pub parent: String,
+}
+
+impl Default for BabyContainerStoragePermissionsSection {
+    fn default() -> Self {
+        Self {
+            baby: default_baby_permission_rw(),
+            parent: default_baby_permission_none(),
+        }
+    }
+}
+
+fn default_baby_permission_rw() -> String {
+    "rw".to_string()
+}
+
+fn default_baby_permission_none() -> String {
+    "none".to_string()
 }
 
 /// Persistent disk definition.
@@ -725,8 +847,11 @@ measured-data = true
 allow = [{ port = 4000, protocol = "tcp" }]
 
 [baby-container]
-allow = true
-max_count = 2
+enabled = true
+max-instances = 2
+
+[baby-container.slots.analysis-job]
+parent-service = "secure-signer"
 
 [disks.data]
 index = 10

@@ -17,6 +17,29 @@ fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
     Ok(())
 }
 
+fn ensure_absolute_clean_path(path: &str, context: &str) -> Result<(), WorkloadError> {
+    if path.as_bytes().contains(&0) {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must not contain NUL: {path:?}"
+        )));
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must be absolute: {path:?}"
+        )));
+    }
+    ensure_no_traversal(path, context)
+}
+
+fn is_stable_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Canonicalize both paths and verify `path` is inside `base` (catches symlink escapes).
 fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), WorkloadError> {
     let canon_path = path.canonicalize().map_err(|_| {
@@ -332,13 +355,7 @@ pub fn validate_config(
     }
 
     // ── baby-container ────────────────────────────────────
-    if let Some(ref bc) = config.baby_container {
-        if bc.max_count == 0 {
-            return Err(WorkloadError::Validation(
-                "baby-container.max_count must be a positive integer".into(),
-            ));
-        }
-    }
+    validate_baby_container(config)?;
 
     // ── disk index + size format + encryption ─────────────
     {
@@ -543,6 +560,186 @@ pub fn validate_config(
     validate_log_grants(config)?;
 
     Ok(warnings)
+}
+
+fn validate_baby_container(config: &WorkloadConfig) -> Result<(), WorkloadError> {
+    let Some(bc) = &config.baby_container else {
+        return Ok(());
+    };
+
+    if !bc.enabled {
+        return Ok(());
+    }
+    let max_instances = bc.max_instances.ok_or_else(|| {
+        WorkloadError::Validation(
+            "baby-container.max-instances must be set when enabled = true".into(),
+        )
+    })?;
+    if max_instances == 0 {
+        return Err(WorkloadError::Validation(
+            "baby-container.max-instances must be a positive integer".into(),
+        ));
+    }
+    if bc.slots.is_empty() {
+        return Err(WorkloadError::Validation(
+            "baby-container.enabled = true requires at least one slot".into(),
+        ));
+    }
+
+    let w = &config.workload;
+    let mut service_names: HashSet<&str> = HashSet::new();
+    service_names.insert(w.name.as_str());
+    for dep_name in config.dependencies.keys() {
+        service_names.insert(dep_name.as_str());
+    }
+
+    let is_portal_service = |service_name: &str| -> bool {
+        if service_name == w.name {
+            return w.atakit_portal;
+        }
+        config
+            .dependencies
+            .get(service_name)
+            .is_some_and(|dep| dep.atakit_portal)
+    };
+
+    for (slot_name, slot) in &bc.slots {
+        let context = format!("baby-container.slots.{slot_name}");
+        if !is_stable_identifier(slot_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: slot name must be a stable identifier"
+            )));
+        }
+        if slot.parent_service.is_empty() {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.parent-service must not be empty"
+            )));
+        }
+        if !service_names.contains(slot.parent_service.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.parent-service references unknown service {:?}",
+                slot.parent_service
+            )));
+        }
+        if !is_portal_service(&slot.parent_service) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.parent-service {:?} must set atakit-portal = true",
+                slot.parent_service
+            )));
+        }
+        if let Some(gid_group) = &slot.gid_group {
+            if gid_group.is_empty() {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}.gid-group must not be empty when specified"
+                )));
+            }
+        }
+        if slot.image_selection != "single" && slot.image_selection != "multiple" {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.image-selection must be \"single\" or \"multiple\", got {:?}",
+                slot.image_selection
+            )));
+        }
+        if slot.max_instances == 0 {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.max-instances must be a positive integer"
+            )));
+        }
+        if slot.max_instances > max_instances {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.max-instances must be <= baby-container.max-instances"
+            )));
+        }
+        if slot.lifecycle.image_retention != "session" && slot.lifecycle.image_retention != "disk" {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.lifecycle.image-retention must be \"session\" or \"disk\", got {:?}",
+                slot.lifecycle.image_retention
+            )));
+        }
+        if !matches!(
+            slot.lifecycle.instance_retention.as_str(),
+            "ephemeral" | "session" | "disk"
+        ) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.lifecycle.instance-retention must be \"ephemeral\", \"session\", or \"disk\", got {:?}",
+                slot.lifecycle.instance_retention
+            )));
+        }
+        if slot.lifecycle.restart != "manual" && slot.lifecycle.restart != "on-workload-start" {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.lifecycle.restart must be \"manual\" or \"on-workload-start\", got {:?}",
+                slot.lifecycle.restart
+            )));
+        }
+        if slot.lifecycle.rootfs != "read-only" {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.lifecycle.rootfs must be \"read-only\" in v1, got {:?}",
+                slot.lifecycle.rootfs
+            )));
+        }
+        if let Some(trust_policy) = &slot.trust_policy {
+            if !is_stable_identifier(trust_policy) {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}.trust-policy must be a stable identifier"
+                )));
+            }
+        }
+        validate_logging(&format!("{context}.logging"), &slot.logging, &service_names)?;
+
+        for (storage_name, storage) in &slot.storage {
+            let storage_context = format!("{context}.storage.{storage_name}");
+            if !is_stable_identifier(storage_name) {
+                return Err(WorkloadError::Validation(format!(
+                    "{storage_context}: storage name must be a stable identifier"
+                )));
+            }
+            if !config.disks.contains_key(&storage.disk) {
+                return Err(WorkloadError::Validation(format!(
+                    "{storage_context}.disk references undefined disk {:?}",
+                    storage.disk
+                )));
+            }
+            ensure_absolute_clean_path(
+                &storage.base_path,
+                &format!("{storage_context}.base-path"),
+            )?;
+            ensure_absolute_clean_path(
+                &storage.mount_path,
+                &format!("{storage_context}.mount-path"),
+            )?;
+            if storage.retention != "session" && storage.retention != "disk" {
+                return Err(WorkloadError::Validation(format!(
+                    "{storage_context}.retention must be \"session\" or \"disk\", got {:?}",
+                    storage.retention
+                )));
+            }
+            if storage.scope != "slot"
+                && storage.scope != "image"
+                && storage.scope != "instance"
+                && !storage
+                    .scope
+                    .strip_prefix("key:")
+                    .is_some_and(is_stable_identifier)
+            {
+                return Err(WorkloadError::Validation(format!(
+                    "{storage_context}.scope must be \"slot\", \"image\", \"instance\", or \"key:<identifier>\", got {:?}",
+                    storage.scope
+                )));
+            }
+            for (field, value) in [
+                ("permissions.baby", &storage.permissions.baby),
+                ("permissions.parent", &storage.permissions.parent),
+            ] {
+                if !matches!(value.as_str(), "none" | "ro" | "rw") {
+                    return Err(WorkloadError::Validation(format!(
+                        "{storage_context}.{field} must be \"none\", \"ro\", or \"rw\", got {value:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Allowlist for `cap-add`. Names use the canonical uppercase form without
