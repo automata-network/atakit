@@ -54,7 +54,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let registration = defaults.registration.as_deref();
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => init_chain_from_config(name, chain, registration)?,
+            Some(chain) => init_chain_from_config(name, chain, registration).await?,
             None if registration_is_off(registration) => synthesize_off_init_chain(),
             None => bail!("chain '{name}' not found in [chains]"),
         },

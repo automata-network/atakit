@@ -9,8 +9,8 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    init_chain_from_config, init_key_from_config, registration_is_off, resolve_instance,
-    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    init_chain_from_config, init_key_from_config, portal_endpoints, registration_is_off,
+    resolve_instance, resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
     synthesize_self_generated_key, InitEnvResolver,
 };
 use crate::config::Config;
@@ -24,12 +24,11 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let mut state = DeployState::load(&env.data_dir, &target_name, &instance_name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let ip = match &state.status {
+    match &state.status {
         DeployStatus::Deployed { ip } => {
             if ip.is_empty() {
                 bail!("deployment {target_name}/{instance_name} has no external IP");
             }
-            ip.clone()
         }
         other => {
             let status_desc = match other {
@@ -44,7 +43,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 				 Only deployed instances can be initialized."
             );
         }
-    };
+    }
+    let (portal_host, status_port, init_port) = portal_endpoints(&state)?;
 
     // 3. Resolve workload.
     let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
@@ -136,7 +136,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let registration = target.registration.as_deref();
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => init_chain_from_config(name, chain, registration)?,
+            Some(chain) => init_chain_from_config(name, chain, registration).await?,
             None if registration_is_off(registration) => synthesize_off_init_chain(),
             None => bail!("chain '{name}' not found in [chains]"),
         },
@@ -233,7 +233,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         "Instance:".dimmed(),
         format!("{target_name}/{instance_name}").bold()
     );
-    eprintln!("  {:<18}{}", "IP:".dimmed(), ip);
+    eprintln!("  {:<18}{}", "IP:".dimmed(), portal_host);
     eprintln!(
         "  {:<18}{}:{}",
         "Workload:".dimmed(),
@@ -257,7 +257,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     // 7. Wait for portal.
     eprint!("  [1/2] Wait for CVM portal... ");
-    init::wait_for_portal(&ip, 2024, args.timeout)
+    init::wait_for_portal(&portal_host, status_port, args.timeout)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
@@ -265,8 +265,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 8. Initialize workload.
     eprint!("  [2/2] Initialize workload... ");
     init::post_portal_init(
-        &ip,
-        1024,
+        &portal_host,
+        init_port,
         &archive_path.display().to_string(),
         unmeasured_tar.as_deref(),
         &init_config,
@@ -299,7 +299,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         "Instance:".dimmed(),
         format!("{target_name}/{instance_name}").bold()
     );
-    eprintln!("    {:<12}{}", "IP:".dimmed(), ip);
+    eprintln!("    {:<12}{}", "IP:".dimmed(), portal_host);
     eprintln!(
         "    {:<12}{}:{}",
         "Workload:".dimmed(),

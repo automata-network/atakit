@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ensure_cloud_image, init_chain_from_config, init_key_from_config, parse_metadata,
-    registration_is_off, resolve_image, resolve_unmeasured_tar, resolve_workload,
+    portal_endpoints, registration_is_off, resolve_image, resolve_unmeasured_tar, resolve_workload,
     synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
@@ -814,7 +814,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 // synthesized off-chain payload.
                 let chain_name = &init_env.chain;
                 let init_chain = match config.chains.get(chain_name) {
-                    Some(chain) => init_chain_from_config(chain_name, chain, registration)?,
+                    Some(chain) => init_chain_from_config(chain_name, chain, registration).await?,
                     None if registration_is_off(registration) => synthesize_off_init_chain(),
                     None if chain_name.is_empty() => bail!(
                         "chain must be set on target or via --chain when /init is sent \
@@ -1205,45 +1205,6 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     eprintln!();
 
     Ok(())
-}
-
-/// Cloud platforms use the deployment's external IP plus the
-/// well-known portal ports `2024` / `1024`. QEMU forwards those ports to
-/// ephemeral host ports allocated at boot. This helper returns
-/// `(host, status_port, init_port)` for whichever platform the state holds.
-fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)> {
-    if let Some(ref q) = state.resources.qemu {
-        let host = if q.external_ip.is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            q.external_ip.clone()
-        };
-        if q.host_status_port == 0 || q.host_init_port == 0 {
-            bail!("qemu host ports not yet recorded; StartLocalVm must run first");
-        }
-        return Ok((host, q.host_status_port, q.host_init_port));
-    }
-    let ip = state
-        .resources
-        .gcp
-        .as_ref()
-        .and_then(|g| g.external_ip.clone())
-        .or_else(|| {
-            state
-                .resources
-                .azure
-                .as_ref()
-                .and_then(|a| a.external_ip.clone())
-        })
-        .or_else(|| {
-            state
-                .resources
-                .aws
-                .as_ref()
-                .and_then(|a| a.external_ip.clone())
-        })
-        .ok_or_else(|| anyhow::anyhow!("no external IP available"))?;
-    Ok((ip, 2024, 1024))
 }
 
 /// Parse a human-readable size string (e.g. "10GB", "500MB", "1TB") into whole gigabytes.

@@ -35,6 +35,73 @@ impl AwsProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CcType, CloudTarget};
+    use crate::state::PersistedInitEnv;
+    use std::collections::BTreeMap;
+
+    fn test_target() -> CloudTarget {
+        CloudTarget {
+            provider: "test-aws".to_string(),
+            vmtype: "m6a.large".to_string(),
+            uefi: None,
+            image: Some("test-image:v1".to_string()),
+            cc_type: Some(CcType::SevSnp),
+            name: None,
+            metadata: BTreeMap::new(),
+            boot_disk_size: None,
+            chain: Some("testnet".to_string()),
+            registration: None,
+            owner_key: Some("owner".to_string()),
+            gas_wallet: Some("gas".to_string()),
+            sp1_payer: None,
+        }
+    }
+
+    fn test_deploy_opts() -> DeployOptions {
+        DeployOptions {
+            instance_name: "test-instance".to_string(),
+            target_name: "test-target".to_string(),
+            target: test_target(),
+            image_ref: "test-image:v1".to_string(),
+            source_image_path: Some("/tmp/disk.raw".to_string()),
+            source_image_certs_dir: Some("/tmp/secure_boot_certs".to_string()),
+            archive_path: String::new(),
+            archive_hash: String::new(),
+            workload_name: String::new(),
+            workload_version: String::new(),
+            init_env: PersistedInitEnv::default(),
+            metadata: BTreeMap::new(),
+            force_image: false,
+            skip_init: true,
+            cc_types: vec![CcType::SevSnp],
+            workload_ports: Vec::new(),
+            workload_disks: Vec::new(),
+            boot_disk_size_gb: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_opens_portal_ports_without_workload_ports() {
+        let provider = AwsProvider::new("us-east-1".to_string());
+        let plan = provider.plan_deploy(&test_deploy_opts()).await.unwrap();
+
+        let ports = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                DeployStep::OpenPorts { ports, .. } => Some(ports),
+                _ => None,
+            })
+            .expect("plan must contain OpenPorts");
+
+        assert!(ports.contains(&"2024/tcp".to_string()));
+        assert!(ports.contains(&"1024/tcp".to_string()));
+    }
+}
+
 #[async_trait::async_trait]
 impl CloudProvider for AwsProvider {
     fn check_deps(&self) -> Result<(), CloudError> {
@@ -53,8 +120,11 @@ impl CloudProvider for AwsProvider {
             force: opts.force_image,
         });
 
-        // Firewall - workload_ports are already resolved "port/proto" strings.
-        let mut ports = Vec::new();
+        // Firewall - always open the cvm-agent ports (2024 portal/measurements,
+        // 1024 workload init), plus workload ports. Normal workload deploys
+        // already get these from resolved manifest ports, but image-only
+        // deploys have no manifest to inject them.
+        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
