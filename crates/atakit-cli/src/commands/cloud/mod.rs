@@ -149,99 +149,6 @@ pub(crate) fn init_chain_from_config(
     })
 }
 
-#[cfg(test)]
-fn test_chain_config() -> ChainConfig {
-    ChainConfig {
-        rpc_url: "https://rpc.test".to_string(),
-        session_registry: "0x1111111111111111111111111111111111111111".to_string(),
-        workload_registry: None,
-        base_image_registry: None,
-        expire_offset: 300,
-        chain_id: None,
-        proving_strategy: None,
-    }
-}
-
-#[cfg(test)]
-mod chain_init_tests {
-    use super::*;
-    use crate::config::KeyType;
-
-    #[test]
-    fn qemu_missing_chain_synthesizes_registration_off() {
-        let got = synthesize_off_init_chain();
-        assert_eq!(got.registration.as_deref(), Some("off"));
-        assert!(got.rpc_url.is_empty());
-        assert_eq!(got.session_registry, ZERO_ADDR);
-        assert_eq!(got.workload_registry, ZERO_ADDR);
-        assert_eq!(got.base_image_registry, ZERO_ADDR);
-    }
-
-    #[test]
-    fn registration_off_does_not_require_derived_registries() {
-        let chain = test_chain_config();
-        let got = init_chain_from_config("offchain", &chain, Some("off")).unwrap();
-        assert_eq!(got.registration.as_deref(), Some("off"));
-        assert_eq!(got.workload_registry, ZERO_ADDR);
-        assert_eq!(got.base_image_registry, ZERO_ADDR);
-    }
-
-    #[test]
-    fn registration_required_still_requires_derived_registries() {
-        let chain = test_chain_config();
-        let err = init_chain_from_config("hoodi", &chain, Some("required")).unwrap_err();
-        assert!(
-            err.to_string().contains("workload_registry required"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn qemu_forces_registration_off() {
-        let chain = test_chain_config();
-        let got = init_chain_from_config("local", &chain, Some("off")).unwrap();
-        assert_eq!(got.registration.as_deref(), Some("off"));
-        assert_eq!(got.workload_registry, ZERO_ADDR);
-        assert_eq!(got.base_image_registry, ZERO_ADDR);
-    }
-
-    #[test]
-    fn self_generated_key_can_be_sent_without_private_key() {
-        let spec = KeySpec {
-            key_type: KeyType::Es256k,
-            mode: KeyMode::SelfGenerated,
-            file: None,
-            command: None,
-            env: None,
-            timeout_secs: None,
-        };
-
-        let got = init_key_from_config("gas", &spec, false).unwrap();
-        assert_eq!(got.mode, "self_generated");
-        assert_eq!(got.key_type, "es256k");
-        assert!(got.private_key.is_none());
-    }
-
-    #[test]
-    fn self_generated_key_cannot_be_forced_to_private_key() {
-        let spec = KeySpec {
-            key_type: KeyType::Es256k,
-            mode: KeyMode::SelfGenerated,
-            file: None,
-            command: None,
-            env: None,
-            timeout_secs: None,
-        };
-
-        let err = init_key_from_config("owner", &spec, true).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot resolve a self_generated key"),
-            "{err}"
-        );
-    }
-}
-
 /// Parse instance reference: "target/instance" or just "instance".
 pub fn parse_instance_ref(s: &str) -> (Option<&str>, &str) {
     if let Some((target, instance)) = s.split_once('/') {
@@ -1057,4 +964,97 @@ pub fn parse_metadata(items: &[String]) -> Result<std::collections::BTreeMap<Str
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
+}
+
+#[cfg(test)]
+fn test_chain_config() -> ChainConfig {
+    ChainConfig {
+        rpc_url: "https://rpc.test".to_string(),
+        session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+        workload_registry: None,
+        base_image_registry: None,
+        expire_offset: 300,
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+#[cfg(test)]
+mod chain_init_tests {
+    use super::*;
+    use crate::config::KeyType;
+
+    #[test]
+    fn qemu_missing_chain_synthesizes_registration_off() {
+        let got = synthesize_off_init_chain();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert!(got.rpc_url.is_empty());
+        assert_eq!(got.session_registry, ZERO_ADDR);
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_off_does_not_require_derived_registries() {
+        let chain = test_chain_config();
+        let got = init_chain_from_config("offchain", &chain, Some("off")).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_required_still_requires_derived_registries() {
+        let chain = test_chain_config();
+        let err = init_chain_from_config("hoodi", &chain, Some("required")).unwrap_err();
+        assert!(
+            err.to_string().contains("workload_registry required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn qemu_forces_registration_off() {
+        let chain = test_chain_config();
+        let got = init_chain_from_config("local", &chain, Some("off")).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn self_generated_key_can_be_sent_without_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let got = init_key_from_config("gas", &spec, false).unwrap();
+        assert_eq!(got.mode, "self_generated");
+        assert_eq!(got.key_type, "es256k");
+        assert!(got.private_key.is_none());
+    }
+
+    #[test]
+    fn self_generated_key_cannot_be_forced_to_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let err = init_key_from_config("owner", &spec, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve a self_generated key"),
+            "{err}"
+        );
+    }
 }

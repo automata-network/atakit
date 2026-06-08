@@ -245,6 +245,7 @@ pub struct CloudTarget {
     /// - `"required"`: submit registration and gate serving on confirmation.
     /// - `"optional"`: submit registration in the background.
     /// - `"off"`: skip chain interaction; `chain` may be omitted.
+    ///
     /// Falls back to `[cloud.defaults] registration`; omitted means the
     /// portal default (`required`) when a chain is used.
     #[serde(default)]
