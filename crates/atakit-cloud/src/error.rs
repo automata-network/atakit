@@ -35,10 +35,7 @@ pub enum CloudError {
     CommandNotFound { program: String },
 
     #[error("missing dependency: {tool} ({install_hint})")]
-    DependencyMissing {
-        tool: String,
-        install_hint: String,
-    },
+    DependencyMissing { tool: String, install_hint: String },
 
     #[error("image upload failed: {message}")]
     ImageUploadFailed { message: String },
@@ -49,17 +46,17 @@ pub enum CloudError {
     #[error("disk error: {message}")]
     DiskError { message: String },
 
+    #[error("invalid --disk-passphrase: {message}")]
+    InvalidDiskPassphrase { message: String },
+
     #[error("instance error: {message}")]
     InstanceError { message: String },
 
-    #[error("CVM agent at {address} did not respond within {timeout_secs}s")]
-    AgentTimeout {
-        address: String,
-        timeout_secs: u64,
-    },
+    #[error("portal at {address} did not respond within {timeout_secs}s")]
+    PortalTimeout { address: String, timeout_secs: u64 },
 
-    #[error("CVM agent initialization failed: {message}")]
-    AgentInitFailed { message: String },
+    #[error("portal initialization failed: {message}")]
+    PortalInitFailed { message: String },
 
     #[error("deploy failed at step '{step}': {message}")]
     DeployFailed { step: String, message: String },

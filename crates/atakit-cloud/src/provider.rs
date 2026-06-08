@@ -4,7 +4,7 @@ use crate::config::{CcType, CloudTarget};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::plan::{DeployPlan, DeployStep, DestroyPlan, DestroyStep, StepResult};
-use crate::state::{DeployState, PersistedAgentEnv};
+use crate::state::{DeployState, PersistedInitEnv};
 
 /// Options for a deploy operation.
 pub struct DeployOptions {
@@ -15,11 +15,13 @@ pub struct DeployOptions {
     /// Local disk image file path for upload. `None` means the image is assumed
     /// to already exist in GCE (e.g. a bare GCE image name was passed).
     pub source_image_path: Option<String>,
+    /// Local secure-boot cert directory for the base image, if available.
+    pub source_image_certs_dir: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub workload_name: String,
     pub workload_version: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     pub metadata: BTreeMap<String, String>,
     pub force_image: bool,
     pub skip_init: bool,
@@ -36,7 +38,9 @@ pub struct DeployOptions {
 
 /// Options for a destroy operation.
 pub struct DestroyOptions {
-    /// Resources to preserve: "image", "disks", "firewall".
+    /// Resources to preserve. Recognised tokens: "image", "disks", "firewall".
+    /// "image" is added by the CLI by default (preserved unless `--clean-image`
+    /// is passed); "disks" and "firewall" come from `--preserve`.
     pub preserve: Vec<String>,
 }
 

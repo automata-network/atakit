@@ -14,14 +14,11 @@ pub fn check_gcloud() -> Result<(), CloudError> {
             install_hint: "install the Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
                 .to_string(),
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(CloudError::DependencyMissing {
-                tool: "gcloud".to_string(),
-                install_hint:
-                    "install the Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
-                        .to_string(),
-            })
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CloudError::DependencyMissing {
+            tool: "gcloud".to_string(),
+            install_hint: "install the Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
+                .to_string(),
+        }),
         Err(e) => Err(CloudError::Io(e)),
     }
 }

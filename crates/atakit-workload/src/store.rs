@@ -27,7 +27,11 @@ fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
 /// Cached on-chain workload spec data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedChainSpec {
-    pub ttl: u64,
+    /// Renamed from `ttl` in an earlier schema. The alias keeps pre-rename
+    /// `meta.json` files loadable so `workload ls` doesn't error out on an
+    /// older local cache.
+    #[serde(alias = "ttl")]
+    pub session_ttl: u64,
     pub base_image_mode: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_image_ids: Vec<String>,
@@ -63,11 +67,7 @@ pub struct WorkloadMeta {
     /// HTTP repos use `https://...`; github repos use `github://owner/repo`.
     /// `#[serde(alias = "registries")]` keeps existing `meta.json` files
     /// loadable after the rename.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        alias = "registries"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "registries")]
     pub repositories: Vec<String>,
     pub added_at: String,
 }
@@ -104,12 +104,14 @@ impl WorkloadStore {
 
         // Canonicalize base_dir for containment checks (must exist).
         let canon_base = if self.base_dir.exists() {
-            Some(self.base_dir.canonicalize().map_err(|e| {
-                WorkloadError::ReadStoreDir {
-                    path: self.base_dir.clone(),
-                    reason: e.to_string(),
-                }
-            })?)
+            Some(
+                self.base_dir
+                    .canonicalize()
+                    .map_err(|e| WorkloadError::ReadStoreDir {
+                        path: self.base_dir.clone(),
+                        reason: e.to_string(),
+                    })?,
+            )
         } else {
             None
         };
@@ -120,10 +122,12 @@ impl WorkloadStore {
         if let Some(ref canon_base) = canon_base {
             if parent.exists() {
                 let canon_parent =
-                    parent.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
-                        path: parent.clone(),
-                        reason: e.to_string(),
-                    })?;
+                    parent
+                        .canonicalize()
+                        .map_err(|e| WorkloadError::ReadStoreDir {
+                            path: parent.clone(),
+                            reason: e.to_string(),
+                        })?;
                 if !canon_parent.starts_with(canon_base) {
                     return Err(WorkloadError::StorePathTraversal { path: parent });
                 }
@@ -134,10 +138,12 @@ impl WorkloadStore {
         let path = parent.join(version);
         if let Some(ref canon_base) = canon_base {
             if path.exists() {
-                let canon = path.canonicalize().map_err(|e| WorkloadError::ReadStoreDir {
-                    path: path.clone(),
-                    reason: e.to_string(),
-                })?;
+                let canon = path
+                    .canonicalize()
+                    .map_err(|e| WorkloadError::ReadStoreDir {
+                        path: path.clone(),
+                        reason: e.to_string(),
+                    })?;
                 if !canon.starts_with(canon_base) {
                     return Err(WorkloadError::StorePathTraversal { path });
                 }
@@ -242,7 +248,11 @@ impl WorkloadStore {
     }
 
     /// Load metadata for a workload, if it exists.
-    pub fn load_meta(&self, name: &str, version: &str) -> Result<Option<WorkloadMeta>, WorkloadError> {
+    pub fn load_meta(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<WorkloadMeta>, WorkloadError> {
         let path = self.meta_path(name, version)?;
         if !path.exists() {
             return Ok(None);
@@ -261,7 +271,8 @@ impl WorkloadStore {
             source: e,
         })?;
 
-        let json = serde_json::to_string_pretty(meta).map_err(|e| WorkloadError::Json(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(meta).map_err(|e| WorkloadError::Json(e.to_string()))?;
         let meta_path = dir.join("meta.json");
         let tmp_path = dir.join("meta.json.tmp");
         fs::write(&tmp_path, json).map_err(|e| WorkloadError::WriteFile {
@@ -278,12 +289,7 @@ impl WorkloadStore {
 
     /// Copy an archive file into the store. Returns the file size.
     /// Uses temp-file + atomic rename to prevent corruption and symlink following.
-    pub fn import_blob(
-        &self,
-        name: &str,
-        version: &str,
-        src: &Path,
-    ) -> Result<u64, WorkloadError> {
+    pub fn import_blob(&self, name: &str, version: &str, src: &Path) -> Result<u64, WorkloadError> {
         let dir = self.entry_dir(name, version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
@@ -306,12 +312,7 @@ impl WorkloadStore {
 
     /// Write raw bytes as an archive blob (for pull).
     /// Uses temp-file + atomic rename to prevent corruption and symlink following.
-    pub fn save_blob(
-        &self,
-        name: &str,
-        version: &str,
-        data: &[u8],
-    ) -> Result<(), WorkloadError> {
+    pub fn save_blob(&self, name: &str, version: &str, data: &[u8]) -> Result<(), WorkloadError> {
         let dir = self.entry_dir(name, version)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
@@ -376,11 +377,15 @@ impl WorkloadStore {
     // ── Query ──────────────────────────────────────────
 
     pub fn has_blob(&self, name: &str, version: &str) -> bool {
-        self.blob_path(name, version).map(|p| p.exists()).unwrap_or(false)
+        self.blob_path(name, version)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     pub fn exists(&self, name: &str, version: &str) -> bool {
-        self.meta_path(name, version).map(|p| p.exists()).unwrap_or(false)
+        self.meta_path(name, version)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     // ── Internal ───────────────────────────────────────

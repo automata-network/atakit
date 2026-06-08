@@ -1,5 +1,11 @@
 # CVM Agent: Dependency Container Support
 
+> **SUPERSEDED.** This document described the pre-v2 migration to multi-container workloads. The current canonical schema lives in:
+> - [`~/docs/specs/atakit-workload-toml-spec.md`](../../docs/specs/atakit-workload-toml-spec.md)
+> - [`~/docs/specs/atawl-archive-spec.md`](../../docs/specs/atawl-archive-spec.md)
+>
+> Content below reflects the pre-v2 design (TOML manifest, `[config]`/`[config.dependencies.*]` sections, `cvm_agent` field, array-form `measured-data`/`unmeasured-data`, `/app/*` mount paths) and is kept for historical reference only.
+
 ## Background
 
 The atakit build pipeline now supports dependency containers. A workload can define multiple containers in `atakit-workload.toml` using `[dependencies.<name>]` sections. The `.atawl` archive bundles all container images (workload + dependencies) and the `manifest.toml` describes how to run them.
@@ -83,8 +89,8 @@ Each `[config.dependencies.<name>]` has these fields:
 | `entrypoint` | string or array | none | Override container ENTRYPOINT. |
 | `environment` | table | `{}` | Environment variables (already resolved, no env_file references). |
 | `depends_on` | array of strings | `[]` | Other dependency names that must start first. Only references other dependencies, never the main workload. |
-| `measured-data` | array of strings | `[]` | Archive-relative paths of measured-data files to mount into this container at `/app/measured-data/`. Read-only. |
-| `unmeasured-data` | array of strings | `[]` | Paths of unmeasured-data files to mount into this container at `/app/unmeasured-data/`. Read-only. |
+| `measured-data` | array of strings | `[]` | Archive-relative paths of measured-data files to mount into this container at `/atakit-portal/measured-data/`. Read-only. |
+| `unmeasured-data` | array of strings | `[]` | Paths of unmeasured-data files to mount into this container at `/atakit-portal/unmeasured-data/`. Read-only. |
 | `disks` | table | `{}` | Disk name to container mount path mapping. Disk names reference `[disks.<name>]` entries. Multiple containers can share the same disk. |
 
 ## Required agent changes
@@ -115,8 +121,8 @@ The agent must start a container for each entry in `[config.dependencies.<name>]
 
 Each container (workload and dependency) specifies which measured-data files it needs via its `measured-data` array. The agent must mount only the listed files into each container.
 
-- Workload's `[config] measured-data = ["config/cert.pem"]` means mount `config/cert.pem` into the workload container at `/app/measured-data/config/cert.pem` (read-only)
-- Dependency's `measured-data = ["config/cert.pem"]` means mount the SAME file into that dependency container at `/app/measured-data/config/cert.pem` (read-only)
+- Workload's `[config] measured-data = ["config/cert.pem"]` means mount `config/cert.pem` into the workload container at `/atakit-portal/measured-data/config/cert.pem` (read-only)
+- Dependency's `measured-data = ["config/cert.pem"]` means mount the SAME file into that dependency container at `/atakit-portal/measured-data/config/cert.pem` (read-only)
 
 The actual files are always under the archive's `measured-data/` directory. The paths in the manifest are archive-relative (no `./` prefix).
 
@@ -124,7 +130,7 @@ The actual files are always under the archive's `measured-data/` directory. The 
 
 Same pattern as measured-data, but for operator-provided files. Each container's `unmeasured-data` array specifies which unmeasured-data files to mount.
 
-Mount point: `/app/unmeasured-data/<path>` (read-only)
+Mount point: `/atakit-portal/unmeasured-data/<path>` (read-only)
 
 ### 5. Mount disks per container
 

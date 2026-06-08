@@ -58,6 +58,11 @@ pub enum DeployStep {
         /// Local file to upload. `None` means the image is assumed to already
         /// exist in GCE -- the step verifies existence but skips upload.
         source_path: Option<String>,
+        /// Local secure-boot cert directory (containing PK.crt / KEK.crt /
+        /// db.crt / kernel.crt). When set, the certs are passed to
+        /// `gcloud compute images create` so the resulting image carries
+        /// custom Secure Boot variables instead of GCE's placeholder PK.
+        certs_dir: Option<String>,
         /// CC capabilities to register on the image. Multiple types produce a
         /// GCE image usable with either CC mode.
         cc_types: Vec<CcType>,
@@ -70,6 +75,9 @@ pub enum DeployStep {
     },
     CreateDisks {
         disks: Vec<DiskSpec>,
+        /// Resource group the disks live in. `None` for providers without
+        /// resource groups (GCP); `Some` for Azure.
+        resource_group: Option<String>,
     },
     CreateInstance {
         instance_name: String,
@@ -81,7 +89,7 @@ pub enum DeployStep {
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
     },
-    WaitForAgent {
+    WaitForPortal {
         timeout_secs: u64,
     },
     InitializeWorkload {
@@ -100,6 +108,7 @@ pub enum DeployStep {
         image_definition: String,
         image_version: String,
         source_path: Option<String>,
+        certs_dir: Option<String>,
         cc_types: Vec<CcType>,
         force: bool,
     },
@@ -115,6 +124,50 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+    },
+    // AWS-specific steps.
+    UploadImageAws {
+        bucket: String,
+        /// AMI name registered for the imported snapshot.
+        image_name: String,
+        /// Local VMDK file to upload. `None` means the AMI is assumed to
+        /// already exist -- the step verifies existence but skips upload.
+        source_path: Option<String>,
+        /// Local secure-boot directory containing `aws-uefi-blob.bin`. The
+        /// blob seeds the AMI's UEFI variables via `register-image
+        /// --uefi-data`. atakit requires Secure Boot on every CVM deploy.
+        certs_dir: Option<String>,
+        /// Delete and re-register the AMI even if it already exists.
+        force: bool,
+    },
+    CreateInstanceAws {
+        instance_name: String,
+        instance_type: String,
+        /// AMI name; the AMI id is resolved by name at execution time.
+        image_name: String,
+        security_group: String,
+        metadata: Vec<(String, String)>,
+        disks: Vec<DiskSpec>,
+        boot_disk_size_gb: Option<u64>,
+    },
+    // QEMU-specific steps.
+    /// Provision a local QEMU instance: create the boot-disk qcow2 overlay,
+    /// create one qcow2 per data disk, start swtpm with `--terminate`,
+    /// allocate free host ports for the portal forwards (+ optional ssh), and
+    /// spawn `qemu-system-x86_64` detached. Returns external_ip = 127.0.0.1
+    /// plus the recorded pid, instance dir, and host-port mapping.
+    StartLocalVm {
+        instance_dir: String,
+        base_disk: String,
+        boot_overlay: String,
+        boot_disk_size_gb: Option<u64>,
+        ovmf_path: String,
+        data_disks: Vec<DiskSpec>,
+        metadata: Vec<(String, String)>,
+        /// Workload-declared `"port/proto"` entries. TCP entries are forwarded
+        /// guest→same-host-port for predictability; non-tcp entries are
+        /// ignored (qemu user-mode networking has no UDP hostfwd in practice).
+        workload_ports: Vec<String>,
     },
 }
 
@@ -139,18 +192,59 @@ pub struct DestroyPlan {
 /// Individual destroy step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DestroyStep {
-    DeleteInstance { name: String },
-    DeleteDisks { names: Vec<String> },
-    DeleteFirewall { name: String },
-    DeleteImage { name: String },
-    DeleteBucket { name: String },
+    DeleteInstance {
+        name: String,
+    },
+    DeleteDisks {
+        names: Vec<String>,
+        /// Resource group the disks live in. `None` for providers without
+        /// resource groups (GCP); `Some` for Azure.
+        resource_group: Option<String>,
+    },
+    DeleteFirewall {
+        name: String,
+    },
+    DeleteImage {
+        name: String,
+    },
+    DeleteBucket {
+        name: String,
+    },
     // Azure-specific destroy steps.
-    DeleteResourceGroup { name: String },
+    DeleteResourceGroup {
+        name: String,
+    },
     DeleteImageVersion {
         gallery_rg: String,
         gallery: String,
         image_definition: String,
         image_version: String,
+    },
+    DeleteImageDefinition {
+        gallery_rg: String,
+        gallery: String,
+        image_definition: String,
+    },
+    // AWS-specific destroy steps.
+    DeleteSecurityGroup {
+        name: String,
+    },
+    /// Deregister the AMI and delete its backing snapshots.
+    DeleteAmi {
+        name: String,
+    },
+    DeleteS3Bucket {
+        name: String,
+    },
+    // QEMU-specific destroy steps.
+    /// Stop the running qemu process (SIGTERM, then SIGKILL on grace timeout).
+    /// swtpm self-terminates with the VM when launched with `--terminate`.
+    StopLocalVm {
+        pid: u32,
+    },
+    /// Remove the per-instance directory (overlays + serial log + swtpm state).
+    RemoveLocalInstanceDir {
+        path: String,
     },
 }
 
@@ -177,6 +271,20 @@ pub struct ResourceUpdates {
     pub image_definition: Option<String>,
     pub image_version: Option<String>,
     pub nsg: Option<String>,
+    // AWS fields.
+    pub snapshot: Option<String>,
+    // QEMU fields.
+    pub qemu_pid: Option<u32>,
+    pub qemu_instance_dir: Option<String>,
+    pub qemu_base_disk: Option<String>,
+    pub qemu_boot_overlay: Option<String>,
+    pub qemu_host_status_port: Option<u16>,
+    pub qemu_host_init_port: Option<u16>,
+    /// Path to the unix-socket chardev that `-serial chardev:ser` is wired to.
+    /// `cloud ssh` socats into this for an interactive console.
+    pub qemu_serial_sock: Option<String>,
+    /// Guest port → host port for workload-declared TCP ports.
+    pub qemu_workload_port_map: BTreeMap<u16, u16>,
 }
 
 impl fmt::Display for DeployStep {
@@ -198,17 +306,21 @@ impl fmt::Display for DeployStep {
                 firewall_rule,
                 ports,
             } => {
-                write!(f, "Open ports {} (rule: {firewall_rule})", format_ports_inline(ports))
+                write!(
+                    f,
+                    "Open ports {} (rule: {firewall_rule})",
+                    format_ports_inline(ports)
+                )
             }
-            DeployStep::CreateDisks { disks } => {
+            DeployStep::CreateDisks { disks, .. } => {
                 let names: Vec<_> = disks.iter().map(|d| d.name.as_str()).collect();
                 write!(f, "Create persistent disks: {}", names.join(", "))
             }
             DeployStep::CreateInstance { instance_name, .. } => {
                 write!(f, "Create VM instance '{instance_name}'")
             }
-            DeployStep::WaitForAgent { timeout_secs } => {
-                write!(f, "Wait for CVM agent (timeout: {timeout_secs}s)")
+            DeployStep::WaitForPortal { timeout_secs } => {
+                write!(f, "Wait for portal (timeout: {timeout_secs}s)")
             }
             DeployStep::InitializeWorkload { .. } => {
                 write!(f, "Initialize workload on CVM")
@@ -230,6 +342,27 @@ impl fmt::Display for DeployStep {
             DeployStep::CreateInstanceAzure { instance_name, .. } => {
                 write!(f, "Create VM instance '{instance_name}'")
             }
+            DeployStep::UploadImageAws {
+                image_name,
+                source_path,
+                ..
+            } => {
+                if source_path.is_some() {
+                    write!(f, "Upload base image '{image_name}'")
+                } else {
+                    write!(f, "Verify base image '{image_name}'")
+                }
+            }
+            DeployStep::CreateInstanceAws { instance_name, .. } => {
+                write!(f, "Create VM instance '{instance_name}'")
+            }
+            DeployStep::StartLocalVm { data_disks, .. } => {
+                if data_disks.is_empty() {
+                    write!(f, "Start local QEMU VM")
+                } else {
+                    write!(f, "Start local QEMU VM ({} data disk(s))", data_disks.len())
+                }
+            }
         }
     }
 }
@@ -238,7 +371,7 @@ impl fmt::Display for DestroyStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DestroyStep::DeleteInstance { name } => write!(f, "Delete VM instance '{name}'"),
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks { names, .. } => {
                 write!(f, "Delete disks: {}", names.join(", "))
             }
             DestroyStep::DeleteFirewall { name } => write!(f, "Delete firewall rule '{name}'"),
@@ -251,7 +384,22 @@ impl fmt::Display for DestroyStep {
                 image_definition,
                 image_version,
                 ..
-            } => write!(f, "Delete image version '{image_definition}:{image_version}'"),
+            } => write!(
+                f,
+                "Delete image version '{image_definition}:{image_version}'"
+            ),
+            DestroyStep::DeleteImageDefinition {
+                image_definition, ..
+            } => write!(f, "Delete image definition '{image_definition}'"),
+            DestroyStep::DeleteSecurityGroup { name } => {
+                write!(f, "Delete security group '{name}'")
+            }
+            DestroyStep::DeleteAmi { name } => write!(f, "Delete AMI '{name}'"),
+            DestroyStep::DeleteS3Bucket { name } => write!(f, "Delete S3 bucket '{name}'"),
+            DestroyStep::StopLocalVm { pid } => write!(f, "Stop local QEMU VM (pid {pid})"),
+            DestroyStep::RemoveLocalInstanceDir { path } => {
+                write!(f, "Remove instance directory '{path}'")
+            }
         }
     }
 }

@@ -76,6 +76,10 @@ impl CloudProvider for AzureProvider {
     }
 
     async fn plan_deploy(&self, opts: &DeployOptions) -> Result<DeployPlan, CloudError> {
+        // Storage account, gallery, and image version are derived from
+        // (region, image_ref) — shared across every deploy of the same image.
+        // The first deploy uploads the VHD; subsequent deploys detect the
+        // existing gallery image version and skip the upload.
         let names =
             AzureResourceNames::for_azure(&opts.instance_name, &opts.image_ref, &self.region);
         let mut steps = vec![DeployStep::CheckDeps];
@@ -95,12 +99,16 @@ impl CloudProvider for AzureProvider {
             image_definition: names.image_definition.clone(),
             image_version: names.image_version.clone(),
             source_path: opts.source_image_path.clone(),
+            certs_dir: opts.source_image_certs_dir.clone(),
             cc_types: opts.cc_types.clone(),
             force: opts.force_image,
         });
 
-        // Firewall - workload_ports are already resolved "port/proto" strings.
-        let mut ports = vec!["1024/tcp".to_string()];
+        // Firewall - always open the cvm-agent ports (2024 portal/measurements,
+        // 1024 workload init), plus workload ports. Skipping these breaks
+        // `fetch-platform-measurements` and image-only deploys.
+        // workload_ports are already resolved "port/proto" strings.
+        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
@@ -125,6 +133,7 @@ impl CloudProvider for AzureProvider {
         if !disks.is_empty() {
             steps.push(DeployStep::CreateDisks {
                 disks: disks.clone(),
+                resource_group: Some(names.resource_group.clone()),
             });
         }
 
@@ -147,7 +156,7 @@ impl CloudProvider for AzureProvider {
         });
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForAgent { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });
@@ -170,25 +179,28 @@ impl CloudProvider for AzureProvider {
             }
 
             DeployStep::CreateResourceGroup { name, region } => {
-                image::ensure_resource_group(name, region, runner).await?;
+                image::ensure_resource_group(&self.subscription, name, region, runner).await?;
                 updates.resource_group = Some(name.clone());
             }
 
             DeployStep::UploadImageAzure {
-                resource_group,
+                resource_group: _,
                 storage_account,
                 gallery_rg,
                 gallery,
                 image_definition,
                 image_version,
                 source_path,
+                certs_dir,
                 cc_types: _,
                 force,
             } => {
                 // Ensure gallery RG exists (shared, survives destroy).
-                image::ensure_resource_group(gallery_rg, &self.region, runner).await?;
+                image::ensure_resource_group(&self.subscription, gallery_rg, &self.region, runner)
+                    .await?;
 
                 let exists = image::check_image_version_exists(
+                    &self.subscription,
                     gallery_rg,
                     gallery,
                     image_definition,
@@ -200,6 +212,7 @@ impl CloudProvider for AzureProvider {
                 if exists && *force {
                     tracing::info!("force: deleting existing image version");
                     image::delete_image_version(
+                        &self.subscription,
                         gallery_rg,
                         gallery,
                         image_definition,
@@ -208,8 +221,26 @@ impl CloudProvider for AzureProvider {
                     )
                     .await?;
                 } else if exists {
-                    tracing::info!("image version already exists, skipping upload");
+                    tracing::info!(
+                        "image version '{image_definition}:{image_version}' already \
+                         exists; verifying it is ready before reuse"
+                    );
+                    // Block on provisioningState. If a prior deploy was
+                    // interrupted mid-replication the image may still be
+                    // Creating/Updating; wait for it. If it's Failed, this
+                    // errors with a pointer to --force-image.
+                    image::wait_for_image_version_succeeded(
+                        &self.subscription,
+                        gallery_rg,
+                        gallery,
+                        image_definition,
+                        image_version,
+                        runner,
+                    )
+                    .await?;
+
                     let image_id = image::get_image_version_id(
+                        &self.subscription,
                         gallery_rg,
                         gallery,
                         image_definition,
@@ -230,15 +261,48 @@ impl CloudProvider for AzureProvider {
 
                 if !exists || *force {
                     if let Some(src) = source_path {
-                        // Ensure storage infra.
+                        let certs =
+                            certs_dir
+                                .as_deref()
+                                .ok_or_else(|| CloudError::ImageUploadFailed {
+                                    message: format!(
+                                        "cannot register Azure image version \
+                                     '{image_definition}:{image_version}': no \
+                                     secure_boot_certs/ directory resolved for \
+                                     the base image. atakit requires Secure \
+                                     Boot to be enabled on every CVM deploy."
+                                    ),
+                                })?;
+                        if !exists {
+                            image::delete_image_definition(
+                                &self.subscription,
+                                gallery_rg,
+                                gallery,
+                                image_definition,
+                                runner,
+                            )
+                            .await?;
+                        }
+
+                        // Ensure storage infra. Storage account lives in the
+                        // shared gallery RG, not the per-instance RG, so it
+                        // survives `cloud destroy` and is reused by future
+                        // deploys of the same image.
                         image::ensure_storage_account(
-                            resource_group,
+                            &self.subscription,
+                            gallery_rg,
                             storage_account,
                             &self.region,
                             runner,
                         )
                         .await?;
-                        image::ensure_storage_container(storage_account, "vhds", runner).await?;
+                        image::ensure_storage_container(
+                            &self.subscription,
+                            storage_account,
+                            "vhds",
+                            runner,
+                        )
+                        .await?;
 
                         // Decompress .vhd.zst to a temp file for upload.
                         let (upload_path, _tmp_dir) = if src.ends_with(".zst") {
@@ -254,7 +318,8 @@ impl CloudProvider for AzureProvider {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("image.vhd");
-                        let blob_url = image::upload_vhd(
+                        image::upload_vhd(
+                            &self.subscription,
                             storage_account,
                             "vhds",
                             filename,
@@ -265,8 +330,10 @@ impl CloudProvider for AzureProvider {
                         .await?;
 
                         // Ensure gallery and image definition.
-                        image::ensure_gallery(gallery_rg, gallery, runner).await?;
+                        image::ensure_gallery(&self.subscription, gallery_rg, gallery, runner)
+                            .await?;
                         image::ensure_image_definition(
+                            &self.subscription,
                             gallery_rg,
                             gallery,
                             image_definition,
@@ -275,21 +342,35 @@ impl CloudProvider for AzureProvider {
                         .await?;
 
                         // Get storage account ID for image version creation.
+                        // The account now lives in the shared gallery RG.
                         let sa_id = image::get_storage_account_id(
+                            &self.subscription,
                             storage_account,
-                            resource_group,
+                            gallery_rg,
                             runner,
                         )
                         .await?;
 
+                        // Plain blob URL. The gallery service authenticates
+                        // through Azure RBAC on --os-vhd-storage-account
+                        // (sa_id); passing a SAS-wrapped URL here is rejected
+                        // by `az sig image-version create` as an invalid blob
+                        // URI.
+                        let blob_url = format!(
+                            "https://{storage_account}.blob.core.windows.net/vhds/{filename}"
+                        );
+
                         // Create image version.
                         let image_id = image::create_image_version(
+                            &self.subscription,
+                            &self.region,
                             gallery_rg,
                             gallery,
                             image_definition,
                             image_version,
                             &sa_id,
                             &blob_url,
+                            certs,
                             runner,
                         )
                         .await?;
@@ -322,36 +403,41 @@ impl CloudProvider for AzureProvider {
                     firewall_rule.strip_suffix("-nsg").unwrap_or(firewall_rule)
                 );
 
-                if firewall::check_nsg_exists(&rg_name, firewall_rule, runner).await? {
+                if firewall::check_nsg_exists(&self.subscription, &rg_name, firewall_rule, runner)
+                    .await?
+                {
                     tracing::info!("NSG '{firewall_rule}' already exists");
                 } else {
-                    firewall::create_nsg(&rg_name, firewall_rule, runner).await?;
-                    firewall::add_nsg_rules(&rg_name, firewall_rule, ports, runner).await?;
+                    firewall::create_nsg(&self.subscription, &rg_name, firewall_rule, runner)
+                        .await?;
+                    firewall::add_nsg_rules(
+                        &self.subscription,
+                        &rg_name,
+                        firewall_rule,
+                        ports,
+                        runner,
+                    )
+                    .await?;
                 }
                 updates.nsg = Some(firewall_rule.clone());
                 updates.firewall_rule = Some(firewall_rule.clone());
             }
 
-            DeployStep::CreateDisks { disks } => {
-                // Derive RG from first disk name pattern.
-                let rg_name = if let Some(first) = disks.first() {
-                    let base = first
-                        .name
-                        .rsplit_once('-')
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(&first.name);
-                    format!("{base}-rg")
-                } else {
-                    return Ok(StepResult {
-                        resource_updates: updates,
-                    });
-                };
+            DeployStep::CreateDisks {
+                disks,
+                resource_group,
+            } => {
+                let rg_name = resource_group.as_deref().ok_or_else(|| CloudError::State {
+                    message: "Azure CreateDisks step is missing its resource group".to_string(),
+                })?;
 
                 for spec in disks {
-                    if disk::check_disk_exists(&rg_name, &spec.name, runner).await? {
+                    if disk::check_disk_exists(&self.subscription, rg_name, &spec.name, runner)
+                        .await?
+                    {
                         tracing::info!("disk '{}' already exists", spec.name);
                     } else {
-                        disk::create_disk(&rg_name, spec, runner).await?;
+                        disk::create_disk(&self.subscription, rg_name, spec, runner).await?;
                     }
                     updates.disks.push(spec.name.clone());
                 }
@@ -371,12 +457,9 @@ impl CloudProvider for AzureProvider {
             } => {
                 // The image_id in the step is empty at plan time. Look up the
                 // gallery image version ID using the image_ref for naming.
-                let names = AzureResourceNames::for_azure(
-                    instance_name,
-                    image_ref,
-                    &self.region,
-                );
+                let names = AzureResourceNames::for_azure(instance_name, image_ref, &self.region);
                 let image_id = image::get_image_version_id(
+                    &self.subscription,
                     &names.gallery_rg,
                     &names.gallery,
                     &names.image_definition,
@@ -387,6 +470,7 @@ impl CloudProvider for AzureProvider {
                 .unwrap_or_default();
 
                 let ip = instance::create_instance(
+                    &self.subscription,
                     resource_group,
                     instance_name,
                     vm_size,
@@ -402,6 +486,7 @@ impl CloudProvider for AzureProvider {
                 // Attach disks with explicit LUN assignments after VM creation.
                 for disk in disks {
                     instance::attach_disk(
+                        &self.subscription,
                         resource_group,
                         instance_name,
                         &disk.name,
@@ -415,7 +500,7 @@ impl CloudProvider for AzureProvider {
                 updates.external_ip = Some(ip);
             }
 
-            DeployStep::WaitForAgent { .. } => {
+            DeployStep::WaitForPortal { .. } => {
                 // Handled by CLI layer.
             }
 
@@ -423,11 +508,14 @@ impl CloudProvider for AzureProvider {
                 // Handled by CLI layer.
             }
 
-            // GCP steps - should not be executed by Azure provider.
+            // GCP / AWS / QEMU steps - should not be executed by Azure provider.
             DeployStep::UploadImage { .. }
-            | DeployStep::CreateInstance { .. } => {
+            | DeployStep::CreateInstance { .. }
+            | DeployStep::UploadImageAws { .. }
+            | DeployStep::CreateInstanceAws { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
-                    message: "GCP step executed by Azure provider".to_string(),
+                    message: "non-Azure step executed by Azure provider".to_string(),
                 });
             }
         }
@@ -461,31 +549,23 @@ impl CloudProvider for AzureProvider {
         if !opts.preserve.contains(&"disks".to_string()) && !az.disks.is_empty() {
             steps.push(DestroyStep::DeleteDisks {
                 names: az.disks.clone(),
+                resource_group: az.resource_group.clone(),
             });
         }
 
-        // Delete NSG (unless firewall preserved).
-        if !opts.preserve.contains(&"firewall".to_string()) {
-            if let Some(ref name) = az.nsg {
-                steps.push(DestroyStep::DeleteFirewall { name: name.clone() });
-            }
-        }
+        // The NSG lives in {instance}-rg, which is deleted below — cascade handles it.
 
-        // Delete image version (unless image preserved).
-        if !opts.preserve.contains(&"image".to_string()) {
-            if let (Some(ref grg), Some(ref g), Some(ref def), Some(ref ver)) =
-                (&az.gallery_rg, &az.gallery, &az.image_definition, &az.image_version)
-            {
-                steps.push(DestroyStep::DeleteImageVersion {
-                    gallery_rg: grg.clone(),
-                    gallery: g.clone(),
-                    image_definition: def.clone(),
-                    image_version: ver.clone(),
-                });
-            }
-        }
+        // The gallery image version + definition + storage account are shared
+        // across every deploy of the same (region, image_ref). Do NOT delete
+        // them on per-instance destroy — sibling instances may still depend on
+        // them, and the next deploy of the same image reuses the upload.
+        // Use `atakit image rm` to clean up shared image artifacts. Azure
+        // therefore ignores both the default-preserved `image` token and the
+        // CLI's `--clean-image` opt-in.
+        let _ = &opts.preserve; // intentionally unused: image is always preserved on destroy
 
-        // Delete the deployment resource group (cleans up storage account, etc.).
+        // Delete the deployment resource group (per-instance: VM, disks, NSG).
+        // The shared storage account lives in the gallery RG and is untouched.
         if let Some(ref name) = az.resource_group {
             steps.push(DestroyStep::DeleteResourceGroup { name: name.clone() });
         }
@@ -502,26 +582,19 @@ impl CloudProvider for AzureProvider {
         match step {
             DestroyStep::DeleteInstance { name } => {
                 let rg = format!("{name}-rg");
-                instance::delete_instance(&rg, name, runner).await
+                instance::delete_instance(&self.subscription, &rg, name, runner).await
             }
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks {
+                names,
+                resource_group,
+            } => {
+                let rg = resource_group.as_deref().ok_or_else(|| CloudError::State {
+                    message: "Azure DeleteDisks step is missing its resource group".to_string(),
+                })?;
                 for name in names {
-                    // Derive RG from disk name: {instance}-{disk} -> instance -> {instance}-rg.
-                    let base = name
-                        .rsplit_once('-')
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(name);
-                    let rg = format!("{base}-rg");
-                    disk::delete_disk(&rg, name, runner).await?;
+                    disk::delete_disk(&self.subscription, rg, name, runner).await?;
                 }
                 Ok(())
-            }
-            DestroyStep::DeleteFirewall { name } => {
-                let rg = format!(
-                    "{}-rg",
-                    name.strip_suffix("-nsg").unwrap_or(name)
-                );
-                firewall::delete_nsg(&rg, name, runner).await
             }
             DestroyStep::DeleteImageVersion {
                 gallery_rg,
@@ -529,18 +602,44 @@ impl CloudProvider for AzureProvider {
                 image_definition,
                 image_version,
             } => {
-                image::delete_image_version(gallery_rg, gallery, image_definition, image_version, runner)
-                    .await
+                image::delete_image_version(
+                    &self.subscription,
+                    gallery_rg,
+                    gallery,
+                    image_definition,
+                    image_version,
+                    runner,
+                )
+                .await
+            }
+            DestroyStep::DeleteImageDefinition {
+                gallery_rg,
+                gallery,
+                image_definition,
+            } => {
+                image::delete_image_definition(
+                    &self.subscription,
+                    gallery_rg,
+                    gallery,
+                    image_definition,
+                    runner,
+                )
+                .await
             }
             DestroyStep::DeleteResourceGroup { name } => {
-                instance::delete_resource_group(name, runner).await
+                instance::delete_resource_group(&self.subscription, name, runner).await
             }
-            // GCP steps.
-            DestroyStep::DeleteImage { .. } | DestroyStep::DeleteBucket { .. } => {
-                Err(CloudError::State {
-                    message: "GCP destroy step executed by Azure provider".to_string(),
-                })
-            }
+            // GCP / AWS / QEMU steps.
+            DestroyStep::DeleteImage { .. }
+            | DestroyStep::DeleteBucket { .. }
+            | DestroyStep::DeleteFirewall { .. }
+            | DestroyStep::DeleteSecurityGroup { .. }
+            | DestroyStep::DeleteAmi { .. }
+            | DestroyStep::DeleteS3Bucket { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
+                message: "non-Azure destroy step executed by Azure provider".to_string(),
+            }),
         }
     }
 
@@ -549,16 +648,23 @@ impl CloudProvider for AzureProvider {
         state: &DeployState,
         runner: &dyn CommandRunner,
     ) -> Result<Option<String>, CloudError> {
-        let az = state.resources.azure.as_ref().ok_or_else(|| CloudError::State {
-            message: "no Azure resources in state".to_string(),
-        })?;
+        let az = state
+            .resources
+            .azure
+            .as_ref()
+            .ok_or_else(|| CloudError::State {
+                message: "no Azure resources in state".to_string(),
+            })?;
         let instance_name = az.instance.as_ref().ok_or_else(|| CloudError::State {
             message: "no instance in state".to_string(),
         })?;
-        let rg = az.resource_group.as_deref().ok_or_else(|| CloudError::State {
-            message: "no resource group in state".to_string(),
-        })?;
-        instance::get_instance_ip(rg, instance_name, runner).await
+        let rg = az
+            .resource_group
+            .as_deref()
+            .ok_or_else(|| CloudError::State {
+                message: "no resource group in state".to_string(),
+            })?;
+        instance::get_instance_ip(&self.subscription, rg, instance_name, runner).await
     }
 
     async fn get_serial_output(
@@ -566,32 +672,48 @@ impl CloudProvider for AzureProvider {
         state: &DeployState,
         runner: &dyn CommandRunner,
     ) -> Result<String, CloudError> {
-        let az = state.resources.azure.as_ref().ok_or_else(|| CloudError::State {
-            message: "no Azure resources in state".to_string(),
-        })?;
+        let az = state
+            .resources
+            .azure
+            .as_ref()
+            .ok_or_else(|| CloudError::State {
+                message: "no Azure resources in state".to_string(),
+            })?;
         let instance_name = az.instance.as_ref().ok_or_else(|| CloudError::State {
             message: "no instance in state".to_string(),
         })?;
-        let rg = az.resource_group.as_deref().ok_or_else(|| CloudError::State {
-            message: "no resource group in state".to_string(),
-        })?;
-        instance::get_boot_log(rg, instance_name, runner).await
+        let rg = az
+            .resource_group
+            .as_deref()
+            .ok_or_else(|| CloudError::State {
+                message: "no resource group in state".to_string(),
+            })?;
+        instance::get_boot_log(&self.subscription, rg, instance_name, runner).await
     }
 
     fn ssh_command(&self, state: &DeployState) -> Result<Vec<String>, CloudError> {
-        let az = state.resources.azure.as_ref().ok_or_else(|| CloudError::State {
-            message: "no Azure resources in state".to_string(),
-        })?;
+        let az = state
+            .resources
+            .azure
+            .as_ref()
+            .ok_or_else(|| CloudError::State {
+                message: "no Azure resources in state".to_string(),
+            })?;
         let instance_name = az.instance.as_ref().ok_or_else(|| CloudError::State {
             message: "no instance in state".to_string(),
         })?;
-        let rg = az.resource_group.as_deref().ok_or_else(|| CloudError::State {
-            message: "no resource group in state".to_string(),
-        })?;
+        let rg = az
+            .resource_group
+            .as_deref()
+            .ok_or_else(|| CloudError::State {
+                message: "no resource group in state".to_string(),
+            })?;
         Ok(vec![
             "az".to_string(),
             "ssh".to_string(),
             "vm".to_string(),
+            "--subscription".to_string(),
+            self.subscription.clone(),
             "--name".to_string(),
             instance_name.clone(),
             "--resource-group".to_string(),
@@ -600,19 +722,28 @@ impl CloudProvider for AzureProvider {
     }
 
     fn serial_command(&self, state: &DeployState) -> Result<Vec<String>, CloudError> {
-        let az = state.resources.azure.as_ref().ok_or_else(|| CloudError::State {
-            message: "no Azure resources in state".to_string(),
-        })?;
+        let az = state
+            .resources
+            .azure
+            .as_ref()
+            .ok_or_else(|| CloudError::State {
+                message: "no Azure resources in state".to_string(),
+            })?;
         let instance_name = az.instance.as_ref().ok_or_else(|| CloudError::State {
             message: "no instance in state".to_string(),
         })?;
-        let rg = az.resource_group.as_deref().ok_or_else(|| CloudError::State {
-            message: "no resource group in state".to_string(),
-        })?;
+        let rg = az
+            .resource_group
+            .as_deref()
+            .ok_or_else(|| CloudError::State {
+                message: "no resource group in state".to_string(),
+            })?;
         Ok(vec![
             "az".to_string(),
             "serial-console".to_string(),
             "connect".to_string(),
+            "--subscription".to_string(),
+            self.subscription.clone(),
             "--name".to_string(),
             instance_name.clone(),
             "--resource-group".to_string(),
@@ -626,21 +757,24 @@ mod tests {
     use super::*;
     use crate::config::{CcType, CloudTarget};
     use crate::provider::{CloudProvider, DeployOptions};
-    use crate::state::PersistedAgentEnv;
+    use crate::state::PersistedInitEnv;
     use std::collections::BTreeMap;
 
     fn test_target() -> CloudTarget {
         CloudTarget {
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
+            uefi: None,
             image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            rpc_url: None,
-            session_registry: None,
-            owner_key_file: None,
-            relay_key_file: None,
+            boot_disk_size: None,
+            chain: Some("testnet".to_string()),
+            registration: None,
+            owner_key: Some("owner".to_string()),
+            gas_wallet: Some("gas".to_string()),
+            sp1_payer: None,
         }
     }
 
@@ -651,11 +785,12 @@ mod tests {
             target: test_target(),
             image_ref: image_ref.into(),
             source_image_path: Some("/tmp/disk.vhd".into()),
+            source_image_certs_dir: Some("/tmp/secure_boot_certs".into()),
             archive_path: "/tmp/test.atawl".into(),
             archive_hash: "abc123".into(),
             workload_name: "test-workload".into(),
             workload_version: "v0.0.1".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             metadata: BTreeMap::new(),
             force_image: false,
             skip_init: true,
@@ -674,16 +809,54 @@ mod tests {
         let plan = provider.plan_deploy(&opts).await.unwrap();
 
         // Find the CreateInstanceAzure step and verify image_ref is populated.
-        let create_step = plan.steps.iter().find(|s| {
-            matches!(s, DeployStep::CreateInstanceAzure { .. })
-        });
-        assert!(create_step.is_some(), "plan must contain CreateInstanceAzure");
+        let create_step = plan
+            .steps
+            .iter()
+            .find(|s| matches!(s, DeployStep::CreateInstanceAzure { .. }));
+        assert!(
+            create_step.is_some(),
+            "plan must contain CreateInstanceAzure"
+        );
 
         if let DeployStep::CreateInstanceAzure { image_ref, .. } = create_step.unwrap() {
             assert_eq!(image_ref, "automata-linux:v0.1.6");
         } else {
             unreachable!();
         }
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_disks_carry_the_created_resource_group() {
+        // Regression: disk steps used to re-derive the RG from the disk name
+        // via rsplit_once('-'), which broke when the instance name and disk
+        // name both contained hyphens (e.g. instance
+        // "multi-container-example-azure-tdx" + disk "shared-data" produced
+        // a bogus "...-shared-rg" instead of "...-rg"). The RG must now match
+        // the one the CreateResourceGroup step actually creates.
+        let provider = AzureProvider::new("sub-123".into(), "eastus".into());
+        let mut opts = test_deploy_opts("test-baseimage:v0.0.5");
+        opts.instance_name = "multi-container-example-azure-tdx".into();
+        opts.workload_disks = vec![("shared-data".to_string(), 10, 10)];
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+
+        let created_rg = plan.steps.iter().find_map(|s| match s {
+            DeployStep::CreateResourceGroup { name, .. } => Some(name.clone()),
+            _ => None,
+        });
+        let disk_rg = plan.steps.iter().find_map(|s| match s {
+            DeployStep::CreateDisks { resource_group, .. } => Some(resource_group.clone()),
+            _ => None,
+        });
+
+        let created_rg = created_rg.expect("plan must create a resource group");
+        let disk_rg = disk_rg
+            .expect("plan must contain CreateDisks")
+            .expect("Azure CreateDisks must carry a resource group");
+        assert_eq!(
+            disk_rg, created_rg,
+            "disk RG must match the resource group that is actually created"
+        );
     }
 
     #[tokio::test]
@@ -706,4 +879,3 @@ mod tests {
         }
     }
 }
-

@@ -11,6 +11,8 @@ const CONFIG_FILENAME: &str = "atakit-workload.toml";
 #[derive(Debug, Deserialize)]
 pub struct WorkloadConfig {
     pub format: u32,
+    #[serde(default)]
+    pub package: Option<PackageSection>,
     pub workload: WorkloadSection,
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySection>,
@@ -19,9 +21,64 @@ pub struct WorkloadConfig {
     #[serde(default, rename = "baby-container")]
     pub baby_container: Option<BabyContainerSection>,
     #[serde(default)]
-    pub signing: Option<SigningSection>,
-    #[serde(default)]
     pub disks: BTreeMap<String, DiskSection>,
+}
+
+/// Package data: file lists for measured-data and unmeasured-data.
+#[derive(Debug, Deserialize)]
+pub struct PackageSection {
+    #[serde(default, rename = "measured-data")]
+    pub measured_data: Vec<String>,
+    #[serde(default, rename = "unmeasured-data")]
+    pub unmeasured_data: Vec<String>,
+}
+
+/// Container logging configuration. Selects the podman log driver, its
+/// options, and the manifest-level allowlist of services that may read this
+/// service's logs.
+///
+/// `driver` is restricted to drivers podman accepts natively in the minimal
+/// CVM image (no journald). Remote-shipping drivers (fluentd, syslog, ...)
+/// are NOT supported by podman natively and are intentionally absent --
+/// remote log delivery is implemented as a shipper dependency, not as a log
+/// driver. `log-readers` is the manifest-level allowlist that gates the
+/// portal-emitted bind-mount; access also requires the reader to be in the
+/// same `gid-group` and to opt in with `workload-logs = true`.
+#[derive(Debug, Deserialize)]
+pub struct LoggingSection {
+    #[serde(default = "default_log_driver")]
+    pub driver: String,
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
+    #[serde(default, rename = "log-readers")]
+    pub log_readers: Vec<String>,
+}
+
+fn default_log_driver() -> String {
+    "k8s-file".to_string()
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        Self {
+            driver: default_log_driver(),
+            options: BTreeMap::new(),
+            log_readers: Vec::new(),
+        }
+    }
+}
+
+impl LoggingSection {
+    /// Inject driver-specific option defaults after deserialization. For
+    /// `k8s-file` with empty options, populate {max-size=50m, max-file=5}.
+    /// Other drivers (currently only `none`) have no defaults.
+    pub(crate) fn inject_defaults(&mut self) {
+        if self.driver == "k8s-file" && self.options.is_empty() {
+            self.options
+                .insert("max-size".to_string(), "50m".to_string());
+            self.options.insert("max-file".to_string(), "5".to_string());
+        }
+    }
 }
 
 impl WorkloadConfig {
@@ -32,7 +89,41 @@ impl WorkloadConfig {
             path: path.clone(),
             source: e,
         })?;
-        toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })
+        check_legacy_fields(&content)?;
+        let mut config: Self =
+            toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
+        config.inject_defaults();
+        Ok(config)
+    }
+
+    /// Parse from a TOML string. Runs legacy field checks.
+    pub fn load_from_str(content: &str) -> Result<Self, WorkloadError> {
+        check_legacy_fields(content)?;
+        let mut config: Self = toml::from_str(content).map_err(|e| WorkloadError::ParseConfig {
+            path: CONFIG_FILENAME.into(),
+            source: e,
+        })?;
+        config.inject_defaults();
+        Ok(config)
+    }
+
+    /// Populate defaults that depend on field interactions (currently logging
+    /// driver-specific option defaults). Called after toml deserialization.
+    fn inject_defaults(&mut self) {
+        self.workload.logging.inject_defaults();
+        for dep in self.dependencies.values_mut() {
+            dep.logging.inject_defaults();
+        }
+    }
+
+    /// Get package measured-data file paths (empty if no [package] section).
+    pub fn measured_data_paths(&self) -> &[String] {
+        self.package.as_ref().map_or(&[], |p| &p.measured_data)
+    }
+
+    /// Get package unmeasured-data file paths (empty if no [package] section).
+    pub fn unmeasured_data_paths(&self) -> &[String] {
+        self.package.as_ref().map_or(&[], |p| &p.unmeasured_data)
     }
 
     /// Resolve disk indices: auto-assign starting from 10 for disks without
@@ -86,14 +177,17 @@ pub struct WorkloadSection {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub env_file: Option<StringOrArray>,
-    #[serde(default = "default_ttl")]
-    pub ttl: u64,
-    #[serde(default)]
-    pub cvm_agent: bool,
+    #[serde(default = "default_session_ttl", rename = "session-ttl")]
+    pub session_ttl: u64,
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    /// GID sharing group. Default: workload name.
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
     /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
@@ -103,10 +197,24 @@ pub struct WorkloadSection {
     /// (currently NET_ADMIN, NET_RAW) so attestation surface stays bounded.
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the default cap set as a hardening
+    /// commitment. Entries must be members of the default set.
+    #[serde(default, rename = "cap-drop")]
+    pub cap_drop: Vec<String>,
+    /// Container logging: driver + options + log-readers allowlist.
+    #[serde(default)]
+    pub logging: LoggingSection,
+    /// Opt-in to receive a bind-mount of `/atakit-portal/workload/logs/`,
+    /// containing only the producer subdirs that grant access via their
+    /// `logging.log-readers` list. The container also needs GID 0 in its
+    /// process credentials to actually read the files (k8s-file logs are
+    /// 0640 group-owned by the gid-group host GID).
+    #[serde(default, rename = "workload-logs")]
+    pub workload_logs: bool,
 }
 
-/// Default TTL: 0 means contract default (30 days).
-fn default_ttl() -> u64 {
+/// Default session TTL: 0 means contract default (30 days).
+fn default_session_ttl() -> u64 {
     0
 }
 
@@ -227,16 +335,27 @@ pub struct DependencySection {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "atakit-portal")]
+    pub atakit_portal: bool,
+    /// GID sharing group. Default: workload name.
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: Vec<String>,
+    pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: Vec<String>,
+    pub unmeasured_data: bool,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
+    #[serde(default, rename = "cap-drop")]
+    pub cap_drop: Vec<String>,
+    #[serde(default)]
+    pub logging: LoggingSection,
+    #[serde(default, rename = "workload-logs")]
+    pub workload_logs: bool,
 }
 
 /// Parsed port specification: `host[:container][/protocol]`.
@@ -361,49 +480,269 @@ impl<'de> serde::Deserialize<'de> for FirewallEntry {
 #[derive(Debug, Deserialize)]
 pub struct BabyContainerSection {
     #[serde(default)]
-    pub allow: bool,
-    #[serde(default = "default_max_count")]
-    pub max_count: u32,
+    pub enabled: bool,
+    #[serde(default, rename = "max-instances")]
+    pub max_instances: Option<u32>,
+    #[serde(default)]
+    pub slots: BTreeMap<String, BabyContainerSlotSection>,
 }
 
-fn default_max_count() -> u32 {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerSlotSection {
+    #[serde(rename = "parent-service")]
+    pub parent_service: String,
+    #[serde(default, rename = "gid-group")]
+    pub gid_group: Option<String>,
+    #[serde(default = "default_baby_image_selection", rename = "image-selection")]
+    pub image_selection: String,
+    #[serde(default = "default_baby_slot_max_instances", rename = "max-instances")]
+    pub max_instances: u32,
+    #[serde(default, rename = "trust-policy")]
+    pub trust_policy: Option<String>,
+    #[serde(default)]
+    pub lifecycle: BabyContainerLifecycleSection,
+    #[serde(default)]
+    pub storage: BTreeMap<String, BabyContainerStorageSection>,
+    #[serde(default)]
+    pub logging: LoggingSection,
+}
+
+fn default_baby_image_selection() -> String {
+    "single".to_string()
+}
+
+fn default_baby_slot_max_instances() -> u32 {
     1
 }
 
-/// Image signing / verification settings.
 #[derive(Debug, Deserialize)]
-pub struct SigningSection {
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerLifecycleSection {
+    #[serde(default = "default_baby_image_retention", rename = "image-retention")]
+    pub image_retention: String,
+    #[serde(
+        default = "default_baby_instance_retention",
+        rename = "instance-retention"
+    )]
+    pub instance_retention: String,
+    #[serde(default = "default_baby_restart")]
+    pub restart: String,
+    #[serde(default = "default_baby_rootfs")]
+    pub rootfs: String,
+}
+
+impl Default for BabyContainerLifecycleSection {
+    fn default() -> Self {
+        Self {
+            image_retention: default_baby_image_retention(),
+            instance_retention: default_baby_instance_retention(),
+            restart: default_baby_restart(),
+            rootfs: default_baby_rootfs(),
+        }
+    }
+}
+
+fn default_baby_image_retention() -> String {
+    "session".to_string()
+}
+
+fn default_baby_instance_retention() -> String {
+    "ephemeral".to_string()
+}
+
+fn default_baby_restart() -> String {
+    "manual".to_string()
+}
+
+fn default_baby_rootfs() -> String {
+    "read-only".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerStorageSection {
+    pub disk: String,
+    #[serde(rename = "base-path")]
+    pub base_path: String,
+    #[serde(rename = "mount-path")]
+    pub mount_path: String,
+    #[serde(default = "default_baby_storage_retention")]
+    pub retention: String,
+    #[serde(default = "default_baby_storage_scope")]
+    pub scope: String,
+    #[serde(default, rename = "read-only")]
+    pub read_only: bool,
     #[serde(default)]
-    pub enable: bool,
-    pub auth_info: Option<String>,
-    pub policy: Option<String>,
+    pub permissions: BabyContainerStoragePermissionsSection,
+}
+
+fn default_baby_storage_retention() -> String {
+    "session".to_string()
+}
+
+fn default_baby_storage_scope() -> String {
+    "instance".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BabyContainerStoragePermissionsSection {
+    #[serde(default = "default_baby_permission_rw")]
+    pub baby: String,
+    #[serde(default = "default_baby_permission_none")]
+    pub parent: String,
+}
+
+impl Default for BabyContainerStoragePermissionsSection {
+    fn default() -> Self {
+        Self {
+            baby: default_baby_permission_rw(),
+            parent: default_baby_permission_none(),
+        }
+    }
+}
+
+fn default_baby_permission_rw() -> String {
+    "rw".to_string()
+}
+
+fn default_baby_permission_none() -> String {
+    "none".to_string()
 }
 
 /// Persistent disk definition.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskSection {
     /// LUN / device index. Must be >= 10 and unique across all disks.
     /// If omitted, auto-assigned starting from 10 in alphabetical disk name order.
     pub index: Option<u32>,
     pub size: String,
-    #[serde(default)]
-    pub bind_fs: bool,
-    #[serde(default)]
-    pub encryption: Option<EncryptionSection>,
+    /// Required: a disk declaration must always carry an `encryption` block.
+    /// Empty arrays (`unlock_method = []`, `bind = []`) are the explicit
+    /// "no encryption" commitment. Omitting the block is a parse error so
+    /// that the absence of encryption is always a deliberate choice.
+    pub encryption: EncryptionSection,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionSection {
     #[serde(default)]
-    pub enable: bool,
-    #[serde(default = "default_key_security")]
-    pub key_security: String,
+    pub unlock_method: Vec<String>,
+    #[serde(default)]
+    pub bind: Vec<String>,
 }
 
-fn default_key_security() -> String {
-    "standard".to_string()
-}
+/// Reject deprecated format-1 fields before serde parsing, with migration hints.
+fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
+    let value: toml::Value = match toml::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // defer to real parser for syntax errors
+    };
 
+    if let Some(fmt) = value.get("format").and_then(|v| v.as_integer()) {
+        if fmt == 1 {
+            return Err(WorkloadError::Validation(
+                "format = 1 is no longer supported. Update to format = 2 \
+                 and apply the v2 migration changes (cvm_agent -> atakit-portal, \
+                 encryption schema, signing removal)."
+                    .into(),
+            ));
+        }
+    }
+
+    if let Some(workload) = value.get("workload").and_then(|v| v.as_table()) {
+        if workload.contains_key("cvm_agent") {
+            return Err(WorkloadError::Validation(
+                "`cvm_agent` is no longer supported in format 2. \
+                 Rename to `atakit-portal`."
+                    .into(),
+            ));
+        }
+        if workload.contains_key("ttl") {
+            return Err(WorkloadError::Validation(
+                "`ttl` has been renamed to `session-ttl` in format 2.".into(),
+            ));
+        }
+        if workload.get("measured-data").is_some_and(|v| v.is_array()) {
+            return Err(WorkloadError::Validation(
+                "`measured-data` on [workload] must be a boolean in format 2. \
+                 Move file lists to `[package] measured-data`."
+                    .into(),
+            ));
+        }
+        if workload
+            .get("unmeasured-data")
+            .is_some_and(|v| v.is_array())
+        {
+            return Err(WorkloadError::Validation(
+                "`unmeasured-data` on [workload] must be a boolean in format 2. \
+                 Move file lists to `[package] unmeasured-data`."
+                    .into(),
+            ));
+        }
+    }
+
+    if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
+        for (name, dep) in deps {
+            if let Some(t) = dep.as_table() {
+                if t.contains_key("cvm_agent") {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `cvm_agent` is no longer supported. \
+                         Rename to `atakit-portal`."
+                    )));
+                }
+                if t.get("measured-data").is_some_and(|v| v.is_array()) {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `measured-data` must be a boolean in format 2. \
+                         Move file lists to `[package] measured-data`."
+                    )));
+                }
+                if t.get("unmeasured-data").is_some_and(|v| v.is_array()) {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
+                         Move file lists to `[package] unmeasured-data`."
+                    )));
+                }
+            }
+        }
+    }
+
+    if value.get("signing").is_some() {
+        return Err(WorkloadError::Validation(
+            "`[signing]` is no longer supported in format 2. \
+             Remove the signing section."
+                .into(),
+        ));
+    }
+
+    if let Some(disks) = value.get("disks").and_then(|v| v.as_table()) {
+        for (name, disk) in disks {
+            if let Some(enc) = disk.get("encryption").and_then(|v| v.as_table()) {
+                if enc.contains_key("enable") || enc.contains_key("key_security") {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?}: encryption schema has changed in format 2. \
+                         Replace {{enable, key_security}} with \
+                         {{unlock_method, bind}}."
+                    )));
+                }
+            }
+            if let Some(t) = disk.as_table() {
+                if t.contains_key("bind_fs") {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?}: `bind_fs` is no longer supported. \
+                         Manual `--uidmap`/`--gidmap` plus the shared GID scheme \
+                         makes bindfs redundant."
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -412,7 +751,7 @@ mod tests {
     #[test]
     fn parse_minimal_config() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "my-app"
@@ -429,7 +768,7 @@ image = "my-app:latest"
     #[test]
     fn parse_build_image() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -454,7 +793,7 @@ image = { build = ".", containerfile = "Containerfile" }
     #[test]
     fn parse_file_image() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -463,13 +802,19 @@ base-image-mode = "blacklist"
 image = { file = "./images/app.tar" }
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.workload.image, ImageSource::File { ref file } if file == "./images/app.tar"));
+        assert!(
+            matches!(cfg.workload.image, ImageSource::File { ref file } if file == "./images/app.tar")
+        );
     }
 
     #[test]
     fn parse_full_config() {
         let toml = r#"
-format = 1
+format = 2
+
+[package]
+measured-data = ["./config/hello", "./config/cert.pem"]
+unmeasured-data = ["./additional-data/signer_key"]
 
 [workload]
 name = "secure-signer"
@@ -479,9 +824,10 @@ base-image = ["mola-linux:v0.1.0-debug"]
 image = { build = ".", containerfile = "Containerfile" }
 ports = ["3000:3000"]
 restart = "unless-stopped"
-cvm_agent = true
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/signer_key"]
+atakit-portal = true
+gid-group = "shared"
+measured-data = true
+unmeasured-data = true
 
 [workload.environment]
 RUST_LOG = "info"
@@ -492,42 +838,53 @@ data = "/data"
 [dependencies.redis]
 image = "redis:7"
 
+[dependencies.model-server]
+image = { file = "./images/model-server.tar" }
+ports = ["8080:8080"]
+measured-data = true
+
 [firewall]
 allow = [{ port = 4000, protocol = "tcp" }]
 
 [baby-container]
-allow = true
-max_count = 2
+enabled = true
+max-instances = 2
 
-[signing]
-enable = true
-auth_info = "./secrets/auth_info.json"
-policy = "./config/cosign_policy.json"
+[baby-container.slots.analysis-job]
+parent-service = "secure-signer"
 
 [disks.data]
 index = 10
 size = "10GB"
-bind_fs = true
-encryption = { enable = true }
+encryption = { unlock_method = ["tpm"], bind = ["workload"] }
 
 "#;
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.workload.name, "secure-signer");
         assert_eq!(cfg.workload.ports, vec!["3000:3000"]);
-        assert!(cfg.workload.cvm_agent);
-        assert_eq!(cfg.workload.measured_data.len(), 2);
+        assert!(cfg.workload.atakit_portal);
+        assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
+        assert!(cfg.workload.measured_data);
+        assert!(cfg.workload.unmeasured_data);
+        let pkg = cfg.package.as_ref().unwrap();
+        assert_eq!(pkg.measured_data.len(), 2);
+        assert_eq!(pkg.unmeasured_data.len(), 1);
         assert!(cfg.dependencies.contains_key("redis"));
+        assert!(cfg.dependencies["model-server"].measured_data);
+        assert!(!cfg.dependencies["model-server"].unmeasured_data);
         assert!(cfg.firewall.is_some());
         assert!(cfg.baby_container.is_some());
-        assert!(cfg.signing.is_some());
         assert!(cfg.disks.contains_key("data"));
         assert_eq!(cfg.disks["data"].index, Some(10));
+        let enc = &cfg.disks["data"].encryption;
+        assert_eq!(enc.unlock_method, vec!["tpm"]);
+        assert_eq!(enc.bind, vec!["workload"]);
     }
 
     #[test]
     fn rejects_build_and_file_together() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -542,7 +899,7 @@ image = { build = ".", file = "./app.tar" }
     #[test]
     fn string_or_array_single() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -561,7 +918,7 @@ command = "echo hello"
     #[test]
     fn string_or_array_array() {
         let toml = r#"
-format = 1
+format = 2
 
 [workload]
 name = "test"
@@ -575,5 +932,195 @@ command = ["echo", "hello"]
             Some(StringOrArray::Array(v)) => assert_eq!(v, &["echo", "hello"]),
             other => panic!("expected Array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_format_1() {
+        let toml = r#"
+format = 1
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("format = 1"));
+    }
+
+    #[test]
+    fn rejects_cvm_agent() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+cvm_agent = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("cvm_agent"));
+    }
+
+    #[test]
+    fn rejects_signing_section() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[signing]
+enable = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("signing"));
+    }
+
+    #[test]
+    fn rejects_old_encryption_schema() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { enable = true }
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("encryption schema"));
+    }
+
+    #[test]
+    fn rejects_disk_bind_fs() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+bind_fs = true
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bind_fs"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("uidmap"),
+            "expected migration hint in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_old_ttl() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+ttl = 3600
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("session-ttl"));
+    }
+
+    #[test]
+    fn rejects_array_measured_data_on_workload() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+measured-data = ["./config/hello"]
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn rejects_array_measured_data_on_dependency() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+
+[dependencies.redis]
+image = "redis:7"
+measured-data = ["./config/hello"]
+"#;
+        let err = check_legacy_fields(toml).unwrap_err();
+        assert!(err.to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn parses_package_section() {
+        let toml = r#"
+format = 2
+
+[package]
+measured-data = ["./config/hello", "./config/cert.pem"]
+unmeasured-data = ["./additional-data/key"]
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+measured-data = true
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.measured_data_paths(),
+            &["./config/hello", "./config/cert.pem"]
+        );
+        assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
+        assert!(cfg.workload.measured_data);
+        assert!(!cfg.workload.unmeasured_data);
+    }
+
+    #[test]
+    fn parses_session_ttl() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+session-ttl = 3600
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.workload.session_ttl, 3600);
     }
 }

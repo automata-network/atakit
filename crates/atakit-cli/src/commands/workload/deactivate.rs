@@ -1,71 +1,46 @@
 use std::io::{self, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use atakit_core::Env;
 use atakit_workload::cli::DeactivateArgs;
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, looks_like_store_ref};
+use super::{compute_workload_id, looks_like_store_ref, resolve_chain, resolve_owner_key};
 use crate::config::Config;
 
 pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
-    // Resolve RPC URL and session registry from args, config, or env
-    let rpc_url = args
-        .rpc_url.clone()
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-        ))?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
-    let session_registry_str = args
-        .session_registry.clone()
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-        ))?;
-
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
-
-    // Resolve owner private key: CLI arg > key file from config
-    let private_key_raw = match args.owner_key.clone() {
-        Some(k) => k,
-        None => match config.publish.owner_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("owner key required: use --owner-key or set publish.owner_key_file in config"),
-        },
-    };
-    let private_key_hex = private_key_raw.strip_prefix("0x").unwrap_or(&private_key_raw);
-    let signer: alloy_ext::signers::local::PrivateKeySigner = private_key_hex
+    let session_registry_address: alloy_ext::core::primitives::Address = chain
+        .session_registry
         .parse()
-        .context("invalid private key")?;
+        .context("invalid session registry address")?;
+
+    // Resolve owner private key from [keys].
+    let private_key_raw = resolve_owner_key(args.owner_key.as_deref(), config)?;
+    let private_key_hex = private_key_raw
+        .strip_prefix("0x")
+        .unwrap_or(&private_key_raw);
+    let signer: alloy_ext::signers::local::PrivateKeySigner =
+        private_key_hex.parse().context("invalid private key")?;
 
     let signer_address = signer.address();
     println!("Signer: {}", format!("{signer_address}").dimmed());
 
     // Resolve workload identity: name+version or workload ID
-    let (name, version, workload_id) = resolve_workload_identity(
-        &args, env, config, verbose,
-    ).await?;
+    let (name, version, workload_id) =
+        resolve_workload_identity(&args, env, config, verbose).await?;
 
     let workload_id_hex = format!("0x{}", hex::encode(workload_id));
 
-    println!(
-        "Workload: {} {}",
-        name.green().bold(),
-        version,
-    );
+    println!("Workload: {} {}", name.green().bold(), version,);
     println!("Workload ID: {}", workload_id_hex.dimmed());
 
-    // Resolve relay key: CLI arg > key file from config
-    let relay_key_raw = match args.relay_key.clone() {
-        Some(k) => k,
-        None => match config.publish.relay_key_file {
-            Some(ref path) => crate::config::read_key_file(path)?,
-            None => bail!("relay key required: use --relay-key or set publish.relay_key_file in config"),
-        },
-    };
+    // Resolve relay key for transaction submission.
+    let relay_key_raw = super::resolve_relay_key(args.relay_key.as_deref(), config)?;
     let relay_key_hex = relay_key_raw.strip_prefix("0x").unwrap_or(&relay_key_raw);
     let relay_key = {
         let bytes: [u8; 32] = hex::decode(relay_key_hex)
@@ -82,11 +57,10 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     };
 
     println!("Connecting to registry...");
-    let measurement = automata_tee_workload_measurement::WorkloadMeasurement::new(
-        measurement_config,
-    )
-    .await
-    .context("failed to connect to WorkloadMeasurement")?;
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .context("failed to connect to WorkloadMeasurement")?;
 
     let registry = measurement.workload_registry();
 
@@ -102,10 +76,7 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
             }
         }
         println!();
-        println!(
-            "{}",
-            "Workload is already deactivated.".yellow().bold()
-        );
+        println!("{}", "Workload is already deactivated.".yellow().bold());
         println!("  {:<18}{}", "Workload ID:", workload_id_hex);
         return Ok(());
     }
@@ -130,21 +101,15 @@ pub async fn run(args: DeactivateArgs, env: &Env, config: &Config, verbose: bool
     }
 
     println!("Submitting deactivateWorkload transaction...");
+    let expire_offset = args.expire_offset.unwrap_or(chain.expire_offset);
     let tx_hash = registry
-        .deactivate_workload(&signer, workload_id, args.expire_offset)
+        .deactivate_workload(&signer, workload_id, expire_offset)
         .await
         .context("deactivateWorkload failed")?;
 
     println!();
-    println!(
-        "{}",
-        "Workload deactivated successfully.".green().bold()
-    );
-    println!(
-        "  {:<18}0x{}",
-        "Tx hash:",
-        hex::encode(tx_hash),
-    );
+    println!("{}", "Workload deactivated successfully.".green().bold());
+    println!("  {:<18}0x{}", "Tx hash:", hex::encode(tx_hash),);
 
     // Mark as revoked in the local store if entry exists
     let store = WorkloadStore::new(&env.workload_dir);
@@ -218,11 +183,9 @@ async fn resolve_from_archive(
 ) -> Result<(String, String, alloy_ext::core::primitives::B256)> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 

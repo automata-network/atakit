@@ -29,13 +29,10 @@ pub async fn upload_release_asset(
             path: file_path.to_path_buf(),
             source: e,
         })?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|e| GithubError::ReadFile {
-            path: file_path.to_path_buf(),
-            source: e,
-        })?;
+    let metadata = file.metadata().await.map_err(|e| GithubError::ReadFile {
+        path: file_path.to_path_buf(),
+        source: e,
+    })?;
     let total = metadata.len();
 
     let url = ReleasesClient::build_asset_upload_url(release_upload_url, asset_name);

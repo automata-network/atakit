@@ -3,12 +3,12 @@ mod config;
 mod progress;
 
 use anyhow::Result;
-use atakit_core::Env;
-use config::Config;
 use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand};
+use atakit_core::Env;
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
 use clap::{Parser, Subcommand};
+use config::Config;
 use tracing_subscriber::EnvFilter;
 
 /// atakit -- All-in-one tool for creation, provisioning, and management of CVMs.
@@ -46,7 +46,10 @@ async fn main() -> Result<()> {
 
     let env = Env::from_env();
     for (path, err) in env.ensure_dirs() {
-        eprintln!("warning: failed to create directory '{}': {err}", path.display());
+        eprintln!(
+            "warning: failed to create directory '{}': {err}",
+            path.display()
+        );
     }
     config::ensure_template(&env.config_dir);
     let cli = Cli::parse();
@@ -60,10 +63,7 @@ async fn main() -> Result<()> {
                 "warning: legacy image store at {} is no longer used",
                 legacy.legacy_dir.display(),
             );
-            eprintln!(
-                "  atakit now uses {}.",
-                legacy.new_dir.display(),
-            );
+            eprintln!("  atakit now uses {}.", legacy.new_dir.display(),);
             if safe(&legacy.legacy_dir) {
                 eprintln!("  You can remove the old directory:");
                 eprintln!(
@@ -114,50 +114,29 @@ async fn main() -> Result<()> {
             WorkloadCommand::Deactivate(args) => {
                 commands::workload::deactivate::run(args, &env, &config, cli.verbose).await
             }
-            WorkloadCommand::Spec(args) => {
-                commands::workload::spec::run(args, &config).await
-            }
-            WorkloadCommand::Ls(args) => {
-                commands::workload::ls::run(args, &env, &config).await
-            }
-            WorkloadCommand::Pull(args) => {
-                commands::workload::pull::run(args, &env, &config).await
-            }
+            WorkloadCommand::Spec(args) => commands::workload::spec::run(args, &config).await,
+            WorkloadCommand::Ls(args) => commands::workload::ls::run(args, &env, &config).await,
+            WorkloadCommand::Pull(args) => commands::workload::pull::run(args, &env, &config).await,
             WorkloadCommand::Push(args) => {
                 commands::workload::push::run(args, &env, &config, cli.verbose).await
             }
-            WorkloadCommand::Import(args) => {
-                commands::workload::import::run(args, &env).await
-            }
-            WorkloadCommand::Export(args) => {
-                commands::workload::export::run(args, &env)
-            }
-            WorkloadCommand::Add(args) => {
-                commands::workload::add::run(args, &env, &config).await
-            }
-            WorkloadCommand::Rm(args) => {
-                commands::workload::rm::run(args, &env)
-            }
+            WorkloadCommand::Import(args) => commands::workload::import::run(args, &env).await,
+            WorkloadCommand::Export(args) => commands::workload::export::run(args, &env),
+            WorkloadCommand::Add(args) => commands::workload::add::run(args, &env, &config).await,
+            WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env),
+            WorkloadCommand::Init(args) => commands::workload::init::run(args, &env, &config).await,
         },
         Command::Cloud(cmd) => match cmd {
             CloudCommand::Deploy(args) => {
                 commands::cloud::deploy::run(args, &env, &config, cli.verbose).await
             }
-            CloudCommand::Destroy(args) => {
-                commands::cloud::destroy::run(args, &env, &config).await
-            }
-            CloudCommand::Status(args) => {
-                commands::cloud::status::run(args, &env, &config).await
-            }
+            CloudCommand::Destroy(args) => commands::cloud::destroy::run(args, &env, &config).await,
+            CloudCommand::Status(args) => commands::cloud::status::run(args, &env, &config).await,
             CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
             CloudCommand::Ssh(args) => commands::cloud::ssh::run(args, &env, &config),
-            CloudCommand::Serial(args) => {
-                commands::cloud::serial::run(args, &env, &config).await
-            }
+            CloudCommand::Serial(args) => commands::cloud::serial::run(args, &env, &config).await,
             CloudCommand::Image(cmd) => match cmd {
-                CloudImageCommand::Ls(args) => {
-                    commands::cloud::image::run_ls(args, &env)
-                }
+                CloudImageCommand::Ls(args) => commands::cloud::image::run_ls(args, &env),
                 CloudImageCommand::Upload(args) => {
                     commands::cloud::image::run_upload(args, &env, &config, cli.verbose).await
                 }
@@ -169,20 +148,14 @@ async fn main() -> Result<()> {
                 }
             },
             CloudCommand::Provider(cmd) => match cmd {
-                CloudProviderCommand::Ls => {
-                    commands::cloud::provider::run(&config)
-                }
+                CloudProviderCommand::Ls => commands::cloud::provider::run(&config),
             },
-            CloudCommand::Init(args) => {
-                commands::cloud::init::run(args, &env, &config).await
-            }
+            CloudCommand::Init(args) => commands::cloud::init::run(args, &env, &config).await,
         },
         Command::External(args) => {
             let subcmd = &args[0];
             let bin = format!("atakit-{subcmd}");
-            let status = std::process::Command::new(&bin)
-                .args(&args[1..])
-                .status();
+            let status = std::process::Command::new(&bin).args(&args[1..]).status();
             match status {
                 Ok(s) => std::process::exit(s.code().unwrap_or(1)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

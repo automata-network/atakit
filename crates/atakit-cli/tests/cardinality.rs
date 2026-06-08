@@ -26,10 +26,22 @@ fn temp_env(config_toml: &str) -> (TempDir, TempDir, TempDir, String, String, St
     let config_path = config_dir.path().to_string_lossy().into_owned();
     let data_path = data_dir.path().to_string_lossy().into_owned();
     let cache_path = cache_dir.path().to_string_lossy().into_owned();
-    (config_dir, data_dir, cache_dir, config_path, data_path, cache_path)
+    (
+        config_dir,
+        data_dir,
+        cache_dir,
+        config_path,
+        data_path,
+        cache_path,
+    )
 }
 
-fn run_atakit(config_dir: &str, data_dir: &str, cache_dir: &str, args: &[&str]) -> std::process::Output {
+fn run_atakit(
+    config_dir: &str,
+    data_dir: &str,
+    cache_dir: &str,
+    args: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_atakit"))
         .args(args)
         .env("ATAKIT_CONFIG_DIR", config_dir)
@@ -352,8 +364,7 @@ fn image_ls_tag_errors_on_unknown_repository() {
 
     assert!(!out.status.success());
     assert!(
-        stderr.contains("no configured repository matches")
-            && stderr.contains("nonexistent"),
+        stderr.contains("no configured repository matches") && stderr.contains("nonexistent"),
         "expected helpful unknown-repo error.\nstderr: {stderr}"
     );
 }

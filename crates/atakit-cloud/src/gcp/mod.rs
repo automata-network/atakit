@@ -58,13 +58,17 @@ impl CloudProvider for GcpProvider {
             bucket: names.bucket.clone(),
             image_name: names.image.clone(),
             source_path: image_source,
+            certs_dir: opts.source_image_certs_dir.clone(),
             cc_types: opts.cc_types.clone(),
             force: opts.force_image,
         });
 
-        // Firewall - always open agent port 1024 (tcp), plus workload ports.
+        // Firewall - always open the cvm-agent ports (2024 portal/measurements,
+        // 1024 workload init), plus workload ports. Skipping these breaks
+        // `fetch-platform-measurements` and image-only deploys (gcloud
+        // `--rules=` rejects an empty list).
         // workload_ports are already resolved "port/proto" strings from the manifest.
-        let mut ports = vec!["1024/tcp".to_string()];
+        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
         for entry in &opts.workload_ports {
             if !ports.contains(entry) {
                 ports.push(entry.clone());
@@ -87,24 +91,31 @@ impl CloudProvider for GcpProvider {
             });
         }
         if !disks.is_empty() {
-            steps.push(DeployStep::CreateDisks { disks: disks.clone() });
+            steps.push(DeployStep::CreateDisks {
+                disks: disks.clone(),
+                resource_group: None,
+            });
         }
 
-        // Create instance.
+        let metadata: Vec<(String, String)> = opts
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         steps.push(DeployStep::CreateInstance {
             instance_name: names.instance.clone(),
             machine_type: opts.target.vmtype.clone(),
             zone: self.zone.clone(),
             image: names.image.clone(),
             cc_type: opts.target.resolved_cc_type(crate::PlatformKind::Gcp)?,
-            metadata: opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            metadata,
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
         });
 
         if !opts.skip_init {
-            // Wait for agent.
-            steps.push(DeployStep::WaitForAgent { timeout_secs: 300 });
+            // Wait for portal.
+            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
             // Initialize workload.
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
@@ -131,6 +142,7 @@ impl CloudProvider for GcpProvider {
                 bucket,
                 image_name,
                 source_path,
+                certs_dir,
                 cc_types,
                 force,
             } => {
@@ -144,10 +156,28 @@ impl CloudProvider for GcpProvider {
                 }
                 if !exists || *force {
                     if let Some(src) = source_path {
+                        let certs =
+                            certs_dir
+                                .as_deref()
+                                .ok_or_else(|| CloudError::ImageUploadFailed {
+                                    message: format!(
+                                        "cannot register GCE image '{image_name}': no \
+                                     secure_boot_certs/ directory resolved for the \
+                                     base image. atakit requires Secure Boot to be \
+                                     enabled on every CVM deploy."
+                                    ),
+                                })?;
                         image::ensure_bucket(&self.project, bucket, &self.zone, runner).await?;
-                        let gcs_uri =
-                            image::upload_image(bucket, src, runner, verbose).await?;
-                        image::register_image(&self.project, image_name, &gcs_uri, cc_types, runner).await?;
+                        let gcs_uri = image::upload_image(bucket, src, runner, verbose).await?;
+                        image::register_image(
+                            &self.project,
+                            image_name,
+                            &gcs_uri,
+                            cc_types,
+                            certs,
+                            runner,
+                        )
+                        .await?;
                         updates.bucket = Some(bucket.clone());
                     } else {
                         return Err(CloudError::ImageUploadFailed {
@@ -172,7 +202,7 @@ impl CloudProvider for GcpProvider {
                 updates.firewall_rule = Some(firewall_rule.clone());
             }
 
-            DeployStep::CreateDisks { disks } => {
+            DeployStep::CreateDisks { disks, .. } => {
                 for spec in disks {
                     if disk::check_disk_exists(&self.project, &self.zone, &spec.name, runner)
                         .await?
@@ -212,7 +242,7 @@ impl CloudProvider for GcpProvider {
                 updates.external_ip = Some(ip);
             }
 
-            DeployStep::WaitForAgent { .. } => {
+            DeployStep::WaitForPortal { .. } => {
                 // IP must be set from a previous step - caller passes it.
                 // This will be handled by the CLI layer.
             }
@@ -221,12 +251,15 @@ impl CloudProvider for GcpProvider {
                 // Handled by the CLI layer (calls init::post_init).
             }
 
-            // Azure steps - should not be executed by GCP provider.
+            // Azure / AWS / QEMU steps - should not be executed by GCP provider.
             DeployStep::CreateResourceGroup { .. }
             | DeployStep::UploadImageAzure { .. }
-            | DeployStep::CreateInstanceAzure { .. } => {
+            | DeployStep::CreateInstanceAzure { .. }
+            | DeployStep::UploadImageAws { .. }
+            | DeployStep::CreateInstanceAws { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
-                    message: "Azure step executed by GCP provider".to_string(),
+                    message: "non-GCP step executed by GCP provider".to_string(),
                 });
             }
         }
@@ -260,6 +293,7 @@ impl CloudProvider for GcpProvider {
         if !opts.preserve.contains(&"disks".to_string()) && !gcp.disks.is_empty() {
             steps.push(DestroyStep::DeleteDisks {
                 names: gcp.disks.clone(),
+                resource_group: None,
             });
         }
 
@@ -297,7 +331,7 @@ impl CloudProvider for GcpProvider {
             DestroyStep::DeleteInstance { name } => {
                 instance::delete_instance(&self.project, &self.zone, name, runner).await
             }
-            DestroyStep::DeleteDisks { names } => {
+            DestroyStep::DeleteDisks { names, .. } => {
                 for name in names {
                     disk::delete_disk(&self.project, &self.zone, name, runner).await?;
                 }
@@ -311,13 +345,17 @@ impl CloudProvider for GcpProvider {
             }
             DestroyStep::DeleteBucket { name } => image::delete_bucket(name, runner).await,
 
-            // Azure steps.
+            // Azure / AWS / QEMU steps.
             DestroyStep::DeleteResourceGroup { .. }
-            | DestroyStep::DeleteImageVersion { .. } => {
-                Err(CloudError::State {
-                    message: "Azure destroy step executed by GCP provider".to_string(),
-                })
-            }
+            | DestroyStep::DeleteImageVersion { .. }
+            | DestroyStep::DeleteImageDefinition { .. }
+            | DestroyStep::DeleteSecurityGroup { .. }
+            | DestroyStep::DeleteAmi { .. }
+            | DestroyStep::DeleteS3Bucket { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
+                message: "non-GCP destroy step executed by GCP provider".to_string(),
+            }),
         }
     }
 

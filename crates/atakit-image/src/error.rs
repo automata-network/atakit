@@ -9,7 +9,7 @@ pub enum ImageError {
     #[error("invalid repository '{0}': must not contain '/'")]
     InvalidRepository(String),
 
-    #[error("unsupported platform '{0}', expected: gcp, aws, azure")]
+    #[error("unsupported platform '{0}', expected: gcp, aws, azure, qemu")]
     UnsupportedPlatform(String),
 
     #[error("GitHub API returned {status}: {body}")]
@@ -28,10 +28,7 @@ pub enum ImageError {
     NoPlatformImage { platform: String, count: u32 },
 
     #[error("release {image_ref} has no {platform} disk image")]
-    MissingPlatformAsset {
-        image_ref: String,
-        platform: String,
-    },
+    MissingPlatformAsset { image_ref: String, platform: String },
 
     #[error("download failed with {status}: {body}")]
     DownloadFailed { status: u16, body: String },

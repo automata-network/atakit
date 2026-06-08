@@ -5,11 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use atakit_cloud::CloudConfig;
-use atakit_workload::{
-    GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository,
-};
+use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -27,6 +25,8 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub chains: IndexMap<String, ChainConfig>,
+    pub keys: IndexMap<String, KeySpec>,
     pub image: ImageConfig,
     pub github: GithubConfig,
     pub build: BuildConfig,
@@ -77,9 +77,7 @@ impl ImageConfig {
     /// the full spec -- so callers can read its credential and
     /// `list_limit` override.
     pub fn primary_entry(&self) -> Option<(&str, &ImageRepositorySpec)> {
-        self.repositories
-            .first()
-            .map(|(k, v)| (k.as_str(), v))
+        self.repositories.first().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Find a configured GitHub repository whose local name (portion
@@ -93,10 +91,7 @@ impl ImageConfig {
     /// picking the first match. Matches the "prefer canonical /
     /// accept one non-canonical / error on multiple" pattern used
     /// for release asset lookup in `find_atawl_asset`.
-    pub fn find_by_local_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<(&str, &ImageRepositorySpec)>> {
+    pub fn find_by_local_name(&self, name: &str) -> Result<Option<(&str, &ImageRepositorySpec)>> {
         let matches: Vec<(&str, &ImageRepositorySpec)> = self
             .repositories
             .iter()
@@ -194,14 +189,16 @@ impl CredentialSpec {
     /// 2. `timeout_secs` is only valid with `command`.
     /// 3. `timeout_secs`, when set, must be > 0.
     pub fn validate(&self, name: &str) -> Result<()> {
-        let set_count = [self.file.is_some(), self.command.is_some(), self.env.is_some()]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
+        let set_count = [
+            self.file.is_some(),
+            self.command.is_some(),
+            self.env.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
         match set_count {
-            0 => bail!(
-                "credential '{name}': must set exactly one of `file`, `command`, `env`"
-            ),
+            0 => bail!("credential '{name}': must set exactly one of `file`, `command`, `env`"),
             1 => {}
             _ => bail!(
                 "credential '{name}': sets more than one of `file` / `command` / `env`; pick one"
@@ -273,11 +270,7 @@ impl CredentialSpec {
     }
 }
 
-fn resolve_command(
-    cred_name: &str,
-    argv: &[String],
-    timeout_secs: Option<u64>,
-) -> Result<String> {
+fn resolve_command(cred_name: &str, argv: &[String], timeout_secs: Option<u64>) -> Result<String> {
     let timeout_secs = timeout_secs.unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS);
     let program = argv
         .first()
@@ -289,12 +282,7 @@ fn resolve_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "credential '{cred_name}': failed to spawn `{}`",
-                program,
-            )
-        })?;
+        .with_context(|| format!("credential '{cred_name}': failed to spawn `{}`", program,))?;
 
     // Drain stdout and stderr on background threads CONCURRENTLY
     // with the wait loop. Reading pipes only after the child has
@@ -397,6 +385,222 @@ fn resolve_command(
     Ok(token)
 }
 
+// ── [chains] section ──────────────────────────────────────────────
+
+/// A named chain configuration: `[chains.<name>]`.
+///
+/// ```toml
+/// [chains.mainnet]
+/// rpc_url = "https://..."
+/// session_registry = "0x..."
+/// expire_offset = 300
+/// # chain_id = 11155111   # only when rpc_url absent (air-gapped)
+/// # proving_strategy = "network" | "local" | "dev"   # SNP CVMs only
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainConfig {
+    pub rpc_url: String,
+    pub session_registry: String,
+    /// Derived from `session_registry` via on-chain call if omitted.
+    pub workload_registry: Option<String>,
+    /// Derived from `session_registry` via on-chain call if omitted.
+    pub base_image_registry: Option<String>,
+    /// Validity window (seconds) for owner-key-signed messages submitted
+    /// to the on-chain registries. Default for the portal's `registerCvm`
+    /// message and for the operator's `workload publish`,
+    /// `workload deactivate`, and `imgbuild publish` signature offsets.
+    /// CLI `--expire-offset` overrides this per call.
+    #[serde(default = "default_expire_offset")]
+    pub expire_offset: u64,
+    /// EIP-155 chain id. Only meaningful under air-gapped operation
+    /// (`rpc_url` not set on the portal side, which atakit-ng doesn't
+    /// support yet — every chain entry here has `rpc_url`). Kept for
+    /// forward compat with portal configs that the operator might
+    /// post manually.
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+    /// Portal-side SNP ZK prover selection. One of:
+    /// - `"network"` — remote proving on the Succinct network (reuses
+    ///   the `gas_wallet` key); the validated path.
+    /// - `"local"` — on-device CPU proving (needs a proving-capable
+    ///   image; heavyweight).
+    /// - `"dev"` — mock proof; will not verify on-chain (testing only).
+    ///
+    /// Only consulted for AMD SEV-SNP CVMs — TDX uses the on-chain
+    /// Solidity/DCAP path and ignores this. When `None`, the field is
+    /// omitted from the `/init` JSON and the portal applies its
+    /// `"network"` default.
+    #[serde(default)]
+    pub proving_strategy: Option<String>,
+}
+
+fn default_expire_offset() -> u64 {
+    300
+}
+
+// ── [keys] section ───────────────────────────────────────────────
+
+/// Key algorithm type, matching on-chain `PublicIdentity.typeId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyType {
+    Es256k,
+    Es256,
+    Rs256,
+}
+
+impl std::fmt::Display for KeyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyType::Es256k => write!(f, "es256k"),
+            KeyType::Es256 => write!(f, "es256"),
+            KeyType::Rs256 => write!(f, "rs256"),
+        }
+    }
+}
+
+/// Key provisioning mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyMode {
+    /// Operator provides the private key via file/command/env.
+    Provisioned,
+    /// Portal generates the key at init time.
+    SelfGenerated,
+}
+
+impl std::fmt::Display for KeyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyMode::Provisioned => write!(f, "provisioned"),
+            KeyMode::SelfGenerated => write!(f, "self_generated"),
+        }
+    }
+}
+
+/// A named key configuration: `[keys.<name>]`.
+///
+/// ```toml
+/// [keys.owner]
+/// type = "es256k"
+/// mode = "provisioned"
+/// file = "~/.config/atakit/owner.key"
+///
+/// [keys.gas]
+/// type = "es256k"
+/// mode = "self_generated"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeySpec {
+    #[serde(rename = "type")]
+    pub key_type: KeyType,
+    pub mode: KeyMode,
+    /// Path to a file containing the private key. `~/` is expanded.
+    pub file: Option<String>,
+    /// Command to exec (no shell) whose stdout yields the key.
+    pub command: Option<Vec<String>>,
+    /// Name of an environment variable holding the key.
+    pub env: Option<String>,
+    /// Optional timeout for `command` keys, in seconds. Default: 30s.
+    pub timeout_secs: Option<u64>,
+}
+
+impl KeySpec {
+    /// Eager validation at config-load time.
+    ///
+    /// - `mode = provisioned`: exactly one of file/command/env must be set.
+    /// - `mode = self_generated`: all of file/command/env/timeout_secs must be None.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let set_count = [
+            self.file.is_some(),
+            self.command.is_some(),
+            self.env.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+
+        match self.mode {
+            KeyMode::Provisioned => match set_count {
+                0 => bail!(
+                    "key '{name}': mode = \"provisioned\" requires exactly one of \
+                         `file`, `command`, `env`"
+                ),
+                1 => {}
+                _ => bail!(
+                    "key '{name}': sets more than one of `file` / `command` / `env`; pick one"
+                ),
+            },
+            KeyMode::SelfGenerated => {
+                if set_count > 0 {
+                    bail!(
+                        "key '{name}': mode = \"self_generated\" must not set \
+                         `file`, `command`, or `env`"
+                    );
+                }
+                if self.timeout_secs.is_some() {
+                    bail!("key '{name}': mode = \"self_generated\" must not set `timeout_secs`");
+                }
+            }
+        }
+
+        if self.timeout_secs.is_some() && self.command.is_none() {
+            bail!("key '{name}': `timeout_secs` is only valid with `command`");
+        }
+        if let Some(0) = self.timeout_secs {
+            bail!("key '{name}': `timeout_secs` must be greater than 0");
+        }
+        if let Some(ref cmd) = self.command {
+            if cmd.is_empty() {
+                bail!("key '{name}': `command` must not be empty");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Lazily resolve this key to a private key string.
+    ///
+    /// Only valid for `mode = provisioned`. Returns an error if called
+    /// on a `self_generated` key.
+    pub fn resolve(&self, name: &str) -> Result<String> {
+        if self.mode != KeyMode::Provisioned {
+            bail!(
+                "key '{name}': cannot resolve a self_generated key; \
+                 it must be mode = \"provisioned\" with a file/command/env source"
+            );
+        }
+        if let Some(ref path) = self.file {
+            return read_key_file(path)
+                .with_context(|| format!("key '{name}': failed to read key from `{path}`"));
+        }
+        if let Some(ref env_name) = self.env {
+            return match env::var(env_name) {
+                Ok(v) => {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() {
+                        Err(anyhow::anyhow!(
+                            "key '{name}': env var '{env_name}' is set but \
+                             empty or whitespace-only"
+                        ))
+                    } else {
+                        Ok(trimmed)
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "key '{name}': env var '{env_name}' is not set"
+                )),
+            };
+        }
+        if let Some(ref argv) = self.command {
+            return resolve_command(name, argv, self.timeout_secs);
+        }
+        bail!("key '{name}': no source set (internal error: validate not called)")
+    }
+}
+
 // ── [build] section ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -419,14 +623,13 @@ impl Default for BuildConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PublishConfig {
-    /// Default RPC URL for publish commands.
-    pub rpc_url: Option<String>,
-    /// Default session registry contract address.
-    pub session_registry: Option<String>,
-    /// Path to file containing the owner private key (hex).
-    pub owner_key_file: Option<String>,
-    /// Path to file containing the relay private key (hex).
-    pub relay_key_file: Option<String>,
+    /// Chain config name (references a key in `[chains]`).
+    pub chain: Option<String>,
+    /// Owner key name (references a key in `[keys]`, must be provisioned).
+    pub owner_key: Option<String>,
+    /// Relay key name (references a key in `[keys]`, must be provisioned).
+    /// Used for submitting on-chain transactions (pays gas).
+    pub relay_key: Option<String>,
 }
 
 // ── [workload] section ─────────────────────────────────────────────
@@ -476,10 +679,7 @@ impl WorkloadConfig {
     /// * an `owner/repo` path (treated as a GitHub repository with no credential).
     ///
     /// If `cli_arg` is `None`, the first declared repository is used.
-    pub fn resolve(
-        &self,
-        cli_arg: Option<&str>,
-    ) -> Result<(String, WorkloadRepositorySpec)> {
+    pub fn resolve(&self, cli_arg: Option<&str>) -> Result<(String, WorkloadRepositorySpec)> {
         if let Some(arg) = cli_arg {
             if arg.starts_with("http://") || arg.starts_with("https://") {
                 return Ok((
@@ -569,9 +769,9 @@ impl WorkloadConfig {
             WorkloadRepositorySpec::Http { url } => {
                 WorkloadRepository::Http(HttpWorkloadRepository::new(&url))
             }
-            WorkloadRepositorySpec::Github { repo, .. } => WorkloadRepository::Github(
-                GithubWorkloadRepository::new(repo, resolved_token),
-            ),
+            WorkloadRepositorySpec::Github { repo, .. } => {
+                WorkloadRepository::Github(GithubWorkloadRepository::new(repo, resolved_token))
+            }
         }
     }
 }
@@ -593,9 +793,7 @@ fn inherit_github_credential(
     let matches: Vec<&Option<String>> = repositories
         .values()
         .filter_map(|spec| match spec {
-            WorkloadRepositorySpec::Github { repo, credential } if repo == arg => {
-                Some(credential)
-            }
+            WorkloadRepositorySpec::Github { repo, credential } if repo == arg => Some(credential),
             _ => None,
         })
         .collect();
@@ -652,13 +850,11 @@ impl Config {
                 return Ok(config);
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read {}", path.display()));
+                return Err(e).with_context(|| format!("failed to read {}", path.display()));
             }
         };
 
-        Self::load_from_str(&contents)
-            .with_context(|| format!("failed to load {}", path.display()))
+        Self::load_from_str(&contents).with_context(|| format!("failed to load {}", path.display()))
     }
 
     /// Parse a config from a TOML string, apply env overrides, and
@@ -666,6 +862,7 @@ impl Config {
     pub fn load_from_str(content: &str) -> Result<Self> {
         check_legacy_fields(content)?;
         let mut config: Config = toml::from_str(content).context("failed to parse config")?;
+        config.cloud.apply_defaults();
         config.apply_env_overrides();
         config.validate()?;
         Ok(config)
@@ -678,12 +875,8 @@ impl Config {
         match self.github.credentials.get(name) {
             Some(spec) => spec.resolve(name),
             None => {
-                let defined: Vec<&str> = self
-                    .github
-                    .credentials
-                    .keys()
-                    .map(|k| k.as_str())
-                    .collect();
+                let defined: Vec<&str> =
+                    self.github.credentials.keys().map(|k| k.as_str()).collect();
                 bail!(
                     "unknown credential '{name}'; defined: [{}]",
                     defined.join(", ")
@@ -702,10 +895,7 @@ impl Config {
     /// `workload pull` in discovery mode) must use
     /// [`resolve_credentials_best_effort`] instead so one broken
     /// credential doesn't abort discovery for every other repository.
-    pub fn resolve_credentials_for(
-        &self,
-        names: &[&str],
-    ) -> Result<HashMap<String, String>> {
+    pub fn resolve_credentials_for(&self, names: &[&str]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::new();
         for name in names {
             if out.contains_key(*name) {
@@ -779,14 +969,98 @@ impl Config {
             spec.validate(name)?;
         }
 
+        // Every key must pass its own mode / xor checks.
+        for (name, spec) in &self.keys {
+            spec.validate(name)?;
+        }
+
+        // Cloud target chain/key references must point to defined entries.
+        let chain_names: Vec<&str> = self.chains.keys().map(|k| k.as_str()).collect();
+        let key_names: Vec<&str> = self.keys.keys().map(|k| k.as_str()).collect();
+        if let Some(ref registration) = self.cloud.defaults.registration {
+            validate_registration_policy(registration, "[cloud.defaults]")?;
+        }
+        for (tname, target) in &self.cloud.targets {
+            if let Some(ref registration) = target.registration {
+                validate_registration_policy(registration, &format!("[cloud.targets.{tname}]"))?;
+            }
+            if let Some(ref chain) = target.chain {
+                if !self.chains.contains_key(chain) {
+                    bail!(
+                        "cloud target '{tname}' references unknown chain '{chain}'; \
+                         defined: [{}]",
+                        chain_names.join(", ")
+                    );
+                }
+            }
+            if let Some(ref owner) = target.owner_key {
+                if !self.keys.contains_key(owner) {
+                    bail!(
+                        "cloud target '{tname}' references unknown key '{owner}' for \
+                         owner_key; defined: [{}]",
+                        key_names.join(", ")
+                    );
+                }
+            }
+            if let Some(ref wallet) = target.gas_wallet {
+                if !self.keys.contains_key(wallet) {
+                    bail!(
+                        "cloud target '{tname}' references unknown key '{wallet}' for \
+                         gas_wallet; defined: [{}]",
+                        key_names.join(", ")
+                    );
+                }
+            }
+        }
+
+        // Publish chain/key references.
+        if let Some(ref chain) = self.publish.chain {
+            if !self.chains.contains_key(chain) {
+                bail!(
+                    "[publish] references unknown chain '{chain}'; \
+                     defined: [{}]",
+                    chain_names.join(", ")
+                );
+            }
+        }
+        if let Some(ref key) = self.publish.owner_key {
+            if !self.keys.contains_key(key) {
+                bail!(
+                    "[publish] references unknown key '{key}' for \
+                     owner_key; defined: [{}]",
+                    key_names.join(", ")
+                );
+            }
+            if let Some(spec) = self.keys.get(key) {
+                if spec.mode != KeyMode::Provisioned {
+                    bail!(
+                        "[publish]: owner_key '{key}' must be \
+                         mode = \"provisioned\""
+                    );
+                }
+            }
+        }
+        if let Some(ref key) = self.publish.relay_key {
+            if !self.keys.contains_key(key) {
+                bail!(
+                    "[publish] references unknown key '{key}' for \
+                     relay_key; defined: [{}]",
+                    key_names.join(", ")
+                );
+            }
+            if let Some(spec) = self.keys.get(key) {
+                if spec.mode != KeyMode::Provisioned {
+                    bail!(
+                        "[publish]: relay_key '{key}' must be \
+                         mode = \"provisioned\""
+                    );
+                }
+            }
+        }
+
         // Every repository `credential` reference must name a defined
         // credential.
-        let defined: Vec<&str> = self
-            .github
-            .credentials
-            .keys()
-            .map(|k| k.as_str())
-            .collect();
+        let defined: Vec<&str> = self.github.credentials.keys().map(|k| k.as_str()).collect();
         for (name, spec) in &self.image.repositories {
             if let Some(ref cred) = spec.credential {
                 if !self.github.credentials.contains_key(cred) {
@@ -845,16 +1119,8 @@ impl Config {
                 self.build.container_engine = v;
             }
         }
-        if let Ok(v) = env::var("ATAKIT_RPC_URL") {
-            if !v.is_empty() {
-                self.publish.rpc_url = Some(v);
-            }
-        }
-        if let Ok(v) = env::var("ATAKIT_SESSION_REGISTRY") {
-            if !v.is_empty() {
-                self.publish.session_registry = Some(v);
-            }
-        }
+        // ATAKIT_RPC_URL and ATAKIT_SESSION_REGISTRY env overrides
+        // removed in v0.4.0; use [chains.*] config instead.
         if let Ok(v) = env::var("ATAKIT_GCP_PROJECT") {
             if !v.is_empty() {
                 for provider in self.cloud.providers.values_mut() {
@@ -871,9 +1137,7 @@ impl Config {
 
 fn validate_repo_path(section: &str, entry_name: &str, repo: &str) -> Result<()> {
     if repo.is_empty() {
-        bail!(
-            "invalid {section} repository '{entry_name}': `repo` must not be empty"
-        );
+        bail!("invalid {section} repository '{entry_name}': `repo` must not be empty");
     }
     if repo.contains('\\') {
         bail!(
@@ -903,6 +1167,15 @@ fn validate_repo_path(section: &str, entry_name: &str, repo: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn validate_registration_policy(value: &str, location: &str) -> Result<()> {
+    match value {
+        "required" | "optional" | "off" => Ok(()),
+        _ => bail!(
+            "{location} registration must be \"required\", \"optional\", or \"off\", got {value:?}"
+        ),
+    }
 }
 
 /// Walk the parsed TOML looking for deprecated fields and emit a clear
@@ -972,6 +1245,122 @@ fn check_legacy_fields(content: &str) -> Result<()> {
              `main = {{ type = \"http\", url = \"https://...\" }}`. \
              See config_template.toml for examples."
         );
+    }
+
+    // v0.4.0: [publish] inline chain/key fields replaced by references.
+    if let Some(publish) = value.get("publish").and_then(|v| v.as_table()) {
+        for field in ["rpc_url", "session_registry"] {
+            if publish.contains_key(field) {
+                bail!(
+                    "`[publish] {field}` is no longer supported. Define a chain under \
+                     `[chains.<name>]` with `rpc_url` and `session_registry`, then \
+                     set `[publish] chain = \"<name>\"`. See config_template.toml."
+                );
+            }
+        }
+        if publish.contains_key("owner_key_file") {
+            bail!(
+                "`[publish] owner_key_file` is no longer supported. Define a key under \
+                 `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
+                 source, then set `[publish] owner_key = \"<name>\"`. \
+                 See config_template.toml."
+            );
+        }
+        if publish.contains_key("relay_key_file") {
+            bail!(
+                "`[publish] relay_key_file` is no longer supported. Define a key under \
+                 `[keys.<name>]` with `mode = \"provisioned\"` and a `file`/`command`/`env` \
+                 source, then set `[publish] relay_key = \"<name>\"`. \
+                 See config_template.toml."
+            );
+        }
+    }
+
+    // v0.4.0: [cloud] inline chain/key fields replaced by references.
+    if let Some(cloud) = value.get("cloud").and_then(|v| v.as_table()) {
+        for field in ["rpc_url", "session_registry"] {
+            if cloud.contains_key(field) {
+                bail!(
+                    "`[cloud] {field}` is no longer supported. Define a chain under \
+                     `[chains.<name>]` and reference it from each target via \
+                     `chain = \"<name>\"`. See config_template.toml."
+                );
+            }
+        }
+        if cloud.contains_key("expire_offset") {
+            bail!(
+                "`[cloud] expire_offset` is no longer supported. Use \
+                 `expire_offset` in `[chains.<name>]` instead."
+            );
+        }
+        for field in ["owner_key_file", "relay_key_file"] {
+            if cloud.contains_key(field) {
+                bail!(
+                    "`[cloud] {field}` is no longer supported. Define a key under \
+                     `[keys.<name>]` and reference it from each target via \
+                     `owner_key = \"<name>\"` or `gas_wallet = \"<name>\"`. \
+                     See config_template.toml."
+                );
+            }
+        }
+        // Per-target overrides.
+        if let Some(targets) = cloud.get("targets").and_then(|v| v.as_table()) {
+            for (tname, tval) in targets {
+                if let Some(t) = tval.as_table() {
+                    for field in [
+                        "rpc_url",
+                        "session_registry",
+                        "owner_key_file",
+                        "relay_key_file",
+                    ] {
+                        if t.contains_key(field) {
+                            bail!(
+                                "`[cloud.targets.{tname}] {field}` is no longer supported. \
+                                 Use `chain`, `owner_key`, and `gas_wallet` references \
+                                 instead. See config_template.toml."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // v0.5.0: `[chains.<name>] session_ttl_seconds` was misnamed; the field
+    // controls signed-message validity, not session TTL. Hard-reject so a
+    // value picked under the wrong semantic is not silently aliased through.
+    //
+    // v0.6.0: `register_cvm_expire_offset` was generalized to `expire_offset`
+    // (now used as the default for both the portal's registerCvm message and
+    // the operator-side publish/deactivate signature offsets).
+    if let Some(chains) = value.get("chains").and_then(|v| v.as_table()) {
+        for (cname, cval) in chains {
+            if let Some(t) = cval.as_table() {
+                if t.contains_key("session_ttl_seconds") {
+                    bail!(
+                        "`[chains.{cname}] session_ttl_seconds` was renamed to \
+                         `expire_offset`."
+                    );
+                }
+                if t.contains_key("register_cvm_expire_offset") {
+                    bail!(
+                        "`[chains.{cname}] register_cvm_expire_offset` was renamed \
+                         to `expire_offset` (now used as the default validity \
+                         window for the portal's registerCvm message AND for the \
+                         operator's `workload publish` / `workload deactivate` / \
+                         `imgbuild publish` signature offsets; CLI \
+                         `--expire-offset` overrides per call)."
+                    );
+                }
+                if t.contains_key("registration") {
+                    bail!(
+                        "`[chains.{cname}] registration` is no longer supported. Move \
+                         `registration = \"required\" | \"optional\" | \"off\"` to \
+                         `[cloud.targets.<name>]` or `[cloud.defaults]`."
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1118,13 +1507,11 @@ mod tests {
         assert_eq!(name, "baseimg");
         assert_eq!(spec.repo, "automata-network/dev-baseimage");
 
-        assert!(
-            config
-                .image
-                .find_by_local_name("nonexistent")
-                .unwrap()
-                .is_none()
-        );
+        assert!(config
+            .image
+            .find_by_local_name("nonexistent")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1144,10 +1531,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = config
-            .image
-            .find_by_local_name("debug-linux")
-            .unwrap_err();
+        let err = config.image.find_by_local_name("debug-linux").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("multiple"), "got: {msg}");
         assert!(msg.contains("owner-a"), "got: {msg}");
@@ -1374,7 +1758,10 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("more than one") || msg.contains("pick one"), "got: {msg}");
+        assert!(
+            msg.contains("more than one") || msg.contains("pick one"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1861,7 +2248,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        let (name, spec) = config.workload.resolve(Some("https://example.com")).unwrap();
+        let (name, spec) = config
+            .workload
+            .resolve(Some("https://example.com"))
+            .unwrap();
         assert_eq!(name, "https://example.com");
         match spec {
             WorkloadRepositorySpec::Http { url } => assert_eq!(url, "https://example.com"),
@@ -2290,5 +2680,449 @@ mod tests {
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(repo_paths(&config), vec!["owner/custom-images"]);
         assert_eq!(config.image.list_limit, 3);
+    }
+
+    // ── [chains] and [keys] ─────────────────────────────────────
+
+    #[test]
+    fn parses_chains_and_keys() {
+        let config = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            expire_offset = 7200
+
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "OWNER_KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.chains.len(), 1);
+        let chain = config.chains.get("testnet").unwrap();
+        assert_eq!(chain.rpc_url, "https://rpc.test");
+        assert_eq!(chain.session_registry, "0xABCD");
+        assert_eq!(chain.expire_offset, 7200);
+        assert!(chain.workload_registry.is_none());
+
+        assert_eq!(config.keys.len(), 2);
+        let owner = config.keys.get("owner").unwrap();
+        assert_eq!(owner.key_type, KeyType::Es256k);
+        assert_eq!(owner.mode, KeyMode::Provisioned);
+        let gas = config.keys.get("gas").unwrap();
+        assert_eq!(gas.mode, KeyMode::SelfGenerated);
+    }
+
+    #[test]
+    fn key_provisioned_requires_source() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "es256k"
+            mode = "provisioned"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exactly one of"),
+            "expected xor error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_self_generated_rejects_source() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "es256k"
+            mode = "self_generated"
+            file = "/tmp/key"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must not set"),
+            "expected rejection, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_resolve_errors_on_self_generated() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+            "#,
+        )
+        .unwrap();
+        let spec = config.keys.get("gas").unwrap();
+        let err = spec.resolve("gas").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot resolve a self_generated key"),
+            "expected resolve error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn target_unknown_chain_reference_errors() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            chain = "nonexistent"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown chain 'nonexistent'"),
+            "expected chain ref error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn cloud_target_registration_is_target_owned() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.offchain]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "off"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["offchain"].registration.as_deref(),
+            Some("off")
+        );
+        assert!(config.cloud.targets["offchain"].chain.is_none());
+    }
+
+    #[test]
+    fn cloud_default_registration_is_inherited_by_targets() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.defaults]
+            registration = "optional"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].registration.as_deref(),
+            Some("optional")
+        );
+    }
+
+    #[test]
+    fn chain_registration_is_rejected_with_migration_hint() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.hoodi]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            registration = "off"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[chains.hoodi] registration` is no longer supported"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn invalid_target_registration_errors() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "disabled"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("registration must be"),
+            "expected registration validation error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn active_registration_allows_self_generated_owner_key() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            owner_key = "owner"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].owner_key.as_deref(),
+            Some("owner")
+        );
+    }
+
+    #[test]
+    fn registration_off_allows_self_generated_owner_key() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "off"
+            owner_key = "owner"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].owner_key.as_deref(),
+            Some("owner")
+        );
+    }
+
+    #[test]
+    fn publish_owner_key_must_be_provisioned() {
+        let err = Config::load_from_str(
+            r#"
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [publish]
+            owner_key = "gas"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be mode = \"provisioned\""),
+            "expected provisioned error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn publish_relay_key_reference_validated() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            relay_key = "missing"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown key 'missing'"),
+            "expected ref error, got: {err:#}"
+        );
+    }
+
+    // ── legacy field rejection ──────────────────────────────────
+
+    #[test]
+    fn legacy_publish_rpc_url_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            rpc_url = "https://old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[publish] rpc_url"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_publish_relay_key_file_points_to_relay_key() {
+        let err = Config::load_from_str(
+            r#"
+            [publish]
+            relay_key_file = "/tmp/old_relay"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("relay_key_file"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("relay_key"),
+            "expected relay_key hint in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_cloud_rpc_url_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud]
+            rpc_url = "https://old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[cloud] rpc_url"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_cloud_target_owner_key_file_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            chain = "c"
+            owner_key = "o"
+            gas_wallet = "g"
+            owner_key_file = "/old"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("owner_key_file"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_chains_session_ttl_seconds_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            session_ttl_seconds = 7200
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("session_ttl_seconds"),
+            "expected field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("expire_offset"),
+            "expected new name in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_chains_register_cvm_expire_offset_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            register_cvm_expire_offset = 7200
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("register_cvm_expire_offset"),
+            "expected old field name in error: {msg}"
+        );
+        assert!(
+            msg.contains("expire_offset"),
+            "expected new name in error: {msg}"
+        );
     }
 }

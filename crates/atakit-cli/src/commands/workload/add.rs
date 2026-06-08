@@ -5,7 +5,7 @@ use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, parse_workload_ref, WorkloadRef};
+use super::{compute_workload_id, parse_workload_ref, resolve_chain, WorkloadRef};
 use crate::config::Config;
 
 pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
@@ -24,36 +24,37 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     // If we have an archive, inspect it to get name+version+sha256+pcr23
-    let (name, version, archive_sha256, archive_pcr23, archive_size) = if let Some(ref path) = archive_path {
-        let opts = atakit_workload::InspectOptions {
-            archive: Some(path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-        };
-        let result = atakit_workload::inspect_workload(&opts)
-            .await
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        let size = std::fs::metadata(path)?.len();
-        (
-            result.manifest.meta.name.clone(),
-            result.manifest.meta.version.clone(),
-            Some(result.sha256),
-            Some(result.pcr23),
-            Some(size),
-        )
-    } else {
-        // Parse as name:version or 0x<id>
-        let wref = parse_workload_ref(&args.reference)?;
-        match wref {
-            WorkloadRef::NameVersion { name, version } => (name, version, None, None, None),
-            WorkloadRef::Id(_) => {
-                // For 0x IDs without an archive, we need on-chain to resolve name+version.
-                // We'll handle this below after the chain query.
-                (String::new(), String::new(), None, None, None)
+    let (name, version, archive_sha256, archive_pcr23, archive_size) =
+        if let Some(ref path) = archive_path {
+            let opts = atakit_workload::InspectOptions {
+                archive: Some(path.clone()),
+                workload_dir: None,
+                engine: None,
+                verbose: false,
+            };
+            let result = atakit_workload::inspect_workload(&opts)
+                .await
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            let size = std::fs::metadata(path)?.len();
+            (
+                result.manifest.meta.name.clone(),
+                result.manifest.meta.version.clone(),
+                Some(result.sha256),
+                Some(result.pcr23),
+                Some(size),
+            )
+        } else {
+            // Parse as name:version or 0x<id>
+            let wref = parse_workload_ref(&args.reference)?;
+            match wref {
+                WorkloadRef::NameVersion { name, version } => (name, version, None, None, None),
+                WorkloadRef::Id(_) => {
+                    // For 0x IDs without an archive, we need on-chain to resolve name+version.
+                    // We'll handle this below after the chain query.
+                    (String::new(), String::new(), None, None, None)
+                }
             }
-        }
-    };
+        };
 
     // Compute workload ID (or parse from 0x ref)
     let (workload_id, is_id_ref) = if name.is_empty() {
@@ -81,27 +82,14 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         }
     }
 
-    // Resolve RPC URL and session registry
-    let rpc_url = args
-        .rpc_url
-        .or_else(|| config.publish.rpc_url.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "RPC URL required: use --rpc-url, ATAKIT_RPC_URL, or [publish] rpc_url in config"
-            )
-        })?;
+    // Resolve chain config (rpc_url + session_registry) from [chains].
+    let chain = resolve_chain(args.chain.as_deref(), config)?;
+    let rpc_url = chain.rpc_url;
 
-    let session_registry_str = args
+    let session_registry_address: alloy_ext::core::primitives::Address = chain
         .session_registry
-        .or_else(|| config.publish.session_registry.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "session registry address required: use --session-registry, ATAKIT_SESSION_REGISTRY, or [publish] session_registry in config"
-            )
-        })?;
-
-    let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry_str.parse().context("invalid session registry address")?;
+        .parse()
+        .context("invalid session registry address")?;
 
     // Query on-chain
     let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
@@ -111,9 +99,10 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     println!("Querying on-chain spec...");
-    let measurement = automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
-        .await
-        .context("failed to connect to WorkloadMeasurement")?;
+    let measurement =
+        automata_tee_workload_measurement::WorkloadMeasurement::new(measurement_config)
+            .await
+            .context("failed to connect to WorkloadMeasurement")?;
 
     let registry = measurement.workload_registry();
     let spec = registry
@@ -152,7 +141,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Build cached chain spec
     let chain_spec = CachedChainSpec {
-        ttl: spec.ttl,
+        session_ttl: spec.ttl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
@@ -165,7 +154,11 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
                 verify_type: p.verifyType,
-                match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
+                match_data: p
+                    .matchData
+                    .iter()
+                    .map(|b| format!("0x{}", hex::encode(b)))
+                    .collect(),
             })
             .collect(),
     };

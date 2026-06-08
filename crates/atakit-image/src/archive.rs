@@ -58,23 +58,22 @@ pub fn create_image_archive(
     } else {
         sorted_names.join("-")
     };
-    let archive_name = format!("{}-{}-{}.atabi", image_ref.repository, image_ref.tag, suffix);
+    let archive_name = format!(
+        "{}-{}-{}.atabi",
+        image_ref.repository, image_ref.tag, suffix
+    );
     let archive_path = output_dir.join(&archive_name);
 
     // Compute total source bytes for progress tracking (only matching platform disk images).
     let platform_prefixes: Vec<String> = platforms.iter().map(|p| format!("{}_", p)).collect();
     let total_bytes = filtered_dir_size(&tag_dir.join("disk_images"), &platform_prefixes)
         + dir_size(&tag_dir.join("secure_boot_certs"));
-    let handle = progress.create(
-        &format!("Packing {}", image_ref),
-        total_bytes,
-    );
+    let handle = progress.create(&format!("Packing {}", image_ref), total_bytes);
 
-    let file =
-        std::fs::File::create(&archive_path).map_err(|e| ImageError::CreateFile {
-            path: archive_path.clone(),
-            source: e,
-        })?;
+    let file = std::fs::File::create(&archive_path).map_err(|e| ImageError::CreateFile {
+        path: archive_path.clone(),
+        source: e,
+    })?;
 
     // Build manifest.
     let prefix = Path::new(&image_ref.repository);
@@ -123,10 +122,7 @@ pub fn create_image_archive(
 ///
 /// Extracts the archive contents into `store_base_dir/<repository>/<tag>/`.
 /// Returns the `ImageRef` parsed from the embedded manifest.
-pub fn import_image_archive(
-    archive_path: &Path,
-    store_base_dir: &Path,
-) -> Result<ImageRef> {
+pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Result<ImageRef> {
     let manifest = read_manifest(archive_path)?;
 
     // Validate manifest-derived path components before using them to build paths.
@@ -146,10 +142,12 @@ pub fn import_image_archive(
         path: store_base_dir.to_path_buf(),
         source: e,
     })?;
-    let canonical_store = store_base_dir.canonicalize().map_err(|e| ImageError::CreateDir {
-        path: store_base_dir.to_path_buf(),
-        source: e,
-    })?;
+    let canonical_store = store_base_dir
+        .canonicalize()
+        .map_err(|e| ImageError::CreateDir {
+            path: store_base_dir.to_path_buf(),
+            source: e,
+        })?;
 
     // Build dest_dir component by component from the canonical store,
     // rejecting pre-existing symlinks at each level.
@@ -159,11 +157,10 @@ pub fn import_image_archive(
         archive_path,
     )?;
 
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| ImageError::ArchiveRead {
-            path: archive_path.to_path_buf(),
-            source: e,
-        })?;
+    let file = std::fs::File::open(archive_path).map_err(|e| ImageError::ArchiveRead {
+        path: archive_path.to_path_buf(),
+        source: e,
+    })?;
     let decoder = open_decoder(archive_path, file)?;
     let mut archive = tar::Archive::new(decoder);
 
@@ -208,10 +205,7 @@ pub fn import_image_archive(
         if !is_safe_relative_path(&relative) {
             return Err(ImageError::ArchiveInvalid {
                 path: archive_path.to_path_buf(),
-                message: format!(
-                    "entry contains path traversal: {}",
-                    entry_path.display()
-                ),
+                message: format!("entry contains path traversal: {}", entry_path.display()),
             });
         }
 
@@ -277,19 +271,13 @@ fn create_dir_checked(base: &Path, components: &[&str], archive_path: &Path) -> 
                 if meta.file_type().is_symlink() {
                     return Err(ImageError::ArchiveInvalid {
                         path: archive_path.to_path_buf(),
-                        message: format!(
-                            "symlink in store path: {}",
-                            current.display()
-                        ),
+                        message: format!("symlink in store path: {}", current.display()),
                     });
                 }
                 if !meta.is_dir() {
                     return Err(ImageError::ArchiveInvalid {
                         path: archive_path.to_path_buf(),
-                        message: format!(
-                            "non-directory in store path: {}",
-                            current.display()
-                        ),
+                        message: format!("non-directory in store path: {}", current.display()),
                     });
                 }
             }
@@ -382,11 +370,10 @@ fn compress_to_zst(path: &Path) -> Result<()> {
 
 /// Read and parse the manifest from an .atabi archive without full extraction.
 pub fn read_manifest(archive_path: &Path) -> Result<ImageManifest> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| ImageError::ArchiveRead {
-            path: archive_path.to_path_buf(),
-            source: e,
-        })?;
+    let file = std::fs::File::open(archive_path).map_err(|e| ImageError::ArchiveRead {
+        path: archive_path.to_path_buf(),
+        source: e,
+    })?;
     let decoder = open_decoder(archive_path, file)?;
     let mut archive = tar::Archive::new(decoder);
 
@@ -453,11 +440,13 @@ fn write_archive_contents<W: std::io::Write>(
         let disk_prefix = prefix.join("disk_images");
         append_dir_entry(tar, &disk_prefix)?;
 
-        let platform_prefixes: Vec<String> =
-            platforms.iter().map(|p| format!("{}_", p)).collect();
+        let platform_prefixes: Vec<String> = platforms.iter().map(|p| format!("{}_", p)).collect();
 
         let mut entries: Vec<_> = std::fs::read_dir(&disk_images_src)
-            .map_err(|e| ImageError::ReadDir { path: disk_images_src.clone(), source: e })?
+            .map_err(|e| ImageError::ReadDir {
+                path: disk_images_src.clone(),
+                source: e,
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ImageError::Io)?;
         entries.sort_by_key(|a| a.file_name());
@@ -466,7 +455,10 @@ fn write_archive_contents<W: std::io::Write>(
             let path = entry.path();
             let fname = path.file_name().expect("entry has a filename");
             let name_str = fname.to_string_lossy();
-            if !platform_prefixes.iter().any(|pfx| name_str.starts_with(pfx.as_str())) {
+            if !platform_prefixes
+                .iter()
+                .any(|pfx| name_str.starts_with(pfx.as_str()))
+            {
                 continue;
             }
             if entry.file_type().map_err(ImageError::Io)?.is_file() {
@@ -485,31 +477,30 @@ fn write_archive_contents<W: std::io::Write>(
 }
 
 /// Open an archive file with auto-detected decompression (zstd or gzip).
-fn open_decoder(
-    archive_path: &Path,
-    mut file: std::fs::File,
-) -> Result<Box<dyn std::io::Read>> {
+fn open_decoder(archive_path: &Path, mut file: std::fs::File) -> Result<Box<dyn std::io::Read>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).map_err(|e| ImageError::ArchiveRead {
-        path: archive_path.to_path_buf(),
-        source: e,
-    })?;
-    file.seek(SeekFrom::Start(0)).map_err(|e| ImageError::ArchiveRead {
-        path: archive_path.to_path_buf(),
-        source: e,
-    })?;
+    file.read_exact(&mut magic)
+        .map_err(|e| ImageError::ArchiveRead {
+            path: archive_path.to_path_buf(),
+            source: e,
+        })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ImageError::ArchiveRead {
+            path: archive_path.to_path_buf(),
+            source: e,
+        })?;
 
     if magic[..2] == [0x1F, 0x8B] {
         Ok(Box::new(flate2::read::GzDecoder::new(file)))
     } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-        Ok(Box::new(
-            zstd::Decoder::new(file).map_err(|e| ImageError::ArchiveRead {
+        Ok(Box::new(zstd::Decoder::new(file).map_err(|e| {
+            ImageError::ArchiveRead {
                 path: archive_path.to_path_buf(),
                 source: e,
-            })?,
-        ))
+            }
+        })?))
     } else {
         Err(ImageError::ParseManifest {
             path: archive_path.to_path_buf(),
@@ -579,7 +570,10 @@ fn filtered_dir_size(path: &Path, prefixes: &[String]) -> u64 {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if prefixes.iter().any(|pfx| name_str.starts_with(pfx.as_str())) {
+        if prefixes
+            .iter()
+            .any(|pfx| name_str.starts_with(pfx.as_str()))
+        {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     total += meta.len();
@@ -592,10 +586,7 @@ fn filtered_dir_size(path: &Path, prefixes: &[String]) -> u64 {
 
 // ── tar helpers ──────────────────────────────────────────────
 
-fn append_dir_entry<W: std::io::Write>(
-    tar: &mut tar::Builder<W>,
-    path: &Path,
-) -> Result<()> {
+fn append_dir_entry<W: std::io::Write>(tar: &mut tar::Builder<W>, path: &Path) -> Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Directory);
     header.set_size(0);
@@ -733,8 +724,15 @@ mod tests {
         // Create archive.
         let out_dir = tmp.path().join("output");
         std::fs::create_dir_all(&out_dir).unwrap();
-        let archive_path =
-            create_image_archive(&tag_dir, &image_ref, &platforms, &out_dir, &NullReporter, ArchiveCompression::default()).unwrap();
+        let archive_path = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &platforms,
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::default(),
+        )
+        .unwrap();
         assert!(archive_path.exists());
         // Single-platform archive should include the platform name.
         assert_eq!(
@@ -1004,13 +1002,16 @@ mod tests {
 
     #[test]
     fn import_rejects_empty_manifest_name() {
-        let err = validate_path_component("", "manifest name", Path::new("test.atabi")).unwrap_err();
+        let err =
+            validate_path_component("", "manifest name", Path::new("test.atabi")).unwrap_err();
         assert!(err.to_string().contains("empty"), "unexpected error: {err}");
     }
 
     #[test]
     fn safe_relative_path_checks() {
-        assert!(is_safe_relative_path(Path::new("disk_images/gcp_disk.tar.gz")));
+        assert!(is_safe_relative_path(Path::new(
+            "disk_images/gcp_disk.tar.gz"
+        )));
         assert!(is_safe_relative_path(Path::new("secure_boot_certs/PK.crt")));
         assert!(!is_safe_relative_path(Path::new("../evil")));
         assert!(!is_safe_relative_path(Path::new("disk_images/../../evil")));

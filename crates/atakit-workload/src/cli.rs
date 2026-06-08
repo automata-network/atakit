@@ -31,6 +31,9 @@ pub enum WorkloadCommand {
     Add(AddArgs),
     /// Remove a workload from the local store
     Rm(RmArgs),
+    /// Initialize a CVM portal directly (e.g. local QEMU)
+    #[command(arg_required_else_help = true)]
+    Init(InitArgs),
 }
 
 /// Arguments for `workload create`.
@@ -84,21 +87,19 @@ pub struct DeactivateArgs {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
-    /// Owner private key hex for signing transactions
+    pub chain: Option<String>,
+    /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
-    /// Relay private key hex for submitting transactions
+    /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds
-    #[arg(long, default_value = "300")]
-    pub expire_offset: u64,
+    /// Signature expiration offset in seconds. If omitted, falls back to
+    /// `[chains.<name>] expire_offset` (default 300).
+    #[arg(long)]
+    pub expire_offset: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
@@ -112,24 +113,22 @@ pub struct PublishArgs {
     /// Workload directory (alternative to archive)
     #[arg(short, long, conflicts_with = "archive")]
     pub dir: Option<PathBuf>,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
-    /// Owner private key hex for signing transactions
+    pub chain: Option<String>,
+    /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
-    /// Relay private key hex for submitting transactions
+    /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds
-    #[arg(long, default_value = "300")]
-    pub expire_offset: u64,
-    /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
+    /// Signature expiration offset in seconds. If omitted, falls back to
+    /// `[chains.<name>] expire_offset` (default 300).
     #[arg(long)]
-    pub ttl: Option<u64>,
+    pub expire_offset: Option<u64>,
+    /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
+    #[arg(long = "session-ttl")]
+    pub session_ttl: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
@@ -146,12 +145,9 @@ pub struct PublishArgs {
 pub struct SpecArgs {
     /// Workload ID (hex bytes32, with or without 0x prefix)
     pub id: String,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub chain: Option<String>,
 }
 
 /// Arguments for `workload ls`.
@@ -237,12 +233,9 @@ pub struct ExportArgs {
 pub struct AddArgs {
     /// Workload reference (name:version or 0x<workload_id>), or path to .atawl file
     pub reference: String,
-    /// Ethereum RPC URL
+    /// Chain config name (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
-    /// Session registry contract address
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub chain: Option<String>,
     /// Force overwrite if already in store
     #[arg(long)]
     pub force: bool,
@@ -256,4 +249,58 @@ pub struct RmArgs {
     /// Remove only the archive blob, keep metadata
     #[arg(long)]
     pub blob_only: bool,
+}
+
+/// Arguments for `workload init`.
+#[derive(Args)]
+pub struct InitArgs {
+    /// Portal address: "host" or "host:port" (default port 1024;
+    /// status port = init port + 1000).
+    pub address: String,
+
+    /// Workload source: name:version (store ref) or path to .atawl file
+    pub source: Option<String>,
+
+    /// Workload directory (default: current directory)
+    #[arg(short, long, conflicts_with = "source")]
+    pub dir: Option<PathBuf>,
+
+    /// Platform string sent as `platform.declared` in the init payload
+    #[arg(long, value_parser = ["gcp", "azure", "qemu"], default_value = "qemu")]
+    pub platform: String,
+
+    /// Chain config name override (references [chains.<name>])
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
+    #[arg(long)]
+    pub owner_key: Option<String>,
+
+    /// Gas wallet key name override (references [keys.<name>])
+    #[arg(long)]
+    pub gas_wallet: Option<String>,
+
+    /// Portal wait timeout in seconds
+    #[arg(long, default_value = "300")]
+    pub timeout: u64,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+
+    /// Skip workload freshness check
+    #[arg(long)]
+    pub skip_freshness_check: bool,
+
+    /// Directory containing unmeasured-data files (overrides workload dir)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_dir: Option<PathBuf>,
+
+    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
+    /// disk declared in the workload manifest with `passphrase` in its
+    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
+    /// init time rather than persisting in config.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub disk_passphrase: Vec<String>,
 }

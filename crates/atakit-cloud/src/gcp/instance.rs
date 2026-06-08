@@ -51,6 +51,12 @@ pub async fn create_instance(
         "--network-interface=network-tier=PREMIUM,nic-type=GVNIC",
         &cc_flag,
         "--maintenance-policy=TERMINATE",
+        // Shielded VM: required for the image's custom PK/KEK/db to take
+        // effect at boot. Without these flags GCE provisions the VM with
+        // SecureBoot=0x00 even when the image carries Secure Boot certs.
+        "--shielded-secure-boot",
+        "--shielded-vtpm",
+        "--shielded-integrity-monitoring",
     ];
     if let Some(ref flag) = boot_disk_flag {
         args.push(flag);
@@ -79,12 +85,13 @@ pub async fn create_instance(
 
     args.push("--format=json");
 
-    let output = runner
-        .run_capture("gcloud", &args)
-        .await
-        .map_err(|e| CloudError::InstanceError {
-            message: format!("failed to create instance: {e}"),
-        })?;
+    let output =
+        runner
+            .run_capture("gcloud", &args)
+            .await
+            .map_err(|e| CloudError::InstanceError {
+                message: format!("failed to create instance: {e}"),
+            })?;
 
     // Parse the external IP from JSON output.
     let ip = parse_external_ip(&output.stdout).unwrap_or_default();

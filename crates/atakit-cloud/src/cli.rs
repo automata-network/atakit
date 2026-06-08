@@ -53,14 +53,17 @@ pub enum CloudProviderCommand {
 }
 
 /// Arguments for `cloud deploy`.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct DeployArgs {
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
 
-    /// Target name from [cloud.targets.<name>]
-    #[arg(long)]
-    pub target: Option<String>,
+    /// Target name(s) from [cloud.targets.<name>]. Repeatable, or comma-separated.
+    /// Passing multiple targets fans out into a concurrent multi-target deploy
+    /// (instance names auto-generated per target; --name and interactive
+    /// confirmation are not supported in multi mode).
+    #[arg(long, value_delimiter = ',')]
+    pub target: Vec<String>,
 
     /// Instance name (default: {workload}-{target})
     #[arg(long)]
@@ -83,21 +86,17 @@ pub struct DeployArgs {
     #[arg(long, value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
 
-    /// Owner key file path override
+    /// Chain config name override (references [chains.<name>])
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
 
-    /// Relay key file path override
+    /// Gas wallet key name override (references [keys.<name>])
     #[arg(long)]
-    pub relay_key: Option<String>,
-
-    /// RPC URL override
-    #[arg(long)]
-    pub rpc_url: Option<String>,
-
-    /// Session registry address override
-    #[arg(long)]
-    pub session_registry: Option<String>,
+    pub gas_wallet: Option<String>,
 
     /// Workload directory (default: current directory)
     #[arg(short, long, conflicts_with = "source")]
@@ -126,21 +125,44 @@ pub struct DeployArgs {
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
+
+    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
+    /// disk declared in the workload manifest with `passphrase` in its
+    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
+    /// deploy time rather than persisting in config.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub disk_passphrase: Vec<String>,
+
+    /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
+    /// Takes precedence over the target's `boot_disk_size` and the workload
+    /// manifest's minimum. Must be >= the workload minimum.
+    #[arg(long, value_name = "SIZE")]
+    pub boot_disk_size: Option<String>,
 }
 
 /// Arguments for `cloud destroy`.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct DestroyArgs {
-    /// Instance name (or target/instance)
-    pub instance: String,
+    /// Instance name(s) (or target/instance). Repeatable: multiple instances
+    /// destroy concurrently.
+    #[arg(required = true)]
+    pub instance: Vec<String>,
 
-    /// Target name (for disambiguation)
+    /// Target name (for disambiguation, applied to all listed instances)
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Resources to preserve (comma-separated: image, disks, firewall)
+    /// Resources to preserve (comma-separated: disks, firewall). Images are
+    /// always preserved by default; pass `--clean-image` to opt in to deletion.
     #[arg(long, value_delimiter = ',')]
     pub preserve: Vec<String>,
+
+    /// Delete the base image (and its staging bucket on GCP/AWS) when
+    /// destroying. Default is to preserve the image so it can be reused by
+    /// future deploys. The image is auto-preserved if any other active
+    /// deployment still references it.
+    #[arg(long)]
+    pub clean_image: bool,
 
     /// Skip confirmation prompt
     #[arg(short, long)]
@@ -253,21 +275,17 @@ pub struct InitArgs {
     #[arg(short, long, conflicts_with = "source")]
     pub dir: Option<PathBuf>,
 
-    /// RPC URL override
+    /// Chain config name override (references [chains.<name>])
     #[arg(long)]
-    pub rpc_url: Option<String>,
+    pub chain: Option<String>,
 
-    /// Session registry address override
-    #[arg(long)]
-    pub session_registry: Option<String>,
-
-    /// Owner key file path override
+    /// Owner key name override (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
 
-    /// Relay key file path override
+    /// Gas wallet key name override (references [keys.<name>])
     #[arg(long)]
-    pub relay_key: Option<String>,
+    pub gas_wallet: Option<String>,
 
     /// Agent wait timeout in seconds
     #[arg(long, default_value = "300")]
@@ -284,6 +302,13 @@ pub struct InitArgs {
     /// Directory containing unmeasured-data files (overrides workload dir)
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
+
+    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
+    /// disk declared in the workload manifest with `passphrase` in its
+    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
+    /// init time rather than persisting in config.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub disk_passphrase: Vec<String>,
 }
 
 /// Arguments for `cloud serial`.

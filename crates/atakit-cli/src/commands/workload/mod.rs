@@ -5,6 +5,7 @@ pub mod deactivate;
 pub mod export;
 pub mod import;
 pub mod info;
+pub mod init;
 pub mod ls;
 pub mod publish;
 pub mod pull;
@@ -14,7 +15,7 @@ pub mod spec;
 
 use std::path::{Path, PathBuf};
 
-use alloy_ext::core::primitives::{B256, keccak256};
+use alloy_ext::core::primitives::{keccak256, B256};
 use alloy_ext::core::sol_types::SolValue;
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadStore};
@@ -88,14 +89,12 @@ pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
         Ok(WorkloadRef::Id(s.to_string()))
     } else if let Some((name, version)) = s.split_once(':') {
         if name.is_empty() || version.is_empty() {
-            anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'");
+            anyhow::bail!(
+                "invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'"
+            );
         }
         // Validate name: alphanumeric + hyphens, no leading hyphen
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-            || name.starts_with('-')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || name.starts_with('-') {
             anyhow::bail!(
                 "invalid workload name in reference: must be alphanumeric + hyphens, got '{name}'"
             );
@@ -136,6 +135,93 @@ pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(St
     }
 }
 
+/// Resolved chain config for workload on-chain commands.
+/// Extracted from `[chains.<name>]` with precedence: CLI --chain > [publish] chain.
+pub struct ResolvedChain {
+    pub rpc_url: String,
+    pub session_registry: String,
+    /// Default validity window (seconds) for owner-key-signed messages
+    /// when the CLI does not pass `--expire-offset`.
+    pub expire_offset: u64,
+}
+
+/// Resolve chain config for on-chain workload commands.
+///
+/// Precedence: `cli_chain` > `config.publish.chain`. Looks up the name
+/// in `config.chains` and returns the rpc_url, session_registry, and
+/// the chain's `expire_offset` default.
+pub fn resolve_chain(
+    cli_chain: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<ResolvedChain> {
+    let chain_name = cli_chain
+        .or(config.publish.chain.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("chain required: use --chain or [publish] chain in config")
+        })?;
+    let chain = config
+        .chains
+        .get(chain_name)
+        .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
+    Ok(ResolvedChain {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        expire_offset: chain.expire_offset,
+    })
+}
+
+/// Resolve owner key for on-chain workload commands.
+///
+/// Precedence: `cli_owner_key` > `config.publish.owner_key`. Looks up
+/// the name in `config.keys` and resolves the private key.
+pub fn resolve_owner_key(
+    cli_owner_key: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let key_name = cli_owner_key
+        .or(config.publish.owner_key.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("owner key required: use --owner-key or [publish] owner_key in config")
+        })?;
+    let key_spec = config
+        .keys
+        .get(key_name)
+        .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
+    if key_spec.key_type != crate::config::KeyType::Es256k {
+        anyhow::bail!(
+            "key '{key_name}' has type {}; on-chain workload commands require es256k",
+            key_spec.key_type
+        );
+    }
+    key_spec.resolve(key_name)
+}
+
+/// Resolve relay key for on-chain workload commands.
+///
+/// Precedence: `cli_relay_key` > `config.publish.relay_key`. Looks up
+/// the name in `config.keys` and resolves the private key.
+pub fn resolve_relay_key(
+    cli_relay_key: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let key_name = cli_relay_key
+        .or(config.publish.relay_key.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("relay key required: use --relay-key or [publish] relay_key in config")
+        })?;
+    let key_spec = config
+        .keys
+        .get(key_name)
+        .ok_or_else(|| anyhow::anyhow!("key '{key_name}' not found in [keys]"))?;
+    if key_spec.key_type != crate::config::KeyType::Es256k {
+        anyhow::bail!(
+            "key '{key_name}' has type {}; on-chain workload commands require es256k",
+            key_spec.key_type
+        );
+    }
+    key_spec.resolve(key_name)
+}
+
 /// On-chain workload data returned by `query_chain_data`.
 pub struct ChainData {
     pub status: String,
@@ -156,7 +242,9 @@ pub async fn query_chain_data(
     session_registry: &str,
 ) -> anyhow::Result<ChainData> {
     let session_registry_address: alloy_ext::core::primitives::Address =
-        session_registry.parse().map_err(|_| anyhow::anyhow!("invalid session registry address"))?;
+        session_registry
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid session registry address"))?;
 
     let measurement_config = automata_tee_workload_measurement::WorkloadMeasurementConfig {
         rpc_url: rpc_url.to_string(),
@@ -202,7 +290,7 @@ pub async fn query_chain_data(
         .map(|b| format!("0x{}", hex::encode(b)));
 
     let cached = CachedChainSpec {
-        ttl: spec.ttl,
+        session_ttl: spec.ttl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
@@ -215,7 +303,11 @@ pub async fn query_chain_data(
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
                 verify_type: p.verifyType,
-                match_data: p.matchData.iter().map(|b| format!("0x{}", hex::encode(b))).collect(),
+                match_data: p
+                    .matchData
+                    .iter()
+                    .map(|b| format!("0x{}", hex::encode(b)))
+                    .collect(),
             })
             .collect(),
     };
@@ -233,10 +325,7 @@ pub async fn query_chain_data(
 
 /// Update WorkloadMeta in the store with on-chain data.
 /// Merges chain data into existing metadata if present, or creates fields on existing.
-pub fn apply_chain_data_to_meta(
-    meta: &mut atakit_workload::WorkloadMeta,
-    chain: &ChainData,
-) {
+pub fn apply_chain_data_to_meta(meta: &mut atakit_workload::WorkloadMeta, chain: &ChainData) {
     meta.revoked = chain.revoked;
     if chain.owner.is_some() {
         meta.owner.clone_from(&chain.owner);
@@ -252,10 +341,7 @@ pub fn apply_chain_data_to_meta(
 /// Check if a string looks like a `name:version` store reference (not a file path).
 pub fn looks_like_store_ref(s: &str) -> bool {
     // Contains a colon and doesn't look like a file path
-    s.contains(':')
-        && !s.starts_with('/')
-        && !s.starts_with('.')
-        && !s.ends_with(".atawl")
+    s.contains(':') && !s.starts_with('/') && !s.starts_with('.') && !s.ends_with(".atawl")
 }
 
 // `hex_equal` now lives in atakit-workload so library code (the
@@ -310,5 +396,40 @@ mod tests {
     fn final_pcr23_rejects_bad_hex() {
         assert!(compute_final_pcr23("notahex").is_none());
         assert!(compute_final_pcr23("0xdeadbeef").is_none()); // too short
+    }
+
+    /// Cross-check vector against atakit-portal's hand-rolled abi.encode + keccak256.
+    /// If this assertion changes, the matching test in atakit-portal must change too,
+    /// or the on-chain workload IDs the portal reports will silently diverge.
+    #[test]
+    fn compute_workload_id_known_vector() {
+        let id = compute_workload_id("test-workload", "v1.0.0");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0xc6025b180ebd852412a9e3490b9759239995d1e0741a9ffd2ada596e1094e608"
+        );
+    }
+
+    /// Real-world vector: a workload published on-chain. Confirms the synthetic
+    /// vector above isn't an artifact of `test-workload`/`v1.0.0` specifically.
+    #[test]
+    fn compute_workload_id_fedora_oci_v0_0_9() {
+        let id = compute_workload_id("fedora-oci", "v0.0.9");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0x45504f5c32f3da742031f059f8aea265a3ed840d19fc27f66aaea0215ae82181"
+        );
+    }
+
+    /// Cross-check vector against atakit-portal's hand-rolled abi.encode + keccak256.
+    /// If this assertion changes, the matching test in atakit-portal must change too,
+    /// or the on-chain base-image IDs the portal reports will silently diverge.
+    #[test]
+    fn compute_base_image_id_known_vector() {
+        let id = compute_base_image_id("test-image", "v1.0.0");
+        assert_eq!(
+            format!("0x{}", hex::encode(id)),
+            "0xe1a0a8f3eb93a84d2c524e46e6604d6dea9f5254e5b2eefb07134fa47f7173a5"
+        );
     }
 }

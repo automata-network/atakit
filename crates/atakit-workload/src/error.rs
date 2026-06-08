@@ -41,9 +41,6 @@ pub enum WorkloadError {
     #[error("measured-data path does not exist: {0}")]
     MeasuredDataMissing(PathBuf),
 
-    #[error("signing file does not exist: {0}")]
-    SigningFileMissing(PathBuf),
-
     #[error("env_file does not exist: {0}")]
     EnvFileMissing(PathBuf),
 
@@ -74,9 +71,6 @@ pub enum WorkloadError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("failed to serialize manifest: {0}")]
-    SerializeManifest(#[from] toml::ser::Error),
 
     // ── store ────────────────────────────────────────────
     #[error("workload not found in store: {name}:{version}")]

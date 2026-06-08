@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,7 @@ pub struct DeployState {
     pub image_ref: String,
     pub archive_path: String,
     pub archive_hash: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     pub resources: ResourceSet,
 }
 
@@ -42,14 +43,17 @@ pub enum DeployStatus {
     Destroyed,
 }
 
-/// Agent environment config persisted for re-deploys.
+/// Init environment config persisted for re-deploys.
+/// Stores reference names into `[chains.*]` and `[keys.*]` config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PersistedAgentEnv {
-    pub rpc_url: Option<String>,
-    pub session_registry: Option<String>,
-    pub owner_key_file: Option<String>,
-    pub relay_key_file: Option<String>,
-    pub expire_offset: Option<u64>,
+pub struct PersistedInitEnv {
+    pub chain: String,
+    pub owner_key: String,
+    pub gas_wallet: String,
+    /// Optional SP1 prover-network key name. `#[serde(default)]` so deploy
+    /// states written before this field existed still load (as `None`).
+    #[serde(default)]
+    pub sp1_payer: Option<String>,
 }
 
 /// Cloud provider resources tracked in state.
@@ -59,6 +63,51 @@ pub struct ResourceSet {
     pub gcp: Option<GcpResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azure: Option<AzureResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qemu: Option<QemuResources>,
+}
+
+/// Local QEMU-specific resource tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QemuResources {
+    /// Per-instance directory (overlays + serial log + swtpm state).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_dir: String,
+    /// PID of the running `qemu-system-x86_64` process. 0 until the
+    /// `StartLocalVm` step records it.
+    #[serde(default)]
+    pub pid: u32,
+    /// Absolute path to the qcow2 image the boot overlay is backed by
+    /// (typically `<image_store>/.../qemu_disk.qcow2`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_disk: String,
+    /// Absolute path to the per-instance boot overlay (qcow2).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_overlay: String,
+    /// Absolute paths of per-instance data-disk qcow2 files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_disks: Vec<String>,
+    /// Host port forwarded to guest port 2024 (portal status endpoint).
+    #[serde(default)]
+    pub host_status_port: u16,
+    /// Host port forwarded to guest port 1024 (portal init endpoint).
+    #[serde(default)]
+    pub host_init_port: u16,
+    /// Path to the unix-socket chardev that `-serial chardev:ser` is wired
+    /// to. `cloud ssh` socats into this for an interactive serial console;
+    /// `cloud serial` keeps tailing the chardev's `logfile=` (`serial.log`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub serial_sock: String,
+    /// Guest port → host port for workload-declared TCP ports.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workload_port_map: BTreeMap<u16, u16>,
+    /// Address the operator can reach the VM at — always `127.0.0.1` for
+    /// QEMU; stored explicitly so `status` / `list` can read it uniformly
+    /// with the cloud platforms.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_ip: String,
 }
 
 /// GCP-specific resource tracking.
@@ -107,6 +156,24 @@ pub struct AzureResources {
     pub external_ip: Option<String>,
 }
 
+/// AWS-specific resource tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AwsResources {
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ami: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_ip: Option<String>,
+}
+
 /// Base directory for deployment state files.
 fn deployments_dir(data_dir: &Path) -> PathBuf {
     let new_path = data_dir.join("cloud").join("deployments");
@@ -141,7 +208,7 @@ pub struct NewDeployParams {
     pub image_ref: String,
     pub archive_path: String,
     pub archive_hash: String,
-    pub agent_env: PersistedAgentEnv,
+    pub init_env: PersistedInitEnv,
     /// Total number of steps in the deployment plan.
     pub total_steps: u32,
 }
@@ -160,11 +227,14 @@ impl DeployState {
             platform: params.platform,
             created_at: now,
             updated_at: now,
-            status: DeployStatus::Deploying { step: 0, total: params.total_steps },
+            status: DeployStatus::Deploying {
+                step: 0,
+                total: params.total_steps,
+            },
             image_ref: params.image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
-            agent_env: params.agent_env,
+            init_env: params.init_env,
             resources: ResourceSet::default(),
         }
     }
@@ -248,19 +318,83 @@ impl DeployState {
 
     /// Apply resource updates from a completed step.
     pub fn apply_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
-        // Route to the correct platform resource set.
-        if self.resources.azure.is_some() {
+        // Route to the correct platform resource set. Qemu is checked first
+        // because cloud arms use the {gcp,azure,aws} fields, all of which are
+        // None on qemu deployments.
+        if self.resources.qemu.is_some() {
+            self.apply_qemu_resource_updates(updates);
+        } else if self.resources.azure.is_some() {
             self.apply_azure_resource_updates(updates);
+        } else if self.resources.aws.is_some() {
+            self.apply_aws_resource_updates(updates);
         } else {
             self.apply_gcp_resource_updates(updates);
         }
     }
 
-    fn apply_gcp_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
-        let gcp = self
+    fn apply_qemu_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let q = self
             .resources
-            .gcp
-            .get_or_insert_with(GcpResources::default);
+            .qemu
+            .get_or_insert_with(QemuResources::default);
+        if let Some(ref dir) = updates.qemu_instance_dir {
+            q.instance_dir = dir.clone();
+        }
+        if let Some(pid) = updates.qemu_pid {
+            q.pid = pid;
+        }
+        if let Some(ref p) = updates.qemu_base_disk {
+            q.base_disk = p.clone();
+        }
+        if let Some(ref p) = updates.qemu_boot_overlay {
+            q.boot_overlay = p.clone();
+        }
+        if !updates.disks.is_empty() {
+            q.data_disks.extend(updates.disks.iter().cloned());
+        }
+        if let Some(p) = updates.qemu_host_status_port {
+            q.host_status_port = p;
+        }
+        if let Some(p) = updates.qemu_host_init_port {
+            q.host_init_port = p;
+        }
+        if let Some(ref s) = updates.qemu_serial_sock {
+            q.serial_sock = s.clone();
+        }
+        if !updates.qemu_workload_port_map.is_empty() {
+            for (g, h) in &updates.qemu_workload_port_map {
+                q.workload_port_map.insert(*g, *h);
+            }
+        }
+        if let Some(ref ip) = updates.external_ip {
+            q.external_ip = ip.clone();
+        }
+    }
+
+    fn apply_aws_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let aws = self.resources.aws.get_or_insert_with(AwsResources::default);
+        if let Some(ref b) = updates.bucket {
+            aws.bucket = Some(b.clone());
+        }
+        if let Some(ref s) = updates.snapshot {
+            aws.snapshot = Some(s.clone());
+        }
+        if let Some(ref i) = updates.image {
+            aws.ami = Some(i.clone());
+        }
+        if let Some(ref f) = updates.firewall_rule {
+            aws.security_group = Some(f.clone());
+        }
+        if let Some(ref i) = updates.instance {
+            aws.instance = Some(i.clone());
+        }
+        if let Some(ref ip) = updates.external_ip {
+            aws.external_ip = Some(ip.clone());
+        }
+    }
+
+    fn apply_gcp_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let gcp = self.resources.gcp.get_or_insert_with(GcpResources::default);
         if let Some(ref b) = updates.bucket {
             gcp.bucket = Some(b.clone());
         }
@@ -361,7 +495,7 @@ pub fn list_deployments(data_dir: &Path) -> Result<Vec<DeployState>, CloudError>
             }
         }
     }
-    states.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    states.sort_by_key(|a| a.created_at);
     Ok(states)
 }
 
@@ -410,10 +544,7 @@ pub fn find_instance(
         1 => Ok((matches.into_iter().next().unwrap(), instance.to_string())),
         _ => Err(CloudError::AmbiguousInstance {
             instance: instance.to_string(),
-            matches: matches
-                .iter()
-                .map(|t| format!("{t}/{instance}"))
-                .collect(),
+            matches: matches.iter().map(|t| format!("{t}/{instance}")).collect(),
         }),
     }
 }
@@ -436,7 +567,7 @@ mod tests {
             image_ref: "automata-linux:v0.1.6".into(),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.resources.gcp = Some(GcpResources {
@@ -476,7 +607,7 @@ mod tests {
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();
@@ -500,7 +631,7 @@ mod tests {
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
-                agent_env: PersistedAgentEnv::default(),
+                init_env: PersistedInitEnv::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -524,7 +655,7 @@ mod tests {
                 image_ref: "img:v1".into(),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
-                agent_env: PersistedAgentEnv::default(),
+                init_env: PersistedInitEnv::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -547,7 +678,7 @@ mod tests {
             image_ref: "img:v1".into(),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
-            agent_env: PersistedAgentEnv::default(),
+            init_env: PersistedInitEnv::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();

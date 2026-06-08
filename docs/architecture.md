@@ -57,7 +57,7 @@ All domain logic for workload management. Clap structs behind a `cli` feature fl
 - **Validation** -- cross-field validation (paths, names, disk refs, signing prefixes, disk sizes, mount constraints, firewall ports)
 - **Container images** -- `ContainerEngine` enum (`Docker`, `Podman`) with detect/build/pull/save via CLI shelling
 - **Hashing** -- SHA-256 hashing of files and directories for integrity verification
-- **Manifest generation** -- `Manifest`, `ManifestMeta` serialization types for deterministic `manifest.toml`
+- **Manifest generation** -- `Manifest`, `ManifestMeta` serialization types for deterministic `manifest.json`
 - **Archive creation** -- `StagingDir` assembly + tar.zst `.atawl` archive output (gzip via `--gz`)
 - **Build pipeline** -- `build_workload()` async orchestrator, `BuildOptions` input, `BuildResult` output
 - **Scaffolding** -- `create_workload()` for creating new workload directories with starter config

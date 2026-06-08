@@ -3,10 +3,31 @@
 # This file defines a single workload: its container image, runtime config,
 # data mounts, on-chain parameters, and optional sidecars. Running
 # `atakit workload build` compiles it into a deterministic .atawl archive
-# containing manifest.toml + images + measured-data.
+# containing manifest.json + images + measured-data.
 
-# Schema version. Must be 1.
-format = 1
+# Schema version. Must be 2.
+format = 2
+
+# ── package data ────────────────────────────────────────────────
+#
+# Declares which files are bundled into the archive (measured-data) and
+# which operators must provide at deploy time (unmeasured-data). These are
+# workload-level concerns; individual containers opt into mounting them
+# via per-container measured-data / unmeasured-data booleans.
+#
+# measured-data: files included in the archive and integrity-verified via PCR23.
+# Paths must start with "./" and must not contain "..". Files must exist
+# at build time. Mounted read-only at /atakit-portal/measured-data/ in containers
+# that set measured-data = true.
+#
+# unmeasured-data: operator-provided files NOT included in the archive.
+# Not verified by PCR23 -- the operator supplies them at deploy time.
+# Mounted read-only at /atakit-portal/unmeasured-data/ in containers
+# that set unmeasured-data = true.
+#
+# [package]
+# measured-data = ["./config/cert.pem", "./config/settings.json"]
+# unmeasured-data = ["./runtime-data/signing-key.pem"]
 
 [workload]
 # Workload identity. The on-chain workload ID is derived from name + version
@@ -31,11 +52,11 @@ base-image-mode = "blacklist"
 # on-chain base image IDs. Override with `--base-image-id` on publish if needed.
 # base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
 
-# ttl: session TTL in seconds. Determines how long a CVM session remains
-# valid after attestation. Default: 0 (contract default, 30 days).
-# Can be overridden per-publish with `--ttl`. The contract computes
+# session-ttl: session TTL in seconds. Determines how long a CVM session
+# remains valid after attestation. Default: 0 (contract default, 30 days).
+# Can be overridden per-publish with `--session-ttl`. The contract computes
 # `block.timestamp + ttl` as uint64, so the value must not cause overflow.
-# ttl = 0
+# session-ttl = 0
 
 # boot-disk-size: minimum boot/OS disk size for cloud deployments.
 # Uses the cloud provider default if omitted. The actual disk may be larger
@@ -74,16 +95,30 @@ image = "{{name}}:latest"
 # entrypoint: override the container ENTRYPOINT. String or array.
 # entrypoint = ["/app/entrypoint.sh"]
 #
-# cvm_agent: mount the CVM agent Unix socket into the container.
+# atakit-portal: mount the atakit-portal Unix socket into the container.
 # Required for workloads that communicate with the host agent.
-# cvm_agent = true
+# atakit-portal = true
 #
-# cap-add: Linux capabilities to grant the container. Allowlisted to a small
-# set so attestation surface stays bounded. Currently allowed: "NET_ADMIN",
-# "NET_RAW". Use NET_ADMIN to let the workload manage nftables in its own
-# network namespace (e.g. firewall/egress enforcement that subordinate baby
-# containers inherit via shared-netns).
+# gid-group: controls GID sharing between containers. Services with the
+# same gid-group share a host GID; services with different values get
+# isolated GIDs. Default: workload name.
+# gid-group = "my-group"
+#
+# cap-add: Linux capabilities to grant on top of the default cap set.
+# Allowlisted to "NET_ADMIN", "NET_RAW" so the attestation surface stays
+# bounded. NET_ADMIN lets the workload manage nftables in its own netns
+# (e.g. firewall/egress enforcement that subordinate baby containers
+# inherit via shared-netns); NET_RAW lets it open raw sockets.
+# Always serialised in manifest.json -- empty [] is a positive commitment
+# bound into PCR23, not noise.
 # cap-add = ["NET_ADMIN"]
+#
+# cap-drop: Linux capabilities to remove from the default cap set as a
+# hardening commitment. Entries must be members of the default set
+# (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE, SETFCAP,
+# SETGID, SETPCAP, SETUID, SYS_CHROOT). Names use canonical uppercase
+# without the CAP_ prefix.
+# cap-drop = ["NET_BIND_SERVICE"]
 
 # ── environment variables ────────────────────────────────────────
 #
@@ -100,18 +135,17 @@ image = "{{name}}:latest"
 # Resolution order when a key appears in both: env_file values are loaded
 # first, then [workload.environment] overrides them.
 
-# ── data mounts ──────────────────────────────────────────────────
+# ── data mount booleans ──────────────────────────────────────────
 #
-# measured-data: files included in the archive and verified via PCR23.
-# Paths must start with "./" and must not contain "..". Files must exist
-# at build time. Mounted read-only at /app/measured-data/ in the container.
-# Changing these files changes PCR23, which changes the on-chain measurement.
-# measured-data = ["./config/cert.pem", "./config/settings.json"]
+# measured-data: when true, bind-mount the measured-data/ directory
+# (read-only) into this container at /atakit-portal/measured-data/.
+# Files are defined in the [package] section above.
+# measured-data = true
 #
-# unmeasured-data: operator-provided files NOT included in the archive.
-# Not verified by PCR23 -- the operator supplies them at deploy time.
-# Mounted read-only at /app/unmeasured-data/ in the container.
-# unmeasured-data = ["./runtime-data/signing-key.pem"]
+# unmeasured-data: when true, bind-mount the unmeasured-data/ directory
+# (read-only) into this container at /atakit-portal/unmeasured-data/.
+# Files are defined in the [package] section above.
+# unmeasured-data = true
 
 # ── persistent disk mounts ───────────────────────────────────────
 #
@@ -165,24 +199,18 @@ image = "{{name}}:latest"
 # they are created dynamically by the main workload container.
 #
 # [baby-container]
-# allow = true
-# max_count = 2                         # max concurrent baby containers (default: 1)
-
-# ── image signing ────────────────────────────────────────────────
+# enabled = true
+# max-instances = 2
 #
-# Cosign-based container image signature verification. When enabled, the
-# CVM agent verifies the workload image signature before running it.
+# [baby-container.slots.analysis-job]
+# parent-service = "{{name}}"           # service whose portal UDS may manage this slot
+# image-selection = "single"            # or "multiple"
 #
-# Both auth_info and policy files must start with "./" and are copied into
-# measured-data/signing/ in the archive -- they ARE part of PCR23.
-#
-# auth_info: JSON file with registry credentials for signature verification.
-# policy: cosign verification policy file.
-#
-# [signing]
-# enable = true
-# auth_info = "./secrets/auth_info.json"
-# policy = "./config/cosign_policy.json"
+# [baby-container.slots.analysis-job.lifecycle]
+# image-retention = "session"           # or "disk"
+# instance-retention = "ephemeral"      # or "session" / "disk"
+# restart = "manual"                    # or "on-workload-start"
+# rootfs = "read-only"
 
 # ── persistent disks ─────────────────────────────────────────────
 #
@@ -193,13 +221,11 @@ image = "{{name}}:latest"
 # index: device LUN / index. Must be >= 10, unique across all disks.
 #        Auto-assigned from 10 in alphabetical order if omitted.
 # size: disk size with unit suffix. Valid units: MB, GB, TB.
-# bind_fs: use bindfs for UID translation (default: false).
-# encryption.enable: encrypt the disk at rest (default: false).
-# encryption.key_security: "standard" (default) or "strong".
+# encryption.unlock_method: list of unlock methods ("tpm", "passphrase",
+#   "keyfile", "kms"). Empty list means no encryption.
+# encryption.bind: list of PCR bindings ("platform", "baseimage", "workload").
 #
 # [disks.my-disk]
 # index = 10
 # size = "10GB"
-# bind_fs = true
-# encryption = { enable = true }
-# encryption = { enable = true, key_security = "strong" }
+# encryption = { unlock_method = ["tpm"], bind = ["workload"] }

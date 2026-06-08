@@ -10,6 +10,11 @@ use crate::error::CloudError;
 pub enum PlatformKind {
     Gcp,
     Azure,
+    Aws,
+    /// Local QEMU functional harness. Not a real TEE — boot is measured into
+    /// a software TPM (swtpm), but there is no genuine TDX/SEV quote. Used
+    /// for offline workload-init iteration.
+    Qemu,
 }
 
 impl std::fmt::Display for PlatformKind {
@@ -17,7 +22,17 @@ impl std::fmt::Display for PlatformKind {
         match self {
             PlatformKind::Gcp => write!(f, "gcp"),
             PlatformKind::Azure => write!(f, "azure"),
+            PlatformKind::Aws => write!(f, "aws"),
+            PlatformKind::Qemu => write!(f, "qemu"),
         }
+    }
+}
+
+impl PlatformKind {
+    /// True for platforms that run the VM on the operator's machine. Used to
+    /// branch around steps that are cloud-only (image upload, firewall, etc.).
+    pub fn is_local(self) -> bool {
+        matches!(self, PlatformKind::Qemu)
     }
 }
 
@@ -62,27 +77,15 @@ impl CcType {
     }
 }
 
-/// GCE `--guest-os-features` flag for image registration supporting one or
-/// more CC types. Features are merged and deduplicated.
-pub fn guest_os_features_for(cc_types: &[CcType]) -> String {
-    let mut features = vec!["UEFI_COMPATIBLE"];
-    for cc in cc_types {
-        match cc {
-            CcType::SevSnp => {
-                if !features.contains(&"SEV_SNP_CAPABLE") {
-                    features.push("SEV_SNP_CAPABLE");
-                    features.push("SEV_CAPABLE");
-                }
-            }
-            CcType::Tdx => {
-                if !features.contains(&"TDX_CAPABLE") {
-                    features.push("TDX_CAPABLE");
-                }
-            }
-        }
-    }
-    features.push("GVNIC");
-    format!("--guest-os-features={}", features.join(","))
+/// GCE `--guest-os-features` flag for image registration.
+///
+/// For now every image is registered as dual-capable (SEV-SNP + TDX)
+/// regardless of the configured CC types — GCP accepts both capability
+/// flags on a single image. `SEV_CAPABLE` (plain SEV) is intentionally
+/// omitted: only SEV-SNP is supported.
+pub fn guest_os_features_for(_cc_types: &[CcType]) -> String {
+    "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC,VIRTIO_SCSI_MULTIQUEUE"
+        .to_string()
 }
 
 /// Per-image registration config in `[cloud.images]`.
@@ -128,24 +131,24 @@ pub struct CloudProviderConfig {
     pub project: Option<String>,
     /// Azure subscription ID.
     pub subscription: Option<String>,
-    /// Cloud region or zone.
+    /// Cloud region or zone. Empty for the qemu platform (no region).
+    #[serde(default)]
     pub region: String,
+    /// QEMU UEFI/OVMF firmware path. Only meaningful when `platform = "qemu"`.
+    /// Shared by every target that references this provider; can be overridden
+    /// per-target with `[cloud.targets.<name>] uefi = "..."`, or per-run via
+    /// `ATAKIT_QEMU_UEFI`.
+    #[serde(default)]
+    pub uefi: Option<String>,
 }
 
 /// Top-level `[cloud]` configuration section.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct CloudConfig {
-    /// Default expire offset for CVM agent sessions (seconds).
-    pub expire_offset: Option<u64>,
-    /// RPC URL (falls back to `[publish]` if not set).
-    pub rpc_url: Option<String>,
-    /// Session registry contract address.
-    pub session_registry: Option<String>,
-    /// Path to owner private key file.
-    pub owner_key_file: Option<String>,
-    /// Path to relay private key file.
-    pub relay_key_file: Option<String>,
+    /// Default values inherited by targets that omit a field.
+    #[serde(default)]
+    pub defaults: CloudTargetDefaults,
     /// Named cloud providers: `[cloud.providers]`.
     #[serde(default)]
     pub providers: BTreeMap<String, CloudProviderConfig>,
@@ -157,17 +160,68 @@ pub struct CloudConfig {
     pub targets: BTreeMap<String, CloudTarget>,
 }
 
+impl CloudConfig {
+    /// Fill target fields from `[cloud.defaults]` where the target omits them.
+    pub fn apply_defaults(&mut self) {
+        let defaults = self.defaults.clone();
+        for target in self.targets.values_mut() {
+            if target.chain.is_none() {
+                target.chain = defaults.chain.clone();
+            }
+            if target.registration.is_none() {
+                target.registration = defaults.registration.clone();
+            }
+            if target.owner_key.is_none() {
+                target.owner_key = defaults.owner_key.clone();
+            }
+            if target.gas_wallet.is_none() {
+                target.gas_wallet = defaults.gas_wallet.clone();
+            }
+            if target.sp1_payer.is_none() {
+                target.sp1_payer = defaults.sp1_payer.clone();
+            }
+            if target.image.is_none() {
+                target.image = defaults.image.clone();
+            }
+        }
+    }
+}
+
+/// Default values for cloud targets: `[cloud.defaults]`.
+///
+/// Any field set here is inherited by targets that omit it.
+/// Target-level values always take precedence.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct CloudTargetDefaults {
+    pub chain: Option<String>,
+    pub registration: Option<String>,
+    pub owner_key: Option<String>,
+    pub gas_wallet: Option<String>,
+    /// Default SP1 prover-network key name (references `[keys.<name>]`),
+    /// inherited by targets that omit `sp1_payer`. Optional.
+    pub sp1_payer: Option<String>,
+    pub image: Option<String>,
+}
+
 /// A named cloud deployment target (e.g. `[cloud.targets.c3-standard-4]`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudTarget {
     /// Provider name (references a key in `[cloud.providers]`).
     pub provider: String,
-    /// VM machine type.
+    /// VM machine type. Optional for `qemu` (ignored — local VMs use a fixed
+    /// 2 vCPU / 4 GiB shape). Required for cloud providers; `validate_target`
+    /// enforces this.
+    #[serde(default)]
     pub vmtype: String,
-    /// Base image reference. Optional here so that unrelated commands
-    /// (`workload ls`, `image ls`, etc.) can still load the config
-    /// when a target entry omits it. `cloud deploy` enforces that
-    /// either this field or the `--image` flag is set.
+    /// Override the provider-level QEMU UEFI firmware path. Only meaningful
+    /// when the target's provider is `platform = "qemu"`. Wins over
+    /// `[cloud.providers.<name>] uefi`; `ATAKIT_QEMU_UEFI` wins over both.
+    #[serde(default)]
+    pub uefi: Option<String>,
+    /// Base image reference. Falls back to `[cloud.defaults] image`.
+    /// `cloud deploy` enforces that either this, the default, or
+    /// the `--image` flag is set.
     #[serde(default)]
     pub image: Option<String>,
     /// Confidential computing type. Optional; inferred from vmtype if absent.
@@ -178,11 +232,38 @@ pub struct CloudTarget {
     /// Extra metadata key-value pairs.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    // Per-target agent env overrides.
-    pub rpc_url: Option<String>,
-    pub session_registry: Option<String>,
-    pub owner_key_file: Option<String>,
-    pub relay_key_file: Option<String>,
+    /// Override OS boot disk size for this target (e.g. "100GB"). Falls
+    /// back to the workload manifest's boot-disk-size if absent. The CLI
+    /// `--boot-disk-size` flag overrides this.
+    #[serde(default)]
+    pub boot_disk_size: Option<String>,
+    /// Chain config name (references a key in `[chains]`).
+    /// Falls back to `[cloud.defaults] chain`.
+    #[serde(default)]
+    pub chain: Option<String>,
+    /// Portal-side chain-registration policy. One of:
+    /// - `"required"`: submit registration and gate serving on confirmation.
+    /// - `"optional"`: submit registration in the background.
+    /// - `"off"`: skip chain interaction; `chain` may be omitted.
+    ///
+    /// Falls back to `[cloud.defaults] registration`; omitted means the
+    /// portal default (`required`) when a chain is used.
+    #[serde(default)]
+    pub registration: Option<String>,
+    /// Owner key name (references a key in `[keys]`; may be provisioned or
+    /// self-generated depending on the registration flow).
+    /// Falls back to `[cloud.defaults] owner_key`.
+    #[serde(default)]
+    pub owner_key: Option<String>,
+    /// Gas wallet key name (references a key in `[keys]`).
+    /// Falls back to `[cloud.defaults] gas_wallet`.
+    #[serde(default)]
+    pub gas_wallet: Option<String>,
+    /// Optional SP1 prover-network key name (references a key in `[keys]`).
+    /// Falls back to `[cloud.defaults] sp1_payer`. When unset, the portal
+    /// reuses the gas wallet for SP1 signing. Only relevant for SNP CVMs.
+    #[serde(default)]
+    pub sp1_payer: Option<String>,
 }
 
 impl CloudTarget {
@@ -228,36 +309,101 @@ pub fn infer_cc_type(platform: PlatformKind, vmtype: &str) -> Result<CcType, Clo
                 })
             }
         }
+        PlatformKind::Aws => {
+            if is_aws_snp_instance(vmtype) {
+                // AWS confidential computing is AMD SEV-SNP only; there is
+                // no TDX offering.
+                Ok(CcType::SevSnp)
+            } else {
+                Err(CloudError::Config {
+                    message: format!(
+                        "cannot infer CC type from instance type '{vmtype}'. \
+                         AWS confidential VMs require an AMD SEV-SNP instance type \
+                         (e.g. 'm6a.large', 'c6a.xlarge', 'r6a.2xlarge'), \
+                         or set cc_type explicitly."
+                    ),
+                })
+            }
+        }
+        // Local qemu has no TEE; cc_type is nominal and never consumed by
+        // qemu steps. Return a stable default so callers that expect a
+        // total mapping (validation, display) keep working.
+        PlatformKind::Qemu => Ok(CcType::Tdx),
     }
 }
 
 // ── Cloud target validation ─────────────────────────────────────────
 
 const GCP_SNP_ZONES: &[&str] = &[
-    "asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c",
-    "europe-west3-a", "europe-west3-b", "europe-west3-c",
-    "europe-west4-a", "europe-west4-b", "europe-west4-c",
-    "us-central1-a", "us-central1-b", "us-central1-c",
+    "asia-southeast1-a",
+    "asia-southeast1-b",
+    "asia-southeast1-c",
+    "europe-west3-a",
+    "europe-west3-b",
+    "europe-west3-c",
+    "europe-west4-a",
+    "europe-west4-b",
+    "europe-west4-c",
+    "us-central1-a",
+    "us-central1-b",
+    "us-central1-c",
 ];
 
 const GCP_TDX_ZONES: &[&str] = &[
-    "asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c",
-    "europe-west4-a", "europe-west4-b", "europe-west4-c",
-    "us-central1-a", "us-central1-b", "us-central1-c",
+    "asia-southeast1-a",
+    "asia-southeast1-b",
+    "asia-southeast1-c",
+    "europe-west4-a",
+    "europe-west4-b",
+    "europe-west4-c",
+    "us-central1-a",
+    "us-central1-b",
+    "us-central1-c",
 ];
 
-#[allow(dead_code)] // AWS platform not yet implemented
 const AWS_SNP_REGIONS: &[&str] = &["us-east-2", "eu-west-1"];
 
-const AZURE_TDX_V6_REGIONS: &[&str] = &[
-    "West Europe", "East US", "West US", "West US 3",
+/// AWS instance type families supporting AMD SEV-SNP.
+const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", "r7a"];
+
+// Azure ARM region IDs (lowercase, no spaces). Match the format passed to
+// `az --location`, which is what downstream image.rs / deploy.rs consume.
+const AZURE_TDX_V6_REGIONS: &[&str] = &["eastus", "westus", "westus3"];
+
+const AZURE_SNP_V5_REGIONS: &[&str] = &[
+    "centralindia",
+    "eastasia",
+    "eastus",
+    "germanywestcentral",
+    "italynorth",
+    "japaneast",
+    "northeurope",
+    "southeastasia",
+    "switzerlandnorth",
+    "uaenorth",
+    "westeurope",
+    "westus",
 ];
 
-const AZURE_SNP_REGIONS: &[&str] = &[
-    "East US", "West US", "Switzerland North", "Italy North",
-    "North Europe", "West Europe", "Germany West Central",
-    "UAE North", "Japan East", "Central India", "East Asia",
-    "Southeast Asia",
+const AZURE_SNP_V6_REGIONS: &[&str] = &[
+    "australiaeast",
+    "canadacentral",
+    "canadaeast",
+    "francesouth",
+    "germanynorth",
+    "germanywestcentral",
+    "italynorth",
+    "koreacentral",
+    "norwayeast",
+    "norwaywest",
+    "southafricanorth",
+    "southcentralus",
+    "switzerlandnorth",
+    "uaenorth",
+    "uksouth",
+    "westeurope",
+    "westus",
+    "westus3",
 ];
 
 /// Valid GCP C3 standard sizes for TDX.
@@ -274,12 +420,24 @@ const AZURE_DC_VCPUS: &[&str] = &["2", "4", "8", "16", "32", "48", "64", "96"];
 /// Validate that the target's machine type, zone/region form a supported
 /// combination. If `cc_type` is set explicitly, validate it matches the
 /// inferred type from vmtype.
-pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, target_name: &str) -> Result<(), CloudError> {
-    let err = |msg: String| CloudError::Config { message: format!("target '{target_name}': {msg}") };
+pub fn validate_target(
+    target: &CloudTarget,
+    provider: &CloudProviderConfig,
+    target_name: &str,
+) -> Result<(), CloudError> {
+    let err = |msg: String| CloudError::Config {
+        message: format!("target '{target_name}': {msg}"),
+    };
+
+    // Local qemu skips zone/region/size validation entirely — there is no
+    // cloud-side compatibility matrix to enforce, and vmtype is ignored.
+    if matches!(provider.platform, PlatformKind::Qemu) {
+        return Ok(());
+    }
 
     // Validate explicit cc_type matches inferred.
-    let inferred = infer_cc_type(provider.platform, &target.vmtype)
-        .map_err(|e| err(e.to_string()))?;
+    let inferred =
+        infer_cc_type(provider.platform, &target.vmtype).map_err(|e| err(e.to_string()))?;
     if let Some(explicit) = target.cc_type {
         if explicit != inferred {
             return Err(err(format!(
@@ -303,7 +461,8 @@ pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, tar
                 if !GCP_SNP_ZONES.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "zone '{}' does not support SEV-SNP VMs. Supported zones: {}",
-                        provider.region, GCP_SNP_ZONES.join(", ")
+                        provider.region,
+                        GCP_SNP_ZONES.join(", ")
                     )));
                 }
             } else if let Some(size) = target.vmtype.strip_prefix("c3-standard-") {
@@ -318,7 +477,8 @@ pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, tar
                 if !GCP_TDX_ZONES.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "zone '{}' does not support TDX VMs. Supported zones: {}",
-                        provider.region, GCP_TDX_ZONES.join(", ")
+                        provider.region,
+                        GCP_TDX_ZONES.join(", ")
                     )));
                 }
             } else {
@@ -333,20 +493,31 @@ pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, tar
         }
         PlatformKind::Azure => {
             let is_tdx_v6 = is_azure_dces_v6(&target.vmtype);
-            let is_snp = is_azure_dcas_v5v6(&target.vmtype);
+            let is_snp_v5 = is_azure_dcas_v5(&target.vmtype);
+            let is_snp_v6 = is_azure_dcas_v6(&target.vmtype);
 
             if is_tdx_v6 {
                 if !AZURE_TDX_V6_REGIONS.contains(&provider.region.as_str()) {
                     return Err(err(format!(
                         "region '{}' does not support TDX DCesv6 VMs. Supported regions: {}",
-                        provider.region, AZURE_TDX_V6_REGIONS.join(", ")
+                        provider.region,
+                        AZURE_TDX_V6_REGIONS.join(", ")
                     )));
                 }
-            } else if is_snp {
-                if !AZURE_SNP_REGIONS.contains(&provider.region.as_str()) {
+            } else if is_snp_v5 {
+                if !AZURE_SNP_V5_REGIONS.contains(&provider.region.as_str()) {
                     return Err(err(format!(
-                        "region '{}' does not support SEV-SNP VMs. Supported regions: {}",
-                        provider.region, AZURE_SNP_REGIONS.join(", ")
+                        "region '{}' does not support SEV-SNP DCasv5 VMs. Supported regions: {}",
+                        provider.region,
+                        AZURE_SNP_V5_REGIONS.join(", ")
+                    )));
+                }
+            } else if is_snp_v6 {
+                if !AZURE_SNP_V6_REGIONS.contains(&provider.region.as_str()) {
+                    return Err(err(format!(
+                        "region '{}' does not support SEV-SNP DCasv6 VMs. Supported regions: {}",
+                        provider.region,
+                        AZURE_SNP_V6_REGIONS.join(", ")
                     )));
                 }
             } else {
@@ -361,24 +532,74 @@ pub fn validate_target(target: &CloudTarget, provider: &CloudProviderConfig, tar
                 )));
             }
         }
+        PlatformKind::Aws => {
+            if !is_aws_snp_instance(&target.vmtype) {
+                return Err(err(format!(
+                    "unsupported AWS instance type '{}'. \
+                     Use an AMD SEV-SNP instance family: {}. \
+                     Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/sev-snp.html",
+                    target.vmtype,
+                    AWS_SNP_INSTANCE_FAMILIES.join(", ")
+                )));
+            }
+            if !AWS_SNP_REGIONS.contains(&provider.region.as_str()) {
+                return Err(err(format!(
+                    "region '{}' does not support SEV-SNP VMs. Supported regions: {}",
+                    provider.region,
+                    AWS_SNP_REGIONS.join(", ")
+                )));
+            }
+        }
+        // Qemu was short-circuited at the top of the function.
+        PlatformKind::Qemu => unreachable!("qemu validation handled by early return"),
     }
     Ok(())
 }
 
+/// Match an AWS SEV-SNP-capable instance type (e.g. `m6a.large`).
+fn is_aws_snp_instance(vmtype: &str) -> bool {
+    match vmtype.split_once('.') {
+        Some((family, size)) => !size.is_empty() && AWS_SNP_INSTANCE_FAMILIES.contains(&family),
+        None => false,
+    }
+}
+
 /// Match `Standard_DC{2,4,8,16,32,64,96,128}es_v6`.
 fn is_azure_dces_v6(vmtype: &str) -> bool {
-    let Some(rest) = vmtype.strip_prefix("Standard_DC") else { return false };
-    let Some(rest) = rest.strip_suffix("es_v6") else { return false };
+    let Some(rest) = vmtype.strip_prefix("Standard_DC") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix("es_v6") else {
+        return false;
+    };
+    AZURE_DC_VCPUS.contains(&rest)
+}
+
+/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v5`.
+fn is_azure_dcas_v5(vmtype: &str) -> bool {
+    let Some(rest) = vmtype.strip_prefix("Standard_DC") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix("as_v5") else {
+        return false;
+    };
+    AZURE_DC_VCPUS.contains(&rest)
+}
+
+/// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v6`.
+fn is_azure_dcas_v6(vmtype: &str) -> bool {
+    let Some(rest) = vmtype.strip_prefix("Standard_DC") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix("as_v6") else {
+        return false;
+    };
     AZURE_DC_VCPUS.contains(&rest)
 }
 
 /// Match `Standard_DC{2,4,8,16,32,64,96,128}as_v{5,6}`.
 fn is_azure_dcas_v5v6(vmtype: &str) -> bool {
-    let Some(rest) = vmtype.strip_prefix("Standard_DC") else { return false };
-    let Some(rest) = rest.strip_suffix("as_v5").or_else(|| rest.strip_suffix("as_v6")) else {
-        return false;
-    };
-    AZURE_DC_VCPUS.contains(&rest)
+    is_azure_dcas_v5(vmtype) || is_azure_dcas_v6(vmtype)
 }
 
 #[cfg(test)]
@@ -391,6 +612,7 @@ mod tests {
             project: None,
             subscription: None,
             region: region.to_string(),
+            uefi: None,
         }
     }
 
@@ -398,14 +620,17 @@ mod tests {
         CloudTarget {
             provider: "test-provider".to_string(),
             vmtype: vmtype.to_string(),
+            uefi: None,
             image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
-            rpc_url: None,
-            session_registry: None,
-            owner_key_file: None,
-            relay_key_file: None,
+            boot_disk_size: None,
+            chain: Some("test-chain".to_string()),
+            registration: None,
+            owner_key: Some("test-owner".to_string()),
+            gas_wallet: Some("test-gas".to_string()),
+            sp1_payer: None,
         }
     }
 
@@ -430,7 +655,10 @@ mod tests {
         for size in GCP_N2D_SIZES {
             let vmtype = format!("n2d-standard-{size}");
             let t = make_target(&vmtype);
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected {vmtype} to be valid"
+            );
         }
     }
 
@@ -448,7 +676,10 @@ mod tests {
         for zone in GCP_SNP_ZONES {
             let p = make_provider(PlatformKind::Gcp, zone);
             let t = make_target("n2d-standard-8");
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected zone {zone} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected zone {zone} to be valid"
+            );
         }
     }
 
@@ -483,7 +714,10 @@ mod tests {
         for size in GCP_C3_SIZES {
             let vmtype = format!("c3-standard-{size}");
             let t = make_target(&vmtype);
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected {vmtype} to be valid"
+            );
         }
     }
 
@@ -501,7 +735,10 @@ mod tests {
         for zone in GCP_TDX_ZONES {
             let p = make_provider(PlatformKind::Gcp, zone);
             let t = make_target("c3-standard-4");
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected zone {zone} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected zone {zone} to be valid"
+            );
         }
     }
 
@@ -535,18 +772,21 @@ mod tests {
 
     #[test]
     fn azure_tdx_valid() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "westus");
         let t = make_target("Standard_DC4es_v6");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_tdx_all_sizes() {
-        let p = make_provider(PlatformKind::Azure, "West Europe");
+        let p = make_provider(PlatformKind::Azure, "westus3");
         for size in AZURE_DC_VCPUS {
             let vmtype = format!("Standard_DC{size}es_v6");
             let t = make_target(&vmtype);
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected {vmtype} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected {vmtype} to be valid"
+            );
         }
     }
 
@@ -555,13 +795,16 @@ mod tests {
         for region in AZURE_TDX_V6_REGIONS {
             let p = make_provider(PlatformKind::Azure, region);
             let t = make_target("Standard_DC4es_v6");
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected region {region} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected region {region} to be valid"
+            );
         }
     }
 
     #[test]
     fn azure_tdx_bad_region() {
-        let p = make_provider(PlatformKind::Azure, "Japan East");
+        let p = make_provider(PlatformKind::Azure, "japaneast");
         let t = make_target("Standard_DC4es_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not support TDX DCesv6"), "{err}");
@@ -569,7 +812,7 @@ mod tests {
 
     #[test]
     fn azure_tdx_wrong_cc_type() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "westus");
         let t = make_target_with_cc("Standard_DC4es_v6", CcType::SevSnp);
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -579,38 +822,77 @@ mod tests {
 
     #[test]
     fn azure_snp_v5_valid() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_DC4as_v5");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
     fn azure_snp_v6_valid() {
-        let p = make_provider(PlatformKind::Azure, "West Europe");
+        let p = make_provider(PlatformKind::Azure, "westeurope");
         let t = make_target("Standard_DC8as_v6");
         assert!(validate_target(&t, &p, "test").is_ok());
     }
 
     #[test]
-    fn azure_snp_all_regions() {
-        for region in AZURE_SNP_REGIONS {
+    fn azure_snp_v5_all_regions() {
+        for region in AZURE_SNP_V5_REGIONS {
             let p = make_provider(PlatformKind::Azure, region);
             let t = make_target("Standard_DC2as_v5");
-            assert!(validate_target(&t, &p, "test").is_ok(), "expected region {region} to be valid");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected region {region} to be valid for DCasv5"
+            );
         }
     }
 
     #[test]
-    fn azure_snp_bad_region() {
-        let p = make_provider(PlatformKind::Azure, "Brazil South");
+    fn azure_snp_v6_all_regions() {
+        for region in AZURE_SNP_V6_REGIONS {
+            let p = make_provider(PlatformKind::Azure, region);
+            let t = make_target("Standard_DC2as_v6");
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected region {region} to be valid for DCasv6"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_snp_v5_bad_region() {
+        let p = make_provider(PlatformKind::Azure, "brazilsouth");
         let t = make_target("Standard_DC4as_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
-        assert!(err.contains("does not support SEV-SNP"), "{err}");
+        assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v6_bad_region() {
+        let p = make_provider(PlatformKind::Azure, "brazilsouth");
+        let t = make_target("Standard_DC4as_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v5_region_not_in_v6() {
+        let p = make_provider(PlatformKind::Azure, "eastus");
+        let t = make_target("Standard_DC4as_v6");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv6"), "{err}");
+    }
+
+    #[test]
+    fn azure_snp_v6_region_not_in_v5() {
+        let p = make_provider(PlatformKind::Azure, "southcentralus");
+        let t = make_target("Standard_DC4as_v5");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP DCasv5"), "{err}");
     }
 
     #[test]
     fn azure_snp_wrong_cc_type() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target_with_cc("Standard_DC4as_v5", CcType::Tdx);
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -620,7 +902,7 @@ mod tests {
 
     #[test]
     fn azure_unsupported_vm_size() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_D4s_v5");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("cannot infer CC type"), "{err}");
@@ -628,10 +910,70 @@ mod tests {
 
     #[test]
     fn azure_bad_dc_size_number() {
-        let p = make_provider(PlatformKind::Azure, "East US");
+        let p = make_provider(PlatformKind::Azure, "eastus");
         let t = make_target("Standard_DC3es_v6");
         let err = validate_target(&t, &p, "test").unwrap_err().to_string();
         assert!(err.contains("cannot infer CC type"), "{err}");
+    }
+
+    // ── AWS SEV-SNP ─────────────────────────────────────
+
+    #[test]
+    fn aws_snp_valid() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target("m6a.large");
+        assert!(validate_target(&t, &p, "test").is_ok());
+    }
+
+    #[test]
+    fn aws_snp_all_families() {
+        let p = make_provider(PlatformKind::Aws, "eu-west-1");
+        for fam in AWS_SNP_INSTANCE_FAMILIES {
+            let vmtype = format!("{fam}.xlarge");
+            let t = make_target(&vmtype);
+            assert!(
+                validate_target(&t, &p, "test").is_ok(),
+                "expected {vmtype} to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_snp_bad_region() {
+        let p = make_provider(PlatformKind::Aws, "us-west-2");
+        let t = make_target("c6a.xlarge");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not support SEV-SNP"), "{err}");
+    }
+
+    #[test]
+    fn aws_unsupported_instance_type() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target("m5.large");
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("cannot infer CC type"), "{err}");
+    }
+
+    #[test]
+    fn aws_tdx_rejected() {
+        let p = make_provider(PlatformKind::Aws, "us-east-2");
+        let t = make_target_with_cc("m6a.large", CcType::Tdx);
+        let err = validate_target(&t, &p, "test").unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn infer_aws_snp() {
+        assert_eq!(
+            infer_cc_type(PlatformKind::Aws, "r6a.2xlarge").unwrap(),
+            CcType::SevSnp
+        );
+    }
+
+    #[test]
+    fn infer_aws_unknown() {
+        assert!(infer_cc_type(PlatformKind::Aws, "t3.micro").is_err());
+        assert!(infer_cc_type(PlatformKind::Aws, "m6a").is_err());
     }
 
     // ── Error messages ──────────────────────────────────
@@ -664,12 +1006,18 @@ mod tests {
 
     #[test]
     fn infer_gcp_n2d() {
-        assert_eq!(infer_cc_type(PlatformKind::Gcp, "n2d-standard-8").unwrap(), CcType::SevSnp);
+        assert_eq!(
+            infer_cc_type(PlatformKind::Gcp, "n2d-standard-8").unwrap(),
+            CcType::SevSnp
+        );
     }
 
     #[test]
     fn infer_gcp_c3() {
-        assert_eq!(infer_cc_type(PlatformKind::Gcp, "c3-standard-4").unwrap(), CcType::Tdx);
+        assert_eq!(
+            infer_cc_type(PlatformKind::Gcp, "c3-standard-4").unwrap(),
+            CcType::Tdx
+        );
     }
 
     #[test]
@@ -679,12 +1027,18 @@ mod tests {
 
     #[test]
     fn infer_azure_dces() {
-        assert_eq!(infer_cc_type(PlatformKind::Azure, "Standard_DC4es_v6").unwrap(), CcType::Tdx);
+        assert_eq!(
+            infer_cc_type(PlatformKind::Azure, "Standard_DC4es_v6").unwrap(),
+            CcType::Tdx
+        );
     }
 
     #[test]
     fn infer_azure_dcas() {
-        assert_eq!(infer_cc_type(PlatformKind::Azure, "Standard_DC4as_v5").unwrap(), CcType::SevSnp);
+        assert_eq!(
+            infer_cc_type(PlatformKind::Azure, "Standard_DC4as_v5").unwrap(),
+            CcType::SevSnp
+        );
     }
 
     // ── resolved_cc_type ────────────────────────────────
@@ -698,7 +1052,10 @@ mod tests {
     #[test]
     fn resolved_cc_type_explicit() {
         let t = make_target_with_cc("n2d-standard-2", CcType::SevSnp);
-        assert_eq!(t.resolved_cc_type(PlatformKind::Gcp).unwrap(), CcType::SevSnp);
+        assert_eq!(
+            t.resolved_cc_type(PlatformKind::Gcp).unwrap(),
+            CcType::SevSnp
+        );
     }
 
     // ── CloudImageEntry deserialization ──────────────────
@@ -710,7 +1067,10 @@ mod tests {
             "img:v1" = ["SEV_SNP", "TDX"]
         "#;
         #[derive(Deserialize)]
-        struct W { images: BTreeMap<String, CloudImageEntry> }
+        struct W {
+            #[allow(dead_code)]
+            images: BTreeMap<String, CloudImageEntry>,
+        }
         let w: W = toml::from_str(toml).unwrap();
         let entry = &w.images["img:v1"];
         assert_eq!(entry.cc_types, vec![CcType::SevSnp, CcType::Tdx]);
@@ -723,7 +1083,10 @@ mod tests {
             cc_types = ["TDX"]
         "#;
         #[derive(Deserialize)]
-        struct W { images: BTreeMap<String, CloudImageEntry> }
+        struct W {
+            #[allow(dead_code)]
+            images: BTreeMap<String, CloudImageEntry>,
+        }
         let w: W = toml::from_str(toml).unwrap();
         let entry = &w.images["img:v2"];
         assert_eq!(entry.cc_types, vec![CcType::Tdx]);
@@ -736,7 +1099,10 @@ mod tests {
             "img:v1" = []
         "#;
         #[derive(Deserialize)]
-        struct W { images: BTreeMap<String, CloudImageEntry> }
+        struct W {
+            #[allow(dead_code)]
+            images: BTreeMap<String, CloudImageEntry>,
+        }
         assert!(toml::from_str::<W>(toml).is_err());
     }
 
@@ -749,7 +1115,10 @@ mod tests {
             cc_types = ["SEV_SNP", "TDX"]
         "#;
         #[derive(Deserialize)]
-        struct W { images: BTreeMap<String, CloudImageEntry> }
+        struct W {
+            #[allow(dead_code)]
+            images: BTreeMap<String, CloudImageEntry>,
+        }
         let w: W = toml::from_str(toml).unwrap();
         assert_eq!(w.images["a:v1"].cc_types, vec![CcType::SevSnp]);
         assert_eq!(w.images["b:v1"].cc_types, vec![CcType::SevSnp, CcType::Tdx]);
@@ -757,39 +1126,49 @@ mod tests {
 
     // ── guest_os_features_for ───────────────────────────
 
+    const EXPECTED_FEATURES: &str =
+        "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC,VIRTIO_SCSI_MULTIQUEUE";
+
     #[test]
-    fn guest_os_features_sev_snp_only() {
-        let f = guest_os_features_for(&[CcType::SevSnp]);
-        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,GVNIC");
+    fn guest_os_features_always_dual_capable() {
+        // Every image is dual-capable regardless of configured CC types.
+        assert_eq!(guest_os_features_for(&[CcType::SevSnp]), EXPECTED_FEATURES);
+        assert_eq!(guest_os_features_for(&[CcType::Tdx]), EXPECTED_FEATURES);
+        assert_eq!(
+            guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]),
+            EXPECTED_FEATURES
+        );
     }
 
     #[test]
-    fn guest_os_features_tdx_only() {
-        let f = guest_os_features_for(&[CcType::Tdx]);
-        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC");
+    fn guest_os_features_omits_plain_sev() {
+        // Only SEV-SNP is supported; plain SEV must not be advertised.
+        assert!(!guest_os_features_for(&[CcType::SevSnp]).contains("SEV_CAPABLE"));
+    }
+
+    // ── Qemu ────────────────────────────────────────────
+
+    #[test]
+    fn qemu_skips_size_and_region_checks() {
+        let p = make_provider(PlatformKind::Qemu, ""); // no region
+        let mut t = make_target(""); // no vmtype
+        t.image = None;
+        assert!(validate_target(&t, &p, "qemu-local").is_ok());
     }
 
     #[test]
-    fn guest_os_features_both() {
-        let f = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
-        assert_eq!(f, "--guest-os-features=UEFI_COMPATIBLE,SEV_SNP_CAPABLE,SEV_CAPABLE,TDX_CAPABLE,GVNIC");
+    fn qemu_infer_cc_is_total() {
+        // Any vmtype (including empty) is fine; cc_type is nominal.
+        assert!(infer_cc_type(PlatformKind::Qemu, "").is_ok());
+        assert!(infer_cc_type(PlatformKind::Qemu, "anything").is_ok());
     }
 
     #[test]
-    fn guest_os_features_both_reversed() {
-        let a = guest_os_features_for(&[CcType::SevSnp, CcType::Tdx]);
-        let b = guest_os_features_for(&[CcType::Tdx, CcType::SevSnp]);
-        // TDX first puts TDX_CAPABLE before SEV fields, so order differs.
-        // Both must contain the same set of features.
-        assert!(a.contains("SEV_SNP_CAPABLE") && a.contains("TDX_CAPABLE"));
-        assert!(b.contains("SEV_SNP_CAPABLE") && b.contains("TDX_CAPABLE"));
-    }
-
-    #[test]
-    fn guest_os_features_dedup() {
-        let single = guest_os_features_for(&[CcType::SevSnp]);
-        let double = guest_os_features_for(&[CcType::SevSnp, CcType::SevSnp]);
-        assert_eq!(single, double);
+    fn qemu_is_local() {
+        assert!(PlatformKind::Qemu.is_local());
+        assert!(!PlatformKind::Gcp.is_local());
+        assert!(!PlatformKind::Azure.is_local());
+        assert!(!PlatformKind::Aws.is_local());
     }
 
     // ── CcType FromStr ──────────────────────────────────
@@ -811,5 +1190,38 @@ mod tests {
         for cc in [CcType::SevSnp, CcType::Tdx] {
             assert_eq!(cc.to_string().parse::<CcType>().unwrap(), cc);
         }
+    }
+
+    // ── CloudTarget deserialization ─────────────────────
+
+    #[test]
+    fn cloud_target_boot_disk_size_parses() {
+        let toml = r#"
+            [targets.my-tdx]
+            provider = "my-gcp"
+            vmtype = "c3-standard-4"
+            boot_disk_size = "100GB"
+        "#;
+        #[derive(Deserialize)]
+        struct W {
+            targets: BTreeMap<String, CloudTarget>,
+        }
+        let w: W = toml::from_str(toml).unwrap();
+        assert_eq!(w.targets["my-tdx"].boot_disk_size.as_deref(), Some("100GB"));
+    }
+
+    #[test]
+    fn cloud_target_boot_disk_size_defaults_none() {
+        let toml = r#"
+            [targets.my-tdx]
+            provider = "my-gcp"
+            vmtype = "c3-standard-4"
+        "#;
+        #[derive(Deserialize)]
+        struct W {
+            targets: BTreeMap<String, CloudTarget>,
+        }
+        let w: W = toml::from_str(toml).unwrap();
+        assert!(w.targets["my-tdx"].boot_disk_size.is_none());
     }
 }

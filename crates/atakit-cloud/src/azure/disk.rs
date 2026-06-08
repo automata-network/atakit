@@ -4,6 +4,7 @@ use crate::plan::DiskSpec;
 
 /// Create a managed disk.
 pub async fn create_disk(
+    subscription: &str,
     rg: &str,
     spec: &DiskSpec,
     runner: &dyn CommandRunner,
@@ -14,6 +15,8 @@ pub async fn create_disk(
             &[
                 "disk",
                 "create",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -33,6 +36,7 @@ pub async fn create_disk(
 
 /// Check if a managed disk exists.
 pub async fn check_disk_exists(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -43,6 +47,8 @@ pub async fn check_disk_exists(
             &[
                 "disk",
                 "show",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",
@@ -59,6 +65,7 @@ pub async fn check_disk_exists(
 
 /// Delete a managed disk.
 pub async fn delete_disk(
+    subscription: &str,
     rg: &str,
     name: &str,
     runner: &dyn CommandRunner,
@@ -69,6 +76,8 @@ pub async fn delete_disk(
             &[
                 "disk",
                 "delete",
+                "--subscription",
+                subscription,
                 "--resource-group",
                 rg,
                 "--name",

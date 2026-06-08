@@ -6,7 +6,8 @@ use crate::archive::{self, StagingDir};
 use crate::config::{ImageSource, WorkloadConfig};
 use crate::hash;
 use crate::image::ContainerEngine;
-use crate::manifest;
+use crate::image_meta;
+use crate::manifest::{self, ManifestImage};
 use crate::validate;
 use crate::WorkloadError;
 
@@ -169,25 +170,13 @@ pub async fn build_workload(
         }
     }
 
-    // 5. Collect measured-data
-    let measured_file_count = if config.workload.measured_data.is_empty()
-        && config.signing.as_ref().is_none_or(|s| !s.enable)
-    {
+    // 5. Collect measured-data (from [package] section)
+    let measured_paths = config.measured_data_paths();
+    let measured_file_count = if measured_paths.is_empty() {
         0
     } else {
         let handle = progress.create("Collecting measured-data...", 0);
-        let mut count =
-            staging.stage_measured_data(&config.workload.measured_data, workload_dir)?;
-
-        // Stage signing files under measured-data/signing/
-        if let Some(ref signing) = config.signing {
-            if signing.enable {
-                let auth = workload_dir.join(signing.auth_info.as_ref().unwrap());
-                let policy = workload_dir.join(signing.policy.as_ref().unwrap());
-                staging.stage_signing_files(&auth, &policy)?;
-                count += 2;
-            }
-        }
+        let count = staging.stage_measured_data(measured_paths, workload_dir)?;
         handle.finish();
         count
     };
@@ -201,8 +190,7 @@ pub async fn build_workload(
     let mut dep_environments = std::collections::BTreeMap::new();
     for dep_name in &dep_names {
         let dep = &config.dependencies[*dep_name];
-        let dep_env =
-            manifest::resolve_environment(&dep.env_file, &dep.environment, workload_dir)?;
+        let dep_env = manifest::resolve_environment(&dep.env_file, &dep.environment, workload_dir)?;
         dep_environments.insert((*dep_name).clone(), dep_env);
     }
 
@@ -213,11 +201,34 @@ pub async fn build_workload(
     hashes.extend(image_hashes);
     handle.finish();
 
+    // 7b. Extract per-service image IDs (immutable identity for `podman run`).
+    let handle = progress.create("Extracting image IDs...", 0);
+    let mut images = std::collections::BTreeMap::new();
+    images.insert(name.clone(), build_image_meta(&staging, &tar_name)?);
+    for dep_name in &dep_names {
+        let dep_tar = archive::image_tar_name(dep_name);
+        images.insert((*dep_name).clone(), build_image_meta(&staging, &dep_tar)?);
+    }
+    handle.finish();
+
     // 8. Generate manifest
-    let handle = progress.create("Generating manifest.toml...", 0);
-    let m = manifest::build_manifest(&config, &resolved_image, environment, dep_environments, hashes);
-    let manifest_toml = toml::to_string_pretty(&m)?;
-    staging.write_manifest(&manifest_toml)?;
+    let handle = progress.create("Generating manifest.json...", 0);
+    // unmeasured-data: declared paths are committed to the manifest (and thus
+    // PCR23) but never bundled. Directories present at build time expand to
+    // their member files; files / absent entries are recorded as leaves.
+    let unmeasured_data =
+        manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
+    let m = manifest::build_manifest(
+        &config,
+        &resolved_image,
+        environment,
+        dep_environments,
+        hashes,
+        unmeasured_data,
+        images,
+    );
+    let manifest_json = manifest::serialize_canonical_json(&m)?;
+    staging.write_manifest(&manifest_json)?;
     handle.finish();
 
     // 9. Create archive
@@ -230,7 +241,14 @@ pub async fn build_workload(
         ),
         total_bytes,
     );
-    let archive_path = archive::create_archive(&staging.root, &name, &version, output_dir, handle.as_ref(), opts.compression)?;
+    let archive_path = archive::create_archive(
+        &staging.root,
+        &name,
+        &version,
+        output_dir,
+        handle.as_ref(),
+        opts.compression,
+    )?;
     handle.finish();
 
     // 10. Hash archive
@@ -243,6 +261,17 @@ pub async fn build_workload(
         version,
         image_count,
         measured_file_count,
+    })
+}
+
+/// Read the image-id from a staged image tar and bundle it with the
+/// archive-relative path the manifest will reference.
+fn build_image_meta(staging: &StagingDir, tar_name: &str) -> Result<ManifestImage, WorkloadError> {
+    let path = staging.image_tar_path(tar_name);
+    let image_id = image_meta::read_image_id(&path)?;
+    Ok(ManifestImage {
+        archive: format!("images/{tar_name}"),
+        image_id,
     })
 }
 

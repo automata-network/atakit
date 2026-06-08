@@ -8,7 +8,7 @@ use atakit_image::{
 };
 use owo_colors::OwoColorize;
 
-use crate::config::{Config, ImageRepositorySpec, repo_local_name};
+use crate::config::{repo_local_name, Config, ImageRepositorySpec};
 
 pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     // Resolve the set of (entry name, spec) pairs to visit. When
@@ -17,12 +17,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
     // matches we synthesize an anonymous spec so raw `owner/repo`
     // arguments still work.
     let targets: Vec<(String, ImageRepositorySpec)> = if let Some(ref r) = args.repo {
-        if let Some((name, spec)) = config
-            .image
-            .repositories
-            .iter()
-            .find(|(_, s)| s.repo == *r)
-        {
+        if let Some((name, spec)) = config.image.repositories.iter().find(|(_, s)| s.repo == *r) {
             vec![(name.clone(), spec.clone())]
         } else {
             vec![(
@@ -322,7 +317,7 @@ impl fmt::Display for PlatformStatus {
 struct ImageRow {
     version: String,
     date: Option<String>,
-    platforms: [PlatformStatus; 3], // GCP, AWS, Azure
+    platforms: [PlatformStatus; 4], // GCP, AWS, Azure, QEMU
     certs: PlatformStatus,
 }
 
@@ -443,7 +438,7 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>, vw: usize) {
         let vh = format!("{:<vw$}", "VERSION");
         let dh = format!("{:10}", "DATE");
         println!(
-            "      {}     {}  GCP  AWS  AZURE  CERTS",
+            "      {}     {}  GCP  AWS  AZURE  QEMU  CERTS",
             vh.dimmed(),
             dh.dimmed(),
         );
@@ -461,10 +456,10 @@ fn print_table(groups: &BTreeMap<String, Vec<ImageRow>>, vw: usize) {
             } else {
                 version_padded
             };
-            let [g, a, z] = &row.platforms;
+            let [g, a, z, q] = &row.platforms;
             println!(
-                "{prefix}{}     {:10}  {}    {}    {}      {}",
-                version, date, g, a, z, row.certs,
+                "{prefix}{}     {:10}  {}    {}    {}      {}     {}",
+                version, date, g, a, z, q, row.certs,
             );
         }
     }

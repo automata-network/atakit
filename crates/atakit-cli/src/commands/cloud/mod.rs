@@ -8,103 +8,290 @@ pub mod serial;
 pub mod ssh;
 pub mod status;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use atakit_cloud::{AzureResourceNames, CloudConfig, CloudTarget, PlatformKind, PersistedAgentEnv, ProcessRunner};
+use alloy_ext::core::primitives::Address;
+use alloy_ext::ext::NetworkProvider;
+use anyhow::{bail, Context, Result};
+use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
+use atakit_cloud::init::{InitChainConfig, InitKeyConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
+use atakit_cloud::{
+    AzureResourceNames, CloudTarget, DeployState, PersistedInitEnv, PlatformKind, ProcessRunner,
+};
 use atakit_core::Env;
-use atakit_image::{ImageRef, ImageStore, Platform as ImagePlatform, import_image_archive};
+use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
+use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 
-use owo_colors::OwoColorize;
+use crate::config::{ChainConfig, KeyMode, KeySpec};
 
-use crate::config::PublishConfig;
-
-/// Resolve agent env fields with precedence: CLI > target > [cloud] > [publish].
-pub struct AgentEnvBuilder<'a> {
-	pub cli_rpc_url: Option<&'a str>,
-	pub cli_session_registry: Option<&'a str>,
-	pub cli_owner_key: Option<&'a str>,
-	pub cli_relay_key: Option<&'a str>,
-	pub target: &'a CloudTarget,
-	pub cloud: &'a CloudConfig,
-	pub publish: &'a PublishConfig,
+/// Resolve init env references with precedence: CLI > target config.
+pub struct InitEnvResolver<'a> {
+    pub cli_chain: Option<&'a str>,
+    pub cli_owner_key: Option<&'a str>,
+    pub cli_gas_wallet: Option<&'a str>,
+    pub target: &'a CloudTarget,
 }
 
-impl<'a> AgentEnvBuilder<'a> {
-	pub fn rpc_url(&self) -> Option<String> {
-		self.cli_rpc_url
-			.map(String::from)
-			.or_else(|| self.target.rpc_url.clone())
-			.or_else(|| self.cloud.rpc_url.clone())
-			.or_else(|| self.publish.rpc_url.clone())
-	}
+impl<'a> InitEnvResolver<'a> {
+    pub fn chain_optional(&self) -> Option<String> {
+        self.cli_chain
+            .map(String::from)
+            .or_else(|| self.target.chain.clone())
+            .filter(|value| !value.is_empty())
+    }
 
-	pub fn session_registry(&self) -> Option<String> {
-		self.cli_session_registry
-			.map(String::from)
-			.or_else(|| self.target.session_registry.clone())
-			.or_else(|| self.cloud.session_registry.clone())
-			.or_else(|| self.publish.session_registry.clone())
-	}
+    /// Optional SP1 prover-network key name. Read from the target (already
+    /// merged with `[cloud.defaults] sp1_payer` via `apply_defaults`); `None`
+    /// when no separate SP1 key is configured (portal reuses gas_wallet).
+    pub fn sp1_payer(&self) -> Option<String> {
+        self.target.sp1_payer.clone()
+    }
 
-	pub fn owner_key_file(&self) -> Option<String> {
-		self.cli_owner_key
-			.map(String::from)
-			.or_else(|| self.target.owner_key_file.clone())
-			.or_else(|| self.cloud.owner_key_file.clone())
-			.or_else(|| self.publish.owner_key_file.clone())
-	}
+    /// Resolve persisted init references without panicking on missing fields.
+    /// Used when no `/init` will be sent or qemu zero-config deploy is allowed.
+    pub fn build_optional(&self) -> PersistedInitEnv {
+        PersistedInitEnv {
+            chain: self.chain_optional().unwrap_or_default(),
+            owner_key: self
+                .cli_owner_key
+                .map(String::from)
+                .or_else(|| self.target.owner_key.clone())
+                .unwrap_or_default(),
+            gas_wallet: self
+                .cli_gas_wallet
+                .map(String::from)
+                .or_else(|| self.target.gas_wallet.clone())
+                .unwrap_or_default(),
+            sp1_payer: self.sp1_payer(),
+        }
+    }
+}
 
-	pub fn relay_key_file(&self) -> Option<String> {
-		self.cli_relay_key
-			.map(String::from)
-			.or_else(|| self.target.relay_key_file.clone())
-			.or_else(|| self.cloud.relay_key_file.clone())
-			.or_else(|| self.publish.relay_key_file.clone())
-	}
+/// Zero-address placeholder used when the init chain is explicitly off.
+/// The portal never submits anything when registration is "off", so the
+/// value is only a structural placeholder for the JSON shape.
+pub(crate) const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
 
-	pub fn expire_offset(&self) -> Option<u64> {
-		self.cloud.expire_offset
-	}
+/// Build an off-chain InitChainConfig: registration "off", placeholder
+/// addresses, no RPC. The portal accepts a chain section with no `rpc_url`
+/// when `registration = "off"`.
+pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
+    InitChainConfig {
+        rpc_url: String::new(),
+        session_registry: ZERO_ADDR.to_string(),
+        workload_registry: ZERO_ADDR.to_string(),
+        base_image_registry: ZERO_ADDR.to_string(),
+        expire_offset: 3600,
+        registration: Some("off".to_string()),
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
 
-	pub fn build(&self) -> PersistedAgentEnv {
-		PersistedAgentEnv {
-			rpc_url: self.rpc_url(),
-			session_registry: self.session_registry(),
-			owner_key_file: self.owner_key_file(),
-			relay_key_file: self.relay_key_file(),
-			expire_offset: self.expire_offset(),
-		}
-	}
+pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
+    registration == Some("off")
+}
+
+pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
+    InitKeyConfig {
+        mode: "self_generated".to_string(),
+        key_type: "es256k".to_string(),
+        private_key: None,
+    }
+}
+
+pub(crate) fn init_key_from_config(
+    key_name: &str,
+    spec: &KeySpec,
+    require_private_key: bool,
+) -> Result<InitKeyConfig> {
+    Ok(InitKeyConfig {
+        mode: spec.mode.to_string(),
+        key_type: spec.key_type.to_string(),
+        private_key: if require_private_key || spec.mode == KeyMode::Provisioned {
+            Some(spec.resolve(key_name)?)
+        } else {
+            None
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ChainRegistries {
+    workload_registry: String,
+    base_image_registry: String,
+}
+
+pub(crate) async fn init_chain_from_config(
+    chain_name: &str,
+    chain: &ChainConfig,
+    registration: Option<&str>,
+) -> Result<InitChainConfig> {
+    let registries = if registration_is_off(registration) {
+        None
+    } else {
+        Some(derive_registries_from_session(chain_name, chain).await?)
+    };
+    build_init_chain_config(chain_name, chain, registration, registries.as_ref())
+}
+
+async fn derive_registries_from_session(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<ChainRegistries> {
+    let session_registry: Address = chain.session_registry.parse().with_context(|| {
+        format!(
+            "invalid session_registry address in chain '{chain_name}': {}",
+            chain.session_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url for chain '{chain_name}': {}",
+            chain.rpc_url
+        )
+    })?;
+    let registry = SessionRegistryInstance::new(session_registry, provider);
+
+    let workload_registry = registry
+        .workloadRegistry()
+        .call()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to derive workload_registry from session_registry in chain '{chain_name}'"
+            )
+        })?
+        .to_string();
+    let base_image_registry = registry
+        .baseImageRegistry()
+        .call()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to derive base_image_registry from session_registry in chain '{chain_name}'"
+            )
+        })?
+        .to_string();
+
+    Ok(ChainRegistries {
+        workload_registry,
+        base_image_registry,
+    })
+}
+
+fn build_init_chain_config(
+    chain_name: &str,
+    chain: &ChainConfig,
+    registration: Option<&str>,
+    registries: Option<&ChainRegistries>,
+) -> Result<InitChainConfig> {
+    let placeholder_ok = registration_is_off(registration);
+    let workload_registry = resolve_registry_address(
+        chain_name,
+        "workload_registry",
+        chain.workload_registry.as_deref(),
+        registries.map(|r| r.workload_registry.as_str()),
+        placeholder_ok,
+    )?;
+    let base_image_registry = resolve_registry_address(
+        chain_name,
+        "base_image_registry",
+        chain.base_image_registry.as_deref(),
+        registries.map(|r| r.base_image_registry.as_str()),
+        placeholder_ok,
+    )?;
+
+    Ok(InitChainConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        workload_registry,
+        base_image_registry,
+        expire_offset: chain.expire_offset,
+        registration: registration.map(str::to_string),
+        chain_id: chain.chain_id,
+        proving_strategy: chain.proving_strategy.clone(),
+    })
+}
+
+fn resolve_registry_address(
+    chain_name: &str,
+    field: &str,
+    configured: Option<&str>,
+    derived: Option<&str>,
+    placeholder_ok: bool,
+) -> Result<String> {
+    match (configured, derived) {
+        (Some(configured), Some(derived)) => {
+            ensure_same_address(chain_name, field, configured, derived)?;
+            Ok(configured.to_string())
+        }
+        (Some(configured), None) => Ok(configured.to_string()),
+        (None, Some(derived)) => Ok(derived.to_string()),
+        (None, None) if placeholder_ok => Ok(ZERO_ADDR.to_string()),
+        (None, None) => {
+            bail!("{field} required in chain '{chain_name}' or derivable from session_registry")
+        }
+    }
+}
+
+fn ensure_same_address(
+    chain_name: &str,
+    field: &str,
+    configured: &str,
+    derived: &str,
+) -> Result<()> {
+    let configured_addr = parse_registry_address(chain_name, field, configured)?;
+    let derived_addr = parse_registry_address(chain_name, field, derived)?;
+    if configured_addr != derived_addr {
+        bail!(
+            "{field} in chain '{chain_name}' does not match session_registry: configured {configured}, derived {derived}"
+        );
+    }
+    Ok(())
+}
+
+fn parse_registry_address(chain_name: &str, field: &str, value: &str) -> Result<Address> {
+    value
+        .parse()
+        .with_context(|| format!("invalid {field} address in chain '{chain_name}': {value}"))
 }
 
 /// Parse instance reference: "target/instance" or just "instance".
 pub fn parse_instance_ref(s: &str) -> (Option<&str>, &str) {
-	if let Some((target, instance)) = s.split_once('/') {
-		(Some(target), instance)
-	} else {
-		(None, s)
-	}
+    if let Some((target, instance)) = s.split_once('/') {
+        (Some(target), instance)
+    } else {
+        (None, s)
+    }
 }
 
 /// Resolve an instance reference to (target_name, instance_name) using the state store.
 pub fn resolve_instance(
-	data_dir: &std::path::Path,
-	instance: &str,
-	target_filter: Option<&str>,
+    data_dir: &std::path::Path,
+    instance: &str,
+    target_filter: Option<&str>,
 ) -> Result<(String, String)> {
-	let (embedded_target, instance_name) = parse_instance_ref(instance);
-	let target = target_filter.or(embedded_target);
-	atakit_cloud::state::find_instance(data_dir, instance_name, target)
-		.map_err(|e| anyhow::anyhow!("{e}"))
+    let (embedded_target, instance_name) = parse_instance_ref(instance);
+    let target = target_filter.or(embedded_target);
+    atakit_cloud::state::find_instance(data_dir, instance_name, target)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Resolved base image: display name for the plan + optional local file path.
@@ -114,6 +301,8 @@ pub(super) struct ResolvedImage {
     /// Local disk image file path for upload. `None` means the image is
     /// assumed to already exist in GCE.
     pub source_path: Option<String>,
+    /// Local secure-boot cert directory from the image store, if available.
+    pub certs_dir: Option<String>,
 }
 
 /// Resolve the `--image` argument into a display name and optional source path.
@@ -145,7 +334,8 @@ pub(super) fn resolve_image(
 
     if image_arg.contains(':') {
         // Parse as ImageRef (repository:tag).
-        let image_ref: ImageRef = image_arg.parse()
+        let image_ref: ImageRef = image_arg
+            .parse()
             .with_context(|| format!("invalid image reference: {image_arg}"))?;
         if store.exists(&image_ref) {
             return resolve_store_image(&store, &image_ref, platform);
@@ -162,6 +352,7 @@ pub(super) fn resolve_image(
     Ok(ResolvedImage {
         display_name: image_arg.to_string(),
         source_path: None,
+        certs_dir: None,
     })
 }
 
@@ -174,6 +365,8 @@ fn resolve_store_image(
     let image_platform = match platform {
         PlatformKind::Gcp => ImagePlatform::Gcp,
         PlatformKind::Azure => ImagePlatform::Azure,
+        PlatformKind::Aws => ImagePlatform::Aws,
+        PlatformKind::Qemu => ImagePlatform::Qemu,
     };
 
     let disk_path = store.image_path(image_ref, image_platform);
@@ -195,32 +388,41 @@ fn resolve_store_image(
     Ok(ResolvedImage {
         display_name: image_ref.to_string(),
         source_path: Some(disk_path.display().to_string()),
+        certs_dir: Some(store.certs_dir(image_ref).display().to_string()),
     })
 }
 
 /// Resolved workload source: archive path + name/version + declared ports + disks.
-pub(super) struct ResolvedWorkload {
+pub(crate) struct ResolvedWorkload {
     pub archive_path: PathBuf,
     pub name: String,
     pub version: String,
     pub ports: Vec<String>,
-    /// Disk name -> (index, size string e.g. "10GB").
-    pub disks: BTreeMap<String, (u32, String)>,
+    /// Disk name -> (index, size string e.g. "10GB", declared unlock_method).
+    /// The unlock_method list is carried so deploy/init can validate
+    /// `--disk-passphrase` against what each disk actually requires.
+    pub disks: BTreeMap<String, (u32, String, Vec<String>)>,
     /// Minimum boot/OS disk size (e.g. "50GB"). None = cloud default.
     pub boot_disk_size: Option<String>,
     /// Base image access control mode: "any", "whitelist", or "blacklist".
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// All unmeasured-data paths from the manifest (workload + dependencies, deduplicated).
-    /// Archive-relative, no ./ prefix.
-    pub unmeasured_data: Vec<String>,
+    /// Declared unmeasured-data file paths from the manifest, as deploy-relative
+    /// paths (the `unmeasured-data/` prefix stripped). The operator must supply
+    /// exactly this set at `/init`.
+    pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
-pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, env: &Env, skip_freshness_check: bool) -> Result<ResolvedWorkload> {
+pub(crate) fn resolve_workload(
+    source: &Option<String>,
+    dir: &Option<PathBuf>,
+    env: &Env,
+    skip_freshness_check: bool,
+) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
         // Store reference: name:version
         if crate::commands::workload::looks_like_store_ref(src) {
@@ -240,13 +442,23 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 verbose: false,
             };
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-            }).context("failed to inspect store archive")?;
-            let disks = result.manifest.disks.iter()
-                .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+                tokio::runtime::Handle::current()
+                    .block_on(atakit_workload::inspect_workload(&inspect_opts))
+            })
+            .context("failed to inspect store archive")?;
+            let disks = result
+                .manifest
+                .disks
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+                    )
+                })
                 .collect();
             let ports = collect_firewall_ports(&result.manifest);
-            let unmeasured = collect_unmeasured_paths(&result.manifest);
+            let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 name,
@@ -256,7 +468,7 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
-                unmeasured_data: unmeasured,
+                unmeasured_data_paths: unmeasured_paths,
                 workload_dir: None,
             });
         }
@@ -274,12 +486,21 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         };
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
-        }).context("failed to inspect archive")?;
-        let disks = result.manifest.disks.iter()
-            .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+        })
+        .context("failed to inspect archive")?;
+        let disks = result
+            .manifest
+            .disks
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+                )
+            })
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
-        let unmeasured = collect_unmeasured_paths(&result.manifest);
+        let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
             name: result.manifest.meta.name,
@@ -289,13 +510,15 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
-            unmeasured_data: unmeasured,
+            unmeasured_data_paths: unmeasured_paths,
             workload_dir: None,
         });
     }
 
     // Dir mode: read atakit-workload.toml, find versioned archive.
-    let workload_dir = dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workload_dir = dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
     if !workload_dir.join("atakit-workload.toml").exists() {
         bail!(
             "no workload source specified and no atakit-workload.toml found in {}",
@@ -327,12 +550,23 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
     };
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-    }).context("failed to inspect archive")?;
+    })
+    .context("failed to inspect archive")?;
     let ports = collect_firewall_ports(&result.manifest);
-    let disks = result.manifest.disks.iter()
-        .map(|(k, v)| (k.clone(), (v.index, v.size.clone())))
+    let disks = result
+        .manifest
+        .disks
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                (v.index, v.size.clone(), v.encryption.unlock_method.clone()),
+            )
+        })
         .collect();
-    let unmeasured = collect_unmeasured_paths(&result.manifest);
+    // The declared unmeasured-data set comes from the manifest (committed to
+    // PCR23), not the source TOML, so every deploy mode resolves the same set.
+    let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
     Ok(ResolvedWorkload {
         archive_path,
         name: result.manifest.meta.name,
@@ -342,24 +576,20 @@ pub(super) fn resolve_workload(source: &Option<String>, dir: &Option<PathBuf>, e
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
-        unmeasured_data: unmeasured,
+        unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
     })
 }
 
-/// Collect all unmeasured-data paths from a manifest (workload + dependencies, deduplicated).
-fn collect_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
-    let mut paths: Vec<String> = m.config.unmeasured_data.clone();
-    if let Some(ref deps) = m.config.dependencies {
-        for dep in deps.values() {
-            for p in &dep.unmeasured_data {
-                if !paths.contains(p) {
-                    paths.push(p.clone());
-                }
-            }
-        }
-    }
-    paths
+/// The declared unmeasured-data file paths from the manifest, as deploy-relative
+/// paths (the `unmeasured-data/` prefix stripped). This is the authoritative set
+/// the operator must supply at `/init`; reading it from the manifest (rather than
+/// the source TOML) means it works for archive/store deploys, not just dir mode.
+fn manifest_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<String> {
+    m.unmeasured_data
+        .iter()
+        .map(|p| p.strip_prefix("unmeasured-data/").unwrap_or(p).to_string())
+        .collect()
 }
 
 /// Walk a workload directory and return the first file newer than `threshold`.
@@ -373,7 +603,11 @@ fn find_newer_source(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == ".git" || name_str == "target" || name_str == ".claude" || name_str == ".codex" {
+        if name_str == ".git"
+            || name_str == "target"
+            || name_str == ".claude"
+            || name_str == ".codex"
+        {
             continue;
         }
         if name_str.ends_with(".atawl") {
@@ -405,6 +639,45 @@ fn collect_firewall_ports(m: &atakit_workload::manifest::Manifest) -> Vec<String
         .iter()
         .map(|fp| format!("{}/{}", fp.port, fp.protocol))
         .collect()
+}
+
+/// Cloud platforms use the deployment's external IP plus the well-known portal
+/// ports `2024` / `1024`. QEMU forwards those guest ports to dynamic host ports
+/// allocated at boot and persisted in state.
+pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)> {
+    if let Some(ref q) = state.resources.qemu {
+        let host = if q.external_ip.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            q.external_ip.clone()
+        };
+        if q.host_status_port == 0 || q.host_init_port == 0 {
+            bail!("qemu host ports not yet recorded; StartLocalVm must run first");
+        }
+        return Ok((host, q.host_status_port, q.host_init_port));
+    }
+
+    let ip = state
+        .resources
+        .gcp
+        .as_ref()
+        .and_then(|g| g.external_ip.clone())
+        .or_else(|| {
+            state
+                .resources
+                .azure
+                .as_ref()
+                .and_then(|a| a.external_ip.clone())
+        })
+        .or_else(|| {
+            state
+                .resources
+                .aws
+                .as_ref()
+                .and_then(|a| a.external_ip.clone())
+        })
+        .ok_or_else(|| anyhow::anyhow!("no external IP available"))?;
+    Ok((ip, 2024, 1024))
 }
 
 /// Validate that the given image ref is allowed by the workload's base-image policy.
@@ -464,69 +737,106 @@ pub(super) fn validate_base_image(
     Ok(())
 }
 
-/// Collect unmeasured-data files from a workload directory into a gzipped tar.
+/// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
+/// given the manifest's declared path set.
 ///
-/// `paths` are archive-relative (no `./` prefix, e.g. `"runtime-data/key.pem"`).
-/// Files are resolved under `workload_dir` with a `./` prefix re-added.
-/// Returns `None` if no files are found. Warns about missing files.
-pub(super) fn collect_unmeasured_tar(
-    paths: &[String],
-    workload_dir: &std::path::Path,
+/// Gated on the **declared path set** (not the per-container mount boolean),
+/// because the portal verifies the uploaded set against the manifest's
+/// `unmeasured-data` array unconditionally. When the manifest declares paths but
+/// no `--unmeasured-data-dir` (and no workload source dir) is available, this is
+/// a hard **error**, not a warning: the portal would reject `/init` for the
+/// missing set, and failing here avoids provisioning a VM that can never init.
+pub(crate) fn resolve_unmeasured_tar(
+    declared_paths: &[String],
+    unmeasured_data_dir: Option<&PathBuf>,
+    workload_dir: Option<&PathBuf>,
 ) -> Result<Option<Vec<u8>>> {
-    if paths.is_empty() {
+    if declared_paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(dir) = unmeasured_data_dir.or(workload_dir) else {
+        bail!(
+            "workload declares {} unmeasured-data file(s) but no source directory is available; \
+             pass --unmeasured-data-dir with the declared files (the portal requires exactly the \
+             declared set at /init)",
+            declared_paths.len(),
+        );
+    };
+    collect_unmeasured_tar(declared_paths, dir)
+}
+
+/// Collect the operator-provided unmeasured-data files into a gzipped tar,
+/// after verifying the directory contains *exactly* the set the manifest
+/// declares.
+///
+/// `declared` are deploy-relative file paths (no `./` prefix, e.g.
+/// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
+/// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
+/// `--unmeasured-data-dir`. Bails if any declared file is missing, or if the
+/// directory holds files the manifest does not declare: the set is committed to
+/// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
+pub(crate) fn collect_unmeasured_tar(
+    declared: &[String],
+    data_dir: &std::path::Path,
+) -> Result<Option<Vec<u8>>> {
+    if declared.is_empty() {
         return Ok(None);
     }
 
-    let mut found_any = false;
+    let canon_base = data_dir
+        .canonicalize()
+        .with_context(|| format!("--unmeasured-data-dir not found: {}", data_dir.display()))?;
+
+    // Enumerate what's actually present, then diff against the declared set.
+    let mut actual: BTreeSet<String> = BTreeSet::new();
+    enumerate_files(&canon_base, &canon_base, &mut actual)?;
+    let declared_set: BTreeSet<String> = declared.iter().cloned().collect();
+
+    let missing: Vec<&str> = declared_set
+        .difference(&actual)
+        .map(String::as_str)
+        .collect();
+    let extra: Vec<&str> = actual
+        .difference(&declared_set)
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        let mut msg = format!(
+            "unmeasured-data in {} does not match the manifest's declared set",
+            data_dir.display()
+        );
+        if !missing.is_empty() {
+            msg.push_str(&format!(
+                "\n  missing (declared in manifest, not found): {}",
+                missing.join(", ")
+            ));
+        }
+        if !extra.is_empty() {
+            msg.push_str(&format!(
+                "\n  extra (present but not declared in manifest): {}",
+                extra.join(", ")
+            ));
+        }
+        bail!(msg);
+    }
+
+    // Set matches: build the tar from exactly the declared files.
     let buf = Vec::new();
     let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(encoder);
-
-    let canon_base = workload_dir.canonicalize()?;
-
-    for rel_path in paths {
-        // Manifest stores paths without ./ prefix. The source files live at
-        // workload_dir/./path (the original config used ./ relative paths).
-        let src = workload_dir.join(rel_path);
-        if !src.exists() {
-            eprintln!(
-                "  {}: unmeasured-data file not found: {}",
-                "warning".yellow(),
-                src.display(),
-            );
-            continue;
-        }
-
-        // Resolve symlinks and verify the real path stays within the workload dir.
-        let canon_src = src.canonicalize()?;
-        if !canon_src.starts_with(&canon_base) {
-            bail!(
-                "unmeasured-data path '{}' resolves outside workload directory: {}",
-                rel_path,
-                canon_src.display(),
-            );
-        }
-
-        if src.is_file() {
-            let metadata = std::fs::metadata(&src)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mtime(0);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            let file = std::fs::File::open(&src)?;
-            tar.append_data(&mut header, rel_path, file)?;
-            found_any = true;
-        } else if src.is_dir() {
-            append_dir_recursive(&mut tar, &src, rel_path)?;
-            found_any = true;
-        }
-    }
-
-    if !found_any {
-        return Ok(None);
+    for rel_path in declared {
+        let src = canon_base.join(rel_path);
+        let metadata = std::fs::metadata(&src)
+            .with_context(|| format!("read unmeasured-data file {rel_path}"))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(metadata.len());
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let file = std::fs::File::open(&src)?;
+        tar.append_data(&mut header, rel_path, file)?;
     }
 
     let encoder = tar.into_inner()?;
@@ -534,36 +844,34 @@ pub(super) fn collect_unmeasured_tar(
     Ok(Some(bytes))
 }
 
-/// Recursively append a directory to a tar archive.
-fn append_dir_recursive<W: std::io::Write>(
-    tar: &mut tar::Builder<W>,
-    src_dir: &std::path::Path,
-    archive_prefix: &str,
+/// Recursively collect file paths under `dir`, relative to `base`, joined with
+/// `/`. Symlinked files are resolved and verified to stay within `base`.
+fn enumerate_files(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(src_dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let child_src = entry.path();
-        let child_name = child_src
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let child_archive = format!("{archive_prefix}/{child_name}");
-        let ft = entry.file_type()?;
-
-        if ft.is_file() {
-            let metadata = std::fs::metadata(&child_src)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mtime(0);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            let file = std::fs::File::open(&child_src)?;
-            tar.append_data(&mut header, &child_archive, file)?;
-        } else if ft.is_dir() {
-            append_dir_recursive(tar, &child_src, &child_archive)?;
+        let path = entry.path();
+        if path.is_dir() {
+            enumerate_files(&path, base, out)?;
+        } else if path.is_file() {
+            let canon = path.canonicalize()?;
+            if !canon.starts_with(base) {
+                bail!(
+                    "unmeasured-data file resolves outside the data directory: {}",
+                    path.display(),
+                );
+            }
+            let rel = path
+                .strip_prefix(base)
+                .expect("path is under base")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.insert(rel);
         }
     }
     Ok(())
@@ -591,7 +899,9 @@ pub(super) fn build_cloud_image_record(
             }
         }
         PlatformKind::Azure => {
-            let names = AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
+            // Only gallery/image fields are used here; storage_account isn't.
+            let names =
+                AzureResourceNames::for_azure(instance_name, image_ref, &provider_config.region);
             CloudImage {
                 platform: PlatformKind::Azure,
                 cloud_name: names.image_definition,
@@ -603,6 +913,23 @@ pub(super) fn build_cloud_image_record(
                 uploaded_at: chrono::Utc::now(),
             }
         }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws(instance_name, image_ref);
+            CloudImage {
+                platform: PlatformKind::Aws,
+                cloud_name: names.image,
+                bucket: Some(names.bucket),
+                gallery_rg: None,
+                gallery: None,
+                image_version: None,
+                cc_types: cc_types.to_vec(),
+                uploaded_at: chrono::Utc::now(),
+            }
+        }
+        PlatformKind::Qemu => unreachable!(
+            "build_cloud_image_record called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     }
 }
 
@@ -623,53 +950,103 @@ pub(super) async fn ensure_cloud_image(
     provider_name: &str,
     provider_config: &CloudProviderConfig,
     source_path: &str,
+    certs_dir: Option<&str>,
     cc_types: &[atakit_cloud::CcType],
     force: bool,
     env: &Env,
     verbose: bool,
 ) -> Result<UploadResult> {
-    let mut cloud_imgs = CloudImages::load(&env.data_dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cloud_imgs = CloudImages::load(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cloud_provider: Box<dyn CloudProvider> = match provider_config.platform {
-        PlatformKind::Gcp => Box::new(GcpProvider::new(
-            provider_config.project.clone().unwrap(),
-            provider_config.region.clone(),
-        )),
-        PlatformKind::Azure => Box::new(AzureProvider::new(
-            provider_config.subscription.clone().unwrap(),
-            provider_config.region.clone(),
-        )),
+        PlatformKind::Gcp => {
+            let project = provider_config.project.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{provider_name}' is missing 'project' in \
+                     [cloud.providers.{provider_name}]"
+                )
+            })?;
+            Box::new(GcpProvider::new(project, provider_config.region.clone()))
+        }
+        PlatformKind::Azure => {
+            let subscription = provider_config.subscription.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{provider_name}' is missing 'subscription' in \
+                     [cloud.providers.{provider_name}] — set it to the Azure \
+                     subscription ID you intend to deploy into (atakit will pass \
+                     --subscription to every az call)"
+                )
+            })?;
+            Box::new(AzureProvider::new(
+                subscription,
+                provider_config.region.clone(),
+            ))
+        }
+        PlatformKind::Aws => Box::new(AwsProvider::new(provider_config.region.clone())),
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image called for qemu — qemu has no cloud-side \
+             image and is filtered out upstream"
+        ),
     };
 
     let runner = ProcessRunner::new(verbose);
 
     // Check deps.
-    cloud_provider.execute_step(&DeployStep::CheckDeps, &runner, verbose).await?;
+    cloud_provider
+        .execute_step(&DeployStep::CheckDeps, &runner, verbose)
+        .await?;
 
     // Check existence before uploading so we can report accurately.
     let already_exists = match provider_config.platform {
         PlatformKind::Gcp => {
             let names = atakit_cloud::naming::ResourceNames::for_gcp("upload", image_ref);
             let exists = atakit_cloud::gcp::image::check_image_exists(
-                provider_config.project.as_deref().unwrap(), &names.image, &runner,
-            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+                provider_config.project.as_deref().unwrap(),
+                &names.image,
+                &runner,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
             exists && !force
         }
         PlatformKind::Azure => {
+            let subscription = provider_config.subscription.as_deref().unwrap();
+            // Image-existence check; storage_account isn't used.
             let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
             let exists = atakit_cloud::azure::image::check_image_version_exists(
-                &names.gallery_rg, &names.gallery, &names.image_definition, &names.image_version, &runner,
-            ).await.map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
+                subscription,
+                &names.gallery_rg,
+                &names.gallery,
+                &names.image_definition,
+                &names.image_version,
+                &runner,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?;
             exists && !force
         }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws("upload", image_ref);
+            let exists =
+                atakit_cloud::aws::image::find_ami(&provider_config.region, &names.image, &runner)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to check image existence: {e}"))?
+                    .is_some();
+            exists && !force
+        }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image existence-check called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     if already_exists {
         // Record in tracking (may be missing if uploaded before tracking existed).
         let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
         cloud_imgs.record(image_ref, provider_name, record);
-        cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        cloud_imgs
+            .save(&env.data_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok(UploadResult { uploaded: false });
     }
 
@@ -681,21 +1058,22 @@ pub(super) async fn ensure_cloud_image(
                 bucket: names.bucket.clone(),
                 image_name: names.image.clone(),
                 source_path: Some(source_path.to_string()),
+                certs_dir: certs_dir.map(str::to_string),
                 cc_types: cc_types.to_vec(),
                 force,
             };
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
         PlatformKind::Azure => {
+            // Image-upload path. The VHD staging storage account lives in the
+            // shared, region-scoped gallery RG (`atakit-images-<region>`), which
+            // the UploadImageAzure executor ensures itself (it creates the
+            // storage account in `gallery_rg` and ignores the step's
+            // `resource_group` field). There is intentionally NO separate staging
+            // RG: a previous `CreateResourceGroup { upload-rg }` here was dead
+            // (nothing consumed it) and broke multi-region uploads, because the
+            // fixed `upload-rg` name cannot exist in two regions at once.
             let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
-            cloud_provider.execute_step(
-                &DeployStep::CreateResourceGroup {
-                    name: names.resource_group.clone(),
-                    region: provider_config.region.clone(),
-                },
-                &runner,
-                verbose,
-            ).await?;
             let step = DeployStep::UploadImageAzure {
                 resource_group: names.resource_group,
                 storage_account: names.storage_account,
@@ -704,31 +1082,241 @@ pub(super) async fn ensure_cloud_image(
                 image_definition: names.image_definition,
                 image_version: names.image_version,
                 source_path: Some(source_path.to_string()),
+                certs_dir: certs_dir.map(str::to_string),
                 cc_types: cc_types.to_vec(),
                 force,
             };
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
+        PlatformKind::Aws => {
+            let names = atakit_cloud::naming::ResourceNames::for_aws("upload", image_ref);
+            let step = DeployStep::UploadImageAws {
+                bucket: names.bucket,
+                image_name: names.image,
+                source_path: Some(source_path.to_string()),
+                certs_dir: certs_dir.map(str::to_string),
+                force,
+            };
+            cloud_provider.execute_step(&step, &runner, verbose).await?;
+        }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image upload step called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
     cloud_imgs.record(image_ref, provider_name, record);
-    cloud_imgs.save(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cloud_imgs
+        .save(&env.data_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(UploadResult { uploaded: true })
 }
 
 /// Parse metadata key=value strings into a map.
 pub fn parse_metadata(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-	let mut map = std::collections::BTreeMap::new();
-	for item in items {
-		let (key, value) = item.split_once('=').ok_or_else(|| {
-			anyhow::anyhow!("invalid metadata format: expected KEY=VALUE, got '{item}'")
-		})?;
-		if key.is_empty() {
-			bail!("metadata key cannot be empty in '{item}'");
-		}
-		map.insert(key.to_string(), value.to_string());
-	}
-	Ok(map)
+    let mut map = std::collections::BTreeMap::new();
+    for item in items {
+        let (key, value) = item.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid metadata format: expected KEY=VALUE, got '{item}'")
+        })?;
+        if key.is_empty() {
+            bail!("metadata key cannot be empty in '{item}'");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+fn test_chain_config() -> ChainConfig {
+    ChainConfig {
+        rpc_url: "https://rpc.test".to_string(),
+        session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+        workload_registry: None,
+        base_image_registry: None,
+        expire_offset: 300,
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+#[cfg(test)]
+mod chain_init_tests {
+    use super::*;
+    use crate::config::KeyType;
+
+    #[test]
+    fn qemu_missing_chain_synthesizes_registration_off() {
+        let got = synthesize_off_init_chain();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert!(got.rpc_url.is_empty());
+        assert_eq!(got.session_registry, ZERO_ADDR);
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_off_does_not_require_derived_registries() {
+        let chain = test_chain_config();
+        let got = build_init_chain_config("offchain", &chain, Some("off"), None).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_required_uses_derived_registries_when_omitted() {
+        let chain = test_chain_config();
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let got =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+
+        assert_eq!(got.workload_registry, derived.workload_registry);
+        assert_eq!(got.base_image_registry, derived.base_image_registry);
+    }
+
+    #[test]
+    fn registration_required_validates_configured_registries() {
+        let mut chain = test_chain_config();
+        chain.workload_registry = Some("0x2222222222222222222222222222222222222222".to_string());
+        chain.base_image_registry = Some("0x3333333333333333333333333333333333333333".to_string());
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let got =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+
+        assert_eq!(got.workload_registry, chain.workload_registry.unwrap());
+        assert_eq!(got.base_image_registry, chain.base_image_registry.unwrap());
+    }
+
+    #[test]
+    fn registration_required_rejects_mismatched_configured_registry() {
+        let mut chain = test_chain_config();
+        chain.workload_registry = Some("0x4444444444444444444444444444444444444444".to_string());
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let err =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap_err();
+
+        assert!(err.to_string().contains("workload_registry"), "{err}");
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn qemu_forces_registration_off() {
+        let chain = test_chain_config();
+        let got = build_init_chain_config("local", &chain, Some("off"), None).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn self_generated_key_can_be_sent_without_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let got = init_key_from_config("gas", &spec, false).unwrap();
+        assert_eq!(got.mode, "self_generated");
+        assert_eq!(got.key_type, "es256k");
+        assert!(got.private_key.is_none());
+    }
+
+    #[test]
+    fn self_generated_key_cannot_be_forced_to_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let err = init_key_from_config("owner", &spec, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve a self_generated key"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod portal_endpoint_tests {
+    use super::*;
+
+    fn base_state(platform: PlatformKind) -> DeployState {
+        let now = chrono::Utc::now();
+        DeployState {
+            format: 1,
+            instance_name: "test-instance".to_string(),
+            workload_name: "test-workload".to_string(),
+            workload_version: "v0.0.1".to_string(),
+            target_name: "test-target".to_string(),
+            provider_name: "test-provider".to_string(),
+            platform,
+            created_at: now,
+            updated_at: now,
+            status: atakit_cloud::DeployStatus::Deployed {
+                ip: "127.0.0.1".to_string(),
+            },
+            image_ref: "test-image:v1".to_string(),
+            archive_path: "/tmp/test.atawl".to_string(),
+            archive_hash: "abc123".to_string(),
+            init_env: PersistedInitEnv::default(),
+            resources: atakit_cloud::ResourceSet::default(),
+        }
+    }
+
+    #[test]
+    fn qemu_uses_recorded_host_ports() {
+        let mut state = base_state(PlatformKind::Qemu);
+        state.resources.qemu = Some(atakit_cloud::QemuResources {
+            external_ip: "127.0.0.1".to_string(),
+            host_status_port: 41024,
+            host_init_port: 41025,
+            ..Default::default()
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("127.0.0.1".to_string(), 41024, 41025));
+    }
+
+    #[test]
+    fn cloud_platform_uses_external_ip_and_well_known_ports() {
+        let mut state = base_state(PlatformKind::Aws);
+        state.resources.aws = Some(atakit_cloud::AwsResources {
+            region: "us-east-1".to_string(),
+            bucket: None,
+            snapshot: None,
+            ami: None,
+            security_group: None,
+            instance: None,
+            external_ip: Some("203.0.113.10".to_string()),
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("203.0.113.10".to_string(), 2024, 1024));
+    }
 }

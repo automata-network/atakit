@@ -151,8 +151,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
                 // skipped because their credential failed. Emit a
                 // per-repo warning so the user sees exactly which
                 // entries were dropped from the listing.
-                let mut ready: Vec<(String, crate::config::WorkloadRepositorySpec)> =
-                    Vec::new();
+                let mut ready: Vec<(String, crate::config::WorkloadRepositorySpec)> = Vec::new();
                 for (repo_name, spec) in specs {
                     if let crate::config::WorkloadRepositorySpec::Github {
                         credential: Some(cred_name),
@@ -284,12 +283,14 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 /// All failure modes (no RPC config, RPC error, workload not registered,
 /// no PCR23 in spec) are silent skips. The function never errors.
 async fn verify_entries_against_chain(entries: &mut [DisplayEntry], config: &Config) {
-    let Some(rpc_url) = config.publish.rpc_url.as_deref() else {
+    let Some(chain_name) = config.publish.chain.as_deref() else {
         return;
     };
-    let Some(session_registry) = config.publish.session_registry.as_deref() else {
+    let Some(chain_config) = config.chains.get(chain_name) else {
         return;
     };
+    let rpc_url = chain_config.rpc_url.as_str();
+    let session_registry = chain_config.session_registry.as_str();
 
     // Pick out entries that we can usefully check: must have an event
     // hash to compare against.
@@ -351,11 +352,7 @@ async fn verify_entries_against_chain(entries: &mut [DisplayEntry], config: &Con
 /// Emits a stderr warning if sha256 values diverge across repositories
 /// for the same workload: identical workload IDs should have identical
 /// content.
-fn merge_remote(
-    entries: &mut Vec<DisplayEntry>,
-    rm: &RepositoryArchiveMeta,
-    repo_name: &str,
-) {
+fn merge_remote(entries: &mut Vec<DisplayEntry>, rm: &RepositoryArchiveMeta, repo_name: &str) {
     // Canonical workload_id is deterministic from (name, version).
     // Every honest repository must report this exact value. If a
     // repository advertises a different one, flag the entry as
@@ -523,7 +520,12 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
     let tw = term_width();
 
     // Fixed column widths.
-    let w_name = entries.iter().map(|e| e.name.len()).max().unwrap_or(4).max(4);
+    let w_name = entries
+        .iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     let w_ver = entries
         .iter()
         .map(|e| e.version.len())
@@ -560,7 +562,11 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
         if wide {
             let avail = remaining.saturating_sub(gap * 3);
             let half = avail / 2;
-            (half.max(10), (avail - half).max(SHA256_MIN), max_source_width)
+            (
+                half.max(10),
+                (avail - half).max(SHA256_MIN),
+                max_source_width,
+            )
         } else {
             let avail = remaining.saturating_sub(gap * 3);
             let w_src = (avail / 3).max(12);
@@ -575,7 +581,11 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
     } else if has_sources {
         if wide {
             let avail = remaining.saturating_sub(gap * 2);
-            (0, avail.saturating_sub(max_source_width).max(SHA256_MIN), max_source_width)
+            (
+                0,
+                avail.saturating_sub(max_source_width).max(SHA256_MIN),
+                max_source_width,
+            )
         } else {
             let avail = remaining.saturating_sub(gap * 2);
             let w_src = (avail / 3).max(12);
@@ -608,7 +618,11 @@ fn print_table(entries: &[DisplayEntry], wide: bool) {
             e.name.clone()
         };
 
-        let symbol = if e.revoked { "\u{2717}" } else { e.status.symbol() }; // ✗ for revoked
+        let symbol = if e.revoked {
+            "\u{2717}"
+        } else {
+            e.status.symbol()
+        }; // ✗ for revoked
 
         let ver_padded = format!("{:<w_ver$}", e.version);
 

@@ -5,17 +5,17 @@ use atakit_workload::manifest::{Manifest, ManifestFirewallPort};
 use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
-use super::{apply_chain_data_to_meta, find_archive, looks_like_store_ref, query_chain_data, ChainData};
+use super::{
+    apply_chain_data_to_meta, find_archive, looks_like_store_ref, query_chain_data, ChainData,
+};
 use crate::config::Config;
 
 pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => {
-            Some(atakit_workload::ContainerEngine::from_str_opt(
-                &config.build.container_engine,
-            )?)
-        }
+        None if config.build.container_engine != "auto" => Some(
+            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        ),
         None => None,
     };
 
@@ -78,19 +78,22 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     // Check on-chain status if RPC is configured
     let chain_data = refresh_chain(name, version, env, config).await;
 
-    print_info(&result.manifest, &result.sha256, &result.pcr23, chain_data.as_ref());
+    print_info(
+        &result.manifest,
+        &result.sha256,
+        &result.pcr23,
+        chain_data.as_ref(),
+    );
     Ok(())
 }
 
-/// Query on-chain data and update local store. Returns None if RPC not configured.
-async fn refresh_chain(
-    name: &str,
-    version: &str,
-    env: &Env,
-    config: &Config,
-) -> Option<ChainData> {
-    let rpc_url = config.publish.rpc_url.as_deref()?;
-    let session_registry = config.publish.session_registry.as_deref()?;
+/// Query on-chain data and update local store. Returns None if chain not configured.
+async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) -> Option<ChainData> {
+    // Best-effort: resolve publish chain, skip if not configured.
+    let chain_name = config.publish.chain.as_deref()?;
+    let chain_config = config.chains.get(chain_name)?;
+    let rpc_url = &chain_config.rpc_url;
+    let session_registry = &chain_config.session_registry;
     let workload_id = super::compute_workload_id(name, version);
 
     let chain = query_chain_data(workload_id, rpc_url, session_registry)
@@ -140,9 +143,10 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!("  {:<18}{}", "Restart:", m.config.restart);
     println!(
         "  {:<18}{}",
-        "CVM Agent:",
-        if m.config.cvm_agent { "yes" } else { "no" }
+        "Atakit Portal:",
+        if m.config.atakit_portal { "yes" } else { "no" }
     );
+    println!("  {:<18}{}", "GID Group:", m.config.gid_group);
     if !m.config.ports.is_empty() {
         print_multi("Ports:", &m.config.ports);
     }
@@ -153,7 +157,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         println!("  {:<18}{}", "Entrypoint:", format_string_or_array(ep));
     }
     if !m.config.environment.is_empty() {
-        let max_key = m.config.environment.keys().map(|k| k.len()).max().unwrap_or(0);
+        let max_key = m
+            .config
+            .environment
+            .keys()
+            .map(|k| k.len())
+            .max()
+            .unwrap_or(0);
         let items: Vec<String> = m
             .config
             .environment
@@ -165,27 +175,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!();
 
     // --- Data ---
-    let has_data = !m.config.measured_data.is_empty()
-        || !m.config.unmeasured_data.is_empty()
-        || m.config.signing.is_some();
-    if has_data {
+    if m.config.measured_data || m.config.unmeasured_data {
         section_header("Data");
-        if !m.config.measured_data.is_empty() {
-            print_multi("Measured:", &m.config.measured_data);
+        if m.config.measured_data {
+            println!("  {:<20}enabled (directory mounted)", "Measured:");
         }
-        if !m.config.unmeasured_data.is_empty() {
-            print_multi("Unmeasured:", &m.config.unmeasured_data);
-        }
-        if let Some(ref signing) = m.config.signing {
-            if signing.enable {
-                println!("  {:<18}enabled", "Signing:");
-                if let Some(ref ai) = signing.auth_info {
-                    println!("    {:<16}{}", "Auth Info:", ai);
-                }
-                if let Some(ref p) = signing.policy {
-                    println!("    {:<16}{}", "Policy:", p);
-                }
-            }
+        if m.config.unmeasured_data {
+            println!("  {:<20}enabled (directory mounted)", "Unmeasured:");
         }
         println!();
     }
@@ -196,15 +192,15 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         for (name, disk) in &m.disks {
             let mount = m.config.disks.get(name).map(|s| s.as_str()).unwrap_or("-");
             let mut flags = vec![&disk.size[..]];
-            if let Some(ref enc) = disk.encryption {
-                if enc.enable {
-                    flags.push("encrypted");
-                }
+            if !disk.encryption.unlock_method.is_empty() {
+                flags.push("encrypted");
             }
-            if disk.bind_fs {
-                flags.push("bind_fs");
-            }
-            println!("  {:<18}{}  {}", format!("{name}:"), mount, flags.join("  "));
+            println!(
+                "  {:<18}{}  {}",
+                format!("{name}:"),
+                mount,
+                flags.join("  ")
+            );
         }
         println!();
     }
@@ -244,6 +240,17 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         println!();
     }
 
+    // --- Images (per-service archive + image-id) ---
+    if !m.images.is_empty() {
+        section_header("Images");
+        let max_svc = m.images.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (svc, img) in &m.images {
+            println!("  {:<width$}  {}", svc, img.archive, width = max_svc);
+            println!("  {:<width$}  {}", "", img.image_id, width = max_svc);
+        }
+        println!();
+    }
+
     // --- Hashes ---
     if !m.hashes.is_empty() {
         section_header("Hashes");
@@ -274,7 +281,11 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     // Compute workload ID: keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))
     // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
     let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
-    println!("  {:<18}{}", "Workload ID:", format!("0x{}", hex::encode(workload_id)).dimmed());
+    println!(
+        "  {:<18}{}",
+        "Workload ID:",
+        format!("0x{}", hex::encode(workload_id)).dimmed()
+    );
     match chain_info {
         Some(info) => match info.status.as_str() {
             "active" => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
@@ -306,4 +317,3 @@ fn format_string_or_array(s: &atakit_workload::manifest::StringOrArrayOut) -> St
 fn format_fw_port(p: &ManifestFirewallPort) -> String {
     format!("{}/{}", p.port, p.protocol)
 }
-
