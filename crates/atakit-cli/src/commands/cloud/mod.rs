@@ -17,6 +17,7 @@ use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
+use atakit_cloud::init::{InitChainConfig, InitKeyConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
@@ -25,6 +26,8 @@ use atakit_cloud::{
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
+
+use crate::config::{ChainConfig, KeyMode, KeySpec};
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -35,25 +38,11 @@ pub struct InitEnvResolver<'a> {
 }
 
 impl<'a> InitEnvResolver<'a> {
-    pub fn chain(&self) -> String {
+    pub fn chain_optional(&self) -> Option<String> {
         self.cli_chain
             .map(String::from)
             .or_else(|| self.target.chain.clone())
-            .expect("chain must be set on target or via --chain")
-    }
-
-    pub fn owner_key(&self) -> String {
-        self.cli_owner_key
-            .map(String::from)
-            .or_else(|| self.target.owner_key.clone())
-            .expect("owner_key must be set on target or via --owner-key")
-    }
-
-    pub fn gas_wallet(&self) -> String {
-        self.cli_gas_wallet
-            .map(String::from)
-            .or_else(|| self.target.gas_wallet.clone())
-            .expect("gas_wallet must be set on target or via --gas-wallet")
+            .filter(|value| !value.is_empty())
     }
 
     /// Optional SP1 prover-network key name. Read from the target (already
@@ -63,26 +52,11 @@ impl<'a> InitEnvResolver<'a> {
         self.target.sp1_payer.clone()
     }
 
-    pub fn build(&self) -> PersistedInitEnv {
-        PersistedInitEnv {
-            chain: self.chain(),
-            owner_key: self.owner_key(),
-            gas_wallet: self.gas_wallet(),
-            sp1_payer: self.sp1_payer(),
-        }
-    }
-
-    /// Like `build`, but never panics on missing fields. Used for the qemu
-    /// platform, where zero-config deploys are supported: unset chain/owner/
-    /// gas come through as empty strings, and the InitializeWorkload arm
-    /// synthesizes an implicit local chain + self-generated keys.
+    /// Resolve persisted init references without panicking on missing fields.
+    /// Used when no `/init` will be sent or qemu zero-config deploy is allowed.
     pub fn build_optional(&self) -> PersistedInitEnv {
         PersistedInitEnv {
-            chain: self
-                .cli_chain
-                .map(String::from)
-                .or_else(|| self.target.chain.clone())
-                .unwrap_or_default(),
+            chain: self.chain_optional().unwrap_or_default(),
             owner_key: self
                 .cli_owner_key
                 .map(String::from)
@@ -95,6 +69,176 @@ impl<'a> InitEnvResolver<'a> {
                 .unwrap_or_default(),
             sp1_payer: self.sp1_payer(),
         }
+    }
+}
+
+/// Zero-address placeholder used when the init chain is explicitly off.
+/// The portal never submits anything when registration is "off", so the
+/// value is only a structural placeholder for the JSON shape.
+pub(crate) const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
+
+/// Build an off-chain InitChainConfig: registration "off", placeholder
+/// addresses, no RPC. The portal accepts a chain section with no `rpc_url`
+/// when `registration = "off"`.
+pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
+    InitChainConfig {
+        rpc_url: String::new(),
+        session_registry: ZERO_ADDR.to_string(),
+        workload_registry: ZERO_ADDR.to_string(),
+        base_image_registry: ZERO_ADDR.to_string(),
+        expire_offset: 3600,
+        registration: Some("off".to_string()),
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
+    registration == Some("off")
+}
+
+pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
+    InitKeyConfig {
+        mode: "self_generated".to_string(),
+        key_type: "es256k".to_string(),
+        private_key: None,
+    }
+}
+
+pub(crate) fn init_key_from_config(
+    key_name: &str,
+    spec: &KeySpec,
+    require_private_key: bool,
+) -> Result<InitKeyConfig> {
+    Ok(InitKeyConfig {
+        mode: spec.mode.to_string(),
+        key_type: spec.key_type.to_string(),
+        private_key: if require_private_key || spec.mode == KeyMode::Provisioned {
+            Some(spec.resolve(key_name)?)
+        } else {
+            None
+        },
+    })
+}
+
+pub(crate) fn init_chain_from_config(
+    chain_name: &str,
+    chain: &ChainConfig,
+    registration: Option<&str>,
+) -> Result<InitChainConfig> {
+    let placeholder_ok = registration_is_off(registration);
+    Ok(InitChainConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        workload_registry: chain
+            .workload_registry
+            .clone()
+            .or_else(|| placeholder_ok.then(|| ZERO_ADDR.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("workload_registry required in chain '{chain_name}'"))?,
+        base_image_registry: chain
+            .base_image_registry
+            .clone()
+            .or_else(|| placeholder_ok.then(|| ZERO_ADDR.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("base_image_registry required in chain '{chain_name}'")
+            })?,
+        expire_offset: chain.expire_offset,
+        registration: registration.map(str::to_string),
+        chain_id: chain.chain_id,
+        proving_strategy: chain.proving_strategy.clone(),
+    })
+}
+
+#[cfg(test)]
+fn test_chain_config() -> ChainConfig {
+    ChainConfig {
+        rpc_url: "https://rpc.test".to_string(),
+        session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+        workload_registry: None,
+        base_image_registry: None,
+        expire_offset: 300,
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+#[cfg(test)]
+mod chain_init_tests {
+    use super::*;
+    use crate::config::KeyType;
+
+    #[test]
+    fn qemu_missing_chain_synthesizes_registration_off() {
+        let got = synthesize_off_init_chain();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert!(got.rpc_url.is_empty());
+        assert_eq!(got.session_registry, ZERO_ADDR);
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_off_does_not_require_derived_registries() {
+        let chain = test_chain_config();
+        let got = init_chain_from_config("offchain", &chain, Some("off")).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_required_still_requires_derived_registries() {
+        let chain = test_chain_config();
+        let err = init_chain_from_config("hoodi", &chain, Some("required")).unwrap_err();
+        assert!(
+            err.to_string().contains("workload_registry required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn qemu_forces_registration_off() {
+        let chain = test_chain_config();
+        let got = init_chain_from_config("local", &chain, Some("off")).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn self_generated_key_can_be_sent_without_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let got = init_key_from_config("gas", &spec, false).unwrap();
+        assert_eq!(got.mode, "self_generated");
+        assert_eq!(got.key_type, "es256k");
+        assert!(got.private_key.is_none());
+    }
+
+    #[test]
+    fn self_generated_key_cannot_be_forced_to_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let err = init_key_from_config("owner", &spec, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve a self_generated key"),
+            "{err}"
+        );
     }
 }
 

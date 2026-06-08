@@ -168,6 +168,9 @@ impl CloudConfig {
             if target.chain.is_none() {
                 target.chain = defaults.chain.clone();
             }
+            if target.registration.is_none() {
+                target.registration = defaults.registration.clone();
+            }
             if target.owner_key.is_none() {
                 target.owner_key = defaults.owner_key.clone();
             }
@@ -192,6 +195,7 @@ impl CloudConfig {
 #[serde(default)]
 pub struct CloudTargetDefaults {
     pub chain: Option<String>,
+    pub registration: Option<String>,
     pub owner_key: Option<String>,
     pub gas_wallet: Option<String>,
     /// Default SP1 prover-network key name (references `[keys.<name>]`),
@@ -237,7 +241,16 @@ pub struct CloudTarget {
     /// Falls back to `[cloud.defaults] chain`.
     #[serde(default)]
     pub chain: Option<String>,
-    /// Owner key name (references a key in `[keys]`, must be provisioned).
+    /// Portal-side chain-registration policy. One of:
+    /// - `"required"`: submit registration and gate serving on confirmation.
+    /// - `"optional"`: submit registration in the background.
+    /// - `"off"`: skip chain interaction; `chain` may be omitted.
+    /// Falls back to `[cloud.defaults] registration`; omitted means the
+    /// portal default (`required`) when a chain is used.
+    #[serde(default)]
+    pub registration: Option<String>,
+    /// Owner key name (references a key in `[keys]`; may be provisioned or
+    /// self-generated depending on the registration flow).
     /// Falls back to `[cloud.defaults] owner_key`.
     #[serde(default)]
     pub owner_key: Option<String>,
@@ -613,6 +626,7 @@ mod tests {
             metadata: BTreeMap::new(),
             boot_disk_size: None,
             chain: Some("test-chain".to_string()),
+            registration: None,
             owner_key: Some("test-owner".to_string()),
             gas_wallet: Some("test-gas".to_string()),
             sp1_payer: None,

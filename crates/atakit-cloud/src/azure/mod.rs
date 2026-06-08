@@ -771,6 +771,7 @@ mod tests {
             metadata: BTreeMap::new(),
             boot_disk_size: None,
             chain: Some("testnet".to_string()),
+            registration: None,
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
             sp1_payer: None,

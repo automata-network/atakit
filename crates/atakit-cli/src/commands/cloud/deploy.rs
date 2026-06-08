@@ -5,7 +5,7 @@ use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig, PortalTerminalState};
+use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::qemu::QemuProvider;
@@ -19,10 +19,11 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ensure_cloud_image, parse_metadata, resolve_image, resolve_unmeasured_tar, resolve_workload,
-    validate_base_image, InitEnvResolver,
+    ensure_cloud_image, init_chain_from_config, init_key_from_config, parse_metadata,
+    registration_is_off, resolve_image, resolve_unmeasured_tar, resolve_workload,
+    synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
-use crate::config::{Config, KeyMode};
+use crate::config::Config;
 
 /// Per-(provider, image_ref) upload metadata kept while fanning out
 /// multi-target deploys. Boxed under a type alias so clippy does not flag
@@ -363,21 +364,39 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         );
     }
 
-    // 6. Build init env (references into [chains] and [keys]).
+    // 6. Build init env references into [chains] and [keys]. Registration is
+    // target-owned: chain is required only when registration is active.
     let init_env_resolver = InitEnvResolver {
         cli_chain: args.chain.as_deref(),
         cli_owner_key: args.owner_key.as_deref(),
         cli_gas_wallet: args.gas_wallet.as_deref(),
         target: &target,
     };
-    // For qemu we don't require any chain/key config: registration defaults
-    // to off (synthesized later in the InitializeWorkload arm), and missing
-    // refs come through as empty strings.
-    let init_env = if matches!(provider_config.platform, PlatformKind::Qemu) {
-        init_env_resolver.build_optional()
+    let init_env = init_env_resolver.build_optional();
+    let is_qemu = matches!(provider_config.platform, PlatformKind::Qemu);
+    let effective_registration = if is_qemu {
+        Some("off".to_string())
     } else {
-        init_env_resolver.build()
+        target.registration.clone()
     };
+    let registration_off = registration_is_off(effective_registration.as_deref());
+    if !image_only && !args.skip_init && !matches!(provider_config.platform, PlatformKind::Qemu) {
+        if init_env.chain.is_empty() && !registration_off {
+            bail!(
+                "chain must be set on target or via --chain when /init is sent \
+                 (set registration = \"off\" on the target to disable on-chain registration)"
+            );
+        }
+        if !init_env.chain.is_empty()
+            && !registration_off
+            && !config.chains.contains_key(&init_env.chain)
+        {
+            bail!("chain '{}' not found in [chains]", init_env.chain);
+        }
+        if init_env.owner_key.is_empty() && !registration_off {
+            bail!("owner_key must be set on target or via --owner-key");
+        }
+    }
 
     // 7. Parse metadata.
     let mut metadata = parse_metadata(&args.metadata)?;
@@ -618,45 +637,36 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
     }
 
-    // Chain config: surface BEFORE the operator confirms so the
-    // effective registration policy (`required` / `optional` /
-    // `off`) is visible — the portal can't change it after /init,
-    // so a misconfigured deployment caught here saves a CVM cycle.
-    // `init_env.chain` is just a name reference; the lookup /init
-    // performs later (around line 450) is the same.
-    //
-    // Qemu: zero-config is supported — when no chain is referenced we
-    // synthesize an implicit local chain with `registration = "off"`
-    // at /init time, and the summary reflects that instead of erroring.
-    let is_qemu = matches!(provider_config.platform, PlatformKind::Qemu);
-    let chain_for_summary = config.chains.get(&init_env.chain);
-    if let Some(chain) = chain_for_summary {
-        eprintln!("  {:<15}{}", "Chain:".dimmed(), init_env.chain);
-        // Qemu always submits as "off" regardless of what the referenced
-        // chain says, because there's no real TEE quote to register —
-        // honoring `registration = "required"` from a shared chain config
-        // would only make /init fail. Cloud platforms keep their config
-        // value (or fall back to the portal's "required" default).
-        let registration_label = if is_qemu {
-            "off (qemu)"
+    // Chain config: surface BEFORE the operator confirms so the effective
+    // registration policy (`required` / `optional` / `off`) is visible.
+    // No-/init deploys do not consume chain config. For real init, qemu can
+    // synthesize registration=off; cloud init requires a named chain only when
+    // registration is active.
+    if image_only || args.skip_init {
+        if init_env.chain.is_empty() {
+            eprintln!("  {:<15}(none - unused)", "Chain:".dimmed());
         } else {
-            chain
-                .registration
-                .as_deref()
-                .unwrap_or("required (default)")
-        };
-        eprintln!("  {:<15}{}", "Submission:".dimmed(), registration_label);
-        // When submission is off the portal doesn't dial `rpc_url` or call
-        // the registry contracts, so surfacing them in the summary suggests
-        // they're load-bearing when they aren't. Hide both in that case.
-        let submission_active = !is_qemu && chain.registration.as_deref() != Some("off");
-        if submission_active {
-            eprintln!("  {:<15}{}", "RPC:".dimmed(), chain.rpc_url);
-            eprintln!("  {:<15}{}", "Registry:".dimmed(), chain.session_registry);
+            eprintln!("  {:<15}{} (unused)", "Chain:".dimmed(), init_env.chain);
         }
-    } else if is_qemu {
-        eprintln!("  {:<15}(none — local default)", "Chain:".dimmed());
-        eprintln!("  {:<15}off (qemu)", "Submission:".dimmed());
+        eprintln!("  {:<15}n/a (no /init)", "Submission:".dimmed());
+    } else if init_env.chain.is_empty() && is_qemu {
+        eprintln!("  {:<15}(none)", "Chain:".dimmed());
+        eprintln!("  {:<15}off (qemu default)", "Submission:".dimmed());
+    } else if registration_off {
+        if init_env.chain.is_empty() {
+            eprintln!("  {:<15}(none)", "Chain:".dimmed());
+        } else {
+            eprintln!("  {:<15}{} (unused)", "Chain:".dimmed(), init_env.chain);
+        }
+        eprintln!("  {:<15}off", "Submission:".dimmed());
+    } else if let Some(chain) = config.chains.get(&init_env.chain) {
+        eprintln!("  {:<15}{}", "Chain:".dimmed(), init_env.chain);
+        let registration_label = effective_registration
+            .as_deref()
+            .unwrap_or("required (default)");
+        eprintln!("  {:<15}{}", "Submission:".dimmed(), registration_label);
+        eprintln!("  {:<15}{}", "RPC:".dimmed(), chain.rpc_url);
+        eprintln!("  {:<15}{}", "Registry:".dimmed(), chain.session_registry);
     } else {
         bail!("chain '{}' not found in [chains]", init_env.chain);
     }
@@ -797,95 +807,52 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             }
             DeployStep::InitializeWorkload { archive_path: ap } => {
                 let (ip, status_port, init_port) = portal_endpoints(&state)?;
-                let is_qemu = matches!(provider_config.platform, PlatformKind::Qemu);
+                let registration = effective_registration.as_deref();
 
-                // Resolve chain config. For qemu, fall back to the implicit
-                // local chain (registration="off") when nothing is configured
-                // — and default `registration` to "off" when the chain is
-                // configured but doesn't specify one.
+                // Resolve chain config. Registration-off init has no chain
+                // interaction, so a missing chain is represented by the
+                // synthesized off-chain payload.
                 let chain_name = &init_env.chain;
                 let init_chain = match config.chains.get(chain_name) {
-                    Some(chain) => InitChainConfig {
-                        rpc_url: chain.rpc_url.clone(),
-                        session_registry: chain.session_registry.clone(),
-                        workload_registry: chain
-                            .workload_registry
-                            .clone()
-                            .or_else(|| is_qemu.then(|| ZERO_ADDR.to_string()))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "workload_registry required in chain '{chain_name}'"
-                                )
-                            })?,
-                        base_image_registry: chain
-                            .base_image_registry
-                            .clone()
-                            .or_else(|| is_qemu.then(|| ZERO_ADDR.to_string()))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "base_image_registry required in chain '{chain_name}'"
-                                )
-                            })?,
-                        expire_offset: chain.expire_offset,
-                        // Qemu forces `"off"` regardless of the chain's
-                        // value — there's no real TEE quote to submit, and
-                        // honoring a shared chain's `"required"` would just
-                        // make /init fail. Cloud platforms keep the chain's
-                        // value (None falls through to the portal default).
-                        registration: if is_qemu {
-                            Some("off".to_string())
-                        } else {
-                            chain.registration.clone()
-                        },
-                        chain_id: chain.chain_id,
-                        proving_strategy: chain.proving_strategy.clone(),
-                    },
-                    None if is_qemu => synthesize_local_init_chain(),
+                    Some(chain) => init_chain_from_config(chain_name, chain, registration)?,
+                    None if registration_is_off(registration) => synthesize_off_init_chain(),
+                    None if chain_name.is_empty() => bail!(
+                        "chain must be set on target or via --chain when /init is sent \
+                         (set registration = \"off\" on the target to disable on-chain registration)"
+                    ),
                     None => bail!("chain '{chain_name}' not found in [chains]"),
                 };
 
-                // Resolve owner / gas keys, with qemu falling back to a
-                // self-generated owner+gas (no private key sent).
+                // Resolve init keys. Active registration requires an owner-key
+                // reference. Owner/gas/sp1 can be provisioned keys supplied by
+                // a relay/prover operator or self-generated ephemeral keys.
+                // Registration-off synthesizes any missing key because no chain
+                // signing is load-bearing.
                 let owner_key_name = &init_env.owner_key;
+                let registration_off = registration_is_off(registration);
                 let owner_init = match config.keys.get(owner_key_name) {
-                    Some(spec) => InitKeyConfig {
-                        mode: spec.mode.to_string(),
-                        key_type: spec.key_type.to_string(),
-                        private_key: Some(spec.resolve(owner_key_name)?),
-                    },
-                    None if is_qemu => synthesize_self_generated_key(),
+                    Some(spec) => init_key_from_config(owner_key_name, spec, false)?,
+                    None if registration_off => synthesize_self_generated_key(),
+                    None if owner_key_name.is_empty() => {
+                        bail!("owner_key must be set on target or via --owner-key")
+                    }
                     None => bail!("key '{owner_key_name}' not found in [keys]"),
                 };
                 let gas_wallet_name = &init_env.gas_wallet;
                 let gas_init = match config.keys.get(gas_wallet_name) {
-                    Some(spec) => InitKeyConfig {
-                        mode: spec.mode.to_string(),
-                        key_type: spec.key_type.to_string(),
-                        private_key: if spec.mode == KeyMode::Provisioned {
-                            Some(spec.resolve(gas_wallet_name)?)
-                        } else {
-                            None
-                        },
-                    },
-                    None if is_qemu => synthesize_self_generated_key(),
+                    Some(spec) => init_key_from_config(gas_wallet_name, spec, false)?,
+                    None if gas_wallet_name.is_empty() => synthesize_self_generated_key(),
+                    None if registration_off => synthesize_self_generated_key(),
                     None => bail!("key '{gas_wallet_name}' not found in [keys]"),
                 };
 
                 // SP1 prover-network key (same shape as gas_wallet). Defaults
-                // to the gas-wallet key when no separate sp1_payer is
-                // configured; qemu falls back to a self-generated key.
+                // to the gas-wallet key when no separate sp1_payer is set.
                 let sp1_payer_name = init_env.sp1_payer.as_deref().unwrap_or(gas_wallet_name);
                 let sp1_init = match config.keys.get(sp1_payer_name) {
-                    Some(spec) => InitKeyConfig {
-                        mode: spec.mode.to_string(),
-                        key_type: spec.key_type.to_string(),
-                        private_key: if spec.mode == KeyMode::Provisioned {
-                            Some(spec.resolve(sp1_payer_name)?)
-                        } else {
-                            None
-                        },
-                    },
-                    None if is_qemu => synthesize_self_generated_key(),
+                    Some(spec) => init_key_from_config(sp1_payer_name, spec, false)?,
+                    None if sp1_payer_name.is_empty() => synthesize_self_generated_key(),
+                    None if registration_off => synthesize_self_generated_key(),
                     None => bail!("key '{sp1_payer_name}' not found in [keys]"),
                 };
 
@@ -1240,11 +1207,6 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     Ok(())
 }
 
-/// Zero-address placeholder used by the synthesized qemu local chain. The
-/// portal never submits anything when registration is "off", so the value
-/// is only a structural placeholder.
-const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
-
 /// Cloud platforms use the deployment's external IP plus the
 /// well-known portal ports `2024` / `1024`. QEMU forwards those ports to
 /// ephemeral host ports allocated at boot. This helper returns
@@ -1282,33 +1244,6 @@ fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)> {
         })
         .ok_or_else(|| anyhow::anyhow!("no external IP available"))?;
     Ok((ip, 2024, 1024))
-}
-
-/// Build the InitChainConfig used for the qemu zero-config path: registration
-/// "off", placeholder addresses, no RPC. The portal accepts a chain section
-/// with no `rpc_url` when `registration = "off"`.
-fn synthesize_local_init_chain() -> InitChainConfig {
-    InitChainConfig {
-        rpc_url: String::new(),
-        session_registry: ZERO_ADDR.to_string(),
-        workload_registry: ZERO_ADDR.to_string(),
-        base_image_registry: ZERO_ADDR.to_string(),
-        expire_offset: 3600,
-        registration: Some("off".to_string()),
-        chain_id: None,
-        proving_strategy: None,
-    }
-}
-
-/// self_generated owner/gas key — no private key is sent; the portal
-/// generates one. Safe to use under the qemu zero-config path because
-/// registration is off, so the gas wallet never signs a real transaction.
-fn synthesize_self_generated_key() -> InitKeyConfig {
-    InitKeyConfig {
-        mode: "self_generated".to_string(),
-        key_type: "es256k".to_string(),
-        private_key: None,
-    }
 }
 
 /// Parse a human-readable size string (e.g. "10GB", "500MB", "1TB") into whole gigabytes.

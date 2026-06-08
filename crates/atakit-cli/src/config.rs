@@ -394,8 +394,6 @@ fn resolve_command(cred_name: &str, argv: &[String], timeout_secs: Option<u64>) 
 /// rpc_url = "https://..."
 /// session_registry = "0x..."
 /// expire_offset = 300
-/// # Optional — controls the portal's on-chain registration policy.
-/// # registration = "required" | "optional" | "off"
 /// # chain_id = 11155111   # only when rpc_url absent (air-gapped)
 /// # proving_strategy = "network" | "local" | "dev"   # SNP CVMs only
 /// ```
@@ -415,19 +413,6 @@ pub struct ChainConfig {
     /// CLI `--expire-offset` overrides this per call.
     #[serde(default = "default_expire_offset")]
     pub expire_offset: u64,
-    /// Portal-side chain-registration policy. One of:
-    /// - `"required"` — portal builds calldata, submits via `rpc_url`,
-    ///   gates workload HTTP serving on `isSessionActive` confirmation.
-    /// - `"optional"` — same submission flow but workload serves
-    ///   immediately; `chain.status` advances independently.
-    /// - `"off"` — no chain interaction (workload runs as if there's
-    ///   no on-chain side).
-    ///
-    /// When `None`, the field is omitted from the `/init` JSON; the
-    /// portal applies its "section present, no `registration` field
-    /// → `required`" default. Set explicitly to override.
-    #[serde(default)]
-    pub registration: Option<String>,
     /// EIP-155 chain id. Only meaningful under air-gapped operation
     /// (`rpc_url` not set on the portal side, which atakit-ng doesn't
     /// support yet — every chain entry here has `rpc_url`). Kept for
@@ -992,7 +977,13 @@ impl Config {
         // Cloud target chain/key references must point to defined entries.
         let chain_names: Vec<&str> = self.chains.keys().map(|k| k.as_str()).collect();
         let key_names: Vec<&str> = self.keys.keys().map(|k| k.as_str()).collect();
+        if let Some(ref registration) = self.cloud.defaults.registration {
+            validate_registration_policy(registration, "[cloud.defaults]")?;
+        }
         for (tname, target) in &self.cloud.targets {
+            if let Some(ref registration) = target.registration {
+                validate_registration_policy(registration, &format!("[cloud.targets.{tname}]"))?;
+            }
             if let Some(ref chain) = target.chain {
                 if !self.chains.contains_key(chain) {
                     bail!(
@@ -1009,14 +1000,6 @@ impl Config {
                          owner_key; defined: [{}]",
                         key_names.join(", ")
                     );
-                }
-                if let Some(spec) = self.keys.get(owner) {
-                    if spec.mode != KeyMode::Provisioned {
-                        bail!(
-                            "cloud target '{tname}': owner_key '{owner}' must be \
-                             mode = \"provisioned\""
-                        );
-                    }
                 }
             }
             if let Some(ref wallet) = target.gas_wallet {
@@ -1184,6 +1167,15 @@ fn validate_repo_path(section: &str, entry_name: &str, repo: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn validate_registration_policy(value: &str, location: &str) -> Result<()> {
+    match value {
+        "required" | "optional" | "off" => Ok(()),
+        _ => bail!(
+            "{location} registration must be \"required\", \"optional\", or \"off\", got {value:?}"
+        ),
+    }
 }
 
 /// Walk the parsed TOML looking for deprecated fields and emit a clear
@@ -1358,6 +1350,13 @@ fn check_legacy_fields(content: &str) -> Result<()> {
                          operator's `workload publish` / `workload deactivate` / \
                          `imgbuild publish` signature offsets; CLI \
                          `--expire-offset` overrides per call)."
+                    );
+                }
+                if t.contains_key("registration") {
+                    bail!(
+                        "`[chains.{cname}] registration` is no longer supported. Move \
+                         `registration = \"required\" | \"optional\" | \"off\"` to \
+                         `[cloud.targets.<name>]` or `[cloud.defaults]`."
                     );
                 }
             }
@@ -2803,6 +2802,176 @@ mod tests {
         assert!(
             format!("{err:#}").contains("unknown chain 'nonexistent'"),
             "expected chain ref error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn cloud_target_registration_is_target_owned() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.offchain]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "off"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["offchain"].registration.as_deref(),
+            Some("off")
+        );
+        assert!(config.cloud.targets["offchain"].chain.is_none());
+    }
+
+    #[test]
+    fn cloud_default_registration_is_inherited_by_targets() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "provisioned"
+            env = "KEY"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.defaults]
+            registration = "optional"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            owner_key = "owner"
+            gas_wallet = "gas"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].registration.as_deref(),
+            Some("optional")
+        );
+    }
+
+    #[test]
+    fn chain_registration_is_rejected_with_migration_hint() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.hoodi]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            registration = "off"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[chains.hoodi] registration` is no longer supported"),
+            "expected migration hint, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn invalid_target_registration_errors() {
+        let err = Config::load_from_str(
+            r#"
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "disabled"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("registration must be"),
+            "expected registration validation error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn active_registration_allows_self_generated_owner_key() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            owner_key = "owner"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].owner_key.as_deref(),
+            Some("owner")
+        );
+    }
+
+    #[test]
+    fn registration_off_allows_self_generated_owner_key() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.owner]
+            type = "es256k"
+            mode = "self_generated"
+
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            registration = "off"
+            owner_key = "owner"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.cloud.targets["t1"].owner_key.as_deref(),
+            Some("owner")
         );
     }
 

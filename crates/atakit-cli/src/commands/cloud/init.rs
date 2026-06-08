@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use atakit_cloud::cli::InitArgs;
-use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig};
+use atakit_cloud::init::{self, InitConfig};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
-use super::{resolve_instance, resolve_unmeasured_tar, resolve_workload, InitEnvResolver};
-use crate::config::{Config, KeyMode};
+use super::{
+    init_chain_from_config, init_key_from_config, registration_is_off, resolve_instance,
+    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    synthesize_self_generated_key, InitEnvResolver,
+};
+use crate::config::Config;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 1. Resolve instance.
@@ -89,7 +93,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 None
             }
         })
-        .unwrap_or_else(|| resolver.chain());
+        .or_else(|| resolver.chain_optional());
     let owner_key_name = args
         .owner_key
         .as_deref()
@@ -101,7 +105,13 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 None
             }
         })
-        .unwrap_or_else(|| resolver.owner_key());
+        .or_else(|| {
+            resolver
+                .target
+                .owner_key
+                .clone()
+                .filter(|value| !value.is_empty())
+        });
     let gas_wallet_name = args
         .gas_wallet
         .as_deref()
@@ -113,36 +123,73 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 None
             }
         })
-        .unwrap_or_else(|| resolver.gas_wallet());
+        .or_else(|| {
+            resolver
+                .target
+                .gas_wallet
+                .clone()
+                .filter(|value| !value.is_empty())
+        });
 
-    // Resolve chain config.
-    let chain = config
-        .chains
-        .get(&chain_name)
-        .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
+    // Resolve chain config. Registration is target-owned. When it is off,
+    // /init has no chain interaction and can omit chain entirely.
+    let registration = target.registration.as_deref();
+    let init_chain = match chain_name.as_deref() {
+        Some(name) => match config.chains.get(name) {
+            Some(chain) => init_chain_from_config(name, chain, registration)?,
+            None if registration_is_off(registration) => synthesize_off_init_chain(),
+            None => bail!("chain '{name}' not found in [chains]"),
+        },
+        None if registration_is_off(registration) => synthesize_off_init_chain(),
+        None => {
+            bail!(
+                "chain must be set on target, in saved init env, or via --chain when /init is sent \
+                 (set registration = \"off\" on the target to disable on-chain registration)"
+            )
+        }
+    };
 
-    // Resolve key specs.
-    let owner_key_spec = config
-        .keys
-        .get(&owner_key_name)
-        .ok_or_else(|| anyhow::anyhow!("key '{owner_key_name}' not found in [keys]"))?;
-    let gas_wallet_spec = config
-        .keys
-        .get(&gas_wallet_name)
-        .ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
+    // Resolve init keys. Active registration requires an owner-key reference.
+    // Owner/gas/sp1 can be provisioned keys supplied by a relay/prover
+    // operator or self-generated ephemeral keys.
+    let registration_off = registration_is_off(registration);
+    let owner_init = match owner_key_name.as_deref() {
+        Some(name) if config.keys.contains_key(name) => {
+            init_key_from_config(name, &config.keys[name], false)?
+        }
+        Some(_) if registration_off => synthesize_self_generated_key(),
+        Some(name) => bail!("key '{name}' not found in [keys]"),
+        None if registration_off => synthesize_self_generated_key(),
+        None => bail!("owner_key must be set on target or via --owner-key"),
+    };
+    let gas_init = match gas_wallet_name.as_deref() {
+        Some(name) => match config.keys.get(name) {
+            Some(spec) => init_key_from_config(name, spec, false)?,
+            None if registration_off => synthesize_self_generated_key(),
+            None => bail!("key '{name}' not found in [keys]"),
+        },
+        None => synthesize_self_generated_key(),
+    };
+    let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
     // SP1 prover-network key: state override > target config > default to the
-    // gas-wallet key. Same shape as gas_wallet; always a concrete key.
+    // gas-wallet key. Missing gas/sp1 synthesizes an ephemeral self-generated
+    // key; configured provisioned keys are also valid.
     let sp1_payer_name = state
         .init_env
         .sp1_payer
         .clone()
         .filter(|s| !s.is_empty())
         .or_else(|| resolver.sp1_payer())
-        .unwrap_or_else(|| gas_wallet_name.clone());
-    let sp1_payer_spec = config
-        .keys
-        .get(&sp1_payer_name)
-        .ok_or_else(|| anyhow::anyhow!("key '{sp1_payer_name}' not found in [keys]"))?;
+        .or_else(|| gas_wallet_name.clone());
+    let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
+    let sp1_init = match sp1_payer_name.as_deref() {
+        Some(name) => match config.keys.get(name) {
+            Some(spec) => init_key_from_config(name, spec, false)?,
+            None if registration_off => synthesize_self_generated_key(),
+            None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
+        },
+        None => synthesize_self_generated_key(),
+    };
 
     // Resolve provider platform for the InitConfig.
     let provider_config = config
@@ -168,43 +215,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     let init_config = InitConfig {
         platform: provider_config.platform.to_string(),
-        chain: InitChainConfig {
-            rpc_url: chain.rpc_url.clone(),
-            session_registry: chain.session_registry.clone(),
-            workload_registry: chain.workload_registry.clone().ok_or_else(|| {
-                anyhow::anyhow!("workload_registry required in chain '{chain_name}'")
-            })?,
-            base_image_registry: chain.base_image_registry.clone().ok_or_else(|| {
-                anyhow::anyhow!("base_image_registry required in chain '{chain_name}'")
-            })?,
-            expire_offset: chain.expire_offset,
-            registration: chain.registration.clone(),
-            chain_id: chain.chain_id,
-            proving_strategy: chain.proving_strategy.clone(),
-        },
-        owner_key: InitKeyConfig {
-            mode: owner_key_spec.mode.to_string(),
-            key_type: owner_key_spec.key_type.to_string(),
-            private_key: Some(owner_key_spec.resolve(&owner_key_name)?),
-        },
-        gas_wallet: InitKeyConfig {
-            mode: gas_wallet_spec.mode.to_string(),
-            key_type: gas_wallet_spec.key_type.to_string(),
-            private_key: if gas_wallet_spec.mode == KeyMode::Provisioned {
-                Some(gas_wallet_spec.resolve(&gas_wallet_name)?)
-            } else {
-                None
-            },
-        },
-        sp1_payer: InitKeyConfig {
-            mode: sp1_payer_spec.mode.to_string(),
-            key_type: sp1_payer_spec.key_type.to_string(),
-            private_key: if sp1_payer_spec.mode == KeyMode::Provisioned {
-                Some(sp1_payer_spec.resolve(&sp1_payer_name)?)
-            } else {
-                None
-            },
-        },
+        chain: init_chain,
+        owner_key: owner_init,
+        gas_wallet: gas_init,
+        sp1_payer: sp1_init,
         disks: disk_passphrases,
     };
 
@@ -267,10 +281,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     state.archive_path = archive_path.display().to_string();
     state.archive_hash = archive_hash;
     state.init_env = atakit_cloud::PersistedInitEnv {
-        chain: chain_name,
-        owner_key: owner_key_name,
-        gas_wallet: gas_wallet_name,
-        sp1_payer: Some(sp1_payer_name),
+        chain: chain_name.unwrap_or_default(),
+        owner_key: owner_key_name.unwrap_or_default(),
+        gas_wallet: gas_wallet_name.unwrap_or_default(),
+        sp1_payer: sp1_payer_name,
     };
     state
         .save(&env.data_dir)
