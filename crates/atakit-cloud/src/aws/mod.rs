@@ -7,7 +7,7 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::ResourceNames;
 use crate::plan::*;
-use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
+use crate::provider::{deployment_firewall_ports, CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
 
 /// AWS cloud provider.
@@ -57,12 +57,7 @@ impl CloudProvider for AwsProvider {
         // 1024 workload init), plus workload ports. Normal workload deploys
         // already get these from resolved manifest ports, but image-only
         // deploys have no manifest to inject them.
-        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
-        for entry in &opts.workload_ports {
-            if !ports.contains(entry) {
-                ports.push(entry.clone());
-            }
-        }
+        let ports = deployment_firewall_ports(opts);
         steps.push(DeployStep::OpenPorts {
             firewall_rule: names.firewall.clone(),
             ports,
@@ -411,7 +406,7 @@ impl CloudProvider for AwsProvider {
 mod tests {
     use super::*;
     use crate::config::{CcType, CloudTarget};
-    use crate::state::PersistedInitEnv;
+    use crate::state::{PersistedInitEnv, PortalPorts};
     use std::collections::BTreeMap;
 
     fn test_target() -> CloudTarget {
@@ -450,6 +445,7 @@ mod tests {
             skip_init: true,
             cc_types: vec![CcType::SevSnp],
             workload_ports: Vec::new(),
+            portal_ports: Default::default(),
             workload_disks: Vec::new(),
             boot_disk_size_gb: None,
         }
@@ -471,5 +467,37 @@ mod tests {
 
         assert!(ports.contains(&"2024/tcp".to_string()));
         assert!(ports.contains(&"1024/tcp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_uses_portal_port_overrides() {
+        let provider = AwsProvider::new("us-east-1".to_string());
+        let mut opts = test_deploy_opts();
+        opts.portal_ports = PortalPorts {
+            status: 6024,
+            init: 5024,
+        };
+        opts.workload_ports = vec![
+            "2024/tcp".to_string(),
+            "1024/tcp".to_string(),
+            "3000/tcp".to_string(),
+        ];
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+
+        let ports = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                DeployStep::OpenPorts { ports, .. } => Some(ports),
+                _ => None,
+            })
+            .expect("plan must contain OpenPorts");
+
+        assert!(ports.contains(&"6024/tcp".to_string()));
+        assert!(ports.contains(&"5024/tcp".to_string()));
+        assert!(ports.contains(&"3000/tcp".to_string()));
+        assert!(!ports.contains(&"2024/tcp".to_string()));
+        assert!(!ports.contains(&"1024/tcp".to_string()));
     }
 }

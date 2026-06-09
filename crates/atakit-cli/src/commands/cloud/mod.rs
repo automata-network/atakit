@@ -641,9 +641,9 @@ fn collect_firewall_ports(m: &atakit_workload::manifest::Manifest) -> Vec<String
         .collect()
 }
 
-/// Cloud platforms use the deployment's external IP plus the well-known portal
-/// ports `2024` / `1024`. QEMU forwards those guest ports to dynamic host ports
-/// allocated at boot and persisted in state.
+/// Cloud platforms use the deployment's external IP plus the portal ports
+/// persisted at deploy time. QEMU forwards those guest ports to dynamic host
+/// ports allocated at boot and persisted in state.
 pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)> {
     if let Some(ref q) = state.resources.qemu {
         let host = if q.external_ip.is_empty() {
@@ -677,7 +677,7 @@ pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)
                 .and_then(|a| a.external_ip.clone())
         })
         .ok_or_else(|| anyhow::anyhow!("no external IP available"))?;
-    Ok((ip, 2024, 1024))
+    Ok((ip, state.portal_ports.status, state.portal_ports.init))
 }
 
 /// Validate that the given image ref is allowed by the workload's base-image policy.
@@ -1263,6 +1263,7 @@ mod chain_init_tests {
 #[cfg(test)]
 mod portal_endpoint_tests {
     use super::*;
+    use atakit_cloud::PortalPorts;
 
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
@@ -1283,6 +1284,7 @@ mod portal_endpoint_tests {
             archive_path: "/tmp/test.atawl".to_string(),
             archive_hash: "abc123".to_string(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             resources: atakit_cloud::ResourceSet::default(),
         }
     }
@@ -1318,5 +1320,23 @@ mod portal_endpoint_tests {
         let got = portal_endpoints(&state).unwrap();
 
         assert_eq!(got, ("203.0.113.10".to_string(), 2024, 1024));
+    }
+
+    #[test]
+    fn cloud_platform_uses_persisted_port_overrides() {
+        let mut state = base_state(PlatformKind::Aws);
+        state.portal_ports = PortalPorts {
+            status: 6024,
+            init: 5024,
+        };
+        state.resources.aws = Some(atakit_cloud::AwsResources {
+            region: "us-east-1".to_string(),
+            external_ip: Some("203.0.113.10".to_string()),
+            ..Default::default()
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("203.0.113.10".to_string(), 6024, 5024));
     }
 }

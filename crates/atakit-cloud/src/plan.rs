@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::CcType;
+use crate::state::PortalPorts;
 
 /// Group `"port/proto"` entries by port number, sorted numerically.
 fn group_ports(ports: &[String]) -> Vec<(u16, Vec<&str>)> {
@@ -164,6 +165,7 @@ pub enum DeployStep {
         ovmf_path: String,
         data_disks: Vec<DiskSpec>,
         metadata: Vec<(String, String)>,
+        portal_ports: PortalPorts,
         /// Workload-declared `"port/proto"` entries. TCP entries are forwarded
         /// guest→same-host-port for predictability; non-tcp entries are
         /// ignored (qemu user-mode networking has no UDP hostfwd in practice).

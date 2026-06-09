@@ -10,7 +10,7 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::AzureResourceNames;
 use crate::plan::*;
-use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
+use crate::provider::{deployment_firewall_ports, CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
 
 /// Decompress a `.zst` file to a destination path.
@@ -108,12 +108,7 @@ impl CloudProvider for AzureProvider {
         // 1024 workload init), plus workload ports. Skipping these breaks
         // `fetch-platform-measurements` and image-only deploys.
         // workload_ports are already resolved "port/proto" strings.
-        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
-        for entry in &opts.workload_ports {
-            if !ports.contains(entry) {
-                ports.push(entry.clone());
-            }
-        }
+        let ports = deployment_firewall_ports(opts);
         steps.push(DeployStep::OpenPorts {
             firewall_rule: names.nsg.clone(),
             ports,
@@ -796,6 +791,7 @@ mod tests {
             skip_init: true,
             cc_types: vec![CcType::SevSnp],
             workload_ports: vec![],
+            portal_ports: Default::default(),
             workload_disks: vec![],
             boot_disk_size_gb: None,
         }

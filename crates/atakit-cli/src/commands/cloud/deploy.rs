@@ -11,8 +11,8 @@ use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::qemu::QemuProvider;
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{
-    AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, ProcessRunner,
-    QemuResources,
+    AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, PortalPorts,
+    ProcessRunner, QemuResources,
 };
 use atakit_core::Env;
 use owo_colors::OwoColorize;
@@ -206,6 +206,7 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
 
 async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let image_only = args.image_only;
+    let portal_ports = resolve_portal_ports(args.status_port, args.init_port)?;
 
     // 1. Resolve workload source (unless --image-only).
     // `workload_boot_min` carries the raw workload manifest boot-disk-size string
@@ -492,6 +493,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         skip_init: image_only || args.skip_init,
         cc_types: cc_types.clone(),
         workload_ports: workload_ports.clone(),
+        portal_ports,
         workload_disks: workload_disks.clone(),
         boot_disk_size_gb,
     };
@@ -603,6 +605,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     if let Some(gb) = boot_disk_size_gb {
         eprintln!("  {:<15}{}GB", "Boot disk:".dimmed(), gb);
     }
+    eprintln!(
+        "  {:<15}{} (status), {} (init)",
+        "Portal:".dimmed(),
+        portal_ports.status,
+        portal_ports.init
+    );
     let port_lines = atakit_cloud::plan::format_ports_list(&ports);
     for line in &port_lines {
         eprintln!("  {:<15}{}", "", line);
@@ -719,6 +727,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         archive_path,
         archive_hash,
         init_env: init_env.clone(),
+        portal_ports,
         total_steps: plan.steps.len() as u32,
     });
     match provider_config.platform {
@@ -1229,6 +1238,23 @@ fn parse_size_gb(s: &str) -> Option<u64> {
     }
 }
 
+fn resolve_portal_ports(status_port: Option<u16>, init_port: Option<u16>) -> Result<PortalPorts> {
+    let ports = PortalPorts {
+        status: status_port.unwrap_or(atakit_cloud::DEFAULT_PORTAL_STATUS_PORT),
+        init: init_port.unwrap_or(atakit_cloud::DEFAULT_PORTAL_INIT_PORT),
+    };
+    if ports.status == 0 {
+        bail!("--status-port must be between 1 and 65535");
+    }
+    if ports.init == 0 {
+        bail!("--init-port must be between 1 and 65535");
+    }
+    if ports.status == ports.init {
+        bail!("--status-port and --init-port must be different");
+    }
+    Ok(ports)
+}
+
 /// Absolute floor for OS boot disk size. The base image is assumed to be
 /// ~1 GB; 2 GB leaves room for an ext4 /data partition on the tail.
 const MIN_BOOT_DISK_GB: u64 = 2;
@@ -1410,5 +1436,37 @@ mod tests {
     fn equal_to_workload_minimum_is_ok() {
         let got = resolve_boot_disk_size(Some("50GB"), None, Some("50GB")).unwrap();
         assert_eq!(got, 50);
+    }
+
+    #[test]
+    fn portal_ports_default_to_well_known_values() {
+        let got = resolve_portal_ports(None, None).unwrap();
+        assert_eq!(got.status, atakit_cloud::DEFAULT_PORTAL_STATUS_PORT);
+        assert_eq!(got.init, atakit_cloud::DEFAULT_PORTAL_INIT_PORT);
+    }
+
+    #[test]
+    fn portal_ports_accept_overrides() {
+        let got = resolve_portal_ports(Some(6024), Some(5024)).unwrap();
+        assert_eq!(got.status, 6024);
+        assert_eq!(got.init, 5024);
+    }
+
+    #[test]
+    fn portal_ports_must_be_distinct_and_nonzero() {
+        let err = resolve_portal_ports(Some(5024), Some(5024))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be different"), "{err}");
+
+        let err = resolve_portal_ports(Some(0), Some(5024))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--status-port"), "{err}");
+
+        let err = resolve_portal_ports(Some(6024), Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--init-port"), "{err}");
     }
 }

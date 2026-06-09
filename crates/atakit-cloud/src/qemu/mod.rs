@@ -122,6 +122,7 @@ impl CloudProvider for QemuProvider {
                 ovmf_path: ovmf.display().to_string(),
                 data_disks,
                 metadata,
+                portal_ports: opts.portal_ports,
                 workload_ports: opts.workload_ports.clone(),
             },
         ];
@@ -156,6 +157,7 @@ impl CloudProvider for QemuProvider {
                 ovmf_path,
                 data_disks,
                 metadata,
+                portal_ports,
                 workload_ports,
             } => {
                 let instance_dir = PathBuf::from(instance_dir);
@@ -189,6 +191,7 @@ impl CloudProvider for QemuProvider {
                     ovmf: std::path::Path::new(ovmf_path),
                     data_disks: &data_pairs,
                     metadata,
+                    portal_ports: *portal_ports,
                     workload_ports,
                 })?;
 

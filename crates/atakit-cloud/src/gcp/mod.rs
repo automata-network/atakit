@@ -9,7 +9,7 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::ResourceNames;
 use crate::plan::*;
-use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
+use crate::provider::{deployment_firewall_ports, CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
 
 /// GCP cloud provider.
@@ -68,12 +68,7 @@ impl CloudProvider for GcpProvider {
         // `fetch-platform-measurements` and image-only deploys (gcloud
         // `--rules=` rejects an empty list).
         // workload_ports are already resolved "port/proto" strings from the manifest.
-        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
-        for entry in &opts.workload_ports {
-            if !ports.contains(entry) {
-                ports.push(entry.clone());
-            }
-        }
+        let ports = deployment_firewall_ports(opts);
         steps.push(DeployStep::OpenPorts {
             firewall_rule: names.firewall.clone(),
             ports,
