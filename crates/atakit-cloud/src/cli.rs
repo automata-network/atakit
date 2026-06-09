@@ -138,6 +138,14 @@ pub struct DeployArgs {
     /// manifest's minimum. Must be >= the workload minimum.
     #[arg(long, value_name = "SIZE")]
     pub boot_disk_size: Option<String>,
+
+    /// CVM portal /init port. Default: 1024.
+    #[arg(long, value_name = "PORT")]
+    pub init_port: Option<u16>,
+
+    /// CVM portal /status port. Default: 2024.
+    #[arg(long, value_name = "PORT")]
+    pub status_port: Option<u16>,
 }
 
 /// Arguments for `cloud destroy`.

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::CloudError;
 use crate::plan::DiskSpec;
+use crate::state::{PortalPorts, DEFAULT_PORTAL_INIT_PORT, DEFAULT_PORTAL_STATUS_PORT};
 
 /// Result of starting a local VM: pid, the host-side port forwards, and the
 /// per-disk file paths the caller persists to state.
@@ -59,6 +60,7 @@ pub struct StartOptions<'a> {
     pub ovmf: &'a Path,
     pub data_disks: &'a [(DiskSpec, PathBuf)],
     pub metadata: &'a [(String, String)],
+    pub portal_ports: PortalPorts,
     /// Workload-declared `"port/proto"` entries from the manifest. Only TCP
     /// is honored by qemu's user-mode `hostfwd`; non-tcp entries are dropped
     /// with a warning.
@@ -85,7 +87,7 @@ pub fn start_vm(opts: StartOptions<'_>) -> Result<StartedVm, CloudError> {
         message: format!("failed to allocate host ports: {e}"),
     })?;
 
-    let workload_port_map = workload_tcp_port_map(opts.workload_ports);
+    let workload_port_map = workload_tcp_port_map(opts.workload_ports, opts.portal_ports);
 
     let serial_log = opts.instance_dir.join("serial.log");
     let serial_sock = opts.instance_dir.join("serial.sock");
@@ -97,6 +99,7 @@ pub fn start_vm(opts: StartOptions<'_>) -> Result<StartedVm, CloudError> {
         &swtpm_sock,
         opts.data_disks,
         opts.metadata,
+        opts.portal_ports,
         &ports,
         &workload_port_map,
         &serial_log,
@@ -224,6 +227,7 @@ pub fn build_qemu_argv(
     swtpm_sock: &Path,
     data_disks: &[(DiskSpec, PathBuf)],
     metadata: &[(String, String)],
+    portal_ports: PortalPorts,
     ports: &AllocatedPorts,
     workload_port_map: &BTreeMap<u16, u16>,
     serial_log: &Path,
@@ -271,15 +275,16 @@ pub fn build_qemu_argv(
     // predictable curl). No guest:22 forward — interactive access is via
     // the serial chardev socket, not sshd.
     let mut hostfwd = vec![
-        format!("hostfwd=tcp:127.0.0.1:{}-:2024", ports.status),
-        format!("hostfwd=tcp:127.0.0.1:{}-:1024", ports.init),
+        format!(
+            "hostfwd=tcp:127.0.0.1:{}-:{}",
+            ports.status, portal_ports.status
+        ),
+        format!(
+            "hostfwd=tcp:127.0.0.1:{}-:{}",
+            ports.init, portal_ports.init
+        ),
     ];
     for (guest, host) in workload_port_map {
-        // Skip the atakit-reserved ports if the workload happens to also
-        // declare them — the portal forwards already cover those.
-        if *guest == 1024 || *guest == 2024 {
-            continue;
-        }
         hostfwd.push(format!("hostfwd=tcp:127.0.0.1:{host}-:{guest}"));
     }
     args.push("-netdev".into());
@@ -322,7 +327,7 @@ pub fn build_qemu_argv(
 /// Pick the TCP workload ports out of the manifest's `"port/proto"` list and
 /// map each guest port to the same host port (for predictable `curl`). UDP
 /// entries are dropped — qemu user-mode hostfwd only supports TCP.
-fn workload_tcp_port_map(ports: &[String]) -> BTreeMap<u16, u16> {
+fn workload_tcp_port_map(ports: &[String], portal_ports: PortalPorts) -> BTreeMap<u16, u16> {
     let mut out = BTreeMap::new();
     for entry in ports {
         let (port_s, proto) = entry.split_once('/').unwrap_or((entry, "tcp"));
@@ -331,6 +336,13 @@ fn workload_tcp_port_map(ports: &[String]) -> BTreeMap<u16, u16> {
             continue;
         }
         if let Ok(p) = port_s.parse::<u16>() {
+            if p == DEFAULT_PORTAL_INIT_PORT
+                || p == DEFAULT_PORTAL_STATUS_PORT
+                || p == portal_ports.init
+                || p == portal_ports.status
+            {
+                continue;
+            }
             out.insert(p, p);
         }
     }
@@ -356,6 +368,7 @@ mod tests {
             Path::new("/run/swtpm.sock"),
             &[],
             &[],
+            PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
             Path::new("/run/serial.log"),
@@ -385,6 +398,7 @@ mod tests {
             Path::new("/s"),
             &[],
             &[],
+            PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
             Path::new("/l"),
@@ -398,6 +412,30 @@ mod tests {
     }
 
     #[test]
+    fn argv_hostfwds_custom_portal_ports() {
+        let argv = build_qemu_argv(
+            Path::new("/b"),
+            Path::new("/f"),
+            Path::new("/s"),
+            &[],
+            &[],
+            PortalPorts {
+                status: 6024,
+                init: 5024,
+            },
+            &ports(),
+            &BTreeMap::new(),
+            Path::new("/l"),
+            Path::new("/sock"),
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("hostfwd=tcp:127.0.0.1:50001-:6024"));
+        assert!(joined.contains("hostfwd=tcp:127.0.0.1:50002-:5024"));
+        assert!(!joined.contains("-:2024"));
+        assert!(!joined.contains("-:1024"));
+    }
+
+    #[test]
     fn argv_workload_ports_forwarded_same_host() {
         let mut map = BTreeMap::new();
         map.insert(3000_u16, 3000_u16);
@@ -408,6 +446,7 @@ mod tests {
             Path::new("/s"),
             &[],
             &[],
+            PortalPorts::default(),
             &ports(),
             &map,
             Path::new("/l"),
@@ -433,6 +472,7 @@ mod tests {
             Path::new("/s"),
             &[(spec, PathBuf::from("/run/data-secrets.qcow2"))],
             &[],
+            PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
             Path::new("/l"),
@@ -451,6 +491,7 @@ mod tests {
             Path::new("/s"),
             &[],
             &[("k1".into(), "v1".into()), ("k2".into(), "v=2".into())],
+            PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
             Path::new("/l"),
@@ -469,6 +510,7 @@ mod tests {
             Path::new("/s"),
             &[],
             &[],
+            PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
             Path::new("/run/serial.log"),
@@ -486,17 +528,19 @@ mod tests {
 
     #[test]
     fn workload_port_map_drops_udp_and_atakit_ports() {
-        let map = workload_tcp_port_map(&[
-            "3000/tcp".into(),
-            "53/udp".into(),
-            "1024/tcp".into(),
-            "8080".into(),
-        ]);
-        // 53/udp dropped; 1024 kept here (filtered at argv-build time so it
-        // can still surface in summary / state).
+        let map = workload_tcp_port_map(
+            &[
+                "3000/tcp".into(),
+                "53/udp".into(),
+                "1024/tcp".into(),
+                "8080".into(),
+            ],
+            PortalPorts::default(),
+        );
+        // 53/udp and the portal ports are dropped.
         assert!(map.contains_key(&3000));
-        assert!(map.contains_key(&1024));
         assert!(map.contains_key(&8080));
+        assert!(!map.contains_key(&1024));
         assert!(!map.contains_key(&53));
     }
 }

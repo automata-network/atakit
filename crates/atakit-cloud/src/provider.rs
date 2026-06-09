@@ -4,7 +4,7 @@ use crate::config::{CcType, CloudTarget};
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::plan::{DeployPlan, DeployStep, DestroyPlan, DestroyStep, StepResult};
-use crate::state::{DeployState, PersistedInitEnv};
+use crate::state::{DeployState, PersistedInitEnv, PortalPorts};
 
 /// Options for a deploy operation.
 pub struct DeployOptions {
@@ -30,10 +30,30 @@ pub struct DeployOptions {
     pub cc_types: Vec<CcType>,
     /// Host ports from the workload manifest (format: "host:container" or "port").
     pub workload_ports: Vec<String>,
+    pub portal_ports: PortalPorts,
     /// Disks from the workload manifest: (disk_name, index, size_gb).
     pub workload_disks: Vec<(String, u32, u64)>,
     /// Minimum boot/OS disk size in GB. Cloud default if None.
     pub boot_disk_size_gb: Option<u64>,
+}
+
+/// Open the deploy-selected portal ports plus workload-declared ports.
+///
+/// Manifest v2 currently injects the historical portal defaults
+/// (`1024/tcp`, `2024/tcp`) into `firewall_ports`. Drop those entries here
+/// and re-add the deploy-selected ports so overrides do not leave the old
+/// portal ports exposed just because the manifest builder emitted them.
+pub fn deployment_firewall_ports(opts: &DeployOptions) -> Vec<String> {
+    let mut ports = opts.portal_ports.firewall_entries();
+    for entry in &opts.workload_ports {
+        if PortalPorts::is_default_portal_entry(entry) {
+            continue;
+        }
+        if !ports.contains(entry) {
+            ports.push(entry.clone());
+        }
+    }
+    ports
 }
 
 /// Options for a destroy operation.

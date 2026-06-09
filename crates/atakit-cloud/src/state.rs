@@ -9,6 +9,34 @@ use crate::config::PlatformKind;
 use crate::error::CloudError;
 
 const FORMAT_VERSION: u32 = 1;
+pub const DEFAULT_PORTAL_INIT_PORT: u16 = 1024;
+pub const DEFAULT_PORTAL_STATUS_PORT: u16 = 2024;
+
+/// Guest-facing portal ports used by cloud deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalPorts {
+    pub status: u16,
+    pub init: u16,
+}
+
+impl PortalPorts {
+    pub fn firewall_entries(self) -> Vec<String> {
+        vec![format!("{}/tcp", self.status), format!("{}/tcp", self.init)]
+    }
+
+    pub fn is_default_portal_entry(entry: &str) -> bool {
+        matches!(entry, "2024/tcp" | "1024/tcp")
+    }
+}
+
+impl Default for PortalPorts {
+    fn default() -> Self {
+        Self {
+            status: DEFAULT_PORTAL_STATUS_PORT,
+            init: DEFAULT_PORTAL_INIT_PORT,
+        }
+    }
+}
 
 /// Persistent deployment state stored as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +57,8 @@ pub struct DeployState {
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
+    #[serde(default)]
+    pub portal_ports: PortalPorts,
     pub resources: ResourceSet,
 }
 
@@ -209,6 +239,7 @@ pub struct NewDeployParams {
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
+    pub portal_ports: PortalPorts,
     /// Total number of steps in the deployment plan.
     pub total_steps: u32,
 }
@@ -235,6 +266,7 @@ impl DeployState {
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
             init_env: params.init_env,
+            portal_ports: params.portal_ports,
             resources: ResourceSet::default(),
         }
     }
@@ -568,6 +600,7 @@ mod tests {
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.resources.gcp = Some(GcpResources {
@@ -608,6 +641,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();
@@ -632,6 +666,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
+                portal_ports: PortalPorts::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -656,6 +691,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
+                portal_ports: PortalPorts::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -679,6 +715,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();
