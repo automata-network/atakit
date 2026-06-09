@@ -70,10 +70,8 @@ pub fn create_image_archive(
         + dir_size(&tag_dir.join("secure_boot_certs"));
     let handle = progress.create(&format!("Packing {}", image_ref), total_bytes);
 
-    let file = std::fs::File::create(&archive_path).map_err(|e| ImageError::CreateFile {
-        path: archive_path.clone(),
-        source: e,
-    })?;
+    let (file, temp_archive_path) =
+        create_replace_file(&archive_path, &archive_path, "archive output path")?;
 
     // Build manifest.
     let prefix = Path::new(&image_ref.repository);
@@ -114,6 +112,10 @@ pub fn create_image_archive(
         }
     }
 
+    std::fs::rename(&temp_archive_path, &archive_path).map_err(|e| ImageError::CreateFile {
+        path: archive_path.clone(),
+        source: e,
+    })?;
     handle.finish();
     Ok(archive_path)
 }
@@ -244,6 +246,7 @@ pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Resul
                 create_dir_checked(&dest_dir, parent_components, archive_path)?;
             }
 
+            validate_regular_output_path(&target, archive_path, "output file path")?;
             entry.unpack(&target).map_err(|e| ImageError::WriteFile {
                 path: target.clone(),
                 source: e,
@@ -251,7 +254,7 @@ pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Resul
 
             // Compress VHD files to save disk space.
             if target.extension().is_some_and(|e| e == "vhd") {
-                compress_to_zst(&target)?;
+                compress_to_zst(&target, archive_path)?;
             }
         }
     }
@@ -298,6 +301,74 @@ fn create_dir_checked(base: &Path, components: &[&str], archive_path: &Path) -> 
     Ok(current)
 }
 
+/// Validate that an output file either does not exist or is a regular file.
+fn validate_regular_output_path(path: &Path, error_path: &Path, context: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(ImageError::ArchiveInvalid {
+                path: error_path.to_path_buf(),
+                message: format!("symlink in {context}: {}", path.display()),
+            });
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(ImageError::ArchiveInvalid {
+                path: error_path.to_path_buf(),
+                message: format!("non-regular file in {context}: {}", path.display()),
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(ImageError::CreateFile {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Open a temporary file next to `path` for a later atomic replacement.
+fn create_replace_file(
+    path: &Path,
+    error_path: &Path,
+    context: &str,
+) -> Result<(std::fs::File, PathBuf)> {
+    validate_regular_output_path(path, error_path, context)?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
+
+    for attempt in 0..100 {
+        let temp_path = parent.join(format!(".{file_name}.tmp-{}-{attempt}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((file, temp_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(ImageError::CreateFile {
+                    path: temp_path,
+                    source: e,
+                });
+            }
+        }
+    }
+
+    Err(ImageError::CreateFile {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate temporary output file",
+        ),
+    })
+}
+
 /// Validate that a value is safe to use as a single path component.
 ///
 /// Rejects empty strings, path separators, parent/current-dir references,
@@ -336,16 +407,14 @@ fn is_safe_relative_path(path: &Path) -> bool {
 }
 
 /// Compress a file to `.zst` and remove the original.
-fn compress_to_zst(path: &Path) -> Result<()> {
+fn compress_to_zst(path: &Path, archive_path: &Path) -> Result<()> {
     use std::io::{Read, Write};
 
     let zst_path = path.with_extension("vhd.zst");
+    let (out, temp_zst_path) =
+        create_replace_file(&zst_path, archive_path, "compressed output path")?;
     let mut reader = std::fs::File::open(path).map_err(|e| ImageError::ReadFile {
         path: path.to_path_buf(),
-        source: e,
-    })?;
-    let out = std::fs::File::create(&zst_path).map_err(|e| ImageError::CreateFile {
-        path: zst_path.clone(),
         source: e,
     })?;
     let mut encoder = zstd::Encoder::new(out, 0).map_err(ImageError::Io)?;
@@ -359,6 +428,11 @@ fn compress_to_zst(path: &Path) -> Result<()> {
         encoder.write_all(&buf[..n]).map_err(ImageError::Io)?;
     }
     encoder.finish().map_err(ImageError::Io)?;
+
+    std::fs::rename(&temp_zst_path, &zst_path).map_err(|e| ImageError::CreateFile {
+        path: zst_path.clone(),
+        source: e,
+    })?;
 
     std::fs::remove_file(path).map_err(|e| ImageError::Remove {
         path: path.to_path_buf(),
@@ -394,12 +468,7 @@ pub fn read_manifest(archive_path: &Path) -> Result<ImageManifest> {
             })?
             .into_owned();
 
-        // manifest.toml is the second entry (after the directory).
-        if entry_path
-            .file_name()
-            .map(|n| n == "manifest.toml")
-            .unwrap_or(false)
-        {
+        if let Some(prefix) = manifest_path_prefix(&entry_path) {
             let mut content = String::new();
             std::io::Read::read_to_string(&mut entry, &mut content).map_err(|e| {
                 ImageError::ArchiveRead {
@@ -414,6 +483,16 @@ pub fn read_manifest(archive_path: &Path) -> Result<ImageManifest> {
                     reason: e.to_string(),
                 })?;
 
+            if manifest.meta.name != prefix {
+                return Err(ImageError::ArchiveInvalid {
+                    path: archive_path.to_path_buf(),
+                    message: format!(
+                        "manifest path prefix {prefix:?} does not match manifest name {:?}",
+                        manifest.meta.name
+                    ),
+                });
+            }
+
             return Ok(manifest);
         }
     }
@@ -421,6 +500,24 @@ pub fn read_manifest(archive_path: &Path) -> Result<ImageManifest> {
     Err(ImageError::ArchiveMissingManifest {
         path: archive_path.to_path_buf(),
     })
+}
+
+fn manifest_path_prefix(path: &Path) -> Option<String> {
+    use std::path::Component;
+
+    let mut components = path.components();
+    let prefix = match components.next()? {
+        Component::Normal(prefix) => prefix,
+        _ => return None,
+    };
+    let file = match components.next()? {
+        Component::Normal(file) => file,
+        _ => return None,
+    };
+    if components.next().is_some() || file != "manifest.toml" {
+        return None;
+    }
+    prefix.to_str().map(ToOwned::to_owned)
 }
 
 /// Write the tar archive contents (manifest, disk images, certs).
@@ -762,6 +859,43 @@ mod tests {
         assert_eq!(std::fs::read(&imported_cert).unwrap(), b"fake-pk-cert");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_rejects_preexisting_symlink_archive_path() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let tag_dir = tmp.path().join("tag");
+        let disk_dir = tag_dir.join("disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"fake-gcp-image").unwrap();
+
+        let image_ref: ImageRef = "test-repo:v1.0.0".parse().unwrap();
+        let platforms = vec![Platform::Gcp];
+        let out_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let outside = tmp.path().join("outside.atabi");
+        std::fs::write(&outside, b"keep").unwrap();
+        let archive_path = out_dir.join("test-repo-v1.0.0-gcp.atabi");
+        std::os::unix::fs::symlink(&outside, &archive_path).unwrap();
+
+        let err = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &platforms,
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlink in archive output path"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
     /// A raw tar entry for building test archives that bypass the tar crate's
     /// path validation.
     enum RawEntry<'a> {
@@ -778,6 +912,16 @@ mod tests {
     /// validation, allowing us to test our validation layer.
     fn build_malicious_archive(
         dir: &Path,
+        name: &str,
+        version: &str,
+        extra_entries: &[RawEntry],
+    ) -> PathBuf {
+        build_malicious_archive_with_prefix(dir, name, name, version, extra_entries)
+    }
+
+    fn build_malicious_archive_with_prefix(
+        dir: &Path,
+        manifest_prefix: &str,
         name: &str,
         version: &str,
         extra_entries: &[RawEntry],
@@ -840,7 +984,13 @@ mod tests {
         }
 
         // Top-level directory.
-        write_raw_entry(&mut tar_bytes, &format!("{name}/"), &[], b'5', "");
+        write_raw_entry(
+            &mut tar_bytes,
+            &format!("{manifest_prefix}/"),
+            &[],
+            b'5',
+            "",
+        );
 
         // Manifest entry.
         let manifest = format!(
@@ -848,7 +998,7 @@ mod tests {
         );
         write_raw_entry(
             &mut tar_bytes,
-            &format!("{name}/manifest.toml"),
+            &format!("{manifest_prefix}/manifest.toml"),
             manifest.as_bytes(),
             b'0',
             "",
@@ -882,11 +1032,11 @@ mod tests {
     #[test]
     fn import_rejects_traversal_in_manifest_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let archive = build_malicious_archive(tmp.path(), "../evil", "v1", &[]);
+        let archive = build_malicious_archive_with_prefix(tmp.path(), "repo", "../evil", "v1", &[]);
         let store_dir = tmp.path().join("store");
         let err = import_image_archive(&archive, &store_dir).unwrap_err();
         assert!(
-            err.to_string().contains("unsafe path characters"),
+            err.to_string().contains("does not match manifest name"),
             "unexpected error: {err}"
         );
     }
@@ -894,11 +1044,11 @@ mod tests {
     #[test]
     fn import_rejects_slash_in_manifest_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let archive = build_malicious_archive(tmp.path(), "foo/bar", "v1", &[]);
+        let archive = build_malicious_archive_with_prefix(tmp.path(), "repo", "foo/bar", "v1", &[]);
         let store_dir = tmp.path().join("store");
         let err = import_image_archive(&archive, &store_dir).unwrap_err();
         assert!(
-            err.to_string().contains("unsafe path characters"),
+            err.to_string().contains("does not match manifest name"),
             "unexpected error: {err}"
         );
     }
@@ -1000,6 +1150,74 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_preexisting_symlink_output_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside-file");
+        std::fs::write(&outside, b"keep").unwrap();
+
+        let archive = build_malicious_archive(
+            tmp.path(),
+            "repo",
+            "v1",
+            &[RawEntry::File("repo/disk_images/gcp_disk.tar.gz", b"data")],
+        );
+
+        let store_dir = tmp.path().join("store");
+        let disk_dir = store_dir.join("repo/v1/disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, disk_dir.join("gcp_disk.tar.gz")).unwrap();
+
+        let err = import_image_archive(&archive, &store_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink in output file path"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_preexisting_symlink_compressed_output_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside-zst");
+        std::fs::write(&outside, b"keep").unwrap();
+
+        let archive = build_malicious_archive(
+            tmp.path(),
+            "repo",
+            "v1",
+            &[RawEntry::File("repo/disk_images/gcp_disk.vhd", b"data")],
+        );
+
+        let store_dir = tmp.path().join("store");
+        let disk_dir = store_dir.join("repo/v1/disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, disk_dir.join("gcp_disk.vhd.zst")).unwrap();
+
+        let err = import_image_archive(&archive, &store_dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("symlink in compressed output path"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn read_manifest_rejects_prefix_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = build_malicious_archive_with_prefix(tmp.path(), "other", "repo", "v1", &[]);
+
+        let err = read_manifest(&archive).unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not match manifest name"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn import_rejects_empty_manifest_name() {
         let err =
@@ -1016,5 +1234,18 @@ mod tests {
         assert!(!is_safe_relative_path(Path::new("../evil")));
         assert!(!is_safe_relative_path(Path::new("disk_images/../../evil")));
         assert!(!is_safe_relative_path(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn manifest_path_prefix_requires_top_level_manifest() {
+        assert_eq!(
+            manifest_path_prefix(Path::new("repo/manifest.toml")),
+            Some("repo".to_string())
+        );
+        assert_eq!(manifest_path_prefix(Path::new("manifest.toml")), None);
+        assert_eq!(
+            manifest_path_prefix(Path::new("repo/nested/manifest.toml")),
+            None
+        );
     }
 }
