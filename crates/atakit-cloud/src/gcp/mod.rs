@@ -9,7 +9,7 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::ResourceNames;
 use crate::plan::*;
-use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
+use crate::provider::{deployment_firewall_ports, CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
 
 /// GCP cloud provider.
@@ -68,12 +68,7 @@ impl CloudProvider for GcpProvider {
         // `fetch-platform-measurements` and image-only deploys (gcloud
         // `--rules=` rejects an empty list).
         // workload_ports are already resolved "port/proto" strings from the manifest.
-        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
-        for entry in &opts.workload_ports {
-            if !ports.contains(entry) {
-                ports.push(entry.clone());
-            }
-        }
+        let ports = deployment_firewall_ports(opts);
         steps.push(DeployStep::OpenPorts {
             firewall_rule: names.firewall.clone(),
             ports,
@@ -251,12 +246,13 @@ impl CloudProvider for GcpProvider {
                 // Handled by the CLI layer (calls init::post_init).
             }
 
-            // Azure / AWS steps - should not be executed by GCP provider.
+            // Azure / AWS / QEMU steps - should not be executed by GCP provider.
             DeployStep::CreateResourceGroup { .. }
             | DeployStep::UploadImageAzure { .. }
             | DeployStep::CreateInstanceAzure { .. }
             | DeployStep::UploadImageAws { .. }
-            | DeployStep::CreateInstanceAws { .. } => {
+            | DeployStep::CreateInstanceAws { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
                     message: "non-GCP step executed by GCP provider".to_string(),
                 });
@@ -344,13 +340,15 @@ impl CloudProvider for GcpProvider {
             }
             DestroyStep::DeleteBucket { name } => image::delete_bucket(name, runner).await,
 
-            // Azure / AWS steps.
+            // Azure / AWS / QEMU steps.
             DestroyStep::DeleteResourceGroup { .. }
             | DestroyStep::DeleteImageVersion { .. }
             | DestroyStep::DeleteImageDefinition { .. }
             | DestroyStep::DeleteSecurityGroup { .. }
             | DestroyStep::DeleteAmi { .. }
-            | DestroyStep::DeleteS3Bucket { .. } => Err(CloudError::State {
+            | DestroyStep::DeleteS3Bucket { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
                 message: "non-GCP destroy step executed by GCP provider".to_string(),
             }),
         }

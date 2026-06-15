@@ -78,7 +78,6 @@ rpc_url             = "https://1rpc.io/hoodi"
 session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
-registration        = "optional"
 expire_offset       = 3600
 
 # secp256k1 private keys, read from the files created in step 1.
@@ -100,9 +99,10 @@ region   = "asia-southeast1-b"
 
 # Defaults shared by every target, so targets stay terse.
 [cloud.defaults]
-chain      = "hoodi"
-owner_key  = "owner"
-gas_wallet = "gas"
+chain        = "hoodi"
+registration = "optional"
+owner_key    = "owner"
+gas_wallet   = "gas"
 
 # A deploy target: a machine type on the provider above.
 [cloud.targets.gcp-tdx]
@@ -218,6 +218,57 @@ atakit cloud serial my-instance --target my-gcp
 atakit cloud destroy my-instance --target my-gcp
 ```
 
+### Local (QEMU) deploy
+
+For offline iteration, `atakit cloud deploy` can target a local QEMU VM via
+the `qemu` platform. This is a **functional harness**, not a real TEE: boot
+is measured into a software TPM (swtpm) and the portal `/init` → workload
+flow runs end-to-end against `localhost`, but there is no genuine TDX/SEV
+quote — so on-chain registration defaults to `off` when the qemu target has
+no chain configured.
+
+Requirements on the host:
+
+- `qemu-system-x86_64`, `qemu-img`, `swtpm` on `PATH`
+- `/dev/kvm` accessible
+- A TPM-enabled OVMF (ie, compiled with `TPM2_ENABLE=TRUE` and `TPM2_CONFIG_ENABLE=TRUE`)
+- `socat` (only needed for `atakit cloud ssh` to attach to the serial console)
+
+Minimal config:
+
+```toml
+[cloud.providers.qemu]
+platform = "qemu"
+uefi     = "~/.local/share/atakit/firmware/ovmf.fd"
+
+[cloud.targets.qemu-local]
+provider = "qemu"
+image    = "automata-linux:v0.1.6"   # uses qemu_disk.qcow2 from the image store
+```
+
+Then:
+
+```sh
+atakit image pull automata-linux:v0.1.6 qemu
+atakit cloud deploy my-service:v0.0.1 --target qemu-local
+
+atakit cloud ls                              # qemu deployments listed alongside cloud
+atakit cloud serial my-service-qemu-local    # tails serial.log (read-only)
+atakit cloud ssh    my-service-qemu-local    # interactive serial console (Ctrl-] to detach)
+atakit cloud destroy my-service-qemu-local   # stops qemu, removes overlays
+```
+
+`vmtype` is ignored for qemu (fixed 2 vCPU / 4 GiB). Data disks declared in
+the workload manifest become per-instance qcow2 overlays attached via virtio
+with `serial=<device_name>`, matching the cloud agent's discovery convention.
+Workload ports are forwarded guest→same host port (so `curl localhost:<port>`
+just works); the portal status/init ports are forwarded to ephemeral host
+ports to avoid collisions between instances.
+
+`cloud ssh` on qemu doesn't run a real ssh client — there's no sshd in the
+guest — it `socat`s into a unix socket wired to the VM's serial chardev for
+an interactive console.
+
 ## Configuration
 
 ### Operator config (`config.toml`)
@@ -239,7 +290,6 @@ rpc_url             = "https://1rpc.io/hoodi"
 session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
-registration        = "optional"   # "required" | "optional" | "off"
 expire_offset       = 3600
 
 # ─── Keys ─────────────────────────────────────────────────────────────
@@ -287,6 +337,12 @@ owner_key = "owner"
 # ─── Cloud ────────────────────────────────────────────────────────────
 # Providers hold the account + region; targets reference a provider, chain,
 # and keys by name. [cloud.defaults] fills in fields a target omits.
+# Active registration requires owner_key, but it may be provisioned or
+# self_generated when an ephemeral owner is acceptable. gas_wallet and
+# sp1_payer identify keys the CVM uses for relay/prover submissions: they may
+# be provisioned keys supplied by the relay owner, or self_generated keys whose
+# public keys are accepted or registered by the relay. registration = "off"
+# can omit chain and keys entirely.
 [cloud.providers.gcp]
 platform = "gcp"
 project  = "my-gcp-project"
@@ -298,9 +354,10 @@ subscription = "your-subscription-id"
 region       = "eastus"
 
 [cloud.defaults]
-chain      = "hoodi"
-owner_key  = "owner"
-gas_wallet = "gas"
+chain        = "hoodi"
+registration = "optional"           # "required" | "optional" | "off"
+owner_key    = "owner"
+gas_wallet   = "gas"
 
 [cloud.targets.gcp-tdx]
 provider = "gcp"

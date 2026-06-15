@@ -75,6 +75,14 @@ pub async fn run_upload(
         PlatformKind::Aws => {
             // AWS providers need only a region, which is always present.
         }
+        PlatformKind::Qemu => {
+            // Local qemu has no cloud-side image. The qcow2 in the image
+            // store is consumed directly at deploy time.
+            bail!(
+                "`cloud image upload` is not supported for qemu providers \
+                 (`atakit image pull <ref> qemu` is the local equivalent)"
+            );
+        }
     }
 
     // 2. Resolve image source (before cc_types, so .atabi imports get their resolved ref).

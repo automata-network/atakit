@@ -26,18 +26,6 @@
 # # messages: registerCvm in the CVM, plus the operator-side
 # # registerWorkload / deactivateWorkload / registerBaseImage flows.
 # # `--expire-offset` on each CLI command overrides per call.
-# registration = "required"
-# # ^ does the workload wait for on-chain registration before serving?
-# # "required" — submit registerCvm and block HTTP serving until the
-# #              chain confirms the session is active. Use in production
-# #              when no traffic should reach an unregistered workload.
-# # "optional" — submit registerCvm but serve HTTP immediately; chain
-# #              registration proceeds in the background and `chain.status`
-# #              advances independently. Use when RPC flakiness or slow
-# #              confirmations shouldn't keep the workload offline.
-# # "off"      — skip the on-chain side entirely (no submission). Useful
-# #              for debugging or running fully off-chain.
-# # Omit the field to fall back to the portal default ("required").
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #
@@ -155,6 +143,18 @@
 # platform = "aws"
 # region = "us-east-2"          # SEV-SNP regions: us-east-2, eu-west-1
 
+# Local QEMU functional harness (not a real TEE). Boot is measured into
+# swtpm and the portal /init flow runs end-to-end against localhost, but
+# there is no genuine TDX/SEV quote. On-chain registration defaults to
+# "off" when the qemu target has no chain configured.
+# `uefi` is the path to a TPM-measuring OVMF firmware blob. Stock distro
+# OVMF lacks the right build; see the project README for the download.
+# Override per-target with `[cloud.targets.<name>] uefi = "..."`, or
+# per-run with `ATAKIT_QEMU_UEFI`.
+# [cloud.providers.qemu]
+# platform = "qemu"
+# uefi = "~/.local/share/atakit/firmware/ovmf.fd"
+
 # Image library: CC capabilities for image registration.
 # Simple form:   "name:tag" = ["SEV_SNP", "TDX"]
 # Extended form:  [cloud.images."name:tag"]
@@ -162,14 +162,29 @@
 # [cloud.images]
 # "my-baseimage:v0.1.0" = ["SEV_SNP", "TDX"]
 
-# Cloud deployment targets. Each target references a chain, owner key,
-# and gas wallet by name.
+# Cloud deployment targets. Each target references a provider, owner key,
+# gas wallet, and optionally a chain by name.
+#
+# registration controls whether /init submits on-chain CVM registration:
+# "required" — submit registerCvm and block serving until chain confirms.
+# "optional" — submit registerCvm but serve immediately.
+# "off"      — skip chain interaction; `chain` may be omitted.
+# Omit the field to fall back to the portal default ("required") when a
+# chain is configured.
+#
+# Active registration requires `owner_key`, but it may be provisioned or
+# `self_generated` when an ephemeral owner is acceptable. `gas_wallet` and
+# `sp1_payer` identify the keys the CVM uses for relay/prover submissions:
+# they may be provisioned keys supplied by the relay owner, or self-generated
+# keys whose public keys are accepted or registered by the relay. With
+# registration = "off", chain/owner_key/gas_wallet/sp1_payer may be omitted.
 # [cloud.targets.my-gcp-tdx]
 # provider = "my-gcp"
 # vmtype = "c3-standard-4"        # cc_type inferred as TDX
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
+# registration = "required"
 # owner_key = "owner"
 # gas_wallet = "gas"
 
@@ -179,6 +194,7 @@
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
+# registration = "optional"
 # owner_key = "owner"
 # gas_wallet = "gas"
 
@@ -188,5 +204,14 @@
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
+# registration = "optional"
 # owner_key = "owner"
 # gas_wallet = "gas"
+
+# [cloud.targets.qemu-local]
+# provider = "qemu"               # vmtype is ignored (fixed 2 vCPU / 4 GiB)
+# image = "my-baseimage:v0.1.0"   # consumes qemu_disk.qcow2 from the image store
+# boot_disk_size = "10GB"         # OS disk overlay size (default 4GB)
+# uefi = "~/.local/share/atakit/firmware/ovmf.fd"  # optional override of [cloud.providers.qemu].uefi
+# chain/owner_key/gas_wallet may be omitted — qemu deploys with no chain
+# configured synthesize a local-only init payload with registration="off".

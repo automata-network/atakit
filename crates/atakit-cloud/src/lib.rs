@@ -9,6 +9,7 @@ pub mod init;
 pub mod naming;
 pub mod plan;
 pub mod provider;
+pub mod qemu;
 pub mod state;
 
 #[cfg(feature = "cli")]
@@ -28,5 +29,6 @@ pub use plan::{
 pub use provider::{CloudProvider, DeployOptions, DestroyOptions};
 pub use state::{
     AwsResources, AzureResources, DeployState, DeployStatus, GcpResources, NewDeployParams,
-    PersistedInitEnv, ResourceSet,
+    PersistedInitEnv, PortalPorts, QemuResources, ResourceSet, DEFAULT_PORTAL_INIT_PORT,
+    DEFAULT_PORTAL_STATUS_PORT,
 };

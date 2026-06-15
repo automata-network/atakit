@@ -10,7 +10,7 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::naming::AzureResourceNames;
 use crate::plan::*;
-use crate::provider::{CloudProvider, DeployOptions, DestroyOptions};
+use crate::provider::{deployment_firewall_ports, CloudProvider, DeployOptions, DestroyOptions};
 use crate::state::DeployState;
 
 /// Decompress a `.zst` file to a destination path.
@@ -108,12 +108,7 @@ impl CloudProvider for AzureProvider {
         // 1024 workload init), plus workload ports. Skipping these breaks
         // `fetch-platform-measurements` and image-only deploys.
         // workload_ports are already resolved "port/proto" strings.
-        let mut ports = vec!["2024/tcp".to_string(), "1024/tcp".to_string()];
-        for entry in &opts.workload_ports {
-            if !ports.contains(entry) {
-                ports.push(entry.clone());
-            }
-        }
+        let ports = deployment_firewall_ports(opts);
         steps.push(DeployStep::OpenPorts {
             firewall_rule: names.nsg.clone(),
             ports,
@@ -508,11 +503,12 @@ impl CloudProvider for AzureProvider {
                 // Handled by CLI layer.
             }
 
-            // GCP / AWS steps - should not be executed by Azure provider.
+            // GCP / AWS / QEMU steps - should not be executed by Azure provider.
             DeployStep::UploadImage { .. }
             | DeployStep::CreateInstance { .. }
             | DeployStep::UploadImageAws { .. }
-            | DeployStep::CreateInstanceAws { .. } => {
+            | DeployStep::CreateInstanceAws { .. }
+            | DeployStep::StartLocalVm { .. } => {
                 return Err(CloudError::State {
                     message: "non-Azure step executed by Azure provider".to_string(),
                 });
@@ -628,13 +624,15 @@ impl CloudProvider for AzureProvider {
             DestroyStep::DeleteResourceGroup { name } => {
                 instance::delete_resource_group(&self.subscription, name, runner).await
             }
-            // GCP / AWS steps.
+            // GCP / AWS / QEMU steps.
             DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
             | DestroyStep::DeleteFirewall { .. }
             | DestroyStep::DeleteSecurityGroup { .. }
             | DestroyStep::DeleteAmi { .. }
-            | DestroyStep::DeleteS3Bucket { .. } => Err(CloudError::State {
+            | DestroyStep::DeleteS3Bucket { .. }
+            | DestroyStep::StopLocalVm { .. }
+            | DestroyStep::RemoveLocalInstanceDir { .. } => Err(CloudError::State {
                 message: "non-Azure destroy step executed by Azure provider".to_string(),
             }),
         }
@@ -761,14 +759,17 @@ mod tests {
         CloudTarget {
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
+            uefi: None,
             image: Some("test-image:v1".to_string()),
             cc_type: None,
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
             chain: Some("testnet".to_string()),
+            registration: None,
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
+            sp1_payer: None,
         }
     }
 
@@ -790,6 +791,7 @@ mod tests {
             skip_init: true,
             cc_types: vec![CcType::SevSnp],
             workload_ports: vec![],
+            portal_ports: Default::default(),
             workload_disks: vec![],
             boot_disk_size_gb: None,
         }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,34 @@ use crate::config::PlatformKind;
 use crate::error::CloudError;
 
 const FORMAT_VERSION: u32 = 1;
+pub const DEFAULT_PORTAL_INIT_PORT: u16 = 1024;
+pub const DEFAULT_PORTAL_STATUS_PORT: u16 = 2024;
+
+/// Guest-facing portal ports used by cloud deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalPorts {
+    pub status: u16,
+    pub init: u16,
+}
+
+impl PortalPorts {
+    pub fn firewall_entries(self) -> Vec<String> {
+        vec![format!("{}/tcp", self.status), format!("{}/tcp", self.init)]
+    }
+
+    pub fn is_default_portal_entry(entry: &str) -> bool {
+        matches!(entry, "2024/tcp" | "1024/tcp")
+    }
+}
+
+impl Default for PortalPorts {
+    fn default() -> Self {
+        Self {
+            status: DEFAULT_PORTAL_STATUS_PORT,
+            init: DEFAULT_PORTAL_INIT_PORT,
+        }
+    }
+}
 
 /// Persistent deployment state stored as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +57,8 @@ pub struct DeployState {
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
+    #[serde(default)]
+    pub portal_ports: PortalPorts,
     pub resources: ResourceSet,
 }
 
@@ -49,6 +80,10 @@ pub struct PersistedInitEnv {
     pub chain: String,
     pub owner_key: String,
     pub gas_wallet: String,
+    /// Optional SP1 prover-network key name. `#[serde(default)]` so deploy
+    /// states written before this field existed still load (as `None`).
+    #[serde(default)]
+    pub sp1_payer: Option<String>,
 }
 
 /// Cloud provider resources tracked in state.
@@ -60,6 +95,49 @@ pub struct ResourceSet {
     pub azure: Option<AzureResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qemu: Option<QemuResources>,
+}
+
+/// Local QEMU-specific resource tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QemuResources {
+    /// Per-instance directory (overlays + serial log + swtpm state).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_dir: String,
+    /// PID of the running `qemu-system-x86_64` process. 0 until the
+    /// `StartLocalVm` step records it.
+    #[serde(default)]
+    pub pid: u32,
+    /// Absolute path to the qcow2 image the boot overlay is backed by
+    /// (typically `<image_store>/.../qemu_disk.qcow2`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_disk: String,
+    /// Absolute path to the per-instance boot overlay (qcow2).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_overlay: String,
+    /// Absolute paths of per-instance data-disk qcow2 files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_disks: Vec<String>,
+    /// Host port forwarded to guest port 2024 (portal status endpoint).
+    #[serde(default)]
+    pub host_status_port: u16,
+    /// Host port forwarded to guest port 1024 (portal init endpoint).
+    #[serde(default)]
+    pub host_init_port: u16,
+    /// Path to the unix-socket chardev that `-serial chardev:ser` is wired
+    /// to. `cloud ssh` socats into this for an interactive serial console;
+    /// `cloud serial` keeps tailing the chardev's `logfile=` (`serial.log`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub serial_sock: String,
+    /// Guest port → host port for workload-declared TCP ports.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workload_port_map: BTreeMap<u16, u16>,
+    /// Address the operator can reach the VM at — always `127.0.0.1` for
+    /// QEMU; stored explicitly so `status` / `list` can read it uniformly
+    /// with the cloud platforms.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_ip: String,
 }
 
 /// GCP-specific resource tracking.
@@ -161,6 +239,7 @@ pub struct NewDeployParams {
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
+    pub portal_ports: PortalPorts,
     /// Total number of steps in the deployment plan.
     pub total_steps: u32,
 }
@@ -187,6 +266,7 @@ impl DeployState {
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
             init_env: params.init_env,
+            portal_ports: params.portal_ports,
             resources: ResourceSet::default(),
         }
     }
@@ -270,13 +350,56 @@ impl DeployState {
 
     /// Apply resource updates from a completed step.
     pub fn apply_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
-        // Route to the correct platform resource set.
-        if self.resources.azure.is_some() {
+        // Route to the correct platform resource set. Qemu is checked first
+        // because cloud arms use the {gcp,azure,aws} fields, all of which are
+        // None on qemu deployments.
+        if self.resources.qemu.is_some() {
+            self.apply_qemu_resource_updates(updates);
+        } else if self.resources.azure.is_some() {
             self.apply_azure_resource_updates(updates);
         } else if self.resources.aws.is_some() {
             self.apply_aws_resource_updates(updates);
         } else {
             self.apply_gcp_resource_updates(updates);
+        }
+    }
+
+    fn apply_qemu_resource_updates(&mut self, updates: &crate::plan::ResourceUpdates) {
+        let q = self
+            .resources
+            .qemu
+            .get_or_insert_with(QemuResources::default);
+        if let Some(ref dir) = updates.qemu_instance_dir {
+            q.instance_dir = dir.clone();
+        }
+        if let Some(pid) = updates.qemu_pid {
+            q.pid = pid;
+        }
+        if let Some(ref p) = updates.qemu_base_disk {
+            q.base_disk = p.clone();
+        }
+        if let Some(ref p) = updates.qemu_boot_overlay {
+            q.boot_overlay = p.clone();
+        }
+        if !updates.disks.is_empty() {
+            q.data_disks.extend(updates.disks.iter().cloned());
+        }
+        if let Some(p) = updates.qemu_host_status_port {
+            q.host_status_port = p;
+        }
+        if let Some(p) = updates.qemu_host_init_port {
+            q.host_init_port = p;
+        }
+        if let Some(ref s) = updates.qemu_serial_sock {
+            q.serial_sock = s.clone();
+        }
+        if !updates.qemu_workload_port_map.is_empty() {
+            for (g, h) in &updates.qemu_workload_port_map {
+                q.workload_port_map.insert(*g, *h);
+            }
+        }
+        if let Some(ref ip) = updates.external_ip {
+            q.external_ip = ip.clone();
         }
     }
 
@@ -477,6 +600,7 @@ mod tests {
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.resources.gcp = Some(GcpResources {
@@ -517,6 +641,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();
@@ -541,6 +666,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
+                portal_ports: PortalPorts::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -565,6 +691,7 @@ mod tests {
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
+                portal_ports: PortalPorts::default(),
                 total_steps: 7,
             });
             state.save(dir.path()).unwrap();
@@ -588,6 +715,7 @@ mod tests {
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
             total_steps: 7,
         });
         state.save(dir.path()).unwrap();

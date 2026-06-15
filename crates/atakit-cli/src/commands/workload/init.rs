@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
-use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig};
+use atakit_cloud::init::{self, InitConfig};
 use atakit_core::Env;
 use atakit_workload::cli::InitArgs;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
-use crate::commands::cloud::{resolve_unmeasured_tar, resolve_workload};
-use crate::config::{Config, KeyMode};
+use crate::commands::cloud::{
+    init_chain_from_config, init_key_from_config, registration_is_off, resolve_unmeasured_tar,
+    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
+};
+use crate::config::Config;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 1. Parse address into (host, init_port). Default port 1024; status = init + 1000.
@@ -38,44 +41,66 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     // 4. Resolve init env. No target available, so fall back to [cloud.defaults] only.
     let defaults = &config.cloud.defaults;
-    let chain_name = args
-        .chain
-        .clone()
-        .or_else(|| defaults.chain.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!("chain required: pass --chain or set [cloud.defaults] chain")
-        })?;
+    let chain_name = args.chain.clone().or_else(|| defaults.chain.clone());
     let owner_key_name = args
         .owner_key
         .clone()
-        .or_else(|| defaults.owner_key.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "owner key required: pass --owner-key or set [cloud.defaults] owner_key"
-            )
-        })?;
+        .or_else(|| defaults.owner_key.clone());
     let gas_wallet_name = args
         .gas_wallet
         .clone()
-        .or_else(|| defaults.gas_wallet.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "gas wallet required: pass --gas-wallet or set [cloud.defaults] gas_wallet"
-            )
-        })?;
+        .or_else(|| defaults.gas_wallet.clone());
 
-    let chain = config
-        .chains
-        .get(&chain_name)
-        .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
-    let owner_key_spec = config
-        .keys
-        .get(&owner_key_name)
-        .ok_or_else(|| anyhow::anyhow!("key '{owner_key_name}' not found in [keys]"))?;
-    let gas_wallet_spec = config
-        .keys
-        .get(&gas_wallet_name)
-        .ok_or_else(|| anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]"))?;
+    let registration = defaults.registration.as_deref();
+    let init_chain = match chain_name.as_deref() {
+        Some(name) => match config.chains.get(name) {
+            Some(chain) => init_chain_from_config(name, chain, registration).await?,
+            None if registration_is_off(registration) => synthesize_off_init_chain(),
+            None => bail!("chain '{name}' not found in [chains]"),
+        },
+        None if registration_is_off(registration) => synthesize_off_init_chain(),
+        None => {
+            bail!(
+                "chain required: pass --chain or set [cloud.defaults] chain \
+                 (or set [cloud.defaults] registration = \"off\" to disable on-chain registration)"
+            )
+        }
+    };
+    let registration_off = registration_is_off(registration);
+    let owner_init = match owner_key_name.as_deref() {
+        Some(name) => match config.keys.get(name) {
+            Some(spec) => init_key_from_config(name, spec, false)?,
+            None if registration_off => synthesize_self_generated_key(),
+            None => bail!("key '{name}' not found in [keys]"),
+        },
+        None if registration_off => synthesize_self_generated_key(),
+        None => bail!("owner key required: pass --owner-key or set [cloud.defaults] owner_key"),
+    };
+    let gas_init = match gas_wallet_name.as_deref() {
+        Some(name) => match config.keys.get(name) {
+            Some(spec) => init_key_from_config(name, spec, false)?,
+            None if registration_off => synthesize_self_generated_key(),
+            None => bail!("key '{name}' not found in [keys]"),
+        },
+        None => synthesize_self_generated_key(),
+    };
+    let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
+    // SP1 prover-network key: `[cloud.defaults] sp1_payer` if set, else default
+    // to the gas-wallet key. Missing gas/sp1 synthesizes an ephemeral
+    // self-generated key; configured provisioned keys are also valid.
+    let sp1_payer_name = defaults
+        .sp1_payer
+        .clone()
+        .or_else(|| gas_wallet_name.clone());
+    let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
+    let sp1_init = match sp1_payer_name.as_deref() {
+        Some(name) => match config.keys.get(name) {
+            Some(spec) => init_key_from_config(name, spec, false)?,
+            None if registration_off => synthesize_self_generated_key(),
+            None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
+        },
+        None => synthesize_self_generated_key(),
+    };
 
     // Validate operator-supplied disk passphrases against what the workload
     // manifest declares (unknown / orphan / missing disks).
@@ -88,33 +113,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     let init_config = InitConfig {
         platform: args.platform.clone(),
-        chain: InitChainConfig {
-            rpc_url: chain.rpc_url.clone(),
-            session_registry: chain.session_registry.clone(),
-            workload_registry: chain.workload_registry.clone().ok_or_else(|| {
-                anyhow::anyhow!("workload_registry required in chain '{chain_name}'")
-            })?,
-            base_image_registry: chain.base_image_registry.clone().ok_or_else(|| {
-                anyhow::anyhow!("base_image_registry required in chain '{chain_name}'")
-            })?,
-            expire_offset: chain.expire_offset,
-            registration: chain.registration.clone(),
-            chain_id: chain.chain_id,
-        },
-        owner_key: InitKeyConfig {
-            mode: owner_key_spec.mode.to_string(),
-            key_type: owner_key_spec.key_type.to_string(),
-            private_key: Some(owner_key_spec.resolve(&owner_key_name)?),
-        },
-        gas_wallet: InitKeyConfig {
-            mode: gas_wallet_spec.mode.to_string(),
-            key_type: gas_wallet_spec.key_type.to_string(),
-            private_key: if gas_wallet_spec.mode == KeyMode::Provisioned {
-                Some(gas_wallet_spec.resolve(&gas_wallet_name)?)
-            } else {
-                None
-            },
-        },
+        chain: init_chain,
+        owner_key: owner_init,
+        gas_wallet: gas_init,
+        sp1_payer: sp1_init,
         disks: disk_passphrases,
     };
 

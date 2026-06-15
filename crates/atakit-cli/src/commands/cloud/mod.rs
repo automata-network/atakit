@@ -10,21 +10,28 @@ pub mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use alloy_ext::core::primitives::Address;
+use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
+use atakit_cloud::init::{InitChainConfig, InitKeyConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
-    AzureResourceNames, CloudTarget, PersistedInitEnv, PlatformKind, ProcessRunner,
+    AzureResourceNames, CloudTarget, DeployState, PersistedInitEnv, PlatformKind, ProcessRunner,
 };
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
+use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
+
+use crate::config::{ChainConfig, KeyMode, KeySpec};
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -35,34 +42,235 @@ pub struct InitEnvResolver<'a> {
 }
 
 impl<'a> InitEnvResolver<'a> {
-    pub fn chain(&self) -> String {
+    pub fn chain_optional(&self) -> Option<String> {
         self.cli_chain
             .map(String::from)
             .or_else(|| self.target.chain.clone())
-            .expect("chain must be set on target or via --chain")
+            .filter(|value| !value.is_empty())
     }
 
-    pub fn owner_key(&self) -> String {
-        self.cli_owner_key
-            .map(String::from)
-            .or_else(|| self.target.owner_key.clone())
-            .expect("owner_key must be set on target or via --owner-key")
+    /// Optional SP1 prover-network key name. Read from the target (already
+    /// merged with `[cloud.defaults] sp1_payer` via `apply_defaults`); `None`
+    /// when no separate SP1 key is configured (portal reuses gas_wallet).
+    pub fn sp1_payer(&self) -> Option<String> {
+        self.target.sp1_payer.clone()
     }
 
-    pub fn gas_wallet(&self) -> String {
-        self.cli_gas_wallet
-            .map(String::from)
-            .or_else(|| self.target.gas_wallet.clone())
-            .expect("gas_wallet must be set on target or via --gas-wallet")
-    }
-
-    pub fn build(&self) -> PersistedInitEnv {
+    /// Resolve persisted init references without panicking on missing fields.
+    /// Used when no `/init` will be sent or qemu zero-config deploy is allowed.
+    pub fn build_optional(&self) -> PersistedInitEnv {
         PersistedInitEnv {
-            chain: self.chain(),
-            owner_key: self.owner_key(),
-            gas_wallet: self.gas_wallet(),
+            chain: self.chain_optional().unwrap_or_default(),
+            owner_key: self
+                .cli_owner_key
+                .map(String::from)
+                .or_else(|| self.target.owner_key.clone())
+                .unwrap_or_default(),
+            gas_wallet: self
+                .cli_gas_wallet
+                .map(String::from)
+                .or_else(|| self.target.gas_wallet.clone())
+                .unwrap_or_default(),
+            sp1_payer: self.sp1_payer(),
         }
     }
+}
+
+/// Zero-address placeholder used when the init chain is explicitly off.
+/// The portal never submits anything when registration is "off", so the
+/// value is only a structural placeholder for the JSON shape.
+pub(crate) const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
+
+/// Build an off-chain InitChainConfig: registration "off", placeholder
+/// addresses, no RPC. The portal accepts a chain section with no `rpc_url`
+/// when `registration = "off"`.
+pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
+    InitChainConfig {
+        rpc_url: String::new(),
+        session_registry: ZERO_ADDR.to_string(),
+        workload_registry: ZERO_ADDR.to_string(),
+        base_image_registry: ZERO_ADDR.to_string(),
+        expire_offset: 3600,
+        registration: Some("off".to_string()),
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
+    registration == Some("off")
+}
+
+pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
+    InitKeyConfig {
+        mode: "self_generated".to_string(),
+        key_type: "es256k".to_string(),
+        private_key: None,
+    }
+}
+
+pub(crate) fn init_key_from_config(
+    key_name: &str,
+    spec: &KeySpec,
+    require_private_key: bool,
+) -> Result<InitKeyConfig> {
+    Ok(InitKeyConfig {
+        mode: spec.mode.to_string(),
+        key_type: spec.key_type.to_string(),
+        private_key: if require_private_key || spec.mode == KeyMode::Provisioned {
+            Some(spec.resolve(key_name)?)
+        } else {
+            None
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ChainRegistries {
+    workload_registry: String,
+    base_image_registry: String,
+}
+
+pub(crate) async fn init_chain_from_config(
+    chain_name: &str,
+    chain: &ChainConfig,
+    registration: Option<&str>,
+) -> Result<InitChainConfig> {
+    let registries = if registration_is_off(registration) {
+        None
+    } else {
+        Some(derive_registries_from_session(chain_name, chain).await?)
+    };
+    build_init_chain_config(chain_name, chain, registration, registries.as_ref())
+}
+
+async fn derive_registries_from_session(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<ChainRegistries> {
+    let session_registry: Address = chain.session_registry.parse().with_context(|| {
+        format!(
+            "invalid session_registry address in chain '{chain_name}': {}",
+            chain.session_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url for chain '{chain_name}': {}",
+            chain.rpc_url
+        )
+    })?;
+    let registry = SessionRegistryInstance::new(session_registry, provider);
+
+    let workload_registry = registry
+        .workloadRegistry()
+        .call()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to derive workload_registry from session_registry in chain '{chain_name}'"
+            )
+        })?
+        .to_string();
+    let base_image_registry = registry
+        .baseImageRegistry()
+        .call()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to derive base_image_registry from session_registry in chain '{chain_name}'"
+            )
+        })?
+        .to_string();
+
+    Ok(ChainRegistries {
+        workload_registry,
+        base_image_registry,
+    })
+}
+
+fn build_init_chain_config(
+    chain_name: &str,
+    chain: &ChainConfig,
+    registration: Option<&str>,
+    registries: Option<&ChainRegistries>,
+) -> Result<InitChainConfig> {
+    let placeholder_ok = registration_is_off(registration);
+    let workload_registry = resolve_registry_address(
+        chain_name,
+        "workload_registry",
+        chain.workload_registry.as_deref(),
+        registries.map(|r| r.workload_registry.as_str()),
+        placeholder_ok,
+    )?;
+    let base_image_registry = resolve_registry_address(
+        chain_name,
+        "base_image_registry",
+        chain.base_image_registry.as_deref(),
+        registries.map(|r| r.base_image_registry.as_str()),
+        placeholder_ok,
+    )?;
+
+    Ok(InitChainConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        workload_registry,
+        base_image_registry,
+        expire_offset: chain.expire_offset,
+        registration: registration.map(str::to_string),
+        chain_id: chain.chain_id,
+        proving_strategy: chain.proving_strategy.clone(),
+    })
+}
+
+fn resolve_registry_address(
+    chain_name: &str,
+    field: &str,
+    configured: Option<&str>,
+    derived: Option<&str>,
+    placeholder_ok: bool,
+) -> Result<String> {
+    match (configured, derived) {
+        (Some(configured), Some(derived)) => {
+            ensure_same_address(chain_name, field, configured, derived)?;
+            Ok(configured.to_string())
+        }
+        (Some(configured), None) => Ok(configured.to_string()),
+        (None, Some(derived)) => Ok(derived.to_string()),
+        (None, None) if placeholder_ok => Ok(ZERO_ADDR.to_string()),
+        (None, None) => {
+            bail!("{field} required in chain '{chain_name}' or derivable from session_registry")
+        }
+    }
+}
+
+fn ensure_same_address(
+    chain_name: &str,
+    field: &str,
+    configured: &str,
+    derived: &str,
+) -> Result<()> {
+    let configured_addr = parse_registry_address(chain_name, field, configured)?;
+    let derived_addr = parse_registry_address(chain_name, field, derived)?;
+    if configured_addr != derived_addr {
+        bail!(
+            "{field} in chain '{chain_name}' does not match session_registry: configured {configured}, derived {derived}"
+        );
+    }
+    Ok(())
+}
+
+fn parse_registry_address(chain_name: &str, field: &str, value: &str) -> Result<Address> {
+    value
+        .parse()
+        .with_context(|| format!("invalid {field} address in chain '{chain_name}': {value}"))
 }
 
 /// Parse instance reference: "target/instance" or just "instance".
@@ -158,6 +366,7 @@ fn resolve_store_image(
         PlatformKind::Gcp => ImagePlatform::Gcp,
         PlatformKind::Azure => ImagePlatform::Azure,
         PlatformKind::Aws => ImagePlatform::Aws,
+        PlatformKind::Qemu => ImagePlatform::Qemu,
     };
 
     let disk_path = store.image_path(image_ref, image_platform);
@@ -432,6 +641,45 @@ fn collect_firewall_ports(m: &atakit_workload::manifest::Manifest) -> Vec<String
         .collect()
 }
 
+/// Cloud platforms use the deployment's external IP plus the portal ports
+/// persisted at deploy time. QEMU forwards those guest ports to dynamic host
+/// ports allocated at boot and persisted in state.
+pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)> {
+    if let Some(ref q) = state.resources.qemu {
+        let host = if q.external_ip.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            q.external_ip.clone()
+        };
+        if q.host_status_port == 0 || q.host_init_port == 0 {
+            bail!("qemu host ports not yet recorded; StartLocalVm must run first");
+        }
+        return Ok((host, q.host_status_port, q.host_init_port));
+    }
+
+    let ip = state
+        .resources
+        .gcp
+        .as_ref()
+        .and_then(|g| g.external_ip.clone())
+        .or_else(|| {
+            state
+                .resources
+                .azure
+                .as_ref()
+                .and_then(|a| a.external_ip.clone())
+        })
+        .or_else(|| {
+            state
+                .resources
+                .aws
+                .as_ref()
+                .and_then(|a| a.external_ip.clone())
+        })
+        .ok_or_else(|| anyhow::anyhow!("no external IP available"))?;
+    Ok((ip, state.portal_ports.status, state.portal_ports.init))
+}
+
 /// Validate that the given image ref is allowed by the workload's base-image policy.
 pub(super) fn validate_base_image(
     image_display_name: &str,
@@ -678,6 +926,10 @@ pub(super) fn build_cloud_image_record(
                 uploaded_at: chrono::Utc::now(),
             }
         }
+        PlatformKind::Qemu => unreachable!(
+            "build_cloud_image_record called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     }
 }
 
@@ -731,6 +983,10 @@ pub(super) async fn ensure_cloud_image(
             ))
         }
         PlatformKind::Aws => Box::new(AwsProvider::new(provider_config.region.clone())),
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image called for qemu — qemu has no cloud-side \
+             image and is filtered out upstream"
+        ),
     };
 
     let runner = ProcessRunner::new(verbose);
@@ -778,6 +1034,10 @@ pub(super) async fn ensure_cloud_image(
                     .is_some();
             exists && !force
         }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image existence-check called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     if already_exists {
@@ -805,21 +1065,15 @@ pub(super) async fn ensure_cloud_image(
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
         PlatformKind::Azure => {
-            // Image-upload path: shared `atakitupload` storage account (no
-            // hash) so a follow-up `cloud image upload` of the same image
-            // reuses rather than duplicates. This is a different lifecycle
-            // from per-deploy storage accounts.
+            // Image-upload path. The VHD staging storage account lives in the
+            // shared, region-scoped gallery RG (`atakit-images-<region>`), which
+            // the UploadImageAzure executor ensures itself (it creates the
+            // storage account in `gallery_rg` and ignores the step's
+            // `resource_group` field). There is intentionally NO separate staging
+            // RG: a previous `CreateResourceGroup { upload-rg }` here was dead
+            // (nothing consumed it) and broke multi-region uploads, because the
+            // fixed `upload-rg` name cannot exist in two regions at once.
             let names = AzureResourceNames::for_azure("upload", image_ref, &provider_config.region);
-            cloud_provider
-                .execute_step(
-                    &DeployStep::CreateResourceGroup {
-                        name: names.resource_group.clone(),
-                        region: provider_config.region.clone(),
-                    },
-                    &runner,
-                    verbose,
-                )
-                .await?;
             let step = DeployStep::UploadImageAzure {
                 resource_group: names.resource_group,
                 storage_account: names.storage_account,
@@ -845,6 +1099,10 @@ pub(super) async fn ensure_cloud_image(
             };
             cloud_provider.execute_step(&step, &runner, verbose).await?;
         }
+        PlatformKind::Qemu => unreachable!(
+            "ensure_cloud_image upload step called for qemu — \
+             qemu has no cloud-side image and is filtered out upstream"
+        ),
     };
 
     let record = build_cloud_image_record(provider_config, image_ref, "upload", cc_types);
@@ -869,4 +1127,216 @@ pub fn parse_metadata(items: &[String]) -> Result<std::collections::BTreeMap<Str
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
+}
+
+#[cfg(test)]
+fn test_chain_config() -> ChainConfig {
+    ChainConfig {
+        rpc_url: "https://rpc.test".to_string(),
+        session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+        workload_registry: None,
+        base_image_registry: None,
+        expire_offset: 300,
+        chain_id: None,
+        proving_strategy: None,
+    }
+}
+
+#[cfg(test)]
+mod chain_init_tests {
+    use super::*;
+    use crate::config::KeyType;
+
+    #[test]
+    fn qemu_missing_chain_synthesizes_registration_off() {
+        let got = synthesize_off_init_chain();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert!(got.rpc_url.is_empty());
+        assert_eq!(got.session_registry, ZERO_ADDR);
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_off_does_not_require_derived_registries() {
+        let chain = test_chain_config();
+        let got = build_init_chain_config("offchain", &chain, Some("off"), None).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn registration_required_uses_derived_registries_when_omitted() {
+        let chain = test_chain_config();
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let got =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+
+        assert_eq!(got.workload_registry, derived.workload_registry);
+        assert_eq!(got.base_image_registry, derived.base_image_registry);
+    }
+
+    #[test]
+    fn registration_required_validates_configured_registries() {
+        let mut chain = test_chain_config();
+        chain.workload_registry = Some("0x2222222222222222222222222222222222222222".to_string());
+        chain.base_image_registry = Some("0x3333333333333333333333333333333333333333".to_string());
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let got =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+
+        assert_eq!(got.workload_registry, chain.workload_registry.unwrap());
+        assert_eq!(got.base_image_registry, chain.base_image_registry.unwrap());
+    }
+
+    #[test]
+    fn registration_required_rejects_mismatched_configured_registry() {
+        let mut chain = test_chain_config();
+        chain.workload_registry = Some("0x4444444444444444444444444444444444444444".to_string());
+        let derived = ChainRegistries {
+            workload_registry: "0x2222222222222222222222222222222222222222".to_string(),
+            base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
+        };
+
+        let err =
+            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap_err();
+
+        assert!(err.to_string().contains("workload_registry"), "{err}");
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn qemu_forces_registration_off() {
+        let chain = test_chain_config();
+        let got = build_init_chain_config("local", &chain, Some("off"), None).unwrap();
+        assert_eq!(got.registration.as_deref(), Some("off"));
+        assert_eq!(got.workload_registry, ZERO_ADDR);
+        assert_eq!(got.base_image_registry, ZERO_ADDR);
+    }
+
+    #[test]
+    fn self_generated_key_can_be_sent_without_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let got = init_key_from_config("gas", &spec, false).unwrap();
+        assert_eq!(got.mode, "self_generated");
+        assert_eq!(got.key_type, "es256k");
+        assert!(got.private_key.is_none());
+    }
+
+    #[test]
+    fn self_generated_key_cannot_be_forced_to_private_key() {
+        let spec = KeySpec {
+            key_type: KeyType::Es256k,
+            mode: KeyMode::SelfGenerated,
+            file: None,
+            command: None,
+            env: None,
+            timeout_secs: None,
+        };
+
+        let err = init_key_from_config("owner", &spec, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve a self_generated key"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod portal_endpoint_tests {
+    use super::*;
+    use atakit_cloud::PortalPorts;
+
+    fn base_state(platform: PlatformKind) -> DeployState {
+        let now = chrono::Utc::now();
+        DeployState {
+            format: 1,
+            instance_name: "test-instance".to_string(),
+            workload_name: "test-workload".to_string(),
+            workload_version: "v0.0.1".to_string(),
+            target_name: "test-target".to_string(),
+            provider_name: "test-provider".to_string(),
+            platform,
+            created_at: now,
+            updated_at: now,
+            status: atakit_cloud::DeployStatus::Deployed {
+                ip: "127.0.0.1".to_string(),
+            },
+            image_ref: "test-image:v1".to_string(),
+            archive_path: "/tmp/test.atawl".to_string(),
+            archive_hash: "abc123".to_string(),
+            init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
+            resources: atakit_cloud::ResourceSet::default(),
+        }
+    }
+
+    #[test]
+    fn qemu_uses_recorded_host_ports() {
+        let mut state = base_state(PlatformKind::Qemu);
+        state.resources.qemu = Some(atakit_cloud::QemuResources {
+            external_ip: "127.0.0.1".to_string(),
+            host_status_port: 41024,
+            host_init_port: 41025,
+            ..Default::default()
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("127.0.0.1".to_string(), 41024, 41025));
+    }
+
+    #[test]
+    fn cloud_platform_uses_external_ip_and_well_known_ports() {
+        let mut state = base_state(PlatformKind::Aws);
+        state.resources.aws = Some(atakit_cloud::AwsResources {
+            region: "us-east-1".to_string(),
+            bucket: None,
+            snapshot: None,
+            ami: None,
+            security_group: None,
+            instance: None,
+            external_ip: Some("203.0.113.10".to_string()),
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("203.0.113.10".to_string(), 2024, 1024));
+    }
+
+    #[test]
+    fn cloud_platform_uses_persisted_port_overrides() {
+        let mut state = base_state(PlatformKind::Aws);
+        state.portal_ports = PortalPorts {
+            status: 6024,
+            init: 5024,
+        };
+        state.resources.aws = Some(atakit_cloud::AwsResources {
+            region: "us-east-1".to_string(),
+            external_ip: Some("203.0.113.10".to_string()),
+            ..Default::default()
+        });
+
+        let got = portal_endpoints(&state).unwrap();
+
+        assert_eq!(got, ("203.0.113.10".to_string(), 6024, 5024));
+    }
 }

@@ -4,6 +4,7 @@ use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::StatusArgs;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::provider::CloudProvider;
+use atakit_cloud::qemu::QemuProvider;
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::ProcessRunner;
 use atakit_core::Env;
@@ -29,6 +30,9 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
                 .ok()
                 .map(|p| Box::new(p) as _),
             atakit_cloud::PlatformKind::Aws => AwsProvider::from_state(&state)
+                .ok()
+                .map(|p| Box::new(p) as _),
+            atakit_cloud::PlatformKind::Qemu => QemuProvider::from_state(&state)
                 .ok()
                 .map(|p| Box::new(p) as _),
         };
@@ -152,6 +156,27 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
         }
         if let Some(ref sg) = aws.security_group {
             eprintln!("    Sec group: {sg}");
+        }
+    }
+    if let Some(ref q) = state.resources.qemu {
+        eprintln!();
+        eprintln!("  {}", "Resources:".dimmed());
+        eprintln!("    Mode:      local (qemu)");
+        eprintln!("    PID:       {}", q.pid);
+        if !q.instance_dir.is_empty() {
+            eprintln!("    Dir:       {}", q.instance_dir);
+        }
+        if q.host_status_port != 0 && q.host_init_port != 0 {
+            eprintln!(
+                "    Portal:    localhost:{} (status), localhost:{} (init)",
+                q.host_status_port, q.host_init_port,
+            );
+        }
+        if !q.serial_sock.is_empty() {
+            eprintln!("    Console:   {}", q.serial_sock);
+        }
+        if !q.data_disks.is_empty() {
+            eprintln!("    Disks:     {} data disk(s)", q.data_disks.len());
         }
     }
 

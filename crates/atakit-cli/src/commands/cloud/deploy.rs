@@ -5,22 +5,25 @@ use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cli::DeployArgs;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{self, InitChainConfig, InitConfig, InitKeyConfig, PortalTerminalState};
+use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
+use atakit_cloud::qemu::QemuProvider;
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{
-    AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, ProcessRunner,
+    AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, PortalPorts,
+    ProcessRunner, QemuResources,
 };
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ensure_cloud_image, parse_metadata, resolve_image, resolve_unmeasured_tar, resolve_workload,
-    validate_base_image, InitEnvResolver,
+    ensure_cloud_image, init_chain_from_config, init_key_from_config, parse_metadata,
+    portal_endpoints, registration_is_off, resolve_image, resolve_unmeasured_tar, resolve_workload,
+    synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
-use crate::config::{Config, KeyMode};
+use crate::config::Config;
 
 /// Per-(provider, image_ref) upload metadata kept while fanning out
 /// multi-target deploys. Boxed under a type alias so clippy does not flag
@@ -88,6 +91,11 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
 							 `image = \"...\"` on the target)"
                         )
                     })?;
+                // Qemu has no cloud-side image; the local qcow2 is consumed
+                // directly by StartLocalVm. Skip it from the pre-upload phase.
+                if matches!(provider_config.platform, PlatformKind::Qemu) {
+                    continue;
+                }
                 let resolved = resolve_image(image_arg, &provider_config.platform, env)?;
                 // If the image ref points at an existing cloud image (no local
                 // source), no upload is needed -- the cloud image already exists
@@ -198,6 +206,7 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
 
 async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let image_only = args.image_only;
+    let portal_ports = resolve_portal_ports(args.status_port, args.init_port)?;
 
     // 1. Resolve workload source (unless --image-only).
     // `workload_boot_min` carries the raw workload manifest boot-disk-size string
@@ -321,6 +330,11 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         PlatformKind::Aws => {
             // AWS targets need only a region, which is always present.
         }
+        PlatformKind::Qemu => {
+            // Local qemu has no cloud-side prerequisites. Firmware (the one
+            // path-based requirement) is resolved during plan_deploy so the
+            // error has full target/provider context.
+        }
     }
 
     // 3b. Resolve effective OS boot disk size.
@@ -351,14 +365,39 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         );
     }
 
-    // 6. Build init env (references into [chains] and [keys]).
+    // 6. Build init env references into [chains] and [keys]. Registration is
+    // target-owned: chain is required only when registration is active.
     let init_env_resolver = InitEnvResolver {
         cli_chain: args.chain.as_deref(),
         cli_owner_key: args.owner_key.as_deref(),
         cli_gas_wallet: args.gas_wallet.as_deref(),
         target: &target,
     };
-    let init_env = init_env_resolver.build();
+    let init_env = init_env_resolver.build_optional();
+    let is_qemu = matches!(provider_config.platform, PlatformKind::Qemu);
+    let effective_registration = if is_qemu {
+        Some("off".to_string())
+    } else {
+        target.registration.clone()
+    };
+    let registration_off = registration_is_off(effective_registration.as_deref());
+    if !image_only && !args.skip_init && !matches!(provider_config.platform, PlatformKind::Qemu) {
+        if init_env.chain.is_empty() && !registration_off {
+            bail!(
+                "chain must be set on target or via --chain when /init is sent \
+                 (set registration = \"off\" on the target to disable on-chain registration)"
+            );
+        }
+        if !init_env.chain.is_empty()
+            && !registration_off
+            && !config.chains.contains_key(&init_env.chain)
+        {
+            bail!("chain '{}' not found in [chains]", init_env.chain);
+        }
+        if init_env.owner_key.is_empty() && !registration_off {
+            bail!("owner_key must be set on target or via --owner-key");
+        }
+    }
 
     // 7. Parse metadata.
     let mut metadata = parse_metadata(&args.metadata)?;
@@ -430,6 +469,10 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             ))
         }
         PlatformKind::Aws => Box::new(AwsProvider::new(provider_config.region.clone())),
+        PlatformKind::Qemu => {
+            let runtime_dir = env.data_dir.join("cloud").join("qemu");
+            Box::new(QemuProvider::new(runtime_dir, provider_config.uefi.clone()))
+        }
     };
 
     // 10. Generate plan.
@@ -450,6 +493,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         skip_init: image_only || args.skip_init,
         cc_types: cc_types.clone(),
         workload_ports: workload_ports.clone(),
+        portal_ports,
         workload_disks: workload_disks.clone(),
         boot_disk_size_gb,
     };
@@ -540,10 +584,33 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             }
             eprintln!("  {:<15}{}", "Sec group:".dimmed(), names.firewall);
         }
+        PlatformKind::Qemu => {
+            let runtime_dir = env.data_dir.join("cloud").join("qemu");
+            eprintln!("  {:<15}qemu (local)", "Platform:".dimmed());
+            eprintln!("  {:<15}2 vCPU / 4 GiB", "Shape:".dimmed());
+            eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+            eprintln!(
+                "  {:<15}{}",
+                "Instance dir:".dimmed(),
+                runtime_dir.join(target_name).join(&instance_name).display()
+            );
+            let uefi_src = target
+                .uefi
+                .as_deref()
+                .or(provider_config.uefi.as_deref())
+                .unwrap_or("(unset — will fail at plan-deploy time)");
+            eprintln!("  {:<15}{}", "UEFI:".dimmed(), uefi_src);
+        }
     }
     if let Some(gb) = boot_disk_size_gb {
         eprintln!("  {:<15}{}GB", "Boot disk:".dimmed(), gb);
     }
+    eprintln!(
+        "  {:<15}{} (status), {} (init)",
+        "Portal:".dimmed(),
+        portal_ports.status,
+        portal_ports.init
+    );
     let port_lines = atakit_cloud::plan::format_ports_list(&ports);
     for line in &port_lines {
         eprintln!("  {:<15}{}", "", line);
@@ -553,6 +620,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             PlatformKind::Gcp => "pd-balanced",
             PlatformKind::Azure => "Premium_LRS",
             PlatformKind::Aws => "gp3",
+            PlatformKind::Qemu => "qcow2",
         };
         for (i, (name, index, gb)) in workload_disks.iter().enumerate() {
             let label = if i == 0 {
@@ -577,31 +645,39 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
     }
 
-    // Chain config: surface BEFORE the operator confirms so the
-    // effective registration policy (`required` / `optional` /
-    // `off`) is visible — the portal can't change it after /init,
-    // so a misconfigured deployment caught here saves a CVM cycle.
-    // `init_env.chain` is just a name reference; the lookup /init
-    // performs later (around line 450) is the same.
-    let chain_for_summary = config
-        .chains
-        .get(&init_env.chain)
-        .ok_or_else(|| anyhow::anyhow!("chain '{}' not found in [chains]", init_env.chain))?;
-    eprintln!("  {:<15}{}", "Chain:".dimmed(), init_env.chain);
-    // `registration` default-when-unset matches the portal: "section
-    // present, registration field absent → required". Surface that
-    // so `off` / `optional` configurations stand out.
-    let registration_label = chain_for_summary
-        .registration
-        .as_deref()
-        .unwrap_or("required (default)");
-    eprintln!("  {:<15}{}", "Submission:".dimmed(), registration_label);
-    eprintln!("  {:<15}{}", "RPC:".dimmed(), chain_for_summary.rpc_url);
-    eprintln!(
-        "  {:<15}{}",
-        "Registry:".dimmed(),
-        chain_for_summary.session_registry
-    );
+    // Chain config: surface BEFORE the operator confirms so the effective
+    // registration policy (`required` / `optional` / `off`) is visible.
+    // No-/init deploys do not consume chain config. For real init, qemu can
+    // synthesize registration=off; cloud init requires a named chain only when
+    // registration is active.
+    if image_only || args.skip_init {
+        if init_env.chain.is_empty() {
+            eprintln!("  {:<15}(none - unused)", "Chain:".dimmed());
+        } else {
+            eprintln!("  {:<15}{} (unused)", "Chain:".dimmed(), init_env.chain);
+        }
+        eprintln!("  {:<15}n/a (no /init)", "Submission:".dimmed());
+    } else if init_env.chain.is_empty() && is_qemu {
+        eprintln!("  {:<15}(none)", "Chain:".dimmed());
+        eprintln!("  {:<15}off (qemu default)", "Submission:".dimmed());
+    } else if registration_off {
+        if init_env.chain.is_empty() {
+            eprintln!("  {:<15}(none)", "Chain:".dimmed());
+        } else {
+            eprintln!("  {:<15}{} (unused)", "Chain:".dimmed(), init_env.chain);
+        }
+        eprintln!("  {:<15}off", "Submission:".dimmed());
+    } else if let Some(chain) = config.chains.get(&init_env.chain) {
+        eprintln!("  {:<15}{}", "Chain:".dimmed(), init_env.chain);
+        let registration_label = effective_registration
+            .as_deref()
+            .unwrap_or("required (default)");
+        eprintln!("  {:<15}{}", "Submission:".dimmed(), registration_label);
+        eprintln!("  {:<15}{}", "RPC:".dimmed(), chain.rpc_url);
+        eprintln!("  {:<15}{}", "Registry:".dimmed(), chain.session_registry);
+    } else {
+        bail!("chain '{}' not found in [chains]", init_env.chain);
+    }
 
     if !metadata.is_empty() {
         for (k, v) in &metadata {
@@ -651,6 +727,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         archive_path,
         archive_hash,
         init_env: init_env.clone(),
+        portal_ports,
         total_steps: plan.steps.len() as u32,
     });
     match provider_config.platform {
@@ -673,6 +750,10 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 region: provider_config.region.clone(),
                 ..Default::default()
             });
+        }
+        PlatformKind::Qemu => {
+            // The StartLocalVm step fills in the actual paths/pid/ports.
+            state.resources.qemu = Some(QemuResources::default());
         }
     }
     state.save(&env.data_dir)?;
@@ -713,28 +794,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         match step {
             DeployStep::WaitForPortal { timeout_secs } => {
                 portal_wait_timeout_secs = *timeout_secs;
-                let ip = state
-                    .resources
-                    .gcp
-                    .as_ref()
-                    .and_then(|g| g.external_ip.as_ref())
-                    .or_else(|| {
-                        state
-                            .resources
-                            .azure
-                            .as_ref()
-                            .and_then(|a| a.external_ip.as_ref())
-                    })
-                    .or_else(|| {
-                        state
-                            .resources
-                            .aws
-                            .as_ref()
-                            .and_then(|a| a.external_ip.as_ref())
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("no external IP available for agent wait"))?
-                    .clone();
-                match init::wait_for_portal(&ip, 2024, *timeout_secs).await {
+                let (ip, status_port, _) = portal_endpoints(&state)?;
+                match init::wait_for_portal(&ip, status_port, *timeout_secs).await {
                     Ok(()) => eprintln!("{}", "done".green()),
                     Err(e) => {
                         eprintln!("{}", "failed".red());
@@ -754,82 +815,73 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 continue;
             }
             DeployStep::InitializeWorkload { archive_path: ap } => {
-                let ip = state
-                    .resources
-                    .gcp
-                    .as_ref()
-                    .and_then(|g| g.external_ip.as_ref())
-                    .or_else(|| {
-                        state
-                            .resources
-                            .azure
-                            .as_ref()
-                            .and_then(|a| a.external_ip.as_ref())
-                    })
-                    .or_else(|| {
-                        state
-                            .resources
-                            .aws
-                            .as_ref()
-                            .and_then(|a| a.external_ip.as_ref())
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("no external IP available for init"))?
-                    .clone();
+                let (ip, status_port, init_port) = portal_endpoints(&state)?;
+                let registration = effective_registration.as_deref();
 
-                // Resolve chain config and key specs from the persisted init_env references.
+                // Resolve chain config. Registration-off init has no chain
+                // interaction, so a missing chain is represented by the
+                // synthesized off-chain payload.
                 let chain_name = &init_env.chain;
-                let chain = config
-                    .chains
-                    .get(chain_name)
-                    .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in [chains]"))?;
+                let init_chain = match config.chains.get(chain_name) {
+                    Some(chain) => init_chain_from_config(chain_name, chain, registration).await?,
+                    None if registration_is_off(registration) => synthesize_off_init_chain(),
+                    None if chain_name.is_empty() => bail!(
+                        "chain must be set on target or via --chain when /init is sent \
+                         (set registration = \"off\" on the target to disable on-chain registration)"
+                    ),
+                    None => bail!("chain '{chain_name}' not found in [chains]"),
+                };
+
+                // Resolve init keys. Active registration requires an owner-key
+                // reference. Owner/gas/sp1 can be provisioned keys supplied by
+                // a relay/prover operator or self-generated ephemeral keys.
+                // Registration-off synthesizes any missing key because no chain
+                // signing is load-bearing.
                 let owner_key_name = &init_env.owner_key;
-                let owner_key_spec = config
-                    .keys
-                    .get(owner_key_name)
-                    .ok_or_else(|| anyhow::anyhow!("key '{owner_key_name}' not found in [keys]"))?;
+                let registration_off = registration_is_off(registration);
+                let owner_init = match config.keys.get(owner_key_name) {
+                    Some(spec) => init_key_from_config(owner_key_name, spec, false)?,
+                    None if registration_off => synthesize_self_generated_key(),
+                    None if owner_key_name.is_empty() => {
+                        bail!("owner_key must be set on target or via --owner-key")
+                    }
+                    None => bail!("key '{owner_key_name}' not found in [keys]"),
+                };
                 let gas_wallet_name = &init_env.gas_wallet;
-                let gas_wallet_spec = config.keys.get(gas_wallet_name).ok_or_else(|| {
-                    anyhow::anyhow!("key '{gas_wallet_name}' not found in [keys]")
-                })?;
+                let gas_init = match config.keys.get(gas_wallet_name) {
+                    Some(spec) => init_key_from_config(gas_wallet_name, spec, false)?,
+                    None if gas_wallet_name.is_empty() => synthesize_self_generated_key(),
+                    None if registration_off => synthesize_self_generated_key(),
+                    None => bail!("key '{gas_wallet_name}' not found in [keys]"),
+                };
+
+                // SP1 prover-network key (same shape as gas_wallet). Defaults
+                // to the gas-wallet key when no separate sp1_payer is set.
+                let sp1_payer_name = init_env.sp1_payer.as_deref().unwrap_or(gas_wallet_name);
+                let sp1_init = match config.keys.get(sp1_payer_name) {
+                    Some(spec) => init_key_from_config(sp1_payer_name, spec, false)?,
+                    None if sp1_payer_name.is_empty() => synthesize_self_generated_key(),
+                    None if registration_off => synthesize_self_generated_key(),
+                    None => bail!("key '{sp1_payer_name}' not found in [keys]"),
+                };
 
                 let init_config = InitConfig {
                     platform: provider_config.platform.to_string(),
-                    chain: InitChainConfig {
-                        rpc_url: chain.rpc_url.clone(),
-                        session_registry: chain.session_registry.clone(),
-                        workload_registry: chain.workload_registry.clone().ok_or_else(|| {
-                            anyhow::anyhow!("workload_registry required in chain '{chain_name}'")
-                        })?,
-                        base_image_registry: chain.base_image_registry.clone().ok_or_else(
-                            || {
-                                anyhow::anyhow!(
-                                    "base_image_registry required in chain '{chain_name}'"
-                                )
-                            },
-                        )?,
-                        expire_offset: chain.expire_offset,
-                        registration: chain.registration.clone(),
-                        chain_id: chain.chain_id,
-                    },
-                    owner_key: InitKeyConfig {
-                        mode: owner_key_spec.mode.to_string(),
-                        key_type: owner_key_spec.key_type.to_string(),
-                        private_key: Some(owner_key_spec.resolve(owner_key_name)?),
-                    },
-                    gas_wallet: InitKeyConfig {
-                        mode: gas_wallet_spec.mode.to_string(),
-                        key_type: gas_wallet_spec.key_type.to_string(),
-                        private_key: if gas_wallet_spec.mode == KeyMode::Provisioned {
-                            Some(gas_wallet_spec.resolve(gas_wallet_name)?)
-                        } else {
-                            None
-                        },
-                    },
+                    chain: init_chain,
+                    owner_key: owner_init,
+                    gas_wallet: gas_init,
+                    sp1_payer: sp1_init,
                     disks: disk_passphrases.clone(),
                 };
 
-                match init::post_portal_init(&ip, 1024, ap, unmeasured_tar.as_deref(), &init_config)
-                    .await
+                match init::post_portal_init(
+                    &ip,
+                    init_port,
+                    ap,
+                    unmeasured_tar.as_deref(),
+                    &init_config,
+                )
+                .await
                 {
                     Ok(()) => {
                         // /init returned 2xx; portal accepted the payload. The
@@ -840,7 +892,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         eprintln!();
                         let outcome = init::wait_for_portal_terminal(
                             &ip,
-                            2024,
+                            status_port,
                             portal_wait_timeout_secs,
                             |s| eprintln!("      state: {s}"),
                         )
@@ -951,6 +1003,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     DeployStep::CreateInstance { .. }
                         | DeployStep::CreateInstanceAzure { .. }
                         | DeployStep::CreateInstanceAws { .. }
+                        | DeployStep::StartLocalVm { .. }
                 ) {
                     if let Some(ref gcp) = state.resources.gcp {
                         let ip = gcp.external_ip.as_deref().unwrap_or("-");
@@ -983,6 +1036,26 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         eprintln!("  {:<12}{}", "VM:".dimmed(), inst.bold());
                         eprintln!("  {:<12}{}", "IP:".dimmed(), ip);
                         eprintln!("  {:<12}{}", "Region:".dimmed(), aws.region.as_str());
+                        eprintln!();
+                    }
+                    if let Some(ref q) = state.resources.qemu {
+                        eprintln!();
+                        eprintln!(
+                            "  {:<12}qemu pid {}",
+                            "VM:".dimmed(),
+                            q.pid.to_string().bold()
+                        );
+                        eprintln!("  {:<12}127.0.0.1", "IP:".dimmed());
+                        eprintln!(
+                            "  {:<12}localhost:{} (status), localhost:{} (init)",
+                            "Portal:".dimmed(),
+                            q.host_status_port,
+                            q.host_init_port
+                        );
+                        if !q.serial_sock.is_empty() {
+                            eprintln!("  {:<12}{}", "Console:".dimmed(), q.serial_sock);
+                        }
+                        eprintln!("  {:<12}{}", "Dir:".dimmed(), q.instance_dir);
                         eprintln!();
                     }
                 }
@@ -1026,6 +1099,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 .aws
                 .as_ref()
                 .and_then(|a| a.external_ip.clone())
+        })
+        .or_else(|| {
+            state.resources.qemu.as_ref().map(|q| {
+                if q.external_ip.is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    q.external_ip.clone()
+                }
+            })
         })
         .unwrap_or_default();
     state.set_status(DeployStatus::Deployed { ip: ip.clone() }, &env.data_dir)?;
@@ -1097,6 +1179,34 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             eprintln!("    {}:", "SSH".dimmed());
             eprintln!("      aws ec2-instance-connect ssh --region {region} --instance-id {vm_id}");
         }
+        PlatformKind::Qemu => {
+            if let Some(ref q) = state.resources.qemu {
+                eprintln!("    {:<12}local (qemu)", "Mode:".dimmed());
+                eprintln!("    {:<12}{}", "PID:".dimmed(), q.pid);
+                eprintln!("    {:<12}{}", "Dir:".dimmed(), q.instance_dir);
+                eprintln!(
+                    "    {:<12}localhost:{} (status), localhost:{} (init)",
+                    "Portal:".dimmed(),
+                    q.host_status_port,
+                    q.host_init_port
+                );
+                if !q.workload_port_map.is_empty() {
+                    let map: Vec<String> = q
+                        .workload_port_map
+                        .iter()
+                        .map(|(g, h)| format!("{g}->{h}"))
+                        .collect();
+                    eprintln!("    {:<12}{}", "Workload:".dimmed(), map.join(", "));
+                }
+                eprintln!();
+                eprintln!("    {}:", "Serial log".dimmed());
+                eprintln!("      atakit cloud serial {instance_name}");
+                eprintln!();
+                eprintln!("    {}:", "Interactive console".dimmed());
+                eprintln!("      atakit cloud ssh {instance_name}");
+                eprintln!("      (Ctrl-] to detach without stopping the VM)");
+            }
+        }
     }
     eprintln!();
     eprintln!("    {}:", "Cleanup".dimmed());
@@ -1126,6 +1236,23 @@ fn parse_size_gb(s: &str) -> Option<u64> {
         "MB" => Some(num.div_ceil(1024)),
         _ => None,
     }
+}
+
+fn resolve_portal_ports(status_port: Option<u16>, init_port: Option<u16>) -> Result<PortalPorts> {
+    let ports = PortalPorts {
+        status: status_port.unwrap_or(atakit_cloud::DEFAULT_PORTAL_STATUS_PORT),
+        init: init_port.unwrap_or(atakit_cloud::DEFAULT_PORTAL_INIT_PORT),
+    };
+    if ports.status == 0 {
+        bail!("--status-port must be between 1 and 65535");
+    }
+    if ports.init == 0 {
+        bail!("--init-port must be between 1 and 65535");
+    }
+    if ports.status == ports.init {
+        bail!("--status-port and --init-port must be different");
+    }
+    Ok(ports)
 }
 
 /// Absolute floor for OS boot disk size. The base image is assumed to be
@@ -1309,5 +1436,37 @@ mod tests {
     fn equal_to_workload_minimum_is_ok() {
         let got = resolve_boot_disk_size(Some("50GB"), None, Some("50GB")).unwrap();
         assert_eq!(got, 50);
+    }
+
+    #[test]
+    fn portal_ports_default_to_well_known_values() {
+        let got = resolve_portal_ports(None, None).unwrap();
+        assert_eq!(got.status, atakit_cloud::DEFAULT_PORTAL_STATUS_PORT);
+        assert_eq!(got.init, atakit_cloud::DEFAULT_PORTAL_INIT_PORT);
+    }
+
+    #[test]
+    fn portal_ports_accept_overrides() {
+        let got = resolve_portal_ports(Some(6024), Some(5024)).unwrap();
+        assert_eq!(got.status, 6024);
+        assert_eq!(got.init, 5024);
+    }
+
+    #[test]
+    fn portal_ports_must_be_distinct_and_nonzero() {
+        let err = resolve_portal_ports(Some(5024), Some(5024))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be different"), "{err}");
+
+        let err = resolve_portal_ports(Some(0), Some(5024))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--status-port"), "{err}");
+
+        let err = resolve_portal_ports(Some(6024), Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--init-port"), "{err}");
     }
 }
