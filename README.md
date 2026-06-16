@@ -1,513 +1,409 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_White%20Text%20with%20Color%20Logo.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_Black%20Text%20with%20Color%20Logo.png">
-    <img src="https://raw.githubusercontent.com/automata-network/automata-brand-kit/main/PNG/ATA_White%20Text%20with%20Color%20Logo.png" width="50%">
-  </picture>
-</div>
+# atakit
 
-# Atakit
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/automata-network/atakit)](https://github.com/automata-network/atakit/releases)
+All-in-one CLI for creation, provisioning, and management of Confidential Virtual Machines (CVMs) and the workloads running within them.
 
-CVM base image deployment toolkit - Build, package, and deploy secure workloads to Confidential Virtual Machines.
+## Features
 
-## Overview
+- **Image management** -- list, pull, import/export CVM base images from GitHub Releases
+- **Workload lifecycle** -- scaffold, build, publish, and manage workload archives (`.atawl`) with deterministic integrity verification (PCR23)
+- **Workload registry** -- push/pull workload archives to/from an HTTP registry
+- **On-chain integration** -- publish and deactivate workload specs on the on-chain WorkloadRegistry; query specs by workload ID
+- **Cloud deployment** -- deploy workloads to CVM instances on GCP and Azure, with full orchestration of images, firewall rules, disks, and instances
+- **Deployment management** -- status, SSH, serial console, destroy with selective resource preservation
 
-Atakit is a command-line tool for deploying containerized workloads to [Automata Linux](https://github.com/automata-network/automata-linux) CVMs across major cloud providers. It handles:
+## Install
 
-- Building workload packages from Docker Compose definitions
-- Managing CVM base images
-- Deploying to GCP, Azure, or local QEMU
-- Registering workloads on-chain via smart contracts
+Requires Rust 1.70+.
 
-## Installation
-
-### From Source
-
-```bash
-git clone https://github.com/automata-network/atakit
-cd atakit
-just install
+```sh
+cargo install --path crates/atakit-cli
 ```
 
-The binary will be available at `atakit`.
+Or build from source:
 
-### Prerequisites
+```sh
+cargo build --release -p atakit-cli
+```
 
-- **Rust**: 2024 edition or later
-- **just**: Command runner ([installation](https://github.com/casey/just#installation))
-- **Cloud CLI tools**: `gcloud` depending on target platform
-- **QEMU**: For local development (optional)
+## Quickstart (GCP)
 
-Cloud account permissions required:
-- Create/delete VMs and disks
-- Manage network and firewall rules
-- Access cloud storage (for disk images)
+The minimal path to deploy a workload to a Confidential VM on GCP. You'll need
+the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) authenticated
+(`gcloud auth login`) and a container engine (Docker or Podman) for building
+workloads.
 
-## Quick Start
+### 1. Generate keys
 
-### 1. Pull a CVM Base Image
+Deployments register on-chain, which needs two secp256k1 (Ethereum-style)
+private keys:
 
-```bash
-# List available images
+- **owner** -- signs the on-chain CVM registration.
+- **gas** -- pays for that transaction; its address must hold funds on the
+  target chain.
+
+Any standard web3 key works (MetaMask "export private key", `openssl`, etc.).
+With [Foundry's `cast`](https://book.getfoundry.sh/):
+
+```sh
+mkdir -p ~/.config/atakit
+cast wallet new            # prints an address + a 0x... private key
+```
+
+Save each private key into its own file, then lock down permissions:
+
+```sh
+printf '0xYOUR_OWNER_KEY' > ~/.config/atakit/owner.key
+printf '0xYOUR_GAS_KEY'   > ~/.config/atakit/gas.key
+chmod 600 ~/.config/atakit/*.key
+```
+
+Fund the **gas** key's address on your target chain so the
+registration transaction(s) can land.
+
+### 2. Write a minimal config
+
+Create `~/.config/atakit/config.toml`. (`atakit` also writes a fully-commented
+template here on first run -- this is the minimal subset needed for a GCP
+deploy.)
+
+```toml
+# Where to pull CVM base images from (GitHub Releases).
+[image.repositories]
+automata = { repo = "automata-network/automata-linux" }
+
+# On-chain registries the CVM registers against. Values below are the
+# Hoodi testnet deployment.
+[chains.hoodi]
+rpc_url             = "https://1rpc.io/hoodi"
+session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
+workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
+base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
+expire_offset       = 3600
+
+# secp256k1 private keys, read from the files created in step 1.
+[keys.owner]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/owner.key"
+
+[keys.gas]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/gas.key"
+
+# Your GCP account + deployment zone.
+[cloud.providers.gcp]
+platform = "gcp"
+project  = "my-gcp-project"
+region   = "asia-southeast1-b"
+
+# Defaults shared by every target, so targets stay terse.
+[cloud.defaults]
+chain        = "hoodi"
+registration = "optional"
+owner_key    = "owner"
+gas_wallet   = "gas"
+
+# A deploy target: a machine type on the provider above.
+[cloud.targets.gcp-tdx]
+provider = "gcp"
+vmtype   = "c3-standard-4"
+```
+
+### 3. Build and deploy
+
+```sh
+# Search for images on remote
+atakit image ls --remote
+
+# Pull the base image for GCP into the local store
+atakit image pull <image_name>:<version> gcp
+
+# Scaffold + build a workload (or point -d at your own).
+atakit workload create my-service
+atakit workload build -d ./my-service
+
+# Deploy it. The base image is uploaded to your GCP project automatically.
+atakit cloud deploy my-service:v0.0.1 --target gcp-tdx --image <image_name>:<version>
+```
+
+The instance is named `<workload>-<target>` by default, so:
+`atakit cloud status my-service-gcp-tdx` shows progress and
+`atakit cloud destroy my-service-gcp-tdx` tears it down.
+
+See [Configuration](#configuration) for the full set of options.
+
+## Usage
+
+```
+atakit <command> [options]
+```
+
+### Image management
+
+```sh
+# List locally cached images
 atakit image ls
 
-# Download an image
-atakit image pull automata-linux:v0.1.0
+# Include remote (GitHub Releases) images
+atakit image ls --remote
+
+# Query a specific GitHub repository
+atakit image ls --remote --repo automata-network/debug-linux
+
+# Pull an image for a specific platform
+atakit image pull automata-linux:v0.1.6 gcp
+
+# Remove a local image
+atakit image rm automata-linux:v0.1.6
+
+# Export/import portable .atabi archives
+atakit image export automata-linux:v0.1.6
+atakit image import automata-linux-v0.1.6-gcp.atabi
 ```
 
-### 2. Create a Workload
+### Workload management
 
-Create an `atakit.json` configuration file in your project directory:
+```sh
+# Scaffold a new workload
+atakit workload create my-workload
 
-```json
-{
-    "workloads": [
-        {
-            "name": "my-workload",
-            "version": "v0.0.1",
-            "image": "automata-linux:v0.1.1",
-            "docker_compose": "./docker-compose.yml"
-        }
-    ],
-    "disks": [
-        {
-            "name": "my-data",
-            "size": "10GB"
-        }
-    ],
-    "deployment": {
-        "my-deployment": {
-            "workload": "my-workload-tdx",
-            "platforms": {
-                "gcp": { "vmtype": "c3-standard-4" }
-            }
-        }
-    }
-}
+# Build a workload into a .atawl archive
+atakit workload build -d ./my-workload
+
+# Inspect a built workload (shows PCR23 measurement)
+atakit workload info my-service:v0.0.1
+
+# Push/pull workloads to a repository
+atakit workload push my-service:v0.0.1
+atakit workload pull my-service:v0.0.1
+
+# Publish workload spec on-chain
+atakit workload publish my-service:v0.0.1
+
+# Query on-chain workload spec
+atakit workload spec <workload-id>
 ```
 
-Create a `docker-compose.yml` for your workload:
+### Cloud deployment
 
-```yaml
-services:
-  app:
-    build: .
-    image: my-workload:v0.0.1
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config:/app/config:ro
-      - ./cvm-agent.sock:/app/cvm-agent.sock
-      - my-data:/data
+Requires a configured target in `config.toml` (see [Configuration](#configuration)).
 
-volumes:
-  my-data:
+```sh
+# Deploy a workload to a cloud CVM
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6
+
+# Deploy with a custom instance name
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6 --name my-instance
+
+# Upload a base image to the cloud without deploying
+atakit cloud upload-image automata-linux:v0.1.6 --target my-gcp
+
+# Initialize an already-deployed instance with a workload
+atakit cloud init my-instance my-service:v0.0.1 --target my-gcp
+
+# Check deployment status
+atakit cloud status my-instance --target my-gcp
+
+# List all deployments
+atakit cloud ls
+
+# SSH into a running instance
+atakit cloud ssh my-instance --target my-gcp
+
+# View serial console output
+atakit cloud serial my-instance --target my-gcp
+
+# Tear down a deployment
+atakit cloud destroy my-instance --target my-gcp
 ```
 
-Create a `Dockerfile`:
+### Local (QEMU) deploy
 
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["python", "main.py"]
+For offline iteration, `atakit cloud deploy` can target a local QEMU VM via
+the `qemu` platform. This is a **functional harness**, not a real TEE: boot
+is measured into a software TPM (swtpm) and the portal `/init` → workload
+flow runs end-to-end against `localhost`, but there is no genuine TDX/SEV
+quote — so on-chain registration defaults to `off` when the qemu target has
+no chain configured.
+
+Requirements on the host:
+
+- `qemu-system-x86_64`, `qemu-img`, `swtpm` on `PATH`
+- `/dev/kvm` accessible
+- A TPM-enabled OVMF (ie, compiled with `TPM2_ENABLE=TRUE` and `TPM2_CONFIG_ENABLE=TRUE`)
+- `socat` (only needed for `atakit cloud ssh` to attach to the serial console)
+
+Minimal config:
+
+```toml
+[cloud.providers.qemu]
+platform = "qemu"
+uefi     = "~/.local/share/atakit/firmware/ovmf.fd"
+
+[cloud.targets.qemu-local]
+provider = "qemu"
+image    = "automata-linux:v0.1.6"   # uses qemu_disk.qcow2 from the image store
 ```
 
-> 💡 See [`workload_examples/`](./workload_examples) for complete working examples.
+Then:
 
-### 3. Build the Workload Package
+```sh
+atakit image pull automata-linux:v0.1.6 qemu
+atakit cloud deploy my-service:v0.0.1 --target qemu-local
 
-```bash
-atakit workload build my-workload
+atakit cloud ls                              # qemu deployments listed alongside cloud
+atakit cloud serial my-service-qemu-local    # tails serial.log (read-only)
+atakit cloud ssh    my-service-qemu-local    # interactive serial console (Ctrl-] to detach)
+atakit cloud destroy my-service-qemu-local   # stops qemu, removes overlays
 ```
 
-This creates a `.tar.gz` package containing:
-- Docker Compose definitions
-- Measured files for attestation
-- Docker images
+`vmtype` is ignored for qemu (fixed 2 vCPU / 4 GiB). Data disks declared in
+the workload manifest become per-instance qcow2 overlays attached via virtio
+with `serial=<device_name>`, matching the cloud agent's discovery convention.
+Workload ports are forwarded guest→same host port (so `curl localhost:<port>`
+just works); the portal status/init ports are forwarded to ephemeral host
+ports to avoid collisions between instances.
 
-### 4. Publish the Workload
-
-```bash
-atakit workload publish my-workload \
-  --rpc-url $RPC_URL \
-  --owner-private-key $PRIVATE_KEY
-```
-
-### 5. Deploy
-
-```bash
-# Deploy to GCP
-atakit deploy my-deployment --platform gcp
-
-# Or deploy locally with QEMU
-atakit deploy my-deployment --qemu
-```
-
-### 6. Check log
-
-```bash
-gcloud compute instances get-serial-port-output ${instance_name} --zone=${zone}
-```
+`cloud ssh` on qemu doesn't run a real ssh client — there's no sshd in the
+guest — it `socat`s into a unix socket wired to the VM's serial chardev for
+an interactive console.
 
 ## Configuration
 
-### atakit.json
+### Operator config (`config.toml`)
 
-The main project configuration file.
+Located at `$XDG_CONFIG_HOME/atakit/config.toml` (default
+`~/.config/atakit/config.toml`). `atakit` writes a fully-commented template
+there on first run. Precedence: CLI args > env vars > this file > defaults.
 
-```json
-{
-    "workloads": [
-        {
-            "name": "workload-name",    // Workload identifier
-            "version": "v0.0.1",        // Version (must start with 'v')
-            "image": "automata-linux:v0.1.1",  // Base image reference
-            "docker_compose": "./path/to/docker-compose.yml"
-        }
-    ],
-    "disks": [
-        {
-            "name": "disk-name",
-            "size": "10GB",
-            "encrypted": false          // Optional
-        }
-    ],
-    "deployment": {
-        "deployment-name": {
-            "workload": "workload-name",
-            "platforms": {
-                "gcp": {
-                    "vmtype": "c3-standard-4",
-                    "zone": "us-central1-a"    // Optional
-                },
-                "azure": {
-                    "vmtype": "Standard_DC4s_v3",
-                    "region": "eastus"         // Optional
-                }
-            }
-        }
-    }
-}
+Targets reference a provider, chain, and keys *by name*, so those are declared
+once and shared. The example below covers the common sections:
+
+```toml
+# ─── Chains ───────────────────────────────────────────────────────────
+# Named on-chain configs. Cloud targets and publish commands reference a
+# chain by name. workload_registry / base_image_registry are derived from
+# session_registry on-chain when omitted.
+[chains.hoodi]
+rpc_url             = "https://1rpc.io/hoodi"
+session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
+workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
+base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
+expire_offset       = 3600
+
+# ─── Keys ─────────────────────────────────────────────────────────────
+# `provisioned` keys supply the private key via exactly one of
+# file / command / env. `self_generated` keys are created by the portal
+# at init time (no source). type: es256k | es256 | rs256.
+[keys.owner]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/owner.key"
+
+[keys.gas]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/gas.key"
+# command = ["pass", "show", "atakit/gas"]   # alternative source
+# env     = "ATAKIT_GAS_KEY"                  # alternative source
+
+# ─── GitHub credentials ───────────────────────────────────────────────
+# Token sources for private repos. Each sets exactly one of
+# file / command / env. Public repos need no credential.
+# [github.credentials]
+# private = { command = ["pass", "show", "github/atakit"] }
+
+# ─── Image repositories ───────────────────────────────────────────────
+# GitHub repos holding .atabi base-image archives. First entry is the
+# implicit default for `image pull`.
+[image.repositories]
+automata = { repo = "automata-network/automata-linux" }
+# private  = { repo = "myorg/private-images", credential = "private" }
+
+# ─── Workload repositories ────────────────────────────────────────────
+# `type = "http"` (registry service) or `type = "github"` (releases).
+# First entry is the implicit default for `workload push`.
+# [workload.repositories]
+# main = { type = "http",   url  = "https://registry.example.com" }
+# gh   = { type = "github", repo = "myorg/workloads", credential = "private" }
+
+# ─── Publish ──────────────────────────────────────────────────────────
+# References for `workload publish` (overridable with --chain / --owner-key).
+[publish]
+chain     = "hoodi"
+owner_key = "owner"
+
+# ─── Cloud ────────────────────────────────────────────────────────────
+# Providers hold the account + region; targets reference a provider, chain,
+# and keys by name. [cloud.defaults] fills in fields a target omits.
+# Active registration requires owner_key, but it may be provisioned or
+# self_generated when an ephemeral owner is acceptable. gas_wallet and
+# sp1_payer identify keys the CVM uses for relay/prover submissions: they may
+# be provisioned keys supplied by the relay owner, or self_generated keys whose
+# public keys are accepted or registered by the relay. registration = "off"
+# can omit chain and keys entirely.
+[cloud.providers.gcp]
+platform = "gcp"
+project  = "my-gcp-project"
+region   = "us-central1-a"
+
+[cloud.providers.azure]
+platform     = "azure"
+subscription = "your-subscription-id"
+region       = "eastus"
+
+[cloud.defaults]
+chain        = "hoodi"
+registration = "optional"           # "required" | "optional" | "off"
+owner_key    = "owner"
+gas_wallet   = "gas"
+
+[cloud.targets.gcp-tdx]
+provider = "gcp"
+vmtype   = "c3-standard-4"          # c3-standard-* → TDX, n2d-standard-* → SEV-SNP
+image    = "automata-linux:v0.1.6"
+
+[cloud.targets.azure-snp]
+provider = "azure"
+vmtype   = "Standard_DC4as_v5"      # *as_v5/v6 → SEV-SNP, *es_v6 → TDX
+image    = "automata-linux:v0.1.6"
 ```
 
-### Docker Compose Requirements
+### Workload config (`atakit-workload.toml`)
 
-Atakit analyzes your `docker-compose.yml` to extract services, volumes, and configurations. Key requirements:
+Each workload is defined by a single `atakit-workload.toml` file:
 
-- **Image references**: Use full registry paths (e.g., `docker.io/library/nginx`)
-- **Bind mounts**: Must be read-only (`:ro`) except for the CVM agent socket
-- **Named volumes**: Each volume must be owned by exactly one service
+```toml
+format = 1
 
-Example:
+[workload]
+name = "my-service"
+version = "v0.0.1"
 
-```yaml
-services:
-  app:
-    image: my-app:v0.0.1
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config:/app/config:ro           # Measured config
-      - ./additional-data/key:/app/key:ro # Runtime data
-      - app-data:/data                    # Persistent volume
-      - ./cvm-agent.sock:/app/cvm-agent.sock  # Agent socket
+image = { build = ".", containerfile = "Containerfile" }
+ports = ["3000:3000"]
+measured-data = ["./config/cert.pem"]
 
-volumes:
-  app-data:
+[workload.environment]
+RUST_LOG = "info"
 ```
 
-### CVM Agent API
+See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for the full specification.
 
-Inside the CVM, workloads can access the CVM agent via a Unix socket at `/app/cvm-agent.sock`. The agent provides cryptographic signing and key management APIs.
-
-**Socket Access with curl:**
-
-```bash
-curl --unix-socket /app/cvm-agent.sock http://localhost/<endpoint>
-```
-
-#### POST /sign-message
-
-Sign an arbitrary message using the session key. Returns a secp256k1 signature along with session metadata.
-
-**Request:**
-
-```json
-{
-  "message": "0x48656c6c6f"
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `message` | hex string | Message bytes to sign (hex-encoded with `0x` prefix) |
-
-**Response:**
-
-```json
-{
-  "signature": "0x...",
-  "sessionId": "0x...",
-  "sessionKeyPublic": {
-    "typeId": 3,
-    "key": "0x..."
-  },
-  "sessionKeyFingerprint": "0x...",
-  "ownerKeyPublic": {
-    "typeId": 3,
-    "key": "0x..."
-  },
-  "ownerFingerprint": "0x...",
-  "workloadId": "0x...",
-  "baseImageId": "0x..."
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `signature` | hex string | secp256k1 signature (65 bytes: r \|\| s \|\| v) |
-| `sessionId` | bytes32 | Current session ID |
-| `sessionKeyPublic.typeId` | uint8 | Key type: 2=P-256, 3=secp256k1 |
-| `sessionKeyPublic.key` | hex string | Public key bytes |
-| `sessionKeyFingerprint` | bytes32 | Session key fingerprint |
-| `ownerKeyPublic` | object | Owner key public identity |
-| `ownerFingerprint` | bytes32 | Owner identity fingerprint |
-| `workloadId` | bytes32 | Workload ID |
-| `baseImageId` | bytes32 | Base image ID |
-
-**Example:**
-
-```bash
-# Sign a message (hex-encoded "Hello")
-curl --unix-socket /app/cvm-agent.sock \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"message": "0x48656c6c6f"}' \
-  http://localhost/sign-message
-```
-
-#### POST /rotate-key
-
-Rotate the session key and register the new key on-chain. This generates a new session keypair and submits a transaction to update the session registry.
-
-**Request:**
-
-```json
-{}
-```
-
-**Response:**
-
-```json
-{
-  "sessionId": "0x...",
-  "sessionKeyFingerprint": "0x...",
-  "sessionKeyPublic": {
-    "typeId": 3,
-    "key": "0x..."
-  },
-  "txHash": "0x..."
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `sessionId` | bytes32 | New session ID after rotation |
-| `sessionKeyFingerprint` | bytes32 | New session key fingerprint |
-| `sessionKeyPublic` | object | New session key public identity |
-| `txHash` | bytes32 | On-chain transaction hash |
-
-**Example:**
-
-```bash
-# Rotate the session key
-curl --unix-socket /app/cvm-agent.sock \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d '{}' \
-  http://localhost/rotate-key
-```
-
-### Directory Structure
-
-Workloads use a standard directory layout:
+## Project structure
 
 ```
-my-workload/
-├── docker-compose.yml       # Service definitions
-├── config/                  # Measured files (included in attestation)
-│   └── app.conf
-└── additional-data/         # Runtime data (not measured)
-    └── secrets.json
+crates/
+  atakit-core/       # Shared types (Env, ProgressReporter trait)
+  atakit-image/      # Image domain logic (GitHub Releases, local store)
+  atakit-workload/   # Workload domain logic (build, registry, on-chain)
+  atakit-cloud/      # Cloud deployment logic (GCP + Azure providers, state management)
+  atakit-cli/        # Binary crate (presentation, progress bars, error display)
 ```
 
-## Local Development with sim-agent
-
-The `sim-agent` command provides a complete local development environment by simulating the CVM agent. It:
-
-- Starts an embedded [Anvil](https://book.getfoundry.sh/reference/anvil/) node that forks from a remote chain
-- Registers a **temporary workload** with a dev version (default: `dev-YYYYMMDD`) to the on-chain WorkloadRegistry
-- Serves mock `/sign-message` and `/rotate-key` endpoints over Unix sockets
-
-### Workflow
-
-#### 1. Start a local Anvil node
-
-We recommend forking from a remote chain so that the Automata contracts (SessionRegistry, BaseImageRegistry, etc.) are already available:
-
-```bash
-anvil --fork-url https://rpc.example.com --hardfork osaka
-```
-
-This gives you a local chain at `http://localhost:8545` with pre-funded test accounts.
-
-You can check available contract addresses with:
-
-```bash
-atakit registry ls
-```
-
-#### 2. First run: get the dev workload ID
-
-```bash
-atakit sim-agent --rpc-url http://localhost:8545 my-workload
-```
-
-The output will show the temporary workload reference and its ID:
-
-```
-Workload: my-workload:dev-20260226 (workload_id: 0xabcd...)
-```
-
-The `--rpc-url` points to your local Anvil. The sim-agent starts a **second** embedded Anvil (default port `14345`, configurable with `--anvil-port`) that forks from it. This second Anvil is accessible at `http://0.0.0.0:14345` for external tools like `cast` or your own scripts.
-
-> By default the dev version changes once per day (`dev-YYYYMMDD`). You can pin it with `--dev-version dev`, but make sure that version is not already registered in the WorkloadRegistry.
-
-#### 3. Deploy contracts and whitelist the workload ID
-
-With the first Anvil running at `localhost:8545`, you can deploy your contracts and add the dev `workload_id` from step 2 to your contract's whitelist:
-
-```bash
-# Deploy your contract to the local Anvil
-forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
-
-# Whitelist the dev workload ID
-cast send <YOUR_CONTRACT> "addWorkload(bytes32)" 0xabcd... --rpc-url http://localhost:8545
-```
-
-#### 4. Build the workload package
-
-```bash
-atakit workload build my-workload
-```
-
-#### 5. Restart sim-agent
-
-```bash
-atakit sim-agent --rpc-url http://localhost:8545 my-workload
-```
-
-The sim-agent will register the temporary workload on its embedded Anvil (which forks from `localhost:8545`, inheriting your deployed contracts and whitelist) and start serving the CVM agent API on Unix sockets.
-
-#### 6. Start your services
-
-```bash
-docker compose -f docker-compose.yml up
-```
-
-Your services can now call the simulated CVM agent via the Unix socket (e.g., `./cvm-agent.sock`) just like they would in a real CVM.
-
-### sim-agent CLI Reference
-
-```
-atakit sim-agent [OPTIONS] --rpc-url <RPC_URL> [WORKLOAD]...
-```
-
-| Option | Description |
-|--------|-------------|
-| `[WORKLOAD]...` | Workload names from `atakit.json`. If omitted, all workloads are started |
-| `--rpc-url <URL>` | Remote RPC endpoint (used as Anvil fork URL) |
-| `--dev-version <VER>` | Dev workload version (default: `dev-YYYYMMDD`) |
-| `--anvil-port <PORT>` | Anvil listen port (default: 14345) |
-| `--session-registry <ADDR>` | SessionRegistry address (auto-detected if omitted) |
-
-## Registry Query Commands
-
-Query on-chain registry data.
-
-### Query base image info
-
-```bash
-atakit registry query image automata-linux:v0.1.0 --rpc-url <RPC_URL>
-```
-
-Shows the full base image hierarchy: spec, platform profiles, invariant PCRs, and measurement variants.
-
-### Query workload spec
-
-```bash
-atakit registry query workload guardian:v0.1.0 --rpc-url <RPC_URL>
-```
-
-Queries the WorkloadRegistry contract and prints the workload spec.
-
-## Container Engine
-
-Atakit supports both Docker and Podman. The container engine is resolved in this order:
-
-1. `CONTAINER_ENGINE` environment variable (`docker` or `podman`)
-2. Global config preference (`~/.atakit/config.json`)
-3. Auto-detect (tries docker first, then podman)
-
-```bash
-# Set the default container engine
-atakit config default-container-engine podman
-
-# Show the current default
-atakit config default-container-engine
-
-# Override per-invocation via env var
-CONTAINER_ENGINE=docker atakit workload build
-```
-
-> **Note:** Podman does not support cross-platform builds. If the target platform (e.g., `linux/amd64`) does not match your host architecture, switch to Docker.
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `RUST_LOG` | Logging level (e.g., `info`, `debug`) |
-| `ATAKIT_HOME` | Override default data directory |
-| `CONTAINER_ENGINE` | Container engine override (`docker` or `podman`) |
-
-## Development
-
-### Building
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-```
-
-### Local QEMU Testing
-
-For local development without cloud resources:
-
-```bash
-# Deploy with QEMU
-atakit deploy my-deployment --qemu
-
-# Instance files are stored in ~/.atakit/qemu/<instance-name>/
-```
+Library crates are frontend-agnostic -- the CLI binary owns all terminal presentation. See [`docs/architecture.md`](docs/architecture.md) for details.
 
 ## License
 
-Apache-2.0
+TODO

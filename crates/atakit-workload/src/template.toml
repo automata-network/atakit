@@ -1,0 +1,231 @@
+# atakit-workload.toml -- workload definition for CVM deployments.
+#
+# This file defines a single workload: its container image, runtime config,
+# data mounts, on-chain parameters, and optional sidecars. Running
+# `atakit workload build` compiles it into a deterministic .atawl archive
+# containing manifest.json + images + measured-data.
+
+# Schema version. Must be 2.
+format = 2
+
+# ── package data ────────────────────────────────────────────────
+#
+# Declares which files are bundled into the archive (measured-data) and
+# which operators must provide at deploy time (unmeasured-data). These are
+# workload-level concerns; individual containers opt into mounting them
+# via per-container measured-data / unmeasured-data booleans.
+#
+# measured-data: files included in the archive and integrity-verified via PCR23.
+# Paths must start with "./" and must not contain "..". Files must exist
+# at build time. Mounted read-only at /atakit-portal/measured-data/ in containers
+# that set measured-data = true.
+#
+# unmeasured-data: operator-provided files NOT included in the archive.
+# Not verified by PCR23 -- the operator supplies them at deploy time.
+# Mounted read-only at /atakit-portal/unmeasured-data/ in containers
+# that set unmeasured-data = true.
+#
+# [package]
+# measured-data = ["./config/cert.pem", "./config/settings.json"]
+# unmeasured-data = ["./runtime-data/signing-key.pem"]
+
+[workload]
+# Workload identity. The on-chain workload ID is derived from name + version
+# via keccak256, so changing either produces a new workload.
+#
+# name: alphanumeric + hyphens, must not start with a hyphen.
+# version: must start with "v", followed by alphanumeric/.-_ chars.
+name = "{{name}}"
+version = "v0.0.1"
+
+# ── on-chain parameters ──────────────────────────────────────────
+#
+# base-image-mode: controls which base OS images this workload trusts.
+#   "blacklist" -- allow all base images except those in base-image list.
+#   "whitelist" -- only allow base images in the base-image list.
+# On-chain AccessMode enum: ANY=0, BLACKLIST=1, WHITELIST=2.
+# (ANY is not exposed here; use "blacklist" with an empty list for the same effect.)
+base-image-mode = "blacklist"
+
+# base-image: list of base image references (name:version) for the whitelist/blacklist.
+# Used by `cloud deploy` for local validation and by `workload publish` to derive
+# on-chain base image IDs. Override with `--base-image-id` on publish if needed.
+# base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
+
+# session-ttl: session TTL in seconds. Determines how long a CVM session
+# remains valid after attestation. Default: 0 (contract default, 30 days).
+# Can be overridden per-publish with `--session-ttl`. The contract computes
+# `block.timestamp + ttl` as uint64, so the value must not cause overflow.
+# session-ttl = 0
+
+# boot-disk-size: minimum boot/OS disk size for cloud deployments.
+# Uses the cloud provider default if omitted. The actual disk may be larger
+# if the base image requires more space. Valid units: MB, GB, TB.
+# boot-disk-size = "50GB"
+
+# ── image source (pick exactly one form) ─────────────────────────
+#
+# Form 1 -- Pull from a container registry:
+image = "{{name}}:latest"
+#
+# Form 2 -- Build from a local Dockerfile/Containerfile:
+#   build: path to build context directory (relative to this file, no ".." allowed).
+#   containerfile: optional, defaults to "Dockerfile" in the build context.
+#   args: optional build-time arguments passed to docker/podman build.
+# image = { build = ".", containerfile = "Containerfile", args = { KEY = "value" } }
+#
+# Form 3 -- Load from a pre-built local tar archive (.tar or .tar.gz):
+# image = { file = "./images/{{name}}.tar" }
+
+# ── container runtime ────────────────────────────────────────────
+#
+# ports: host:container port mappings. Optional /tcp or /udp suffix.
+# No suffix opens both TCP and UDP. Use /tcp or /udp to restrict to one protocol.
+# Host ports from this list automatically get firewall allow rules.
+# ports = ["3000:3000", "8080:8080/tcp", "5353:5353/udp"]
+#
+# restart: container restart policy.
+# Values: "no" (default), "always", "on-failure", "unless-stopped".
+# restart = "unless-stopped"
+#
+# command: override the container CMD. String (shell form) or array (exec form).
+# command = "echo hello"
+# command = ["echo", "hello"]
+#
+# entrypoint: override the container ENTRYPOINT. String or array.
+# entrypoint = ["/app/entrypoint.sh"]
+#
+# atakit-portal: mount the atakit-portal Unix socket into the container.
+# Required for workloads that communicate with the host agent.
+# atakit-portal = true
+#
+# gid-group: controls GID sharing between containers. Services with the
+# same gid-group share a host GID; services with different values get
+# isolated GIDs. Default: workload name.
+# gid-group = "my-group"
+#
+# cap-add: Linux capabilities to grant on top of the default cap set.
+# Allowlisted to "NET_ADMIN", "NET_RAW" so the attestation surface stays
+# bounded. NET_ADMIN lets the workload manage nftables in its own netns
+# (e.g. firewall/egress enforcement that subordinate baby containers
+# inherit via shared-netns); NET_RAW lets it open raw sockets.
+# Always serialised in manifest.json -- empty [] is a positive commitment
+# bound into PCR23, not noise.
+# cap-add = ["NET_ADMIN"]
+#
+# cap-drop: Linux capabilities to remove from the default cap set as a
+# hardening commitment. Entries must be members of the default set
+# (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE, SETFCAP,
+# SETGID, SETPCAP, SETUID, SYS_CHROOT). Names use canonical uppercase
+# without the CAP_ prefix.
+# cap-drop = ["NET_BIND_SERVICE"]
+
+# ── environment variables ────────────────────────────────────────
+#
+# Inline key-value pairs merged into the container environment.
+# [workload.environment]
+# RUST_LOG = "info"
+# LISTEN_ADDR = "0.0.0.0:3000"
+#
+# env_file: load variables from a dotenv file. Path must start with "./"
+# and must not contain "..". Can be a string or array of strings.
+# env_file = "./.env"
+# env_file = ["./.env", "./.env.production"]
+#
+# Resolution order when a key appears in both: env_file values are loaded
+# first, then [workload.environment] overrides them.
+
+# ── data mount booleans ──────────────────────────────────────────
+#
+# measured-data: when true, bind-mount the measured-data/ directory
+# (read-only) into this container at /atakit-portal/measured-data/.
+# Files are defined in the [package] section above.
+# measured-data = true
+#
+# unmeasured-data: when true, bind-mount the unmeasured-data/ directory
+# (read-only) into this container at /atakit-portal/unmeasured-data/.
+# Files are defined in the [package] section above.
+# unmeasured-data = true
+
+# ── persistent disk mounts ───────────────────────────────────────
+#
+# Maps disk names (defined in [disks.*] below) to container mount paths.
+# Disks can be shared between the workload and dependencies.
+# [workload.disks]
+# my-disk = "/data"
+
+# ── dependencies ──────────────────────────────────────────────────
+#
+# Sidecar containers that run alongside the main workload. Each dependency
+# has its own image, ports, restart, command, entrypoint, environment,
+# env_file, depends_on, and disk mounts. Host ports must be unique
+# across all containers.
+#
+# Dependencies can also specify measured-data and unmeasured-data arrays
+# to control which workload-level data files get mounted into their
+# containers.
+#
+# [dependencies.redis]
+# image = "redis:7"
+# ports = ["6379:6379"]
+# restart = "unless-stopped"
+# depends_on = []
+# [dependencies.redis.environment]
+# REDIS_PASSWORD = "secret"
+# [dependencies.redis.disks]
+# redis-data = "/cache"
+
+# ── firewall ─────────────────────────────────────────────────────
+#
+# By default, every host port in `ports` gets firewall allow rules (both TCP
+# and UDP unless a protocol suffix restricts it). Use [firewall] to add extra
+# rules or deny auto-derived ones.
+#
+# Format: same as ports -- "host-port[/protocol]" (no container port).
+# A bare port number (integer or string without /protocol) means both tcp+udp.
+# Port must be >= 1025. Also accepts { port, protocol } object form.
+#
+# allow: additional firewall rules beyond auto-derived ones.
+# deny:  suppress auto-derived rules. Only useful for ports in `ports` above.
+#
+# [firewall]
+# allow = ["4000/tcp", "5000/udp"]
+# deny = [3000, "8080/udp"]
+
+# ── baby containers ──────────────────────────────────────────────
+#
+# Allow ephemeral sidecar containers spawned at runtime via the CVM agent's
+# /baby-container/* API. These are not defined in the workload config --
+# they are created dynamically by the main workload container.
+#
+# [baby-container]
+# enabled = true
+# max-instances = 2
+#
+# [baby-container.slots.analysis-job]
+# parent-service = "{{name}}"           # service whose portal UDS may manage this slot
+# image-selection = "single"            # or "multiple"
+#
+# [baby-container.slots.analysis-job.lifecycle]
+# image-retention = "session"           # or "disk"
+# instance-retention = "ephemeral"      # or "session" / "disk"
+# restart = "manual"                    # or "on-workload-start"
+# rootfs = "read-only"
+
+# ── persistent disks ─────────────────────────────────────────────
+#
+# Define persistent disks that survive container restarts. Referenced by
+# [workload.disks] or [dependencies.<name>.disks]. Disks can be shared
+# between multiple containers.
+#
+# index: device LUN / index. Must be >= 10, unique across all disks.
+#        Auto-assigned from 10 in alphabetical order if omitted.
+# size: disk size with unit suffix. Valid units: MB, GB, TB.
+# encryption.unlock_method: list of unlock methods ("tpm", "passphrase",
+#   "keyfile", "kms"). Empty list means no encryption.
+# encryption.bind: list of PCR bindings ("platform", "baseimage", "workload").
+#
+# [disks.my-disk]
+# index = 10
+# size = "10GB"
+# encryption = { unlock_method = ["tpm"], bind = ["workload"] }
