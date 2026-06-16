@@ -1,56 +1,72 @@
 [workspace]
-members = ["crates/*"]
 resolver = "2"
-exclude = ["workload_examples/*"]
+members = [
+    "crates/atakit-core",
+    "crates/atakit-github",
+    "crates/atakit-image",
+    "crates/atakit-workload",
+    "crates/atakit-cloud",
+    "crates/atakit-cli",
+]
 
 [workspace.package]
-version = "0.1.0"
-authors = ["Automata Team"]
-edition = "2024"
-license = "Apache-2.0"
-
-#[profile.dev]
-#opt-level = 3
-
-[profile.release]
-debug = 1
-lto = "thin"
+version = "0.5.2"
+edition = "2021"
 
 [workspace.dependencies]
-
-automata-linux-release = { path = "crates/automata-linux-release" }
-csp = { path = "crates/csp" }
-automata-cvm-agent = { path = "crates/automata-cvm-agent" }
-automata-tee-workload-compose = { path = "crates/automata-tee-workload-compose" }
-container-engine = { path = "crates/container-engine" }
-automata-tee-workload-measurement = "0.1.1"
-
-clap = { version = "4", features = ["derive", "env"] }
-anyhow = "1"
-rand = "0.8"
+# Shared
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
-sha2 = "0.10"
-flate2 = "1"
-tar = "0.4"
-tokio = { version = "1", features = ["full"] }
-axum = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-indexmap = { version = "2", features = ["serde"] }
-compose_spec = "0.3"
-fatfs = "0.3"
-fscommon = "0.1"
+thiserror = "2"
+
+# Network
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
-indicatif = "0.17"
-async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["rt"] }
-k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-sha3 = "0.10"
-hex = "0.4"
-alloy = { version = "1.7.4", package = "alloy-ext" }
-alloy-chains = "0.2"
+futures-util = "0.3"
+
+# Build / archive
 tempfile = "3"
-chrono = "0.4"
+toml = "0.8"
+serde_json_canonicalizer = "0.3"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Blockchain
+alloy-ext = "1.7.4"
+automata-tee-workload-measurement = "0.1.2"
+hex = "0.4"
+
+# Async
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+indicatif = "0.17"
+owo-colors = "4"
+shell-escape = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal
+atakit-core = { path = "crates/atakit-core" }
+atakit-github = { path = "crates/atakit-github" }
+atakit-image = { path = "crates/atakit-image" }
+atakit-workload = { path = "crates/atakit-workload" }
+atakit-cloud = { path = "crates/atakit-cloud" }
+
+# Optimize compression and crypto in dev builds -- decompression
+# of large .atawl archives is unusably slow without this.
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3

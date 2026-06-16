@@ -1,0 +1,6 @@
+[package]
+name = "atakit-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
