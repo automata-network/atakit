@@ -4,6 +4,8 @@ use std::path::{Component, Path};
 use crate::config::{self, ImageSource, WorkloadConfig};
 use crate::WorkloadError;
 
+const MIN_DATA_DISK_GB: u64 = 10;
+
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
 fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
     let p = Path::new(path);
@@ -379,10 +381,10 @@ pub fn validate_config(
                     disk.size
                 )));
             }
-            if let Some(gb) = parse_size_gb(&disk.size) {
-                if gb < 10 {
+            if let Some(mb) = parse_size_mb(&disk.size) {
+                if mb < MIN_DATA_DISK_GB * 1024 {
                     return Err(WorkloadError::Validation(format!(
-                        "disk {name:?} size must be at least 10GB, got {:?}",
+                        "disk {name:?} size must be at least {MIN_DATA_DISK_GB}GB, got {:?}",
                         disk.size
                     )));
                 }
@@ -1075,8 +1077,8 @@ fn is_valid_size(s: &str) -> bool {
     false
 }
 
-/// Parse a size string to gigabytes. Returns None for invalid formats.
-fn parse_size_gb(s: &str) -> Option<u64> {
+/// Parse a size string to megabytes without rounding.
+fn parse_size_mb(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num_str, suffix) = if let Some(n) = s.strip_suffix("TB") {
         (n, "TB")
@@ -1089,9 +1091,9 @@ fn parse_size_gb(s: &str) -> Option<u64> {
     };
     let num: u64 = num_str.trim().parse().ok()?;
     match suffix {
-        "TB" => Some(num * 1024),
-        "GB" => Some(num),
-        "MB" => Some(num.div_ceil(1024)),
+        "TB" => num.checked_mul(1024 * 1024),
+        "GB" => num.checked_mul(1024),
+        "MB" => Some(num),
         _ => None,
     }
 }
@@ -1441,6 +1443,71 @@ encryption = { unlock_method = [], bind = [] }
 [disks.c]
 index = 12
 size = "1TB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_disk_size_below_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "4GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("size must be at least 10GB"));
+    }
+
+    #[test]
+    fn rejects_disk_size_mb_that_rounds_up_below_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10239MB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("size must be at least 10GB"));
+    }
+
+    #[test]
+    fn accepts_disk_size_mb_at_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10240MB"
 encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
