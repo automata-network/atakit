@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
 use crate::config::{self, ImageSource, WorkloadConfig};
@@ -8,6 +8,11 @@ const MIN_DATA_DISK_GB: u64 = 10;
 
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
 fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
+    if path.as_bytes().contains(&0) {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must not contain NUL: {path:?}"
+        )));
+    }
     let p = Path::new(path);
     for component in p.components() {
         if component == Component::ParentDir {
@@ -17,6 +22,15 @@ fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
         }
     }
     Ok(())
+}
+
+fn validate_package_relative_path(path: &str, context: &str) -> Result<(), WorkloadError> {
+    if !path.starts_with("./") {
+        return Err(WorkloadError::Validation(format!(
+            "{context} path must start with \"./\": {path:?}"
+        )));
+    }
+    ensure_no_traversal(path, context)
 }
 
 fn ensure_absolute_clean_path(path: &str, context: &str) -> Result<(), WorkloadError> {
@@ -238,12 +252,7 @@ pub fn validate_config(
 
     // ── package measured-data paths ─────────────────────────
     for p in config.measured_data_paths() {
-        if !p.starts_with("./") {
-            return Err(WorkloadError::Validation(format!(
-                "package measured-data path must start with \"./\": {p:?}"
-            )));
-        }
-        ensure_no_traversal(p, "package measured-data")?;
+        validate_package_relative_path(p, "package measured-data")?;
         let abs = workload_dir.join(p);
         if !abs.exists() {
             return Err(WorkloadError::MeasuredDataMissing(abs));
@@ -253,12 +262,7 @@ pub fn validate_config(
 
     // ── package unmeasured-data paths (format check only, files need not exist) ──
     for p in config.unmeasured_data_paths() {
-        if !p.starts_with("./") {
-            return Err(WorkloadError::Validation(format!(
-                "package unmeasured-data path must start with \"./\": {p:?}"
-            )));
-        }
-        ensure_no_traversal(p, "package unmeasured-data")?;
+        validate_package_relative_path(p, "package unmeasured-data")?;
     }
 
     // ── package ↔ service opt-in consistency ───────────────
@@ -300,22 +304,15 @@ pub fn validate_config(
         }
     }
 
-    // ── env_file ──────────────────────────────────────────
-    if let Some(ref env_files) = w.env_file {
-        for ef in env_files.as_vec() {
-            if !ef.starts_with("./") {
-                return Err(WorkloadError::Validation(format!(
-                    "env_file path must start with \"./\": {ef:?}"
-                )));
-            }
-            ensure_no_traversal(&ef, "env_file")?;
-            let abs = workload_dir.join(&ef);
-            if !abs.exists() {
-                return Err(WorkloadError::EnvFileMissing(abs));
-            }
-            ensure_within(&abs, workload_dir, "env_file")?;
-        }
-    }
+    let declared_unmeasured_data =
+        crate::manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
+
+    validate_env_files(&w.env_file, workload_dir, "env-file")?;
+    validate_unmeasured_env_files(
+        &w.unmeasured_env_file,
+        &declared_unmeasured_data,
+        "unmeasured-env-file",
+    )?;
 
     // ── boot-disk-size ─────────────────────────────────────
     if let Some(ref bds) = w.boot_disk_size {
@@ -497,26 +494,16 @@ pub fn validate_config(
             }
         }
 
-        // env_file validation.
-        if let Some(ref env_files) = dep.env_file {
-            for ef in env_files.as_vec() {
-                if !ef.starts_with("./") {
-                    return Err(WorkloadError::Validation(format!(
-                        "dependencies.{dep_name}.env_file path must start with \"./\": {ef:?}"
-                    )));
-                }
-                ensure_no_traversal(&ef, &format!("dependencies.{dep_name}.env_file"))?;
-                let abs = workload_dir.join(&ef);
-                if !abs.exists() {
-                    return Err(WorkloadError::EnvFileMissing(abs));
-                }
-                ensure_within(
-                    &abs,
-                    workload_dir,
-                    &format!("dependencies.{dep_name}.env_file"),
-                )?;
-            }
-        }
+        validate_env_files(
+            &dep.env_file,
+            workload_dir,
+            &format!("dependencies.{dep_name}.env-file"),
+        )?;
+        validate_unmeasured_env_files(
+            &dep.unmeasured_env_file,
+            &declared_unmeasured_data,
+            &format!("dependencies.{dep_name}.unmeasured-env-file"),
+        )?;
 
         // gid-group validation.
         if let Some(ref gg) = dep.gid_group {
@@ -562,6 +549,49 @@ pub fn validate_config(
     validate_log_grants(config)?;
 
     Ok(warnings)
+}
+
+fn validate_env_files(
+    env_files: &Option<config::StringOrArray>,
+    workload_dir: &Path,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    if let Some(env_files) = env_files {
+        for ef in env_files.as_vec() {
+            validate_package_relative_path(&ef, context)?;
+            let abs = workload_dir.join(&ef);
+            if !abs.exists() {
+                return Err(WorkloadError::EnvFileMissing(abs));
+            }
+            ensure_within(&abs, workload_dir, context)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_unmeasured_env_files(
+    env_files: &Option<config::StringOrArray>,
+    declared_unmeasured_data: &BTreeSet<String>,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    if let Some(env_files) = env_files {
+        let mut seen = BTreeSet::new();
+        for ef in env_files.as_vec() {
+            validate_package_relative_path(&ef, context)?;
+            let normalized = format!("unmeasured-data/{}", crate::manifest::strip_dot_slash(&ef));
+            if !seen.insert(normalized.clone()) {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: duplicate path {normalized:?}"
+                )));
+            }
+            if !declared_unmeasured_data.contains(&normalized) {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: {normalized:?} must be declared in [package] unmeasured-data"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_baby_container(config: &WorkloadConfig) -> Result<(), WorkloadError> {
@@ -1824,7 +1854,45 @@ env_file = "prod.env"
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("env_file path must start with"));
+        assert!(err.to_string().contains("env-file path must start with"));
+    }
+
+    #[test]
+    fn accepts_unmeasured_env_file_declared_in_package() {
+        let toml = r#"
+format = 2
+
+[package]
+unmeasured-data = ["./secrets/runtime.env"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "./secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_unmeasured_env_file_missing_package_declaration() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "./secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("[package] unmeasured-data"));
     }
 
     #[test]
