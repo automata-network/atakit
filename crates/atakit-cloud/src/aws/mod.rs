@@ -42,6 +42,11 @@ impl CloudProvider for AwsProvider {
     }
 
     async fn plan_deploy(&self, opts: &DeployOptions) -> Result<DeployPlan, CloudError> {
+        if opts.static_ip.is_some() {
+            return Err(CloudError::Config {
+                message: "static_ip is not yet supported for AWS".to_string(),
+            });
+        }
         let names = ResourceNames::for_aws(&opts.instance_name, &opts.image_ref);
         let mut steps = vec![DeployStep::CheckDeps];
 
@@ -89,6 +94,7 @@ impl CloudProvider for AwsProvider {
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
+            static_ip: opts.static_ip.clone(),
         });
 
         if !opts.skip_init {
@@ -199,6 +205,7 @@ impl CloudProvider for AwsProvider {
                 metadata,
                 disks,
                 boot_disk_size_gb,
+                static_ip: _,
             } => {
                 let ami_id = image::find_ami(&self.region, image_name, runner)
                     .await?
@@ -419,6 +426,8 @@ mod tests {
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
             chain: Some("testnet".to_string()),
             registration: None,
             owner_key: Some("owner".to_string()),
@@ -448,6 +457,8 @@ mod tests {
             portal_ports: Default::default(),
             workload_disks: Vec::new(),
             boot_disk_size_gb: None,
+            static_ip: None,
+            static_ip_resource_group: None,
         }
     }
 
@@ -499,5 +510,22 @@ mod tests {
         assert!(ports.contains(&"3000/tcp".to_string()));
         assert!(!ports.contains(&"2024/tcp".to_string()));
         assert!(!ports.contains(&"1024/tcp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_static_ip_errors_until_aws_support_is_implemented() {
+        let provider = AwsProvider::new("us-east-1".to_string());
+        let mut opts = test_deploy_opts();
+        opts.static_ip = Some("eipalloc-0123456789abcdef0".to_string());
+
+        let err = match provider.plan_deploy(&opts).await {
+            Ok(_) => panic!("AWS static_ip should fail until support is implemented"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("static_ip is not yet supported for AWS"),
+            "{err}"
+        );
     }
 }

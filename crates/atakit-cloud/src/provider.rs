@@ -35,6 +35,10 @@ pub struct DeployOptions {
     pub workload_disks: Vec<(String, u32, u64)>,
     /// Minimum boot/OS disk size in GB. Cloud default if None.
     pub boot_disk_size_gb: Option<u64>,
+    /// Existing operator-managed static public IP resource to attach.
+    pub static_ip: Option<String>,
+    /// Azure resource group containing `static_ip`.
+    pub static_ip_resource_group: Option<String>,
 }
 
 /// Open the deploy-selected portal ports plus workload-declared ports.
