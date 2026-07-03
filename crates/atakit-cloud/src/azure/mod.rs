@@ -148,6 +148,8 @@ impl CloudProvider for AzureProvider {
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
+            static_ip: opts.static_ip.clone(),
+            static_ip_resource_group: opts.static_ip_resource_group.clone(),
         });
 
         if !opts.skip_init {
@@ -449,6 +451,8 @@ impl CloudProvider for AzureProvider {
                 metadata,
                 disks,
                 boot_disk_size_gb,
+                static_ip,
+                static_ip_resource_group,
             } => {
                 // The image_id in the step is empty at plan time. Look up the
                 // gallery image version ID using the image_ref for naming.
@@ -464,6 +468,21 @@ impl CloudProvider for AzureProvider {
                 .await
                 .unwrap_or_default();
 
+                let static_ip_id = match (static_ip, static_ip_resource_group) {
+                    (Some(name), Some(rg)) => Some(
+                        instance::resolve_static_public_ip(&self.subscription, rg, name, runner)
+                            .await?,
+                    ),
+                    (Some(name), None) => {
+                        return Err(CloudError::Config {
+                            message: format!(
+                                "Azure static_ip '{name}' requires static_ip_resource_group"
+                            ),
+                        });
+                    }
+                    (None, _) => None,
+                };
+
                 let ip = instance::create_instance(
                     &self.subscription,
                     resource_group,
@@ -474,6 +493,7 @@ impl CloudProvider for AzureProvider {
                     nsg,
                     metadata,
                     *boot_disk_size_gb,
+                    static_ip_id.as_deref(),
                     runner,
                 )
                 .await?;
@@ -765,6 +785,8 @@ mod tests {
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
             chain: Some("testnet".to_string()),
             registration: None,
             owner_key: Some("owner".to_string()),
@@ -794,6 +816,8 @@ mod tests {
             portal_ports: Default::default(),
             workload_disks: vec![],
             boot_disk_size_gb: None,
+            static_ip: None,
+            static_ip_resource_group: None,
         }
     }
 

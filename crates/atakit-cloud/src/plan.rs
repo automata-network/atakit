@@ -89,6 +89,7 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
     },
     WaitForPortal {
         timeout_secs: u64,
@@ -125,6 +126,8 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
+        static_ip_resource_group: Option<String>,
     },
     // AWS-specific steps.
     UploadImageAws {
@@ -150,6 +153,7 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
     },
     // QEMU-specific steps.
     /// Provision a local QEMU instance: create the boot-disk qcow2 overlay,

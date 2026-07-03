@@ -175,8 +175,10 @@ pub struct WorkloadSection {
     pub entrypoint: Option<StringOrArray>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "env-file", alias = "env_file")]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "unmeasured-env-file")]
+    pub unmeasured_env_file: Option<StringOrArray>,
     #[serde(default = "default_session_ttl", rename = "session-ttl")]
     pub session_ttl: u64,
     #[serde(default, rename = "atakit-portal")]
@@ -333,8 +335,10 @@ pub struct DependencySection {
     pub entrypoint: Option<StringOrArray>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "env-file", alias = "env_file")]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "unmeasured-env-file")]
+    pub unmeasured_env_file: Option<StringOrArray>,
     #[serde(default, rename = "atakit-portal")]
     pub atakit_portal: bool,
     /// GID sharing group. Default: workload name.
@@ -654,6 +658,12 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     }
 
     if let Some(workload) = value.get("workload").and_then(|v| v.as_table()) {
+        if workload.contains_key("env-file") && workload.contains_key("env_file") {
+            return Err(WorkloadError::Validation(
+                "[workload] cannot use both `env-file` and legacy `env_file`; use `env-file`"
+                    .into(),
+            ));
+        }
         if workload.contains_key("cvm_agent") {
             return Err(WorkloadError::Validation(
                 "`cvm_agent` is no longer supported in format 2. \
@@ -688,6 +698,11 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
         for (name, dep) in deps {
             if let Some(t) = dep.as_table() {
+                if t.contains_key("env-file") && t.contains_key("env_file") {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name} cannot use both `env-file` and legacy `env_file`; use `env-file`"
+                    )));
+                }
                 if t.contains_key("cvm_agent") {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `cvm_agent` is no longer supported. \
@@ -1106,6 +1121,58 @@ measured-data = true
         assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
         assert!(cfg.workload.measured_data);
         assert!(!cfg.workload.unmeasured_data);
+    }
+
+    #[test]
+    fn parses_env_file_aliases_and_unmeasured_env_file() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+env-file = ["./defaults.env"]
+unmeasured-env-file = "./runtime.env"
+
+[dependencies.sidecar]
+image = "sidecar:latest"
+env_file = "./legacy.env"
+unmeasured-env-file = ["./sidecar.env"]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workload.env_file.unwrap().as_vec(),
+            vec!["./defaults.env"]
+        );
+        assert_eq!(
+            cfg.workload.unmeasured_env_file.unwrap().as_vec(),
+            vec!["./runtime.env"]
+        );
+        let dep = &cfg.dependencies["sidecar"];
+        assert_eq!(dep.env_file.clone().unwrap().as_vec(), vec!["./legacy.env"]);
+        assert_eq!(
+            dep.unmeasured_env_file.clone().unwrap().as_vec(),
+            vec!["./sidecar.env"]
+        );
+    }
+
+    #[test]
+    fn rejects_both_env_file_spellings() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+env-file = "./defaults.env"
+env_file = "./legacy.env"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("both `env-file`"));
     }
 
     #[test]

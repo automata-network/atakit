@@ -26,5 +26,5 @@ pub use repository::{
 pub use scaffold::create_workload;
 pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
 
-/// Current format version for `atakit-workload.toml` and `manifest.toml`.
-pub const FORMAT_VERSION: u32 = 2;
+/// Current format version for `atakit-workload.toml` and `manifest.json`.
+pub const FORMAT_VERSION: u32 = 3;

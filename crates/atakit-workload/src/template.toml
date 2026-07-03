@@ -5,8 +5,8 @@
 # `atakit workload build` compiles it into a deterministic .atawl archive
 # containing manifest.json + images + measured-data.
 
-# Schema version. Must be 2.
-format = 2
+# Schema version. Current: 3.
+format = 3
 
 # ── package data ────────────────────────────────────────────────
 #
@@ -95,6 +95,16 @@ image = "{{name}}:latest"
 # entrypoint: override the container ENTRYPOINT. String or array.
 # entrypoint = ["/app/entrypoint.sh"]
 #
+# env-file: measured build-time .env files. Parsed during `workload build`,
+# merged into the manifest environment, and overridden by explicit
+# [workload.environment] values.
+# env-file = "./defaults.env"
+#
+# unmeasured-env-file: runtime operator-supplied .env files. Each file must be
+# declared in [package] unmeasured-data; only the path and receiving service
+# are measured. Contents are provided at init/deploy time.
+# unmeasured-env-file = "./runtime-data/secrets.env"
+#
 # atakit-portal: mount the atakit-portal Unix socket into the container.
 # Required for workloads that communicate with the host agent.
 # atakit-portal = true
@@ -127,12 +137,12 @@ image = "{{name}}:latest"
 # RUST_LOG = "info"
 # LISTEN_ADDR = "0.0.0.0:3000"
 #
-# env_file: load variables from a dotenv file. Path must start with "./"
-# and must not contain "..". Can be a string or array of strings.
-# env_file = "./.env"
-# env_file = ["./.env", "./.env.production"]
+# env-file: load variables from measured dotenv files. Path must start with
+# "./" and must not contain "..". Can be a string or array of strings.
+# env-file = "./.env"
+# env-file = ["./.env", "./.env.production"]
 #
-# Resolution order when a key appears in both: env_file values are loaded
+# Resolution order when a key appears in both: env-file values are loaded
 # first, then [workload.environment] overrides them.
 
 # ── data mount booleans ──────────────────────────────────────────
@@ -158,7 +168,7 @@ image = "{{name}}:latest"
 #
 # Sidecar containers that run alongside the main workload. Each dependency
 # has its own image, ports, restart, command, entrypoint, environment,
-# env_file, depends_on, and disk mounts. Host ports must be unique
+# env-file, unmeasured-env-file, depends_on, and disk mounts. Host ports must be unique
 # across all containers.
 #
 # Dependencies can also specify measured-data and unmeasured-data arrays

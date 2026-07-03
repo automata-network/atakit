@@ -153,6 +153,7 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         atakit_portal: false,
                         gid_group: workload_name.clone(),
                         environment: dep.environment,
+                        unmeasured_env_files: Vec::new(),
                         depends_on: dep.depends_on,
                         measured_data: has_measured,
                         unmeasured_data: has_unmeasured,
@@ -209,6 +210,7 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             measured_data: !v1.config.measured_data.is_empty(),
             unmeasured_data: !v1.config.unmeasured_data.is_empty(),
             environment: v1.config.environment,
+            unmeasured_env_files: Vec::new(),
             disks: v1.config.disks,
             dependencies,
             firewall_ports: {

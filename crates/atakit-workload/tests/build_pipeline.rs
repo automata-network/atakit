@@ -192,6 +192,10 @@ async fn build_produces_valid_archive() {
         .to_string_lossy()
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
+    assert_eq!(
+        read_manifest_json(&result.archive_path)["meta"]["format"],
+        3
+    );
 
     // Verify archive contents
     let file = std::fs::File::open(&result.archive_path).unwrap();

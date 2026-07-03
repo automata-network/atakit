@@ -139,6 +139,16 @@ pub struct DeployArgs {
     #[arg(long, value_name = "SIZE")]
     pub boot_disk_size: Option<String>,
 
+    /// Existing operator-managed static public IP resource to attach.
+    /// GCP: reserved address name. Azure: Public IP name. AWS: Elastic IP
+    /// allocation ID once supported.
+    #[arg(long, value_name = "REF")]
+    pub static_ip: Option<String>,
+
+    /// Azure resource group containing --static-ip.
+    #[arg(long, value_name = "RG")]
+    pub static_ip_resource_group: Option<String>,
+
     /// CVM portal /init port. Default: 1024.
     #[arg(long, value_name = "PORT")]
     pub init_port: Option<u16>,

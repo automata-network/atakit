@@ -106,6 +106,7 @@ impl CloudProvider for GcpProvider {
             metadata,
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
+            static_ip: opts.static_ip.clone(),
         });
 
         if !opts.skip_init {
@@ -219,7 +220,15 @@ impl CloudProvider for GcpProvider {
                 metadata,
                 disks,
                 boot_disk_size_gb,
+                static_ip,
             } => {
+                let static_ip_address = match static_ip {
+                    Some(name) => Some(
+                        instance::resolve_static_ip_address(&self.project, zone, name, runner)
+                            .await?,
+                    ),
+                    None => None,
+                };
                 let ip = instance::create_instance(
                     &self.project,
                     zone,
@@ -230,6 +239,7 @@ impl CloudProvider for GcpProvider {
                     metadata,
                     disks,
                     *boot_disk_size_gb,
+                    static_ip_address.as_deref(),
                     runner,
                 )
                 .await?;

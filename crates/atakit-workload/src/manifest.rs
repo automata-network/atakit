@@ -83,6 +83,8 @@ pub struct ManifestConfig {
     pub unmeasured_data: bool,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: Vec<String>,
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
     #[serde(default)]
@@ -174,6 +176,8 @@ pub struct ManifestDependency {
     pub gid_group: String,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
@@ -356,6 +360,20 @@ pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTree
     out
 }
 
+/// Normalize per-service runtime env-file declarations to manifest paths.
+pub fn normalize_unmeasured_env_files(env_files: &Option<StringOrArray>) -> Vec<String> {
+    env_files
+        .as_ref()
+        .map(|files| {
+            files
+                .as_vec()
+                .into_iter()
+                .map(|p| format!("unmeasured-data/{}", strip_dot_slash(&p)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Recursively collect files under `dir` as `unmeasured-data/<rel_prefix>/<...>`
 /// paths into the set.
 fn collect_member_files(dir: &Path, rel_prefix: &str, out: &mut BTreeSet<String>) {
@@ -485,6 +503,9 @@ pub fn build_manifest(
                             .clone()
                             .unwrap_or_else(|| default_gid_group.clone()),
                         environment: env,
+                        unmeasured_env_files: normalize_unmeasured_env_files(
+                            &dep.unmeasured_env_file,
+                        ),
                         depends_on: dep.depends_on.clone(),
                         measured_data: dep.measured_data,
                         unmeasured_data: dep.unmeasured_data,
@@ -629,6 +650,7 @@ pub fn build_manifest(
             measured_data: w.measured_data,
             unmeasured_data: w.unmeasured_data,
             environment,
+            unmeasured_env_files: normalize_unmeasured_env_files(&w.unmeasured_env_file),
             disks: w.disks.clone(),
             dependencies,
             firewall_ports,
@@ -779,7 +801,7 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":2"));
+        assert!(output.contains("\"format\":3"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
@@ -796,6 +818,37 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn unmeasured_env_files_are_normalized_into_manifest() {
+        let toml_str = r#"
+format = 2
+
+[package]
+unmeasured-data = ["./secrets/runtime.env"]
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+unmeasured-env-file = ["./secrets/runtime.env"]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from(["unmeasured-data/secrets/runtime.env".to_string()]),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            manifest.config.unmeasured_env_files,
+            vec!["unmeasured-data/secrets/runtime.env"]
+        );
     }
 
     #[test]

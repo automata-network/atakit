@@ -16,6 +16,7 @@ pub async fn create_instance(
     metadata: &[(String, String)],
     disks: &[DiskSpec],
     boot_disk_size_gb: Option<u64>,
+    static_ip_address: Option<&str>,
     runner: &dyn CommandRunner,
 ) -> Result<String, CloudError> {
     let cc_flag = format!("--confidential-compute-type={cc_type}");
@@ -35,6 +36,11 @@ pub async fn create_instance(
         None
     };
 
+    let network_interface_flag = match static_ip_address {
+        Some(ip) => format!("--network-interface=network-tier=PREMIUM,nic-type=GVNIC,address={ip}"),
+        None => "--network-interface=network-tier=PREMIUM,nic-type=GVNIC".to_string(),
+    };
+
     let mut args = vec![
         "compute",
         "instances",
@@ -48,7 +54,7 @@ pub async fn create_instance(
         &image_flag,
         "--image-project",
         project,
-        "--network-interface=network-tier=PREMIUM,nic-type=GVNIC",
+        &network_interface_flag,
         &cc_flag,
         "--maintenance-policy=TERMINATE",
         // Shielded VM: required for the image's custom PK/KEK/db to take
@@ -99,6 +105,52 @@ pub async fn create_instance(
         tracing::warn!("could not determine external IP from instance creation output");
     }
     Ok(ip)
+}
+
+/// Resolve an existing regional reserved address name to its IP address.
+pub async fn resolve_static_ip_address(
+    project: &str,
+    zone: &str,
+    name: &str,
+    runner: &dyn CommandRunner,
+) -> Result<String, CloudError> {
+    let region = region_from_zone(zone).ok_or_else(|| CloudError::Config {
+        message: format!("cannot derive GCP region from zone '{zone}' for static_ip '{name}'"),
+    })?;
+    let output = runner
+        .run_capture(
+            "gcloud",
+            &[
+                "compute",
+                "addresses",
+                "describe",
+                name,
+                "--region",
+                &region,
+                "--project",
+                project,
+                "--format=get(address)",
+            ],
+        )
+        .await
+        .map_err(|e| CloudError::InstanceError {
+            message: format!("failed to resolve static IP '{name}' in region '{region}': {e}"),
+        })?;
+    let address = output.stdout.trim();
+    if address.is_empty() {
+        return Err(CloudError::InstanceError {
+            message: format!("static IP '{name}' in region '{region}' did not return an address"),
+        });
+    }
+    Ok(address.to_string())
+}
+
+fn region_from_zone(zone: &str) -> Option<String> {
+    let (region, suffix) = zone.rsplit_once('-')?;
+    if region.is_empty() || suffix.is_empty() {
+        return None;
+    }
+    Some(region.to_string())
 }
 
 /// Check if an instance exists.
@@ -238,4 +290,149 @@ fn parse_external_ip(json_output: &str) -> Option<String> {
     let access_configs = iface.get("accessConfigs")?.as_array()?;
     let config = access_configs.first()?;
     config.get("natIP")?.as_str().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::CommandOutput;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct MockRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+        responses: Mutex<VecDeque<CommandOutput>>,
+    }
+
+    impl MockRunner {
+        fn new(responses: Vec<CommandOutput>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses.into()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for MockRunner {
+        async fn run_capture(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<CommandOutput, CloudError> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            ));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| CloudError::State {
+                    message: "missing mock response".to_string(),
+                })
+        }
+
+        async fn run_stream(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _verbose: bool,
+        ) -> Result<CommandOutput, CloudError> {
+            unimplemented!("streaming is not used by these tests")
+        }
+    }
+
+    fn output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_ip_lookup_uses_regional_address_and_create_uses_resolved_ip() {
+        let runner = MockRunner::new(vec![
+            output("203.0.113.10\n"),
+            output(r#"[{"networkInterfaces":[{"accessConfigs":[{"natIP":"203.0.113.10"}]}]}]"#),
+        ]);
+
+        let static_ip =
+            resolve_static_ip_address("proj", "asia-southeast1-b", "reserved-ip", &runner)
+                .await
+                .unwrap();
+        assert_eq!(static_ip, "203.0.113.10");
+
+        let ip = create_instance(
+            "proj",
+            "asia-southeast1-b",
+            "vm1",
+            "c3-standard-4",
+            "img1",
+            CcType::Tdx,
+            &[],
+            &[],
+            None,
+            Some(&static_ip),
+            &runner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ip, "203.0.113.10");
+
+        let calls = runner.calls();
+        assert_eq!(calls[0].0, "gcloud");
+        assert_eq!(
+            calls[0].1,
+            vec![
+                "compute",
+                "addresses",
+                "describe",
+                "reserved-ip",
+                "--region",
+                "asia-southeast1",
+                "--project",
+                "proj",
+                "--format=get(address)",
+            ]
+        );
+        assert!(calls[1].1.contains(
+            &"--network-interface=network-tier=PREMIUM,nic-type=GVNIC,address=203.0.113.10"
+                .to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_instance_without_static_ip_preserves_ephemeral_public_ip_args() {
+        let runner = MockRunner::new(vec![output(
+            r#"[{"networkInterfaces":[{"accessConfigs":[{"natIP":"198.51.100.20"}]}]}]"#,
+        )]);
+
+        create_instance(
+            "proj",
+            "us-central1-a",
+            "vm1",
+            "c3-standard-4",
+            "img1",
+            CcType::Tdx,
+            &[],
+            &[],
+            None,
+            None,
+            &runner,
+        )
+        .await
+        .unwrap();
+
+        let calls = runner.calls();
+        assert!(!calls[0].1.iter().any(|arg| arg.starts_with("--address=")));
+        assert!(calls[0]
+            .1
+            .contains(&"--network-interface=network-tier=PREMIUM,nic-type=GVNIC".to_string()));
+    }
 }

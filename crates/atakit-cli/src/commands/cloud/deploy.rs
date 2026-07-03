@@ -355,6 +355,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         None if image_only => bail!("--name is required with --image-only"),
         None => format!("{workload_name}-{target_name}"),
     };
+    let static_ip = resolve_static_ip_selection(
+        provider_config.platform,
+        &instance_name,
+        &target,
+        args.static_ip.as_deref(),
+        args.static_ip_resource_group.as_deref(),
+    )?;
 
     // 5. Check for existing deployment.
     if atakit_cloud::state::find_instance(&env.data_dir, &instance_name, Some(target_name)).is_ok()
@@ -496,6 +503,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         portal_ports,
         workload_disks: workload_disks.clone(),
         boot_disk_size_gb,
+        static_ip: static_ip.static_ip.clone(),
+        static_ip_resource_group: static_ip.static_ip_resource_group.clone(),
     };
     let plan = provider.plan_deploy(&deploy_opts).await?;
 
@@ -533,6 +542,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             eprintln!("  {:<15}{}", "Machine type:".dimmed(), target.vmtype);
             eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
             eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+            if let Some(ref ip) = static_ip.static_ip {
+                eprintln!("  {:<15}{}", "Static IP:".dimmed(), ip);
+            }
             eprintln!("  {:<15}{}", "GCE name:".dimmed(), names.image);
             if resolved_image.source_path.is_some() {
                 eprintln!("  {:<15}{}", "Bucket:".dimmed(), names.bucket);
@@ -562,6 +574,10 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             eprintln!("  {:<15}{}", "VM size:".dimmed(), target.vmtype);
             eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
             eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+            if let Some(ref ip) = static_ip.static_ip {
+                let rg = static_ip.static_ip_resource_group.as_deref().unwrap_or("-");
+                eprintln!("  {:<15}{}/{}", "Static IP:".dimmed(), rg, ip);
+            }
             eprintln!("  {:<15}{}", "RG:".dimmed(), names.resource_group);
             eprintln!(
                 "  {:<15}{}/{}",
@@ -578,6 +594,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             eprintln!("  {:<15}{}", "Instance type:".dimmed(), target.vmtype);
             eprintln!("  {:<15}{}", "CC type:".dimmed(), resolved_cc);
             eprintln!("  {:<15}{}", "Image:".dimmed(), image_ref);
+            if let Some(ref ip) = static_ip.static_ip {
+                eprintln!("  {:<15}{}", "Static IP:".dimmed(), ip);
+            }
             eprintln!("  {:<15}{}", "AMI name:".dimmed(), names.image);
             if resolved_image.source_path.is_some() {
                 eprintln!("  {:<15}{}", "Bucket:".dimmed(), names.bucket);
@@ -1255,6 +1274,50 @@ fn resolve_portal_ports(status_port: Option<u16>, init_port: Option<u16>) -> Res
     Ok(ports)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaticIpSelection {
+    static_ip: Option<String>,
+    static_ip_resource_group: Option<String>,
+}
+
+fn resolve_static_ip_selection(
+    platform: PlatformKind,
+    instance_name: &str,
+    target: &atakit_cloud::CloudTarget,
+    cli_static_ip: Option<&str>,
+    cli_static_ip_resource_group: Option<&str>,
+) -> Result<StaticIpSelection> {
+    let static_ip = cli_static_ip
+        .map(ToOwned::to_owned)
+        .or_else(|| target.static_ip.clone());
+    let static_ip_resource_group = cli_static_ip_resource_group
+        .map(ToOwned::to_owned)
+        .or_else(|| target.static_ip_resource_group.clone());
+
+    if static_ip_resource_group.is_some() && !matches!(platform, PlatformKind::Azure) {
+        bail!("--static-ip-resource-group is only valid for Azure targets");
+    }
+    if static_ip.is_some() && matches!(platform, PlatformKind::Qemu) {
+        bail!("static_ip is not supported for qemu targets");
+    }
+    if matches!(platform, PlatformKind::Azure) {
+        match (&static_ip, &static_ip_resource_group) {
+            (Some(_), None) => bail!("Azure static_ip requires static_ip_resource_group"),
+            (None, Some(_)) => bail!("static_ip_resource_group requires static_ip"),
+            (Some(_), Some(rg)) if rg == &format!("{instance_name}-rg") => bail!(
+                "Azure static_ip_resource_group must not be the deployment resource group \
+                 '{instance_name}-rg' because cloud destroy deletes it"
+            ),
+            _ => {}
+        }
+    }
+
+    Ok(StaticIpSelection {
+        static_ip,
+        static_ip_resource_group,
+    })
+}
+
 /// Absolute floor for OS boot disk size. The base image is assumed to be
 /// ~1 GB; 2 GB leaves room for an ext4 /data partition on the tail.
 const MIN_BOOT_DISK_GB: u64 = 2;
@@ -1321,6 +1384,27 @@ fn resolve_boot_disk_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    fn test_target() -> atakit_cloud::CloudTarget {
+        atakit_cloud::CloudTarget {
+            provider: "test-provider".to_string(),
+            vmtype: "c3-standard-4".to_string(),
+            uefi: None,
+            image: Some("test-image:v1".to_string()),
+            cc_type: None,
+            name: None,
+            metadata: BTreeMap::new(),
+            boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
+            chain: Some("test-chain".to_string()),
+            registration: None,
+            owner_key: Some("test-owner".to_string()),
+            gas_wallet: Some("test-gas".to_string()),
+            sp1_payer: None,
+        }
+    }
 
     #[test]
     fn cli_wins_over_target_and_workload() {
@@ -1468,5 +1552,102 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--init-port"), "{err}");
+    }
+
+    #[test]
+    fn static_ip_cli_values_override_target_config() {
+        let mut target = test_target();
+        target.static_ip = Some("target-ip".to_string());
+        target.static_ip_resource_group = Some("target-rg".to_string());
+
+        let got = resolve_static_ip_selection(
+            PlatformKind::Azure,
+            "deploy-vm",
+            &target,
+            Some("cli-ip"),
+            Some("cli-rg"),
+        )
+        .unwrap();
+
+        assert_eq!(got.static_ip.as_deref(), Some("cli-ip"));
+        assert_eq!(got.static_ip_resource_group.as_deref(), Some("cli-rg"));
+    }
+
+    #[test]
+    fn static_ip_uses_target_config_when_cli_absent() {
+        let mut target = test_target();
+        target.static_ip = Some("target-ip".to_string());
+        target.static_ip_resource_group = Some("target-rg".to_string());
+
+        let got =
+            resolve_static_ip_selection(PlatformKind::Azure, "deploy-vm", &target, None, None)
+                .unwrap();
+
+        assert_eq!(got.static_ip.as_deref(), Some("target-ip"));
+        assert_eq!(got.static_ip_resource_group.as_deref(), Some("target-rg"));
+    }
+
+    #[test]
+    fn azure_static_ip_requires_resource_group() {
+        let target = test_target();
+        let err = resolve_static_ip_selection(
+            PlatformKind::Azure,
+            "deploy-vm",
+            &target,
+            Some("portal-ip"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("static_ip_resource_group"), "{err}");
+    }
+
+    #[test]
+    fn azure_static_ip_must_not_live_in_deployment_resource_group() {
+        let target = test_target();
+        let err = resolve_static_ip_selection(
+            PlatformKind::Azure,
+            "deploy-vm",
+            &target,
+            Some("portal-ip"),
+            Some("deploy-vm-rg"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("deployment resource group"), "{err}");
+    }
+
+    #[test]
+    fn qemu_static_ip_errors() {
+        let target = test_target();
+        let err = resolve_static_ip_selection(
+            PlatformKind::Qemu,
+            "deploy-vm",
+            &target,
+            Some("portal-ip"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("qemu"), "{err}");
+    }
+
+    #[test]
+    fn static_ip_resource_group_is_azure_only() {
+        let target = test_target();
+        let err = resolve_static_ip_selection(
+            PlatformKind::Gcp,
+            "deploy-vm",
+            &target,
+            Some("reserved-ip"),
+            Some("network-rg"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("only valid for Azure"), "{err}");
     }
 }

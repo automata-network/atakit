@@ -237,6 +237,17 @@ pub struct CloudTarget {
     /// `--boot-disk-size` flag overrides this.
     #[serde(default)]
     pub boot_disk_size: Option<String>,
+    /// Existing operator-managed static public IP resource to attach during
+    /// deploy. GCP expects a regional reserved address name, Azure expects a
+    /// Public IP name, and AWS will use an Elastic IP allocation ID once
+    /// implemented.
+    #[serde(default)]
+    pub static_ip: Option<String>,
+    /// Azure resource group containing `static_ip`. Required for Azure static
+    /// IP deploys and intentionally separate from the per-instance deployment
+    /// resource group, which `cloud destroy` deletes.
+    #[serde(default)]
+    pub static_ip_resource_group: Option<String>,
     /// Chain config name (references a key in `[chains]`).
     /// Falls back to `[cloud.defaults] chain`.
     #[serde(default)]
@@ -626,6 +637,8 @@ mod tests {
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
             chain: Some("test-chain".to_string()),
             registration: None,
             owner_key: Some("test-owner".to_string()),
@@ -1223,5 +1236,65 @@ mod tests {
         }
         let w: W = toml::from_str(toml).unwrap();
         assert!(w.targets["my-tdx"].boot_disk_size.is_none());
+    }
+
+    #[test]
+    fn cloud_target_static_ip_parses() {
+        let toml = r#"
+            [targets.my-tdx]
+            provider = "my-gcp"
+            vmtype = "c3-standard-4"
+            static_ip = "reserved-address"
+        "#;
+        #[derive(Deserialize)]
+        struct W {
+            targets: BTreeMap<String, CloudTarget>,
+        }
+        let w: W = toml::from_str(toml).unwrap();
+        assert_eq!(
+            w.targets["my-tdx"].static_ip.as_deref(),
+            Some("reserved-address")
+        );
+        assert!(w.targets["my-tdx"].static_ip_resource_group.is_none());
+    }
+
+    #[test]
+    fn cloud_target_azure_static_ip_resource_group_parses() {
+        let toml = r#"
+            [targets.my-tdx]
+            provider = "my-azure"
+            vmtype = "Standard_DC4as_v5"
+            static_ip = "portal-public-ip"
+            static_ip_resource_group = "network-rg"
+        "#;
+        #[derive(Deserialize)]
+        struct W {
+            targets: BTreeMap<String, CloudTarget>,
+        }
+        let w: W = toml::from_str(toml).unwrap();
+        assert_eq!(
+            w.targets["my-tdx"].static_ip.as_deref(),
+            Some("portal-public-ip")
+        );
+        assert_eq!(
+            w.targets["my-tdx"].static_ip_resource_group.as_deref(),
+            Some("network-rg")
+        );
+    }
+
+    #[test]
+    fn cloud_target_static_ip_defaults_none() {
+        let toml = r#"
+            [targets.my-tdx]
+            provider = "my-gcp"
+            vmtype = "c3-standard-4"
+        "#;
+        #[derive(Deserialize)]
+        struct W {
+            targets: BTreeMap<String, CloudTarget>,
+        }
+        let w: W = toml::from_str(toml).unwrap();
+        assert!(w.targets["my-tdx"].static_ip.is_none());
+        assert!(w.targets["my-tdx"].static_ip_resource_group.is_none());
     }
 }
