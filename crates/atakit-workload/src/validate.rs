@@ -39,6 +39,11 @@ fn ensure_absolute_clean_path(path: &str, context: &str) -> Result<(), WorkloadE
             "{context}: path must not contain NUL: {path:?}"
         )));
     }
+    if path.contains(':') || path.contains(',') {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must not contain ':' or ',': {path:?}"
+        )));
+    }
     let p = Path::new(path);
     if !p.is_absolute() {
         return Err(WorkloadError::Validation(format!(
@@ -1789,6 +1794,102 @@ mount-path = "/data"
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_storage_path_delimiters() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[workload.storage.data]
+disk = "data"
+base-path = "/workload"
+mount-path = "/data:ro"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_v2_legacy_disk_mount_path_delimiters() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[workload.disks]
+data = "/data:ro"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_baby_storage_path_delimiters() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+atakit-portal = true
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[baby-container]
+enabled = true
+max-instances = 1
+
+[baby-container.slots.worker]
+parent-service = "app"
+
+[baby-container.slots.worker.storage.workspace]
+disk = "data"
+base-path = "/workspace,shared"
+mount-path = "/workspace"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':' or ','"),
+            "got: {err}"
+        );
     }
 
     #[test]
