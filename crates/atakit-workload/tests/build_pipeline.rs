@@ -101,9 +101,12 @@ base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 atakit-portal = true
 gid-group = "app"
+ip-env = true
 
-[workload.disks]
-data = "/data"
+[workload.storage.data]
+disk = "data"
+base-path = "/"
+mount-path = "/data"
 
 [baby-container]
 enabled = true
@@ -114,6 +117,7 @@ parent-service = "baby-workload"
 image-selection = "single"
 max-instances = 1
 trust-policy = "user-helper-image"
+ip-env = true
 
 [baby-container.slots.analysis-job.lifecycle]
 image-retention = "disk"
@@ -273,6 +277,8 @@ async fn build_materializes_baby_container_slots_in_manifest() {
     .unwrap();
 
     let manifest = read_manifest_json(&result.archive_path);
+    assert_eq!(manifest["config"]["ip_env"], true);
+    assert_eq!(manifest["config"]["storage"]["data"]["mount_path"], "/data");
     let baby = &manifest["config"]["baby-container"];
     assert_eq!(baby["enabled"], true);
     assert_eq!(baby["max_instances"], 2);
@@ -282,6 +288,7 @@ async fn build_materializes_baby_container_slots_in_manifest() {
     );
     assert_eq!(baby["slots"]["analysis-job"]["gid_group"], "app");
     assert_eq!(baby["slots"]["analysis-job"]["image_selection"], "single");
+    assert_eq!(baby["slots"]["analysis-job"]["ip_env"], true);
     assert_eq!(
         baby["slots"]["analysis-job"]["lifecycle"]["image_retention"],
         "disk"
@@ -481,6 +488,7 @@ ports = ["3000:3000"]
 image = { file = "./sidecar.tar" }
 ports = ["6379:6379"]
 restart = "unless-stopped"
+ip-env = true
 
 [dependencies.redis.environment]
 REDIS_MAX_MEMORY = "256mb"
@@ -555,6 +563,7 @@ async fn build_with_dependency() {
     assert_eq!(redis.image, "redis:v0.2.0"); // auto-tagged from file source
     assert_eq!(redis.ports, vec!["6379:6379"]);
     assert_eq!(redis.restart, "unless-stopped");
+    assert!(redis.ip_env);
     assert_eq!(redis.environment.get("REDIS_MAX_MEMORY").unwrap(), "256mb");
 
     // The `images` section must hold one entry per service, each with the

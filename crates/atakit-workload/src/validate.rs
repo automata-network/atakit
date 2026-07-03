@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
-use crate::config::{self, ImageSource, WorkloadConfig};
+use crate::config::{self, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig};
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
@@ -323,14 +323,14 @@ pub fn validate_config(
         }
     }
 
-    // ── disk references ───────────────────────────────────
-    for disk_name in w.disks.keys() {
-        if !config.disks.contains_key(disk_name) {
-            return Err(WorkloadError::Validation(format!(
-                "workload.disks references undefined disk: {disk_name:?}"
-            )));
-        }
-    }
+    // ── service storage references ────────────────────────
+    validate_service_storage_compat(
+        config.format,
+        "workload",
+        &w.storage,
+        &w.disks,
+        &config.disks,
+    )?;
 
     // ── firewall ──────────────────────────────────────────
     if let Some(ref fw) = config.firewall {
@@ -439,15 +439,15 @@ pub fn validate_config(
         }
     }
 
-    // ── dependency disk refs ────────────────────────────
+    // ── dependency storage refs ────────────────────────────
     for (dep_name, dep) in &config.dependencies {
-        for disk_name in dep.disks.keys() {
-            if !config.disks.contains_key(disk_name) {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.disks references undefined disk: {disk_name:?}"
-                )));
-            }
-        }
+        validate_service_storage_compat(
+            config.format,
+            &format!("dependencies.{dep_name}"),
+            &dep.storage,
+            &dep.disks,
+            &config.disks,
+        )?;
     }
 
     // ── firewall cross-reference with ports ───────────────
@@ -590,6 +590,83 @@ fn validate_unmeasured_env_files(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_service_storage(
+    context: &str,
+    storage: &BTreeMap<String, ServiceStorageSection>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    let mut seen_mount_paths = BTreeSet::new();
+    for (storage_name, item) in storage {
+        let item_context = format!("{context}.{storage_name}");
+        if !is_stable_identifier(storage_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{item_context}: storage name must be a stable identifier"
+            )));
+        }
+        if !disks.contains_key(&item.disk) {
+            return Err(WorkloadError::Validation(format!(
+                "{item_context}.disk references undefined disk {:?}",
+                item.disk
+            )));
+        }
+        ensure_absolute_clean_path(&item.base_path, &format!("{item_context}.base-path"))?;
+        ensure_absolute_clean_path(&item.mount_path, &format!("{item_context}.mount-path"))?;
+        if !seen_mount_paths.insert(item.mount_path.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: duplicate mount-path {:?}",
+                item.mount_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_service_disk_mounts(
+    context: &str,
+    mounts: &BTreeMap<String, String>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    let mut seen_mount_paths = BTreeSet::new();
+    for (disk_name, mount_path) in mounts {
+        if !disks.contains_key(disk_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.disks references undefined disk: {disk_name:?}"
+            )));
+        }
+        ensure_absolute_clean_path(mount_path, &format!("{context}.disks.{disk_name}"))?;
+        if !seen_mount_paths.insert(mount_path.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.disks: duplicate mount path {mount_path:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_storage_compat(
+    format: u32,
+    context: &str,
+    storage: &BTreeMap<String, ServiceStorageSection>,
+    legacy_disks: &BTreeMap<String, String>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    if !storage.is_empty() && !legacy_disks.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: cannot use both legacy `disks` and `storage`; use `storage` for format = 3"
+        )));
+    }
+    if format >= 3 && !legacy_disks.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.disks is only supported for format = 2 compatibility; use {context}.storage"
+        )));
+    }
+    validate_service_storage(&format!("{context}.storage"), storage, disks)?;
+    if format == 2 {
+        validate_legacy_service_disk_mounts(context, legacy_disks, disks)?;
     }
     Ok(())
 }
@@ -1418,8 +1495,10 @@ image = "x:latest"
 [dependencies.sidecar]
 image = "redis:7"
 
-[dependencies.sidecar.disks]
-missing-disk = "/data"
+[dependencies.sidecar.storage.data]
+disk = "missing-disk"
+base-path = "/"
+mount-path = "/data"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1605,14 +1684,18 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
 
-[workload.disks]
-shared = "/data"
+[workload.storage.data]
+disk = "shared"
+base-path = "/workload"
+mount-path = "/data"
 
 [dependencies.sidecar]
 image = "redis:7"
 
-[dependencies.sidecar.disks]
-shared = "/cache"
+[dependencies.sidecar.storage.cache]
+disk = "shared"
+base-path = "/sidecar"
+mount-path = "/cache"
 
 [disks.shared]
 index = 10
@@ -1688,7 +1771,7 @@ deny = [3000]
     }
 
     #[test]
-    fn rejects_undefined_disk_ref() {
+    fn rejects_undefined_storage_disk_ref() {
         let toml = r#"
 format = 2
 
@@ -1698,8 +1781,10 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
 
-[workload.disks]
-missing-disk = "/data"
+[workload.storage.data]
+disk = "missing-disk"
+base-path = "/"
+mount-path = "/data"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();

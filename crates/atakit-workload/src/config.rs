@@ -157,6 +157,7 @@ impl WorkloadConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadSection {
     pub name: String,
     pub version: String,
@@ -190,8 +191,14 @@ pub struct WorkloadSection {
     pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: bool,
+    /// Legacy format-2 service disk mounts. Kept as source compatibility and
+    /// compiled into manifest v3 `storage`.
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage: BTreeMap<String, ServiceStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
@@ -323,6 +330,7 @@ impl<'de> Deserialize<'de> for StringOrArray {
 
 /// Dependency container configuration (same container fields as workload).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DependencySection {
     pub image: ImageSource,
     #[serde(default)]
@@ -350,8 +358,14 @@ pub struct DependencySection {
     pub measured_data: bool,
     #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: bool,
+    /// Legacy format-2 service disk mounts. Kept as source compatibility and
+    /// compiled into manifest v3 `storage`.
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage: BTreeMap<String, ServiceStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
@@ -508,6 +522,8 @@ pub struct BabyContainerSlotSection {
     pub lifecycle: BabyContainerLifecycleSection,
     #[serde(default)]
     pub storage: BTreeMap<String, BabyContainerStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     #[serde(default)]
     pub logging: LoggingSection,
 }
@@ -518,6 +534,18 @@ fn default_baby_image_selection() -> String {
 
 fn default_baby_slot_max_instances() -> u32 {
     1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceStorageSection {
+    pub disk: String,
+    #[serde(rename = "base-path")]
+    pub base_path: String,
+    #[serde(rename = "mount-path")]
+    pub mount_path: String,
+    #[serde(default, rename = "read-only")]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,7 +674,8 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
         Err(_) => return Ok(()), // defer to real parser for syntax errors
     };
 
-    if let Some(fmt) = value.get("format").and_then(|v| v.as_integer()) {
+    let format = value.get("format").and_then(|v| v.as_integer());
+    if let Some(fmt) = format {
         if fmt == 1 {
             return Err(WorkloadError::Validation(
                 "format = 1 is no longer supported. Update to format = 2 \
@@ -693,6 +722,14 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                     .into(),
             ));
         }
+        if workload.contains_key("disks") && format != Some(2) {
+            return Err(WorkloadError::Validation(
+                "`[workload.disks]` is only supported for format = 2 compatibility. \
+                 Use `[workload.storage.<label>]` with `disk`, `base-path`, \
+                 `mount-path`, and optional `read-only`."
+                    .into(),
+            ));
+        }
     }
 
     if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
@@ -719,6 +756,13 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
                          Move file lists to `[package] unmeasured-data`."
+                    )));
+                }
+                if t.contains_key("disks") && format != Some(2) {
+                    return Err(WorkloadError::Validation(format!(
+                        "`[dependencies.{name}.disks]` is only supported for format = 2 compatibility. \
+                         Use `[dependencies.{name}.storage.<label>]` with `disk`, `base-path`, \
+                         `mount-path`, and optional `read-only`."
                     )));
                 }
             }
@@ -847,8 +891,10 @@ unmeasured-data = true
 [workload.environment]
 RUST_LOG = "info"
 
-[workload.disks]
-data = "/data"
+[workload.storage.data]
+disk = "data"
+base-path = "/"
+mount-path = "/data"
 
 [dependencies.redis]
 image = "redis:7"
@@ -881,6 +927,9 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
         assert!(cfg.workload.measured_data);
         assert!(cfg.workload.unmeasured_data);
+        assert_eq!(cfg.workload.storage["data"].disk, "data");
+        assert_eq!(cfg.workload.storage["data"].base_path, "/");
+        assert_eq!(cfg.workload.storage["data"].mount_path, "/data");
         let pkg = cfg.package.as_ref().unwrap();
         assert_eq!(pkg.measured_data.len(), 2);
         assert_eq!(pkg.unmeasured_data.len(), 1);
@@ -894,6 +943,86 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         let enc = &cfg.disks["data"].encryption;
         assert_eq!(enc.unlock_method, vec!["tpm"]);
         assert_eq!(enc.bind, vec!["workload"]);
+    }
+
+    #[test]
+    fn accepts_format_2_legacy_workload_disks_mounts() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.workload.disks["data"], "/data");
+    }
+
+    #[test]
+    fn rejects_format_3_legacy_workload_disks_mounts() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("[workload.storage.<label>]"));
+    }
+
+    #[test]
+    fn accepts_format_2_legacy_dependency_disks_mounts() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+data = "/data"
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.dependencies["sidecar"].disks["data"], "/data");
+    }
+
+    #[test]
+    fn rejects_format_3_legacy_dependency_disks_mounts() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+data = "/data"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("[dependencies.sidecar.storage.<label>]"));
     }
 
     #[test]
