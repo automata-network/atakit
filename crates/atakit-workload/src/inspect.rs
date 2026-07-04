@@ -268,9 +268,102 @@ async fn stage_image(
 
 /// Compute PCR23 and build InspectResult from raw manifest JSON (v2).
 fn build_result_json(manifest_raw: String) -> Result<InspectResult, WorkloadError> {
-    let manifest: Manifest =
+    let mut value: serde_json::Value =
         serde_json::from_str(&manifest_raw).map_err(|e| WorkloadError::Json(e.to_string()))?;
+    normalize_legacy_service_disks(&mut value)?;
+    let manifest: Manifest =
+        serde_json::from_value(value).map_err(|e| WorkloadError::Json(e.to_string()))?;
     compute_pcr_result(manifest, manifest_raw)
+}
+
+fn normalize_legacy_service_disks(value: &mut serde_json::Value) -> Result<(), WorkloadError> {
+    let format = value
+        .get("meta")
+        .and_then(|meta| meta.get("format"))
+        .and_then(serde_json::Value::as_u64);
+    let Some(config) = value
+        .get_mut("config")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    if format.is_some_and(|format| format >= 3) {
+        reject_v3_legacy_service_disks("config", config)?;
+        if let Some(dependencies) = config
+            .get_mut("dependencies")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for (name, dependency) in dependencies {
+                if let Some(dependency) = dependency.as_object_mut() {
+                    reject_v3_legacy_service_disks(
+                        &format!("config.dependencies.{name}"),
+                        dependency,
+                    )?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    normalize_legacy_service_disks_for_service("config", config)?;
+    if let Some(dependencies) = config
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (name, dependency) in dependencies {
+            if let Some(dependency) = dependency.as_object_mut() {
+                normalize_legacy_service_disks_for_service(
+                    &format!("config.dependencies.{name}"),
+                    dependency,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_v3_legacy_service_disks(
+    context: &str,
+    service: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), WorkloadError> {
+    if service
+        .get("disks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|disks| !disks.is_empty())
+    {
+        return Err(WorkloadError::Json(format!(
+            "{context}.disks is not supported in manifest format 3; use {context}.storage"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_legacy_service_disks_for_service(
+    context: &str,
+    service: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), WorkloadError> {
+    if service.contains_key("storage") {
+        return Ok(());
+    }
+    let Some(disks) = service.get("disks").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    let mut storage = serde_json::Map::new();
+    for (disk, mount_path) in disks {
+        let mount_path = mount_path.as_str().ok_or_else(|| {
+            WorkloadError::Json(format!("{context}.disks.{disk} must be a string"))
+        })?;
+        storage.insert(
+            disk.clone(),
+            serde_json::json!({
+                "disk": disk,
+                "base_path": "/",
+                "mount_path": mount_path,
+                "read_only": false,
+            }),
+        );
+    }
+    service.insert("storage".to_string(), serde_json::Value::Object(storage));
+    Ok(())
 }
 
 /// Compute PCR23 and build InspectResult from raw manifest TOML (v1 compat).
@@ -335,7 +428,7 @@ mod tests {
                 "measured-data": false,
                 "unmeasured-data": false,
                 "environment": {},
-                "disks": {},
+                "storage": {},
                 "dependencies": null,
                 "firewall-ports": [],
                 "baby-container": null,
@@ -403,6 +496,86 @@ mod tests {
         let sha256_hex = result.sha256.strip_prefix("0x").unwrap();
         let manifest_hex = result.manifest_hash.strip_prefix("sha256:").unwrap();
         assert_eq!(sha256_hex, manifest_hex);
+    }
+
+    #[test]
+    fn legacy_json_disks_are_normalized_to_storage_for_inspect() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["config"].as_object_mut().unwrap().remove("storage");
+        value["config"]["disks"] = serde_json::json!({ "data": "/data" });
+        value["config"]["dependencies"] = serde_json::json!({
+            "sidecar": {
+                "image": "sidecar:v0.1.0",
+                "ports": [],
+                "restart": "no",
+                "command": null,
+                "entrypoint": null,
+                "atakit-portal": false,
+                "gid-group": "test",
+                "environment": {},
+                "unmeasured-env-files": [],
+                "depends_on": [],
+                "measured-data": false,
+                "unmeasured-data": false,
+                "disks": { "data": "/cache" },
+                "cap-add": [],
+                "cap-drop": [],
+                "logging": {
+                    "driver": "k8s-file",
+                    "options": {"max-file": "5", "max-size": "50m"},
+                    "log-readers": []
+                },
+                "workload-logs": false
+            }
+        });
+        value["disks"] = serde_json::json!({
+            "data": {
+                "index": 10,
+                "size": "10GB",
+                "encryption": {"unlock_method": [], "bind": []}
+            }
+        });
+        let raw = value.to_string();
+        let result = build_result_json(raw.clone()).unwrap();
+
+        let storage = &result.manifest.config.storage["data"];
+        assert_eq!(storage.disk, "data");
+        assert_eq!(storage.base_path, "/");
+        assert_eq!(storage.mount_path, "/data");
+        assert!(!storage.read_only);
+
+        let dep_storage =
+            &result.manifest.config.dependencies.as_ref().unwrap()["sidecar"].storage["data"];
+        assert_eq!(dep_storage.mount_path, "/cache");
+
+        let mut h = Sha256::new();
+        h.update(raw.as_bytes());
+        assert_eq!(result.sha256, format!("0x{:x}", h.finalize()));
+    }
+
+    #[test]
+    fn legacy_json_disks_reject_non_string_mounts() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["config"].as_object_mut().unwrap().remove("storage");
+        value["config"]["disks"] = serde_json::json!({ "data": 123 });
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected non-string legacy disk mount to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("config.disks.data"));
+    }
+
+    #[test]
+    fn v3_json_rejects_legacy_disks() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["meta"]["format"] = serde_json::json!(3);
+        value["config"].as_object_mut().unwrap().remove("storage");
+        value["config"]["disks"] = serde_json::json!({ "data": "/data" });
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected v3 legacy disk mount to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("config.disks is not supported"));
     }
 
     #[test]

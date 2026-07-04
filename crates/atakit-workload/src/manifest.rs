@@ -86,7 +86,9 @@ pub struct ManifestConfig {
     #[serde(default, rename = "unmeasured-env-files")]
     pub unmeasured_env_files: Vec<String>,
     #[serde(default)]
-    pub disks: BTreeMap<String, String>,
+    pub storage: BTreeMap<String, ManifestServiceStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     #[serde(default)]
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
     #[serde(default, rename = "firewall-ports")]
@@ -185,7 +187,9 @@ pub struct ManifestDependency {
     #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: bool,
     #[serde(default)]
-    pub disks: BTreeMap<String, String>,
+    pub storage: BTreeMap<String, ManifestServiceStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
@@ -193,6 +197,14 @@ pub struct ManifestDependency {
     pub logging: ManifestLogging,
     #[serde(rename = "workload-logs")]
     pub workload_logs: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestServiceStorage {
+    pub disk: String,
+    pub base_path: String,
+    pub mount_path: String,
+    pub read_only: bool,
 }
 
 /// A resolved firewall port to open: port number + protocol.
@@ -226,6 +238,8 @@ pub struct ManifestBabyContainerSlot {
     pub max_instances: u32,
     pub lifecycle: ManifestBabyContainerLifecycle,
     pub storage: BTreeMap<String, ManifestBabyContainerStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     pub logging: ManifestLogging,
     pub trust_policy: Option<String>,
 }
@@ -509,7 +523,8 @@ pub fn build_manifest(
                         depends_on: dep.depends_on.clone(),
                         measured_data: dep.measured_data,
                         unmeasured_data: dep.unmeasured_data,
-                        disks: dep.disks.clone(),
+                        storage: convert_service_storage_compat(&dep.storage, &dep.disks),
+                        ip_env: dep.ip_env,
                         cap_add: dep.cap_add.clone(),
                         cap_drop: dep.cap_drop.clone(),
                         logging: convert_logging(&dep.logging),
@@ -579,6 +594,7 @@ pub fn build_manifest(
                                 rootfs: slot.lifecycle.rootfs.replace('-', "_"),
                             },
                             storage,
+                            ip_env: slot.ip_env,
                             logging: convert_logging(&slot.logging),
                             trust_policy: slot.trust_policy.clone(),
                         },
@@ -651,7 +667,8 @@ pub fn build_manifest(
             unmeasured_data: w.unmeasured_data,
             environment,
             unmeasured_env_files: normalize_unmeasured_env_files(&w.unmeasured_env_file),
-            disks: w.disks.clone(),
+            storage: convert_service_storage_compat(&w.storage, &w.disks),
+            ip_env: w.ip_env,
             dependencies,
             firewall_ports,
             baby_container,
@@ -673,6 +690,55 @@ fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
         driver: logging.driver.clone(),
         options: logging.options.clone(),
         log_readers: logging.log_readers.clone(),
+    }
+}
+
+fn convert_service_storage(
+    storage: &BTreeMap<String, crate::config::ServiceStorageSection>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    storage
+        .iter()
+        .map(|(name, item)| {
+            (
+                name.clone(),
+                ManifestServiceStorage {
+                    disk: item.disk.clone(),
+                    base_path: item.base_path.clone(),
+                    mount_path: item.mount_path.clone(),
+                    read_only: item.read_only,
+                },
+            )
+        })
+        .collect()
+}
+
+fn convert_legacy_service_disks(
+    disks: &BTreeMap<String, String>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    disks
+        .iter()
+        .map(|(disk, mount_path)| {
+            (
+                disk.clone(),
+                ManifestServiceStorage {
+                    disk: disk.clone(),
+                    base_path: "/".to_string(),
+                    mount_path: mount_path.clone(),
+                    read_only: false,
+                },
+            )
+        })
+        .collect()
+}
+
+fn convert_service_storage_compat(
+    storage: &BTreeMap<String, crate::config::ServiceStorageSection>,
+    legacy_disks: &BTreeMap<String, String>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    if storage.is_empty() {
+        convert_legacy_service_disks(legacy_disks)
+    } else {
+        convert_service_storage(storage)
     }
 }
 
@@ -818,6 +884,58 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn format_2_legacy_service_disks_compile_to_manifest_storage() {
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+cache = "/cache"
+
+[disks.data]
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[disks.cache]
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        );
+
+        let workload_storage = &manifest.config.storage["data"];
+        assert_eq!(workload_storage.disk, "data");
+        assert_eq!(workload_storage.base_path, "/");
+        assert_eq!(workload_storage.mount_path, "/data");
+        assert!(!workload_storage.read_only);
+
+        let sidecar_storage = &manifest.config.dependencies.unwrap()["sidecar"].storage["cache"];
+        assert_eq!(sidecar_storage.disk, "cache");
+        assert_eq!(sidecar_storage.base_path, "/");
+        assert_eq!(sidecar_storage.mount_path, "/cache");
+        assert!(!sidecar_storage.read_only);
     }
 
     #[test]

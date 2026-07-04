@@ -144,6 +144,11 @@ image = "{{name}}:latest"
 #
 # Resolution order when a key appears in both: env-file values are loaded
 # first, then [workload.environment] overrides them.
+#
+# ip-env: opt in to VM network identity env vars. When true, the portal
+# injects ATAKIT_PUBLIC_IP and ATAKIT_INTERNAL_IP at runtime; unavailable
+# values are empty strings. Injected values override matching user env vars.
+# ip-env = true
 
 # ── data mount booleans ──────────────────────────────────────────
 #
@@ -157,19 +162,23 @@ image = "{{name}}:latest"
 # Files are defined in the [package] section above.
 # unmeasured-data = true
 
-# ── persistent disk mounts ───────────────────────────────────────
+# ── persistent storage mounts ────────────────────────────────────
 #
-# Maps disk names (defined in [disks.*] below) to container mount paths.
-# Disks can be shared between the workload and dependencies.
-# [workload.disks]
-# my-disk = "/data"
+# Mount a subpath of a declared disk into this container.
+# `disk` references [disks.<name>] below. `base-path` is resolved under the
+# mounted disk root and is created if missing. `read-only` defaults to false.
+# [workload.storage.data]
+# disk = "my-disk"
+# base-path = "/app"
+# mount-path = "/data"
+# read-only = false
 
 # ── dependencies ──────────────────────────────────────────────────
 #
 # Sidecar containers that run alongside the main workload. Each dependency
 # has its own image, ports, restart, command, entrypoint, environment,
-# env-file, unmeasured-env-file, depends_on, and disk mounts. Host ports must be unique
-# across all containers.
+# env-file, unmeasured-env-file, depends_on, and storage mounts. Host ports
+# must be unique across all containers.
 #
 # Dependencies can also specify measured-data and unmeasured-data arrays
 # to control which workload-level data files get mounted into their
@@ -179,11 +188,14 @@ image = "{{name}}:latest"
 # image = "redis:7"
 # ports = ["6379:6379"]
 # restart = "unless-stopped"
+# ip-env = true
 # depends_on = []
 # [dependencies.redis.environment]
 # REDIS_PASSWORD = "secret"
-# [dependencies.redis.disks]
-# redis-data = "/cache"
+# [dependencies.redis.storage.cache]
+# disk = "redis-data"
+# base-path = "/redis"
+# mount-path = "/cache"
 
 # ── firewall ─────────────────────────────────────────────────────
 #
@@ -215,6 +227,7 @@ image = "{{name}}:latest"
 # [baby-container.slots.analysis-job]
 # parent-service = "{{name}}"           # service whose portal UDS may manage this slot
 # image-selection = "single"            # or "multiple"
+# ip-env = true
 #
 # [baby-container.slots.analysis-job.lifecycle]
 # image-retention = "session"           # or "disk"
@@ -225,8 +238,8 @@ image = "{{name}}:latest"
 # ── persistent disks ─────────────────────────────────────────────
 #
 # Define persistent disks that survive container restarts. Referenced by
-# [workload.disks] or [dependencies.<name>.disks]. Disks can be shared
-# between multiple containers.
+# [workload.storage.<label>] or [dependencies.<name>.storage.<label>].
+# Disks can be shared between multiple containers.
 #
 # index: device LUN / index. Must be >= 10, unique across all disks.
 #        Auto-assigned from 10 in alphabetical order if omitted.

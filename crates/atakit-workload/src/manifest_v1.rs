@@ -9,7 +9,8 @@ use serde::Deserialize;
 
 use crate::manifest::{
     Manifest, ManifestBabyContainer, ManifestConfig, ManifestDependency, ManifestDisk,
-    ManifestDiskEncryption, ManifestFirewallPort, ManifestLogging, ManifestMeta, StringOrArrayOut,
+    ManifestDiskEncryption, ManifestFirewallPort, ManifestLogging, ManifestMeta,
+    ManifestServiceStorage, StringOrArrayOut,
 };
 
 /// Default `ManifestLogging` for v1-migrated manifests: k8s-file driver
@@ -157,7 +158,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         depends_on: dep.depends_on,
                         measured_data: has_measured,
                         unmeasured_data: has_unmeasured,
-                        disks: dep.disks,
+                        storage: legacy_disks_to_storage(dep.disks),
+                        ip_env: false,
                         cap_add: Vec::new(),
                         cap_drop: Vec::new(),
                         logging: default_logging_v1(),
@@ -211,7 +213,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             unmeasured_data: !v1.config.unmeasured_data.is_empty(),
             environment: v1.config.environment,
             unmeasured_env_files: Vec::new(),
-            disks: v1.config.disks,
+            storage: legacy_disks_to_storage(v1.config.disks),
+            ip_env: false,
             dependencies,
             firewall_ports: {
                 // Inject always-allowed portal ports so v1 manifests
@@ -260,6 +263,25 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
         // re-emitted), so an empty map is correct.
         images: BTreeMap::new(),
     }
+}
+
+fn legacy_disks_to_storage(
+    disks: BTreeMap<String, String>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    disks
+        .into_iter()
+        .map(|(disk, mount_path)| {
+            (
+                disk.clone(),
+                ManifestServiceStorage {
+                    disk,
+                    base_path: "/".to_string(),
+                    mount_path,
+                    read_only: false,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Convert v1 encryption to v2. Returns None if encryption was disabled.

@@ -190,17 +190,23 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if !m.disks.is_empty() {
         section_header("Disks");
         for (name, disk) in &m.disks {
-            let mount = m.config.disks.get(name).map(|s| s.as_str()).unwrap_or("-");
             let mut flags = vec![&disk.size[..]];
             if !disk.encryption.unlock_method.is_empty() {
                 flags.push("encrypted");
             }
-            println!(
-                "  {:<18}{}  {}",
-                format!("{name}:"),
-                mount,
-                flags.join("  ")
-            );
+            println!("  {:<18}{}", format!("{name}:"), flags.join("  "));
+        }
+        if !m.config.storage.is_empty() {
+            for (label, storage) in &m.config.storage {
+                let mode = if storage.read_only { "ro" } else { "rw" };
+                println!(
+                    "  {:<18}{}:{} -> {} ({mode})",
+                    format!("{label}:"),
+                    storage.disk,
+                    storage.base_path,
+                    storage.mount_path
+                );
+            }
         }
         println!();
     }
@@ -222,9 +228,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
                 if !dep.depends_on.is_empty() {
                     println!("    {:<16}{}", "Depends on:", dep.depends_on.join(", "));
                 }
-                if !dep.disks.is_empty() {
-                    for (dk, mount) in &dep.disks {
-                        println!("    {:<16}{} -> {}", "Disk:", dk, mount);
+                if !dep.storage.is_empty() {
+                    for (label, storage) in &dep.storage {
+                        let mode = if storage.read_only { "ro" } else { "rw" };
+                        println!(
+                            "    {:<16}{}: {}:{} -> {} ({mode})",
+                            "Storage:", label, storage.disk, storage.base_path, storage.mount_path
+                        );
                     }
                 }
             }

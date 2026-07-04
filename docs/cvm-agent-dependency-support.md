@@ -52,8 +52,10 @@ measured-data = ["config/cert.pem"]
 [config.environment]
 RUST_LOG = "info"
 
-[config.disks]
-app-data = "/data"
+[workload.storage.data]
+disk = "app-data"
+base-path = "/"
+mount-path = "/data"
 
 # NEW: dependency containers
 [config.dependencies.redis]
@@ -65,8 +67,10 @@ measured-data = ["config/cert.pem"]
 [config.dependencies.redis.environment]
 REDIS_MAX_MEMORY = "256mb"
 
-[config.dependencies.redis.disks]
-app-data = "/cache"
+[dependencies.redis.storage.cache]
+disk = "app-data"
+base-path = "/redis"
+mount-path = "/cache"
 
 [config.dependencies.model-server]
 image = "model-server:v0.1.0"
@@ -135,8 +139,8 @@ Mount point: `/atakit-portal/unmeasured-data/<path>` (read-only)
 ### 5. Mount disks per container
 
 Disks can be shared between containers. A disk defined in `[disks.app-data]` might appear in both:
-- `[config.disks] app-data = "/data"` (workload mounts at /data)
-- `[config.dependencies.redis.disks] app-data = "/cache"` (redis mounts at /cache)
+- `[workload.storage.data] disk = "app-data", base-path = "/", mount-path = "/data"` (workload mounts at /data)
+- `[dependencies.redis.storage.cache] disk = "app-data", base-path = "/redis", mount-path = "/cache"` (redis mounts a subdirectory at /cache)
 
 The same underlying disk volume is mounted at different paths in different containers.
 
