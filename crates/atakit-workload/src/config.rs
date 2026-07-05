@@ -188,9 +188,9 @@ pub struct WorkloadSection {
     #[serde(default, rename = "gid-group")]
     pub gid_group: Option<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: DataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: DataMount,
     /// Legacy format-2 service disk mounts. Kept as source compatibility and
     /// compiled into manifest v3 `storage`.
     #[serde(default)]
@@ -328,6 +328,57 @@ impl<'de> Deserialize<'de> for StringOrArray {
     }
 }
 
+/// Per-service data mount selector.
+///
+/// `true` preserves the format-3 whole-directory opt-in. A path array is the
+/// format-4 selective form and expands against the package-declared data set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataMount {
+    Bool(bool),
+    Paths(Vec<String>),
+}
+
+impl Default for DataMount {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
+}
+
+impl DataMount {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::Bool(enabled) => *enabled,
+            Self::Paths(paths) => !paths.is_empty(),
+        }
+    }
+
+    pub fn paths(&self) -> &[String] {
+        match self {
+            Self::Bool(_) => &[],
+            Self::Paths(paths) => paths,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataMount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Paths(Vec<String>),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(v) => Ok(DataMount::Bool(v)),
+            Raw::Paths(v) => Ok(DataMount::Paths(v)),
+        }
+    }
+}
+
 /// Dependency container configuration (same container fields as workload).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -355,9 +406,9 @@ pub struct DependencySection {
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: DataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: DataMount,
     /// Legacy format-2 service disk mounts. Kept as source compatibility and
     /// compiled into manifest v3 `storage`.
     #[serde(default)]
@@ -705,23 +756,6 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                 "`ttl` has been renamed to `session-ttl` in format 2.".into(),
             ));
         }
-        if workload.get("measured-data").is_some_and(|v| v.is_array()) {
-            return Err(WorkloadError::Validation(
-                "`measured-data` on [workload] must be a boolean in format 2. \
-                 Move file lists to `[package] measured-data`."
-                    .into(),
-            ));
-        }
-        if workload
-            .get("unmeasured-data")
-            .is_some_and(|v| v.is_array())
-        {
-            return Err(WorkloadError::Validation(
-                "`unmeasured-data` on [workload] must be a boolean in format 2. \
-                 Move file lists to `[package] unmeasured-data`."
-                    .into(),
-            ));
-        }
         if workload.contains_key("disks") && format != Some(2) {
             return Err(WorkloadError::Validation(
                 "`[workload.disks]` is only supported for format = 2 compatibility. \
@@ -744,18 +778,6 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `cvm_agent` is no longer supported. \
                          Rename to `atakit-portal`."
-                    )));
-                }
-                if t.get("measured-data").is_some_and(|v| v.is_array()) {
-                    return Err(WorkloadError::Validation(format!(
-                        "dependencies.{name}: `measured-data` must be a boolean in format 2. \
-                         Move file lists to `[package] measured-data`."
-                    )));
-                }
-                if t.get("unmeasured-data").is_some_and(|v| v.is_array()) {
-                    return Err(WorkloadError::Validation(format!(
-                        "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
-                         Move file lists to `[package] unmeasured-data`."
                     )));
                 }
                 if t.contains_key("disks") && format != Some(2) {
@@ -925,8 +947,8 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert_eq!(cfg.workload.ports, vec!["3000:3000"]);
         assert!(cfg.workload.atakit_portal);
         assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
-        assert!(cfg.workload.measured_data);
-        assert!(cfg.workload.unmeasured_data);
+        assert!(cfg.workload.measured_data.is_enabled());
+        assert!(cfg.workload.unmeasured_data.is_enabled());
         assert_eq!(cfg.workload.storage["data"].disk, "data");
         assert_eq!(cfg.workload.storage["data"].base_path, "/");
         assert_eq!(cfg.workload.storage["data"].mount_path, "/data");
@@ -934,8 +956,10 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert_eq!(pkg.measured_data.len(), 2);
         assert_eq!(pkg.unmeasured_data.len(), 1);
         assert!(cfg.dependencies.contains_key("redis"));
-        assert!(cfg.dependencies["model-server"].measured_data);
-        assert!(!cfg.dependencies["model-server"].unmeasured_data);
+        assert!(cfg.dependencies["model-server"].measured_data.is_enabled());
+        assert!(!cfg.dependencies["model-server"]
+            .unmeasured_data
+            .is_enabled());
         assert!(cfg.firewall.is_some());
         assert!(cfg.baby_container.is_some());
         assert!(cfg.disks.contains_key("data"));
@@ -1192,7 +1216,7 @@ ttl = 3600
     }
 
     #[test]
-    fn rejects_array_measured_data_on_workload() {
+    fn accepts_array_measured_data_on_workload() {
         let toml = r#"
 format = 2
 
@@ -1203,12 +1227,12 @@ base-image-mode = "blacklist"
 image = "test:latest"
 measured-data = ["./config/hello"]
 "#;
-        let err = check_legacy_fields(toml).unwrap_err();
-        assert!(err.to_string().contains("boolean"));
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.workload.measured_data.paths(), &["./config/hello"]);
     }
 
     #[test]
-    fn rejects_array_measured_data_on_dependency() {
+    fn accepts_array_measured_data_on_dependency() {
         let toml = r#"
 format = 2
 
@@ -1222,8 +1246,11 @@ image = "test:latest"
 image = "redis:7"
 measured-data = ["./config/hello"]
 "#;
-        let err = check_legacy_fields(toml).unwrap_err();
-        assert!(err.to_string().contains("boolean"));
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.dependencies["redis"].measured_data.paths(),
+            &["./config/hello"]
+        );
     }
 
     #[test]
@@ -1248,8 +1275,8 @@ measured-data = true
             &["./config/hello", "./config/cert.pem"]
         );
         assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
-        assert!(cfg.workload.measured_data);
-        assert!(!cfg.workload.unmeasured_data);
+        assert!(cfg.workload.measured_data.is_enabled());
+        assert!(!cfg.workload.unmeasured_data.is_enabled());
     }
 
     #[test]

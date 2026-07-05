@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ImageSource, StringOrArray, WorkloadConfig};
+use crate::config::{DataMount, ImageSource, StringOrArray, WorkloadConfig};
 use crate::WorkloadError;
 
 /// Top-level manifest written to `manifest.json` inside the archive.
@@ -78,9 +78,9 @@ pub struct ManifestConfig {
     #[serde(rename = "gid-group")]
     pub gid_group: String,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: ManifestDataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: ManifestDataMount,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     #[serde(default, rename = "unmeasured-env-files")]
@@ -118,6 +118,32 @@ pub struct ManifestLogging {
     pub options: BTreeMap<String, String>,
     #[serde(rename = "log-readers")]
     pub log_readers: Vec<String>,
+}
+
+/// Service data mount declaration in `manifest.json`.
+///
+/// Old manifest formats used a boolean. Format 4 emits the selective path-list
+/// form, but the enum keeps older manifests parseable by tooling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManifestDataMount {
+    All(bool),
+    Paths(Vec<String>),
+}
+
+impl Default for ManifestDataMount {
+    fn default() -> Self {
+        Self::All(false)
+    }
+}
+
+impl ManifestDataMount {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::All(enabled) => *enabled,
+            Self::Paths(paths) => !paths.is_empty(),
+        }
+    }
 }
 
 fn default_restart() -> String {
@@ -183,9 +209,9 @@ pub struct ManifestDependency {
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: ManifestDataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: ManifestDataMount,
     #[serde(default)]
     pub storage: BTreeMap<String, ManifestServiceStorage>,
     #[serde(default)]
@@ -374,6 +400,63 @@ pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTree
     out
 }
 
+/// Normalize declared `[package] measured-data` entries into the sorted,
+/// deduped, `measured-data/`-prefixed path set staged into the archive.
+pub fn normalize_measured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for entry in paths {
+        let rel = strip_dot_slash(entry);
+        let abs = workload_dir.join(rel);
+        if abs.is_dir() {
+            collect_member_files_with_prefix(&abs, rel, "measured-data", &mut out);
+        } else {
+            out.insert(format!("measured-data/{rel}"));
+        }
+    }
+    out
+}
+
+/// Extract the archive-relative measured-data path set from manifest hashes.
+pub fn measured_data_from_hashes(hashes: &BTreeMap<String, String>) -> BTreeSet<String> {
+    hashes
+        .keys()
+        .filter(|path| path.starts_with("measured-data/"))
+        .cloned()
+        .collect()
+}
+
+fn expand_data_mount(
+    mount: &DataMount,
+    full_set: &BTreeSet<String>,
+    prefix: &str,
+) -> ManifestDataMount {
+    match mount {
+        DataMount::Bool(enabled) => {
+            if *enabled {
+                ManifestDataMount::Paths(full_set.iter().cloned().collect())
+            } else {
+                ManifestDataMount::Paths(Vec::new())
+            }
+        }
+        DataMount::Paths(paths) => {
+            let mut selected = BTreeSet::new();
+            for path in paths {
+                let normalized = format!("{prefix}/{}", strip_dot_slash(path));
+                for entry in full_set {
+                    if entry == &normalized
+                        || entry
+                            .strip_prefix(&normalized)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                    {
+                        selected.insert(entry.clone());
+                    }
+                }
+            }
+            ManifestDataMount::Paths(selected.into_iter().collect())
+        }
+    }
+}
+
 /// Normalize per-service runtime env-file declarations to manifest paths.
 pub fn normalize_unmeasured_env_files(env_files: &Option<StringOrArray>) -> Vec<String> {
     env_files
@@ -391,6 +474,15 @@ pub fn normalize_unmeasured_env_files(env_files: &Option<StringOrArray>) -> Vec<
 /// Recursively collect files under `dir` as `unmeasured-data/<rel_prefix>/<...>`
 /// paths into the set.
 fn collect_member_files(dir: &Path, rel_prefix: &str, out: &mut BTreeSet<String>) {
+    collect_member_files_with_prefix(dir, rel_prefix, "unmeasured-data", out)
+}
+
+fn collect_member_files_with_prefix(
+    dir: &Path,
+    rel_prefix: &str,
+    prefix: &str,
+    out: &mut BTreeSet<String>,
+) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -399,9 +491,9 @@ fn collect_member_files(dir: &Path, rel_prefix: &str, out: &mut BTreeSet<String>
         let name = entry.file_name().to_string_lossy().into_owned();
         let child_rel = format!("{rel_prefix}/{name}");
         if path.is_dir() {
-            collect_member_files(&path, &child_rel, out);
+            collect_member_files_with_prefix(&path, &child_rel, prefix, out);
         } else {
-            out.insert(format!("unmeasured-data/{child_rel}"));
+            out.insert(format!("{prefix}/{child_rel}"));
         }
     }
 }
@@ -442,6 +534,7 @@ pub fn build_manifest(
     images: BTreeMap<String, ManifestImage>,
 ) -> Manifest {
     let w = &config.workload;
+    let measured_data = measured_data_from_hashes(&hashes);
 
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
@@ -521,8 +614,16 @@ pub fn build_manifest(
                             &dep.unmeasured_env_file,
                         ),
                         depends_on: dep.depends_on.clone(),
-                        measured_data: dep.measured_data,
-                        unmeasured_data: dep.unmeasured_data,
+                        measured_data: expand_data_mount(
+                            &dep.measured_data,
+                            &measured_data,
+                            "measured-data",
+                        ),
+                        unmeasured_data: expand_data_mount(
+                            &dep.unmeasured_data,
+                            &unmeasured_data,
+                            "unmeasured-data",
+                        ),
                         storage: convert_service_storage_compat(&dep.storage, &dep.disks),
                         ip_env: dep.ip_env,
                         cap_add: dep.cap_add.clone(),
@@ -663,8 +764,12 @@ pub fn build_manifest(
                 .gid_group
                 .clone()
                 .unwrap_or_else(|| default_gid_group.clone()),
-            measured_data: w.measured_data,
-            unmeasured_data: w.unmeasured_data,
+            measured_data: expand_data_mount(&w.measured_data, &measured_data, "measured-data"),
+            unmeasured_data: expand_data_mount(
+                &w.unmeasured_data,
+                &unmeasured_data,
+                "unmeasured-data",
+            ),
             environment,
             unmeasured_env_files: normalize_unmeasured_env_files(&w.unmeasured_env_file),
             storage: convert_service_storage_compat(&w.storage, &w.disks),
@@ -867,16 +972,16 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":3"));
+        assert!(output.contains("\"format\":4"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
         assert!(output.contains("images/my-app.tar"));
         // gid-group defaults to workload name
         assert!(output.contains("\"gid-group\":\"my-app\""));
-        // measured-data and unmeasured-data are booleans
-        assert!(output.contains("\"measured-data\":false"));
-        assert!(output.contains("\"unmeasured-data\":false"));
+        // measured-data and unmeasured-data are selective path arrays.
+        assert!(output.contains("\"measured-data\":[]"));
+        assert!(output.contains("\"unmeasured-data\":[]"));
         // top-level unmeasured-data path list is always emitted (empty here)
         assert!(output.contains("\"unmeasured-data\":[]"));
         // session-ttl defaults to 0
@@ -967,6 +1072,75 @@ unmeasured-env-file = ["./secrets/runtime.env"]
             manifest.config.unmeasured_env_files,
             vec!["unmeasured-data/secrets/runtime.env"]
         );
+    }
+
+    #[test]
+    fn service_data_arrays_expand_against_declared_sets() {
+        let toml_str = r#"
+format = 4
+
+[package]
+measured-data = ["./config/a.txt", "./config/b.txt"]
+unmeasured-data = ["./runtime/a.env", "./runtime/b.env"]
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+measured-data = ["./config/a.txt"]
+unmeasured-data = ["./runtime"]
+
+[dependencies.helper]
+image = "helper:latest"
+measured-data = true
+unmeasured-data = false
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml_str).unwrap();
+        let mut hashes = BTreeMap::new();
+        hashes.insert("measured-data/config/a.txt".into(), "sha256:aaa".into());
+        hashes.insert("measured-data/config/b.txt".into(), "sha256:bbb".into());
+        let unmeasured_data = BTreeSet::from([
+            "unmeasured-data/runtime/a.env".to_string(),
+            "unmeasured-data/runtime/b.env".to_string(),
+        ]);
+
+        let manifest = build_manifest(
+            &cfg,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes,
+            unmeasured_data,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            manifest.config.measured_data,
+            ManifestDataMount::Paths(vec!["measured-data/config/a.txt".to_string()])
+        );
+        assert_eq!(
+            manifest.config.unmeasured_data,
+            ManifestDataMount::Paths(vec![
+                "unmeasured-data/runtime/a.env".to_string(),
+                "unmeasured-data/runtime/b.env".to_string(),
+            ])
+        );
+        let helper = manifest
+            .config
+            .dependencies
+            .as_ref()
+            .unwrap()
+            .get("helper")
+            .unwrap();
+        assert_eq!(
+            helper.measured_data,
+            ManifestDataMount::Paths(vec![
+                "measured-data/config/a.txt".to_string(),
+                "measured-data/config/b.txt".to_string(),
+            ])
+        );
+        assert_eq!(helper.unmeasured_data, ManifestDataMount::Paths(vec![]));
     }
 
     #[test]

@@ -175,12 +175,12 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!();
 
     // --- Data ---
-    if m.config.measured_data || m.config.unmeasured_data {
+    if m.config.measured_data.is_enabled() || m.config.unmeasured_data.is_enabled() {
         section_header("Data");
-        if m.config.measured_data {
+        if m.config.measured_data.is_enabled() {
             println!("  {:<20}enabled (directory mounted)", "Measured:");
         }
-        if m.config.unmeasured_data {
+        if m.config.unmeasured_data.is_enabled() {
             println!("  {:<20}enabled (directory mounted)", "Unmeasured:");
         }
         println!();

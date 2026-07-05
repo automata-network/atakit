@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::manifest::{
-    Manifest, ManifestBabyContainer, ManifestConfig, ManifestDependency, ManifestDisk,
-    ManifestDiskEncryption, ManifestFirewallPort, ManifestLogging, ManifestMeta,
+    Manifest, ManifestBabyContainer, ManifestConfig, ManifestDataMount, ManifestDependency,
+    ManifestDisk, ManifestDiskEncryption, ManifestFirewallPort, ManifestLogging, ManifestMeta,
     ManifestServiceStorage, StringOrArrayOut,
 };
 
@@ -156,8 +156,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
                         environment: dep.environment,
                         unmeasured_env_files: Vec::new(),
                         depends_on: dep.depends_on,
-                        measured_data: has_measured,
-                        unmeasured_data: has_unmeasured,
+                        measured_data: ManifestDataMount::All(has_measured),
+                        unmeasured_data: ManifestDataMount::All(has_unmeasured),
                         storage: legacy_disks_to_storage(dep.disks),
                         ip_env: false,
                         cap_add: Vec::new(),
@@ -209,8 +209,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             session_ttl: v1.config.ttl,
             atakit_portal: v1.config.cvm_agent,
             gid_group: workload_name,
-            measured_data: !v1.config.measured_data.is_empty(),
-            unmeasured_data: !v1.config.unmeasured_data.is_empty(),
+            measured_data: ManifestDataMount::All(!v1.config.measured_data.is_empty()),
+            unmeasured_data: ManifestDataMount::All(!v1.config.unmeasured_data.is_empty()),
             environment: v1.config.environment,
             unmeasured_env_files: Vec::new(),
             storage: legacy_disks_to_storage(v1.config.disks),
