@@ -2177,6 +2177,55 @@ unmeasured-env-file = "./secrets/runtime.env"
     }
 
     #[test]
+    fn accepts_measured_data_selected_from_trailing_slash_package_dir() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["./config/"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.fluent-bit]
+image = "x:latest"
+measured-data = ["./config/fluent-bit-entrypoint.sh"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("fluent-bit-entrypoint.sh"), "#!/bin/sh\n").unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn accepts_unmeasured_env_file_from_trailing_slash_package_dir() {
+        let toml = r#"
+format = 4
+
+[package]
+unmeasured-data = ["./secrets/"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "./secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::write(secrets_dir.join("runtime.env"), "A=B\n").unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
     fn rejects_unmeasured_env_file_missing_package_declaration() {
         let toml = r#"
 format = 2

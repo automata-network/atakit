@@ -373,9 +373,9 @@ pub fn resolve_environment(
     Ok(merged)
 }
 
-/// Strip leading `./` from a path string.
+/// Normalize a package-relative path string for manifest storage.
 pub fn strip_dot_slash(p: &str) -> &str {
-    p.strip_prefix("./").unwrap_or(p)
+    p.strip_prefix("./").unwrap_or(p).trim_end_matches('/')
 }
 
 /// Normalize declared `[package] unmeasured-data` entries into the sorted,
@@ -880,7 +880,9 @@ mod tests {
     #[test]
     fn strip_dot_slash_works() {
         assert_eq!(strip_dot_slash("./config/hello"), "config/hello");
+        assert_eq!(strip_dot_slash("./config/"), "config");
         assert_eq!(strip_dot_slash("config/hello"), "config/hello");
+        assert_eq!(strip_dot_slash("config/"), "config");
         assert_eq!(strip_dot_slash("./a"), "a");
     }
 
@@ -1509,5 +1511,19 @@ cap-add = ["NET_ADMIN"]
             tmp.path(),
         );
         assert_eq!(from_dir, from_files);
+    }
+
+    #[test]
+    fn measured_data_directory_with_trailing_slash_expands_without_double_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.conf"), "x").unwrap();
+
+        let from_dir = normalize_measured_data(&["./config/".to_string()], tmp.path());
+        assert_eq!(
+            from_dir.iter().cloned().collect::<Vec<_>>(),
+            vec!["measured-data/config/app.conf".to_string()]
+        );
     }
 }
