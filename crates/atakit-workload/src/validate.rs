@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
-use crate::config::{self, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig};
+use crate::config::{
+    self, DataMount, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig,
+};
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
@@ -277,11 +279,11 @@ pub fn validate_config(
     // inconsistent shape at build time so a no-op opt-in doesn't ship.
     {
         let mut measured_offenders: Vec<String> = Vec::new();
-        if w.measured_data {
+        if w.measured_data.is_enabled() {
             measured_offenders.push("workload".to_string());
         }
         for (name, dep) in &config.dependencies {
-            if dep.measured_data {
+            if dep.measured_data.is_enabled() {
                 measured_offenders.push(format!("dependencies.{name}"));
             }
         }
@@ -293,11 +295,11 @@ pub fn validate_config(
         }
 
         let mut unmeasured_offenders: Vec<String> = Vec::new();
-        if w.unmeasured_data {
+        if w.unmeasured_data.is_enabled() {
             unmeasured_offenders.push("workload".to_string());
         }
         for (name, dep) in &config.dependencies {
-            if dep.unmeasured_data {
+            if dep.unmeasured_data.is_enabled() {
                 unmeasured_offenders.push(format!("dependencies.{name}"));
             }
         }
@@ -309,8 +311,22 @@ pub fn validate_config(
         }
     }
 
+    let declared_measured_data =
+        crate::manifest::normalize_measured_data(config.measured_data_paths(), workload_dir);
     let declared_unmeasured_data =
         crate::manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
+    validate_data_mount(
+        &w.measured_data,
+        &declared_measured_data,
+        "measured-data",
+        "workload.measured-data",
+    )?;
+    validate_data_mount(
+        &w.unmeasured_data,
+        &declared_unmeasured_data,
+        "unmeasured-data",
+        "workload.unmeasured-data",
+    )?;
 
     validate_env_files(&w.env_file, workload_dir, "env-file")?;
     validate_unmeasured_env_files(
@@ -509,6 +525,18 @@ pub fn validate_config(
             &declared_unmeasured_data,
             &format!("dependencies.{dep_name}.unmeasured-env-file"),
         )?;
+        validate_data_mount(
+            &dep.measured_data,
+            &declared_measured_data,
+            "measured-data",
+            &format!("dependencies.{dep_name}.measured-data"),
+        )?;
+        validate_data_mount(
+            &dep.unmeasured_data,
+            &declared_unmeasured_data,
+            "unmeasured-data",
+            &format!("dependencies.{dep_name}.unmeasured-data"),
+        )?;
 
         // gid-group validation.
         if let Some(ref gg) = dep.gid_group {
@@ -594,6 +622,39 @@ fn validate_unmeasured_env_files(
                     "{context}: {normalized:?} must be declared in [package] unmeasured-data"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_data_mount(
+    mount: &DataMount,
+    declared_paths: &BTreeSet<String>,
+    prefix: &str,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    let DataMount::Paths(paths) = mount else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        validate_package_relative_path(path, context)?;
+        let normalized = format!("{prefix}/{}", crate::manifest::strip_dot_slash(path));
+        if !seen.insert(normalized.clone()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: duplicate path {normalized:?}"
+            )));
+        }
+        let matched = declared_paths.iter().any(|declared| {
+            declared == &normalized
+                || declared
+                    .strip_prefix(&normalized)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+        if !matched {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: {normalized:?} must match a path declared in [package] {prefix}"
+            )));
         }
     }
     Ok(())
@@ -1441,6 +1502,58 @@ unmeasured-data = true
             msg.contains("unmeasured-data = true") && msg.contains("[package].unmeasured-data"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn accepts_selective_data_mounts_declared_in_package() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["./config/public.txt", "./config/private.txt"]
+unmeasured-data = ["./runtime/public.env", "./runtime/private.env"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = ["./config/public.txt"]
+unmeasured-data = ["./runtime/public.env"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/public.txt"), "public").unwrap();
+        std::fs::write(tmp.path().join("config/private.txt"), "private").unwrap();
+
+        let warnings = validate_config(&cfg, tmp.path()).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_selective_data_mount_not_declared_in_package() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["./config/public.txt"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = ["./config/private.txt"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/public.txt"), "public").unwrap();
+
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must match a path declared"), "got: {msg}");
     }
 
     #[test]
