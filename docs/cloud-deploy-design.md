@@ -263,7 +263,7 @@ Deploy assembles this from the existing `[publish]` config section (which alread
 ### Current State
 
 During `workload build`:
-- `unmeasured-data` paths listed in `atakit-workload.toml` are validated (must start with `./`, no traversal)
+- `unmeasured-data` paths listed in `atakit-workload.toml` are validated as logical absolute paths under the unmeasured-data root (for example `/runtime-data/key.pem`, no traversal)
 - Files are NOT required to exist at build time
 - Paths are written to `manifest.json` so the CVM agent knows what to expect
 - Files are NOT included in the `.atawl` archive
@@ -272,12 +272,12 @@ Gap: no mechanism delivers the actual files to the CVM.
 
 ### Solution
 
-Deploy collects the unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the source directory or an explicit `--unmeasured-data-dir`.
+Deploy collects the unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the workload's default `unmeasured-data/` root in dir mode or an explicit `--unmeasured-data-root`.
 
 **During deploy (atakit-ng side):**
 
-1. Read the declared `unmeasured-data` paths from `manifest.json` (strip the `unmeasured-data/` prefix to get deploy-relative paths).
-2. Resolve them under the `--unmeasured-data-dir` (or the workload directory in dir mode).
+1. Read the declared `unmeasured-data` paths from `manifest.json` (strip the `unmeasured-data/` prefix to get paths relative to the unmeasured-data root).
+2. Resolve them under `--unmeasured-data-root` (or `<workload-dir>/unmeasured-data` in dir mode).
 3. Verify the directory contains **exactly** that set — error on any missing or extra file. Then tar the declared files into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`).
 4. Add as the `unmeasured-data` multipart field in the `POST /init` request.
 
@@ -293,21 +293,21 @@ The path set is committed to PCR23, so it must match exactly on both the CLI and
 
 ```
 - manifest declares unmeasured-data: ["unmeasured-data/runtime-data/key.pem", "unmeasured-data/runtime-data/config.json"]
-- --unmeasured-data-dir has:
+- --unmeasured-data-root has:
   - runtime-data/key.pem       -> included in POST
   - runtime-data/config.json   -> MISSING => deploy errors (must match the manifest exactly)
   - runtime-data/extra.txt     -> EXTRA   => deploy errors (not declared in the manifest)
 ```
 
-### `--unmeasured-data-dir`
+### `--unmeasured-data-root`
 
 For cases where unmeasured-data lives outside the workload directory (e.g., secrets from a vault):
 
 ```
-atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-dir /path/to/secrets/
+atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-root /path/to/secrets/
 ```
 
-The `--unmeasured-data-dir` must contain exactly the files the manifest's unmeasured-data paths declare — no more, no less.
+The `--unmeasured-data-root` must contain exactly the files the manifest's unmeasured-data paths declare — no more, no less. `--unmeasured-data-dir` remains as a deprecated alias.
 
 ---
 
@@ -1089,7 +1089,7 @@ back to requiring real keys if not).
 2. **CVM agent endpoints.** Only `/init` (POST, one-shot) and `/platform-measurements` (GET). No status/health endpoint currently.
 3. **Port.** Single port 1024 for the CVM agent. No separate port 8000.
 4. **Unmeasured-data in CVM agent.** We own the agent, change approved. Add `unmeasured` multipart field to `POST /init`.
-5. **Unmeasured-data tar layout.** Strip `./` prefix, preserve relative directory structure. `./runtime-data/key.pem` becomes `runtime-data/key.pem` in the tar. Agent extracts into `<WorkloadTempDir>/unmeasured-data/`, so it ends up at `<WorkloadTempDir>/unmeasured-data/runtime-data/key.pem` (bind-mounted into the container at `/atakit-portal/unmeasured-data/runtime-data/key.pem`). Same convention as measured-data staging in `.atawl`.
+5. **Unmeasured-data tar layout.** Source TOML uses logical absolute paths under the unmeasured-data root. `/runtime-data/key.pem` becomes `runtime-data/key.pem` in the tar. Agent extracts into `<WorkloadTempDir>/unmeasured-data/`, so it ends up at `<WorkloadTempDir>/unmeasured-data/runtime-data/key.pem` (bind-mounted into the container at `/atakit-portal/unmeasured-data/runtime-data/key.pem`). Same convention as measured-data staging in `.atawl`.
 6. **`agent_env` in config JSON.** Required. Contains on-chain config (rpc_url, session_registry, owner_private_key, relay_private_key, expire_offset). Assembled from `[publish]` config + `[cloud] expire_offset`. Always sent.
 7. **`cloud status --live`.** TCP connect to port 1024. No richer status until agent adds a `/status` endpoint.
 

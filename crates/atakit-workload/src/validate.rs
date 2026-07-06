@@ -4,6 +4,7 @@ use std::path::{Component, Path};
 use crate::config::{
     self, DataMount, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig,
 };
+use crate::data::{namespaced_data_path, validate_logical_data_path, DataRoots};
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
@@ -79,7 +80,7 @@ fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), Workload
     })?;
     if !canon_path.starts_with(&canon_base) {
         return Err(WorkloadError::Validation(format!(
-            "{context}: path escapes workload directory: {}",
+            "{context}: path escapes its allowed root: {}",
             path.display()
         )));
     }
@@ -88,11 +89,23 @@ fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), Workload
 
 /// Validate a parsed config against the spec rules.
 ///
-/// `workload_dir` is the directory containing `atakit-workload.toml`, used to
-/// resolve relative paths.
 pub fn validate_config(
     config: &WorkloadConfig,
     workload_dir: &Path,
+) -> Result<Vec<String>, WorkloadError> {
+    let roots = DataRoots::resolve(workload_dir, None, None);
+    validate_config_with_roots(config, workload_dir, &roots)
+}
+
+/// Validate a parsed config against the spec rules with explicit data roots.
+///
+/// `workload_dir` is the directory containing `atakit-workload.toml`. Package
+/// measured/unmeasured paths are logical absolute paths resolved under
+/// `data_roots`, not under `workload_dir`.
+pub fn validate_config_with_roots(
+    config: &WorkloadConfig,
+    workload_dir: &Path,
+    data_roots: &DataRoots,
 ) -> Result<Vec<String>, WorkloadError> {
     let mut warnings = Vec::new();
     let w = &config.workload;
@@ -259,17 +272,17 @@ pub fn validate_config(
 
     // ── package measured-data paths ─────────────────────────
     for p in config.measured_data_paths() {
-        validate_package_relative_path(p, "package measured-data")?;
-        let abs = workload_dir.join(p);
+        let rel = validate_logical_data_path(p, "package measured-data")?;
+        let abs = data_roots.measured.join(rel);
         if !abs.exists() {
             return Err(WorkloadError::MeasuredDataMissing(abs));
         }
-        ensure_within(&abs, workload_dir, "package measured-data")?;
+        ensure_within(&abs, &data_roots.measured, "package measured-data")?;
     }
 
     // ── package unmeasured-data paths (format check only, files need not exist) ──
     for p in config.unmeasured_data_paths() {
-        validate_package_relative_path(p, "package unmeasured-data")?;
+        validate_logical_data_path(p, "package unmeasured-data")?;
     }
 
     // ── package ↔ service opt-in consistency ───────────────
@@ -311,10 +324,14 @@ pub fn validate_config(
         }
     }
 
-    let declared_measured_data =
-        crate::manifest::normalize_measured_data(config.measured_data_paths(), workload_dir);
-    let declared_unmeasured_data =
-        crate::manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
+    let declared_measured_data = crate::manifest::normalize_measured_data(
+        config.measured_data_paths(),
+        &data_roots.measured,
+    );
+    let declared_unmeasured_data = crate::manifest::normalize_unmeasured_data(
+        config.unmeasured_data_paths(),
+        &data_roots.unmeasured,
+    );
     validate_data_mount(
         &w.measured_data,
         &declared_measured_data,
@@ -610,8 +627,8 @@ fn validate_unmeasured_env_files(
     if let Some(env_files) = env_files {
         let mut seen = BTreeSet::new();
         for ef in env_files.as_vec() {
-            validate_package_relative_path(&ef, context)?;
-            let normalized = format!("unmeasured-data/{}", crate::manifest::strip_dot_slash(&ef));
+            validate_logical_data_path(&ef, context)?;
+            let normalized = namespaced_data_path("unmeasured-data", &ef);
             if !seen.insert(normalized.clone()) {
                 return Err(WorkloadError::Validation(format!(
                     "{context}: duplicate path {normalized:?}"
@@ -638,8 +655,8 @@ fn validate_data_mount(
     };
     let mut seen = BTreeSet::new();
     for path in paths {
-        validate_package_relative_path(path, context)?;
-        let normalized = format!("{prefix}/{}", crate::manifest::strip_dot_slash(path));
+        validate_logical_data_path(path, context)?;
+        let normalized = namespaced_data_path(prefix, path);
         if !seen.insert(normalized.clone()) {
             return Err(WorkloadError::Validation(format!(
                 "{context}: duplicate path {normalized:?}"
@@ -1398,7 +1415,7 @@ image = "x:latest"
 format = 2
 
 [package]
-measured-data = ["./does-not-exist"]
+measured-data = ["/does-not-exist"]
 
 [workload]
 name = "app"
@@ -1510,22 +1527,26 @@ unmeasured-data = true
 format = 4
 
 [package]
-measured-data = ["./config/public.txt", "./config/private.txt"]
-unmeasured-data = ["./runtime/public.env", "./runtime/private.env"]
+measured-data = ["/config/public.txt", "/config/private.txt"]
+unmeasured-data = ["/runtime/public.env", "/runtime/private.env"]
 
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-measured-data = ["./config/public.txt"]
-unmeasured-data = ["./runtime/public.env"]
+measured-data = ["/config/public.txt"]
+unmeasured-data = ["/runtime/public.env"]
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
-        std::fs::write(tmp.path().join("config/public.txt"), "public").unwrap();
-        std::fs::write(tmp.path().join("config/private.txt"), "private").unwrap();
+        std::fs::create_dir_all(tmp.path().join("measured-data/config")).unwrap();
+        std::fs::write(tmp.path().join("measured-data/config/public.txt"), "public").unwrap();
+        std::fs::write(
+            tmp.path().join("measured-data/config/private.txt"),
+            "private",
+        )
+        .unwrap();
 
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
         assert!(warnings.is_empty());
@@ -1537,19 +1558,19 @@ unmeasured-data = ["./runtime/public.env"]
 format = 4
 
 [package]
-measured-data = ["./config/public.txt"]
+measured-data = ["/config/public.txt"]
 
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-measured-data = ["./config/private.txt"]
+measured-data = ["/config/private.txt"]
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
-        std::fs::write(tmp.path().join("config/public.txt"), "public").unwrap();
+        std::fs::create_dir_all(tmp.path().join("measured-data/config")).unwrap();
+        std::fs::write(tmp.path().join("measured-data/config/public.txt"), "public").unwrap();
 
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         let msg = err.to_string();
@@ -2011,7 +2032,7 @@ mount-path = "/workspace"
 format = 2
 
 [package]
-measured-data = ["./../etc/passwd"]
+measured-data = ["/../etc/passwd"]
 
 [workload]
 name = "app"
@@ -2031,7 +2052,7 @@ image = "x:latest"
 format = 2
 
 [package]
-unmeasured-data = ["./../secrets"]
+unmeasured-data = ["/../secrets"]
 
 [workload]
 name = "app"
@@ -2043,6 +2064,46 @@ image = "x:latest"
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_relative_measured_data_path() {
+        let toml = r#"
+format = 2
+
+[package]
+measured-data = ["config/app.conf"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("logical absolute path"));
+    }
+
+    #[test]
+    fn rejects_dot_slash_unmeasured_data_path() {
+        let toml = r#"
+format = 2
+
+[package]
+unmeasured-data = ["./secrets"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("logical absolute path"));
     }
 
     #[test]
@@ -2162,14 +2223,14 @@ env_file = "prod.env"
 format = 2
 
 [package]
-unmeasured-data = ["./secrets/runtime.env"]
+unmeasured-data = ["/secrets/runtime.env"]
 
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-unmeasured-env-file = "./secrets/runtime.env"
+unmeasured-env-file = "/secrets/runtime.env"
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -2182,7 +2243,7 @@ unmeasured-env-file = "./secrets/runtime.env"
 format = 4
 
 [package]
-measured-data = ["./config/"]
+measured-data = ["/config/"]
 
 [workload]
 name = "app"
@@ -2192,11 +2253,11 @@ image = "x:latest"
 
 [dependencies.fluent-bit]
 image = "x:latest"
-measured-data = ["./config/fluent-bit-entrypoint.sh"]
+measured-data = ["/config/fluent-bit-entrypoint.sh"]
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join("config");
+        let config_dir = tmp.path().join("measured-data/config");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join("fluent-bit-entrypoint.sh"), "#!/bin/sh\n").unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_ok());
@@ -2208,18 +2269,18 @@ measured-data = ["./config/fluent-bit-entrypoint.sh"]
 format = 4
 
 [package]
-unmeasured-data = ["./secrets/"]
+unmeasured-data = ["/secrets/"]
 
 [workload]
 name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-unmeasured-env-file = "./secrets/runtime.env"
+unmeasured-env-file = "/secrets/runtime.env"
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let secrets_dir = tmp.path().join("secrets");
+        let secrets_dir = tmp.path().join("unmeasured-data/secrets");
         std::fs::create_dir_all(&secrets_dir).unwrap();
         std::fs::write(secrets_dir.join("runtime.env"), "A=B\n").unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_ok());
@@ -2235,7 +2296,7 @@ name = "app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
-unmeasured-env-file = "./secrets/runtime.env"
+unmeasured-env-file = "/secrets/runtime.env"
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();

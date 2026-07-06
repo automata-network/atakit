@@ -52,13 +52,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let workload_name = resolved.name;
     let workload_version = resolved.version;
 
-    // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over
-    // workload dir. Errors if the manifest declares paths but none are available.
-    let unmeasured_tar = resolve_unmeasured_tar(
-        &resolved.unmeasured_data_paths,
+    // Collect unmeasured-data files. Explicit root flags take precedence over
+    // the default <workload-dir>/unmeasured-data root.
+    let unmeasured_root = super::effective_unmeasured_data_root(
+        args.unmeasured_data_root.as_ref(),
         args.unmeasured_data_dir.as_ref(),
         resolved.workload_dir.as_ref(),
     )?;
+    let unmeasured_tar =
+        resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
 
     // 4. Compute archive hash.
     let bytes = std::fs::read(&archive_path)

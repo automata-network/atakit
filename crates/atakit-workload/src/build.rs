@@ -4,6 +4,7 @@ use atakit_core::{ArchiveCompression, ProgressReporter};
 
 use crate::archive::{self, StagingDir};
 use crate::config::{ImageSource, WorkloadConfig};
+use crate::data::DataRoots;
 use crate::hash;
 use crate::image::ContainerEngine;
 use crate::image_meta;
@@ -23,6 +24,12 @@ pub struct BuildOptions {
     pub verbose: bool,
     /// Archive compression format (default: zstd).
     pub compression: ArchiveCompression,
+    /// Root for logical measured-data paths. Defaults to
+    /// `<workload_dir>/measured-data`.
+    pub measured_data_root: Option<PathBuf>,
+    /// Root for logical unmeasured-data declarations. Defaults to
+    /// `<workload_dir>/unmeasured-data`.
+    pub unmeasured_data_root: Option<PathBuf>,
 }
 
 /// Result of a successful build.
@@ -56,10 +63,15 @@ pub async fn build_workload(
 
     let name = config.workload.name.clone();
     let version = config.workload.version.clone();
+    let data_roots = DataRoots::resolve(
+        workload_dir,
+        opts.measured_data_root.as_ref(),
+        opts.unmeasured_data_root.as_ref(),
+    );
 
     // 2. Validate
     let handle = progress.create("Validating config...", 0);
-    let warnings = validate::validate_config(&config, workload_dir)?;
+    let warnings = validate::validate_config_with_roots(&config, workload_dir, &data_roots)?;
     handle.finish();
     for w in &warnings {
         tracing::warn!("{}", w);
@@ -176,7 +188,7 @@ pub async fn build_workload(
         0
     } else {
         let handle = progress.create("Collecting measured-data...", 0);
-        let count = staging.stage_measured_data(measured_paths, workload_dir)?;
+        let count = staging.stage_measured_data(measured_paths, &data_roots.measured)?;
         handle.finish();
         count
     };
@@ -217,7 +229,7 @@ pub async fn build_workload(
     // PCR23) but never bundled. Directories present at build time expand to
     // their member files; files / absent entries are recorded as leaves.
     let unmeasured_data =
-        manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), workload_dir);
+        manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), &data_roots.unmeasured);
     let m = manifest::build_manifest(
         &config,
         &resolved_image,

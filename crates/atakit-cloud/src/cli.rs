@@ -122,7 +122,11 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Root containing logical unmeasured-data files (default: <workload-dir>/unmeasured-data)
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
@@ -317,7 +321,11 @@ pub struct InitArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Root containing logical unmeasured-data files (default: <workload-dir>/unmeasured-data)
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 

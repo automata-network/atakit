@@ -35,6 +35,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         engine,
         verbose,
         compression,
+        measured_data_root: args.measured_data_root,
+        unmeasured_data_root: args.unmeasured_data_root,
     };
 
     let progress = IndicatifReporter;
@@ -48,6 +50,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
     let inspect = atakit_workload::inspect_workload(&inspect_opts).await?;
 

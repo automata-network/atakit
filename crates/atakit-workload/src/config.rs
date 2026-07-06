@@ -894,8 +894,8 @@ image = { file = "./images/app.tar" }
 format = 2
 
 [package]
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/signer_key"]
+measured-data = ["/config/hello", "/config/cert.pem"]
+unmeasured-data = ["/additional-data/signer_key"]
 
 [workload]
 name = "secure-signer"
@@ -1225,10 +1225,10 @@ name = "test"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "test:latest"
-measured-data = ["./config/hello"]
+measured-data = ["/config/hello"]
 "#;
         let cfg = WorkloadConfig::load_from_str(toml).unwrap();
-        assert_eq!(cfg.workload.measured_data.paths(), &["./config/hello"]);
+        assert_eq!(cfg.workload.measured_data.paths(), &["/config/hello"]);
     }
 
     #[test]
@@ -1244,12 +1244,12 @@ image = "test:latest"
 
 [dependencies.redis]
 image = "redis:7"
-measured-data = ["./config/hello"]
+measured-data = ["/config/hello"]
 "#;
         let cfg = WorkloadConfig::load_from_str(toml).unwrap();
         assert_eq!(
             cfg.dependencies["redis"].measured_data.paths(),
-            &["./config/hello"]
+            &["/config/hello"]
         );
     }
 
@@ -1259,8 +1259,8 @@ measured-data = ["./config/hello"]
 format = 2
 
 [package]
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/key"]
+measured-data = ["/config/hello", "/config/cert.pem"]
+unmeasured-data = ["/additional-data/key"]
 
 [workload]
 name = "test"
@@ -1272,9 +1272,9 @@ measured-data = true
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
         assert_eq!(
             cfg.measured_data_paths(),
-            &["./config/hello", "./config/cert.pem"]
+            &["/config/hello", "/config/cert.pem"]
         );
-        assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
+        assert_eq!(cfg.unmeasured_data_paths(), &["/additional-data/key"]);
         assert!(cfg.workload.measured_data.is_enabled());
         assert!(!cfg.workload.unmeasured_data.is_enabled());
     }
@@ -1290,12 +1290,12 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "test:latest"
 env-file = ["./defaults.env"]
-unmeasured-env-file = "./runtime.env"
+unmeasured-env-file = "/runtime.env"
 
 [dependencies.sidecar]
 image = "sidecar:latest"
 env_file = "./legacy.env"
-unmeasured-env-file = ["./sidecar.env"]
+unmeasured-env-file = ["/sidecar.env"]
 "#;
         let cfg = WorkloadConfig::load_from_str(toml).unwrap();
         assert_eq!(
@@ -1304,13 +1304,13 @@ unmeasured-env-file = ["./sidecar.env"]
         );
         assert_eq!(
             cfg.workload.unmeasured_env_file.unwrap().as_vec(),
-            vec!["./runtime.env"]
+            vec!["/runtime.env"]
         );
         let dep = &cfg.dependencies["sidecar"];
         assert_eq!(dep.env_file.clone().unwrap().as_vec(), vec!["./legacy.env"]);
         assert_eq!(
             dep.unmeasured_env_file.clone().unwrap().as_vec(),
-            vec!["./sidecar.env"]
+            vec!["/sidecar.env"]
         );
     }
 

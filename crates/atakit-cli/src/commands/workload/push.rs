@@ -50,6 +50,8 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         workload_dir: None,
         engine: None,
         verbose,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
     let result = atakit_workload::inspect_workload(&inspect_opts).await?;
     let manifest = &result.manifest;

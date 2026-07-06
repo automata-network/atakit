@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use atakit_core::{ArchiveCompression, ProgressHandle};
 
+use crate::data::{logical_data_path_rel, validate_logical_data_path};
 use crate::WorkloadError;
 
 /// Staging directory layout for a workload archive.
@@ -34,26 +35,18 @@ impl StagingDir {
 
     /// Copy measured-data files from source into the staging directory.
     ///
-    /// Preserves directory structure relative to `workload_dir`.
+    /// Preserves directory structure relative to `measured_data_root`.
     /// Returns the number of files copied.
     pub fn stage_measured_data(
         &self,
         paths: &[String],
-        workload_dir: &Path,
+        measured_data_root: &Path,
     ) -> Result<usize, WorkloadError> {
         let mut count = 0;
         for p in paths {
-            let rel = p.strip_prefix("./").unwrap_or(p);
-            // Defense-in-depth: reject any ".." components before joining
-            if Path::new(rel)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-            {
-                return Err(WorkloadError::Validation(format!(
-                    "measured-data path must not contain \"..\": {p:?}"
-                )));
-            }
-            let src = workload_dir.join(p);
+            validate_logical_data_path(p, "package measured-data")?;
+            let rel = logical_data_path_rel(p);
+            let src = measured_data_root.join(&rel);
             let dest = self.measured_dir.join(rel);
             count += copy_recursive(&src, &dest)?;
         }
@@ -342,15 +335,15 @@ mod tests {
     #[test]
     fn stage_measured_data_copies_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let wl_dir = tmp.path().join("workload");
-        std::fs::create_dir_all(wl_dir.join("config")).unwrap();
-        std::fs::write(wl_dir.join("config/hello"), "world").unwrap();
+        let measured_root = tmp.path().join("measured-data");
+        std::fs::create_dir_all(measured_root.join("config")).unwrap();
+        std::fs::write(measured_root.join("config/hello"), "world").unwrap();
 
         let staging_tmp = tempfile::tempdir().unwrap();
         let staging = StagingDir::create(staging_tmp.path(), "test").unwrap();
 
         let count = staging
-            .stage_measured_data(&["./config/hello".into()], &wl_dir)
+            .stage_measured_data(&["/config/hello".into()], &measured_root)
             .unwrap();
         assert_eq!(count, 1);
         assert!(staging.measured_dir.join("config/hello").exists());

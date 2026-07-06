@@ -5,8 +5,8 @@
 # `atakit workload build` compiles it into a deterministic .atawl archive
 # containing manifest.json + images + measured-data.
 
-# Schema version. Current: 3.
-format = 3
+# Schema version. Current: 4.
+format = 4
 
 # ── package data ────────────────────────────────────────────────
 #
@@ -16,18 +16,20 @@ format = 3
 # via per-container measured-data / unmeasured-data booleans.
 #
 # measured-data: files included in the archive and integrity-verified via PCR23.
-# Paths must start with "./" and must not contain "..". Files must exist
-# at build time. Mounted read-only at /atakit-portal/measured-data/ in containers
-# that set measured-data = true.
+# Paths are logical absolute paths under the measured-data root (default:
+# <workload-dir>/measured-data). Files must exist at build time. Mounted
+# read-only at /atakit-portal/measured-data/ in containers that set
+# measured-data = true.
 #
 # unmeasured-data: operator-provided files NOT included in the archive.
-# Not verified by PCR23 -- the operator supplies them at deploy time.
-# Mounted read-only at /atakit-portal/unmeasured-data/ in containers
-# that set unmeasured-data = true.
+# Paths are logical absolute paths under the unmeasured-data root (default:
+# <workload-dir>/unmeasured-data). Not verified by PCR23 -- the operator
+# supplies them at deploy time. Mounted read-only at
+# /atakit-portal/unmeasured-data/ in containers that set unmeasured-data = true.
 #
 # [package]
-# measured-data = ["./config/cert.pem", "./config/settings.json"]
-# unmeasured-data = ["./runtime-data/signing-key.pem"]
+# measured-data = ["/config/cert.pem", "/config/settings.json"]
+# unmeasured-data = ["/runtime-data/signing-key.pem"]
 
 [workload]
 # Workload identity. The on-chain workload ID is derived from name + version
@@ -103,7 +105,7 @@ image = "{{name}}:latest"
 # unmeasured-env-file: runtime operator-supplied .env files. Each file must be
 # declared in [package] unmeasured-data; only the path and receiving service
 # are measured. Contents are provided at init/deploy time.
-# unmeasured-env-file = "./runtime-data/secrets.env"
+# unmeasured-env-file = "/runtime-data/secrets.env"
 #
 # atakit-portal: mount the atakit-portal Unix socket into the container.
 # Required for workloads that communicate with the host agent.

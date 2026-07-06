@@ -71,6 +71,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         workload_dir: None,
         engine,
         verbose,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
 
     let result = atakit_workload::inspect_workload(&opts).await?;

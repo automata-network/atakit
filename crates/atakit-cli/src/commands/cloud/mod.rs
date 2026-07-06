@@ -440,6 +440,8 @@ pub(crate) fn resolve_workload(
                 workload_dir: None,
                 engine: None,
                 verbose: false,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             };
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -483,6 +485,8 @@ pub(crate) fn resolve_workload(
             workload_dir: None,
             engine: None,
             verbose: false,
+            measured_data_root: None,
+            unmeasured_data_root: None,
         };
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
@@ -547,6 +551,8 @@ pub(crate) fn resolve_workload(
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
@@ -743,21 +749,20 @@ pub(super) fn validate_base_image(
 /// Gated on the **declared path set** (not the per-container mount boolean),
 /// because the portal verifies the uploaded set against the manifest's
 /// `unmeasured-data` array unconditionally. When the manifest declares paths but
-/// no `--unmeasured-data-dir` (and no workload source dir) is available, this is
+/// no `--unmeasured-data-root` (and no workload source dir) is available, this is
 /// a hard **error**, not a warning: the portal would reject `/init` for the
 /// missing set, and failing here avoids provisioning a VM that can never init.
 pub(crate) fn resolve_unmeasured_tar(
     declared_paths: &[String],
-    unmeasured_data_dir: Option<&PathBuf>,
-    workload_dir: Option<&PathBuf>,
+    unmeasured_data_root: Option<&PathBuf>,
 ) -> Result<Option<Vec<u8>>> {
     if declared_paths.is_empty() {
         return Ok(None);
     }
-    let Some(dir) = unmeasured_data_dir.or(workload_dir) else {
+    let Some(dir) = unmeasured_data_root else {
         bail!(
             "workload declares {} unmeasured-data file(s) but no source directory is available; \
-             pass --unmeasured-data-dir with the declared files (the portal requires exactly the \
+             pass --unmeasured-data-root with the declared files (the portal requires exactly the \
              declared set at /init)",
             declared_paths.len(),
         );
@@ -765,14 +770,28 @@ pub(crate) fn resolve_unmeasured_tar(
     collect_unmeasured_tar(declared_paths, dir)
 }
 
+pub(crate) fn effective_unmeasured_data_root(
+    unmeasured_data_root: Option<&PathBuf>,
+    unmeasured_data_dir: Option<&PathBuf>,
+    workload_dir: Option<&PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if unmeasured_data_root.is_some() && unmeasured_data_dir.is_some() {
+        bail!("use either --unmeasured-data-root or deprecated --unmeasured-data-dir, not both");
+    }
+    if let Some(root) = unmeasured_data_root.or(unmeasured_data_dir) {
+        return Ok(Some(root.clone()));
+    }
+    Ok(workload_dir.map(|dir| atakit_workload::data::default_unmeasured_data_root(dir)))
+}
+
 /// Collect the operator-provided unmeasured-data files into a gzipped tar,
 /// after verifying the directory contains *exactly* the set the manifest
 /// declares.
 ///
-/// `declared` are deploy-relative file paths (no `./` prefix, e.g.
+/// `declared` are paths relative to the unmeasured-data root (for example
 /// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
 /// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
-/// `--unmeasured-data-dir`. Bails if any declared file is missing, or if the
+/// `--unmeasured-data-root`. Bails if any declared file is missing, or if the
 /// directory holds files the manifest does not declare: the set is committed to
 /// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
 pub(crate) fn collect_unmeasured_tar(
@@ -785,7 +804,7 @@ pub(crate) fn collect_unmeasured_tar(
 
     let canon_base = data_dir
         .canonicalize()
-        .with_context(|| format!("--unmeasured-data-dir not found: {}", data_dir.display()))?;
+        .with_context(|| format!("--unmeasured-data-root not found: {}", data_dir.display()))?;
 
     // Enumerate what's actually present, then diff against the declared set.
     let mut actual: BTreeSet<String> = BTreeSet::new();

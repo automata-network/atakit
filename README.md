@@ -375,7 +375,10 @@ image    = "automata-linux:v0.1.6"
 Each workload is defined by a single `atakit-workload.toml` file:
 
 ```toml
-format = 1
+format = 4
+
+[package]
+measured-data = ["/config/cert.pem"]
 
 [workload]
 name = "my-service"
@@ -383,7 +386,7 @@ version = "v0.0.1"
 
 image = { build = ".", containerfile = "Containerfile" }
 ports = ["3000:3000"]
-measured-data = ["./config/cert.pem"]
+measured-data = ["/config/cert.pem"]
 
 [workload.environment]
 RUST_LOG = "info"
