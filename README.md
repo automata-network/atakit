@@ -123,8 +123,17 @@ atakit image pull <image_name>:<version> gcp
 atakit workload create my-service
 atakit workload build -d ./my-service
 
+# If the workload declares package data paths, measured files default to
+# ./my-service/measured-data. Unmeasured declarations default to
+# ./my-service/unmeasured-data for path expansion/validation, but their
+# contents are supplied later during deploy/init.
+atakit workload build -d ./my-service \
+  --measured-data-root ./public-inputs \
+  --unmeasured-data-root ./unmeasured-data
+
 # Deploy it. The base image is uploaded to your GCP project automatically.
-atakit cloud deploy my-service:v0.0.1 --target gcp-tdx --image <image_name>:<version>
+atakit cloud deploy my-service:v0.0.1 --target gcp-tdx --image <image_name>:<version> \
+  --unmeasured-data-root ./operator-secrets
 ```
 
 The instance is named `<workload>-<target>` by default, so:
@@ -171,6 +180,13 @@ atakit workload create my-workload
 # Build a workload into a .atawl archive
 atakit workload build -d ./my-workload
 
+# Package paths are logical absolute paths. By default, measured files are read
+# from ./my-workload/measured-data. The unmeasured root is used to expand or
+# validate unmeasured declarations; contents are not embedded in the archive.
+atakit workload build -d ./my-workload \
+  --measured-data-root ./measured-data \
+  --unmeasured-data-root ./unmeasured-data
+
 # Inspect a built workload (shows PCR23 measurement)
 atakit workload info my-service:v0.0.1
 
@@ -201,6 +217,13 @@ atakit cloud upload-image automata-linux:v0.1.6 --target my-gcp
 
 # Initialize an already-deployed instance with a workload
 atakit cloud init my-instance my-service:v0.0.1 --target my-gcp
+
+# Supply unmeasured data at deploy/init time when the workload declares it.
+atakit cloud deploy my-service:v0.0.1 --target my-gcp \
+  --image automata-linux:v0.1.6 \
+  --unmeasured-data-root ./unmeasured-data
+atakit cloud init my-instance my-service:v0.0.1 --target my-gcp \
+  --unmeasured-data-root ./unmeasured-data
 
 # Check deployment status
 atakit cloud status my-instance --target my-gcp
@@ -379,6 +402,7 @@ format = 4
 
 [package]
 measured-data = ["/config/cert.pem"]
+unmeasured-data = ["/runtime.env"]
 
 [workload]
 name = "my-service"
@@ -387,10 +411,24 @@ version = "v0.0.1"
 image = { build = ".", containerfile = "Containerfile" }
 ports = ["3000:3000"]
 measured-data = ["/config/cert.pem"]
+unmeasured-data = ["/runtime.env"]
+unmeasured-env-file = "/runtime.env"
 
 [workload.environment]
 RUST_LOG = "info"
 ```
+
+Package data paths are logical absolute paths. `/config/cert.pem` is read from
+`<workload-dir>/measured-data/config/cert.pem` by default and included in the
+archive. `/runtime.env` is declared in the archive, but its contents are
+supplied from `<workload-dir>/unmeasured-data/runtime.env` at deploy/init time.
+Use `--measured-data-root` on `workload build` or `workload info --dir` to read
+measured data from another root. Use `--unmeasured-data-root` on
+`workload build` / `workload info --dir` to expand and validate unmeasured
+declarations from another root, and on `cloud deploy`, `cloud init`, or
+`workload init` to supply the exact operator-specific unmeasured file set.
+`--unmeasured-data-dir` remains as a deprecated alias for the deploy/init
+commands.
 
 See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for the full specification.
 
