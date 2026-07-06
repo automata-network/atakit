@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+use crate::data::DataRoots;
 use crate::image::ContainerEngine;
 use crate::manifest::Manifest;
 use crate::WorkloadError;
@@ -17,6 +18,12 @@ pub struct InspectOptions {
     pub engine: Option<ContainerEngine>,
     /// Show verbose output from container commands.
     pub verbose: bool,
+    /// Root for logical measured-data paths in dir mode. Defaults to
+    /// `<workload_dir>/measured-data`.
+    pub measured_data_root: Option<PathBuf>,
+    /// Root for logical unmeasured-data declarations in dir mode. Defaults to
+    /// `<workload_dir>/unmeasured-data`.
+    pub unmeasured_data_root: Option<PathBuf>,
 }
 
 /// Result of inspecting a workload.
@@ -38,7 +45,14 @@ pub async fn inspect_workload(opts: &InspectOptions) -> Result<InspectResult, Wo
     if let Some(ref archive_path) = opts.archive {
         inspect_archive(archive_path)
     } else if let Some(ref workload_dir) = opts.workload_dir {
-        inspect_dir(workload_dir, opts.engine, opts.verbose).await
+        inspect_dir(
+            workload_dir,
+            opts.engine,
+            opts.verbose,
+            opts.measured_data_root.as_ref(),
+            opts.unmeasured_data_root.as_ref(),
+        )
+        .await
     } else {
         Err(WorkloadError::Validation(
             "either --archive or --dir must be specified".into(),
@@ -98,6 +112,8 @@ async fn inspect_dir(
     workload_dir: &std::path::Path,
     engine_override: Option<ContainerEngine>,
     verbose: bool,
+    measured_data_root: Option<&PathBuf>,
+    unmeasured_data_root: Option<&PathBuf>,
 ) -> Result<InspectResult, WorkloadError> {
     let workload_dir = if workload_dir.is_absolute() {
         workload_dir.to_path_buf()
@@ -106,7 +122,9 @@ async fn inspect_dir(
     };
 
     let config = crate::config::WorkloadConfig::from_dir(&workload_dir)?;
-    let warnings = crate::validate::validate_config(&config, &workload_dir)?;
+    let data_roots = DataRoots::resolve(&workload_dir, measured_data_root, unmeasured_data_root);
+    let warnings =
+        crate::validate::validate_config_with_roots(&config, &workload_dir, &data_roots)?;
     for w in &warnings {
         tracing::warn!("{}", w);
     }
@@ -122,7 +140,7 @@ async fn inspect_dir(
     // Stage measured-data (from [package] section)
     let measured_paths = config.measured_data_paths();
     if !measured_paths.is_empty() {
-        staging.stage_measured_data(measured_paths, &workload_dir)?;
+        staging.stage_measured_data(measured_paths, &data_roots.measured)?;
     }
 
     // We need to stage the image to compute hashes, but for dir mode we need
@@ -186,8 +204,10 @@ async fn inspect_dir(
     }
 
     // Build manifest
-    let unmeasured_data =
-        crate::manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), &workload_dir);
+    let unmeasured_data = crate::manifest::normalize_unmeasured_data(
+        config.unmeasured_data_paths(),
+        &data_roots.unmeasured,
+    );
     let manifest = crate::manifest::build_manifest(
         &config,
         &resolved_image,

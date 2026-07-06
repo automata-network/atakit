@@ -48,7 +48,7 @@ fn make_docker_archive_tar(marker: &str) -> Vec<u8> {
 /// build pipeline can run without Docker/Podman.
 fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     let wl_dir = tmp.join("my-workload");
-    std::fs::create_dir_all(wl_dir.join("config")).unwrap();
+    std::fs::create_dir_all(wl_dir.join("measured-data/config")).unwrap();
 
     // Real (minimal) docker-archive tar so the build pipeline can extract
     // the image config digest. Content is otherwise unused.
@@ -59,13 +59,13 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
 
     // Measured-data file
-    std::fs::write(wl_dir.join("config/cert.pem"), b"fake-cert").unwrap();
+    std::fs::write(wl_dir.join("measured-data/config/cert.pem"), b"fake-cert").unwrap();
 
     let config = r#"
 format = 2
 
 [package]
-measured-data = ["./config/cert.pem"]
+measured-data = ["/config/cert.pem"]
 
 [workload]
 name = "my-workload"
@@ -180,6 +180,8 @@ async fn build_produces_valid_archive() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -270,6 +272,8 @@ async fn build_materializes_baby_container_slots_in_manifest() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -323,6 +327,8 @@ async fn build_defaults_output_to_workload_dir() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -349,6 +355,8 @@ async fn build_is_deterministic() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -362,6 +370,8 @@ async fn build_is_deterministic() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -392,6 +402,8 @@ async fn inspect_archive_matches_build() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -403,6 +415,8 @@ async fn inspect_archive_matches_build() {
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -432,6 +446,8 @@ async fn inspect_dir_matches_archive() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -443,6 +459,8 @@ async fn inspect_dir_matches_archive() {
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -452,6 +470,8 @@ async fn inspect_dir_matches_archive() {
         workload_dir: Some(wl_dir),
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -511,6 +531,8 @@ async fn build_with_dependency() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -548,6 +570,8 @@ async fn build_with_dependency() {
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -598,6 +622,8 @@ async fn build_with_dependency_is_deterministic() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -611,6 +637,8 @@ async fn build_with_dependency_is_deterministic() {
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )

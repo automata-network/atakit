@@ -55,6 +55,12 @@ pub struct BuildArgs {
     /// Container engine override (docker or podman)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
+    /// Root for logical measured-data paths (default: <workload-dir>/measured-data)
+    #[arg(long, value_name = "DIR")]
+    pub measured_data_root: Option<PathBuf>,
+    /// Root for logical unmeasured-data declarations (default: <workload-dir>/unmeasured-data)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_root: Option<PathBuf>,
     /// Skip importing the built archive into the local workload store
     #[arg(long)]
     pub no_store: bool,
@@ -74,6 +80,12 @@ pub struct InfoArgs {
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
+    /// Root for logical measured-data paths in --dir mode
+    #[arg(long, value_name = "DIR")]
+    pub measured_data_root: Option<PathBuf>,
+    /// Root for logical unmeasured-data declarations in --dir mode
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_root: Option<PathBuf>,
 }
 
 /// Arguments for `workload deactivate`.
@@ -293,7 +305,11 @@ pub struct InitArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Root containing logical unmeasured-data files (default: <workload-dir>/unmeasured-data)
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 

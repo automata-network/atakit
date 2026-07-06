@@ -3,6 +3,7 @@ pub mod build;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
+pub mod data;
 mod error;
 pub mod hash;
 pub mod image;

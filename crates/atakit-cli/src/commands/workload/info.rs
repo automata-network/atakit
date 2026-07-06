@@ -37,6 +37,8 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         } else {
             atakit_workload::InspectOptions {
@@ -44,6 +46,8 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         }
     } else {
@@ -60,6 +64,8 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         } else {
             atakit_workload::InspectOptions {
@@ -67,6 +73,8 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 workload_dir: Some(dir),
                 engine,
                 verbose,
+                measured_data_root: args.measured_data_root,
+                unmeasured_data_root: args.unmeasured_data_root,
             }
         }
     };

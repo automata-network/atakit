@@ -295,6 +295,8 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
     let inspection = atakit_workload::inspect_workload(&inspect_opts)
         .await

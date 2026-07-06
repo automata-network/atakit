@@ -19,9 +19,10 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ensure_cloud_image, init_chain_from_config, init_key_from_config, parse_metadata,
-    portal_endpoints, registration_is_off, resolve_image, resolve_unmeasured_tar, resolve_workload,
-    synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
+    effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
+    init_key_from_config, parse_metadata, portal_endpoints, registration_is_off, resolve_image,
+    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
 
@@ -278,13 +279,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_boot_min = resolved.boot_disk_size.clone();
         base_image_mode = resolved.base_image_mode;
         base_image_list = resolved.base_image;
-        // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over
-        // workload dir. Errors if the manifest declares paths but none are available.
-        unmeasured_tar = resolve_unmeasured_tar(
-            &resolved.unmeasured_data_paths,
+        // Collect unmeasured-data files. Explicit root flags take precedence over
+        // the default <workload-dir>/unmeasured-data root.
+        let unmeasured_root = effective_unmeasured_data_root(
+            args.unmeasured_data_root.as_ref(),
             args.unmeasured_data_dir.as_ref(),
             resolved.workload_dir.as_ref(),
         )?;
+        unmeasured_tar =
+            resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
         unmeasured_data_paths = resolved.unmeasured_data_paths;
         let ap = resolved.archive_path;
         let bytes = std::fs::read(&ap)
@@ -704,11 +707,16 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         }
     }
     if unmeasured_tar.is_some() {
-        let dir_label = args
-            .unmeasured_data_dir
+        let explicit_unmeasured_root = args
+            .unmeasured_data_root
             .as_ref()
+            .or(args.unmeasured_data_dir.as_ref());
+        let dir_label = args
+            .unmeasured_data_root
+            .as_ref()
+            .or(explicit_unmeasured_root)
             .map(|d| d.display().to_string())
-            .unwrap_or_else(|| "(workload dir)".to_string());
+            .unwrap_or_else(|| "(workload unmeasured-data root)".to_string());
         eprintln!(
             "  {:<15}{} ({} path{})",
             "Unmeasured:".dimmed(),

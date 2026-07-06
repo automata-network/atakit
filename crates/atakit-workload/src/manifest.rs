@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{DataMount, ImageSource, StringOrArray, WorkloadConfig};
+use crate::data::{logical_data_path_rel, namespaced_data_path};
 use crate::WorkloadError;
 
 /// Top-level manifest written to `manifest.json` inside the archive.
@@ -382,19 +383,19 @@ pub fn strip_dot_slash(p: &str) -> &str {
 /// deduped, `unmeasured-data/`-prefixed path list recorded in the manifest.
 ///
 /// An entry that resolves to an existing directory under `workload_dir` is
-/// enumerated into its member file paths (so declaring `./config` yields the
-/// same set as declaring each `./config/<file>`). A file, or an entry absent at
+/// enumerated into its member file paths (so declaring `/config` yields the
+/// same set as declaring each `/config/<file>`). A file, or an entry absent at
 /// build time, is recorded as a single leaf path -- operator-provided secrets
 /// need not exist on the author's machine.
 pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for entry in paths {
-        let rel = strip_dot_slash(entry);
+        let rel = logical_data_path_rel(entry);
         let abs = workload_dir.join(rel);
         if abs.is_dir() {
-            collect_member_files(&abs, rel, &mut out);
+            collect_member_files(&abs, &logical_data_path_rel(entry), &mut out);
         } else {
-            out.insert(format!("unmeasured-data/{rel}"));
+            out.insert(namespaced_data_path("unmeasured-data", entry));
         }
     }
     out
@@ -405,12 +406,17 @@ pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTree
 pub fn normalize_measured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for entry in paths {
-        let rel = strip_dot_slash(entry);
+        let rel = logical_data_path_rel(entry);
         let abs = workload_dir.join(rel);
         if abs.is_dir() {
-            collect_member_files_with_prefix(&abs, rel, "measured-data", &mut out);
+            collect_member_files_with_prefix(
+                &abs,
+                &logical_data_path_rel(entry),
+                "measured-data",
+                &mut out,
+            );
         } else {
-            out.insert(format!("measured-data/{rel}"));
+            out.insert(namespaced_data_path("measured-data", entry));
         }
     }
     out
@@ -441,7 +447,7 @@ fn expand_data_mount(
         DataMount::Paths(paths) => {
             let mut selected = BTreeSet::new();
             for path in paths {
-                let normalized = format!("{prefix}/{}", strip_dot_slash(path));
+                let normalized = namespaced_data_path(prefix, path);
                 for entry in full_set {
                     if entry == &normalized
                         || entry
@@ -465,7 +471,7 @@ pub fn normalize_unmeasured_env_files(env_files: &Option<StringOrArray>) -> Vec<
             files
                 .as_vec()
                 .into_iter()
-                .map(|p| format!("unmeasured-data/{}", strip_dot_slash(&p)))
+                .map(|p| namespaced_data_path("unmeasured-data", &p))
                 .collect()
         })
         .unwrap_or_default()
@@ -489,7 +495,11 @@ fn collect_member_files_with_prefix(
     for entry in read.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let child_rel = format!("{rel_prefix}/{name}");
+        let child_rel = if rel_prefix.is_empty() {
+            name
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
         if path.is_dir() {
             collect_member_files_with_prefix(&path, &child_rel, prefix, out);
         } else {
@@ -1051,14 +1061,14 @@ encryption = { unlock_method = [], bind = [] }
 format = 2
 
 [package]
-unmeasured-data = ["./secrets/runtime.env"]
+unmeasured-data = ["/secrets/runtime.env"]
 
 [workload]
 name = "my-app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
-unmeasured-env-file = ["./secrets/runtime.env"]
+unmeasured-env-file = ["/secrets/runtime.env"]
 "#;
         let cfg = WorkloadConfig::load_from_str(toml_str).unwrap();
         let manifest = build_manifest(
@@ -1082,16 +1092,16 @@ unmeasured-env-file = ["./secrets/runtime.env"]
 format = 4
 
 [package]
-measured-data = ["./config/a.txt", "./config/b.txt"]
-unmeasured-data = ["./runtime/a.env", "./runtime/b.env"]
+measured-data = ["/config/a.txt", "/config/b.txt"]
+unmeasured-data = ["/runtime/a.env", "/runtime/b.env"]
 
 [workload]
 name = "my-app"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
-measured-data = ["./config/a.txt"]
-unmeasured-data = ["./runtime"]
+measured-data = ["/config/a.txt"]
+unmeasured-data = ["/runtime"]
 
 [dependencies.helper]
 image = "helper:latest"
@@ -1467,7 +1477,7 @@ cap-add = ["NET_ADMIN"]
         let tmp = tempfile::tempdir().unwrap();
         // A file that exists, plus a path that does not exist at build time.
         std::fs::write(tmp.path().join("present.bin"), "x").unwrap();
-        let paths = vec!["./present.bin".to_string(), "./secrets/api_key".to_string()];
+        let paths = vec!["/present.bin".to_string(), "/secrets/api_key".to_string()];
         let out: Vec<String> = normalize_unmeasured_data(&paths, tmp.path())
             .into_iter()
             .collect();
@@ -1490,7 +1500,7 @@ cap-add = ["NET_ADMIN"]
         std::fs::write(dir.join("nested/c"), "c").unwrap();
 
         // Declaring the directory expands to its sorted member files...
-        let from_dir = normalize_unmeasured_data(&["./config".to_string()], tmp.path());
+        let from_dir = normalize_unmeasured_data(&["/config".to_string()], tmp.path());
         assert_eq!(
             from_dir.iter().cloned().collect::<Vec<_>>(),
             vec![
@@ -1504,9 +1514,9 @@ cap-add = ["NET_ADMIN"]
         // (the determinism property the boolean refactor lost).
         let from_files = normalize_unmeasured_data(
             &[
-                "./config/nested/c".to_string(),
-                "./config/a".to_string(),
-                "./config/b".to_string(),
+                "/config/nested/c".to_string(),
+                "/config/a".to_string(),
+                "/config/b".to_string(),
             ],
             tmp.path(),
         );
@@ -1520,10 +1530,28 @@ cap-add = ["NET_ADMIN"]
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.conf"), "x").unwrap();
 
-        let from_dir = normalize_measured_data(&["./config/".to_string()], tmp.path());
+        let from_dir = normalize_measured_data(&["/config/".to_string()], tmp.path());
         assert_eq!(
             from_dir.iter().cloned().collect::<Vec<_>>(),
             vec!["measured-data/config/app.conf".to_string()]
+        );
+    }
+
+    #[test]
+    fn root_data_directories_expand_without_double_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.txt"), "x").unwrap();
+
+        let measured = normalize_measured_data(&["/".to_string()], tmp.path());
+        assert_eq!(
+            measured.iter().cloned().collect::<Vec<_>>(),
+            vec!["measured-data/root.txt".to_string()]
+        );
+
+        let unmeasured = normalize_unmeasured_data(&["/".to_string()], tmp.path());
+        assert_eq!(
+            unmeasured.iter().cloned().collect::<Vec<_>>(),
+            vec!["unmeasured-data/root.txt".to_string()]
         );
     }
 }
