@@ -41,17 +41,11 @@ const TPM_ALG_ECDSA: u16 = 0x0018;
 const TPM_ALG_ECC: u16 = 0x0023;
 const TDX_QUOTE_HEADER_LEN: usize = 48;
 const TDX_QUOTE_V5_BODY_HEADER_LEN: usize = 6;
-const TDX_TD10_QUOTE_BODY_LEN: usize = 584;
-const TDX_TD15_QUOTE_BODY_LEN: usize = 648;
 const TDX_TEE_TYPE: u32 = 0x0000_0081;
 const TDX_BODY_TD_REPORT10_TYPE: u16 = 2;
 const TDX_BODY_TD_REPORT15_TYPE: u16 = 3;
 const TDX_REPORT_RTMR3_OFFSET: usize = 472;
 const TDX_REPORT_REPORT_DATA_OFFSET: usize = 520;
-const AUTOMATA_DCAP_OUTPUT_HEADER_LEN: usize = 11;
-const AUTOMATA_DCAP_TCB_STATUS_OFFSET: usize = 4;
-const AUTOMATA_DCAP_TCB_STATUS_OK: u8 = 0;
-const AUTOMATA_DCAP_TCB_STATUS_SW_HARDENING_NEEDED: u8 = 1;
 const GCP_TDX_UUID_LEN: usize = 16;
 const SNP_REPORT_REPORT_ID_OFFSET: usize = 0x140;
 const SNP_REPORT_REPORT_ID_LEN: usize = 32;
@@ -214,8 +208,10 @@ pub struct MeasurementPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct TrustAnchors {
     pub gcp_roots: Vec<Vec<u8>>,
+    pub gcp_root_hashes: Vec<[u8; 32]>,
     pub azure_maa_keys: Vec<Vec<u8>>,
     pub amd_ark_roots: Vec<Vec<u8>>,
+    pub amd_ark_root_hashes: Vec<[u8; 32]>,
     pub aws_nitro_roots: Vec<Vec<u8>>,
 }
 
@@ -712,6 +708,7 @@ pub fn verify_tls_attestation(
                 binding,
                 ak_public,
                 &inputs.trust_anchors.gcp_roots,
+                &inputs.trust_anchors.gcp_root_hashes,
             );
             verify_tpm_quote_signature(
                 &mut report,
@@ -784,6 +781,7 @@ pub fn verify_tls_attestation(
             &inputs.response.platform.tee,
             &inputs.response.collateral,
             &inputs.trust_anchors.amd_ark_roots,
+            &inputs.trust_anchors.amd_ark_root_hashes,
         );
     }
 
@@ -1124,6 +1122,7 @@ fn verify_gcp_ak_cert_chain(
     binding: &AkBinding,
     ak_public: &[u8],
     trusted_roots: &[Vec<u8>],
+    trusted_root_hashes: &[[u8; 32]],
 ) {
     if binding.kind != "gcp-cert-chain" {
         fail(
@@ -1137,12 +1136,12 @@ fn verify_gcp_ak_cert_chain(
         );
         return;
     }
-    if trusted_roots.is_empty() {
+    if trusted_roots.is_empty() && trusted_root_hashes.is_empty() {
         fail(
             report,
             errors,
             "gcp-ak-cert-chain",
-            "no trusted GCP AK root certificates configured".to_string(),
+            "no trusted GCP AK root certificates or root hashes configured".to_string(),
         );
         return;
     }
@@ -1247,12 +1246,20 @@ fn verify_gcp_ak_cert_chain(
     }
 
     let root_der = chain.last().expect("checked chain len");
-    if !trusted_roots.iter().any(|trusted| trusted == root_der) {
+    let root_hash: [u8; 32] = Keccak256::digest(root_der).into();
+    if !trusted_roots.iter().any(|trusted| trusted == root_der)
+        && !trusted_root_hashes
+            .iter()
+            .any(|trusted| trusted == &root_hash)
+    {
         fail(
             report,
             errors,
             "gcp-ak-cert-chain",
-            "GCP AK chain root is not in trusted roots".to_string(),
+            format!(
+                "GCP AK chain root is not trusted; keccak256(root_der)=0x{}",
+                hex::encode(root_hash)
+            ),
         );
         return;
     }
@@ -1447,48 +1454,6 @@ fn gcp_tdx_report_start(quote: &[u8]) -> std::result::Result<usize, String> {
     }
 }
 
-fn gcp_tdx_quote_body(quote: &[u8]) -> std::result::Result<&[u8], String> {
-    let start = gcp_tdx_report_start(quote)?;
-    if start == 0 {
-        return Ok(quote);
-    }
-    let version = read_le_u16_opt(quote, 0)
-        .ok_or_else(|| "GCP TDX quote is too short for version".to_string())?;
-    let body_len = match version {
-        4 => TDX_TD10_QUOTE_BODY_LEN,
-        5 => {
-            let body_type = read_le_u16_opt(quote, TDX_QUOTE_HEADER_LEN)
-                .ok_or_else(|| "GCP TDX quote v5 is too short for body type".to_string())?;
-            let declared_size = read_le_u32_opt(quote, TDX_QUOTE_HEADER_LEN + 2)
-                .ok_or_else(|| "GCP TDX quote v5 is too short for body size".to_string())?
-                as usize;
-            let expected = match body_type {
-                TDX_BODY_TD_REPORT10_TYPE => TDX_TD10_QUOTE_BODY_LEN,
-                TDX_BODY_TD_REPORT15_TYPE => TDX_TD15_QUOTE_BODY_LEN,
-                other => {
-                    return Err(format!(
-                        "GCP TDX quote v5 has unsupported body type {other}"
-                    ))
-                }
-            };
-            if declared_size != expected {
-                return Err(format!(
-                    "GCP TDX quote v5 declares body size {declared_size}, expected {expected}"
-                ));
-            }
-            declared_size
-        }
-        other => return Err(format!("GCP TDX quote has unsupported version {other}")),
-    };
-    quote.get(start..start + body_len).ok_or_else(|| {
-        format!(
-            "GCP TDX quote body is truncated: got {}, need {}",
-            quote.len(),
-            start + body_len
-        )
-    })
-}
-
 fn read_le_u16_opt(bytes: &[u8], offset: usize) -> Option<u16> {
     let slice = bytes.get(offset..offset + 2)?;
     Some(u16::from_le_bytes([slice[0], slice[1]]))
@@ -1560,9 +1525,16 @@ fn verify_gcp_tee_vendor_report(
     tee: &str,
     collateral: &serde_json::Value,
     trusted_amd_ark_roots: &[Vec<u8>],
+    trusted_amd_ark_root_hashes: &[[u8; 32]],
 ) {
     match tee {
-        "sev-snp" => verify_gcp_snp_vendor_report(report, errors, evidence, trusted_amd_ark_roots),
+        "sev-snp" => verify_gcp_snp_vendor_report(
+            report,
+            errors,
+            evidence,
+            trusted_amd_ark_roots,
+            trusted_amd_ark_root_hashes,
+        ),
         "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral),
         other => fail(
             report,
@@ -1604,10 +1576,6 @@ fn verify_gcp_tdx_vendor_report(
             return;
         }
     };
-    if let Some(onchain) = collateral.get("gcpTdxAutomataOnchain") {
-        verify_gcp_tdx_automata_onchain_output(report, errors, &raw_quote, onchain);
-        return;
-    }
     let collateral = match parse_gcp_tdx_dcap_collateral(collateral) {
         Ok(collateral) => collateral,
         Err(detail) => {
@@ -1638,109 +1606,6 @@ fn verify_gcp_tdx_vendor_report(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AutomataOnchainDcapCollateral {
-    #[serde(default)]
-    chain: Option<String>,
-    #[serde(default)]
-    rpc_url: Option<String>,
-    contract: String,
-    output: String,
-}
-
-fn verify_gcp_tdx_automata_onchain_output(
-    report: &mut VerificationReport,
-    errors: &mut Vec<VerificationError>,
-    raw_quote: &[u8],
-    value: &serde_json::Value,
-) {
-    let collateral: AutomataOnchainDcapCollateral = match serde_json::from_value(value.clone()) {
-        Ok(collateral) => collateral,
-        Err(e) => {
-            fail(
-                report,
-                errors,
-                "gcp-tee-vendor-report",
-                format!("GCP TDX Automata on-chain DCAP collateral did not parse: {e}"),
-            );
-            return;
-        }
-    };
-    let output = match URL_SAFE_NO_PAD.decode(&collateral.output) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            fail(
-                report,
-                errors,
-                "gcp-tee-vendor-report",
-                format!("GCP TDX Automata on-chain DCAP output is not base64url: {e}"),
-            );
-            return;
-        }
-    };
-    match verify_automata_dcap_output_matches_quote(raw_quote, &output) {
-        Ok(()) => pass(report, "gcp-tee-vendor-report"),
-        Err(e) => fail(
-            report,
-            errors,
-            "gcp-tee-vendor-report",
-            format!(
-                "GCP TDX Automata on-chain DCAP verification failed for contract {} on {}{}: {e}",
-                collateral.contract,
-                collateral.chain.as_deref().unwrap_or("unknown-chain"),
-                collateral
-                    .rpc_url
-                    .as_deref()
-                    .map(|url| format!(" via {url}"))
-                    .unwrap_or_default()
-            ),
-        ),
-    }
-}
-
-fn verify_automata_dcap_output_matches_quote(
-    raw_quote: &[u8],
-    output: &[u8],
-) -> std::result::Result<(), String> {
-    if output.len() < AUTOMATA_DCAP_OUTPUT_HEADER_LEN + TDX_TD10_QUOTE_BODY_LEN {
-        return Err(format!(
-            "output is too short: got {}, need at least {}",
-            output.len(),
-            AUTOMATA_DCAP_OUTPUT_HEADER_LEN + TDX_TD10_QUOTE_BODY_LEN
-        ));
-    }
-    let tcb_status = output[AUTOMATA_DCAP_TCB_STATUS_OFFSET];
-    if !matches!(
-        tcb_status,
-        AUTOMATA_DCAP_TCB_STATUS_OK | AUTOMATA_DCAP_TCB_STATUS_SW_HARDENING_NEEDED
-    ) {
-        return Err(format!("unaccepted TCB status {tcb_status}"));
-    }
-    let body_type = u16::from_be_bytes([output[2], output[3]]);
-    let expected_body_len = match body_type {
-        TDX_BODY_TD_REPORT10_TYPE => TDX_TD10_QUOTE_BODY_LEN,
-        TDX_BODY_TD_REPORT15_TYPE => TDX_TD15_QUOTE_BODY_LEN,
-        other => return Err(format!("unsupported Automata DCAP quote body type {other}")),
-    };
-    if output.len() < AUTOMATA_DCAP_OUTPUT_HEADER_LEN + expected_body_len {
-        return Err(format!(
-            "output body is too short for body type {body_type}: got {}, need {}",
-            output.len() - AUTOMATA_DCAP_OUTPUT_HEADER_LEN,
-            expected_body_len
-        ));
-    }
-    let output_body = &output
-        [AUTOMATA_DCAP_OUTPUT_HEADER_LEN..AUTOMATA_DCAP_OUTPUT_HEADER_LEN + expected_body_len];
-    let quote_body = gcp_tdx_quote_body(raw_quote)?;
-    if quote_body != output_body {
-        return Err(
-            "verified Automata DCAP quote body does not match TLS evidence quote body".to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn parse_gcp_tdx_dcap_collateral(
     collateral: &serde_json::Value,
 ) -> std::result::Result<dcap_qvl::QuoteCollateralV3, String> {
@@ -1759,6 +1624,7 @@ fn verify_gcp_snp_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     trusted_amd_ark_roots: &[Vec<u8>],
+    trusted_amd_ark_root_hashes: &[[u8; 32]],
 ) {
     let Some(evidence) = evidence else {
         fail(
@@ -1792,16 +1658,21 @@ fn verify_gcp_snp_vendor_report(
             return;
         }
     };
-    if trusted_amd_ark_roots.is_empty() {
+    if trusted_amd_ark_roots.is_empty() && trusted_amd_ark_root_hashes.is_empty() {
         fail(
             report,
             errors,
             "gcp-tee-vendor-report",
-            "no trusted AMD SEV-SNP ARK root certificates configured".to_string(),
+            "no trusted AMD SEV-SNP ARK root certificates or root hashes configured".to_string(),
         );
         return;
     }
-    match verify_snp_report_with_aux_certs(&snp_report, &auxblob, trusted_amd_ark_roots) {
+    match verify_snp_report_with_aux_certs(
+        &snp_report,
+        &auxblob,
+        trusted_amd_ark_roots,
+        trusted_amd_ark_root_hashes,
+    ) {
         Ok(()) => pass(report, "gcp-tee-vendor-report"),
         Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
     }
@@ -1811,6 +1682,7 @@ fn verify_snp_report_with_aux_certs(
     report: &[u8],
     auxblob: &[u8],
     trusted_amd_ark_roots: &[Vec<u8>],
+    trusted_amd_ark_root_hashes: &[[u8; 32]],
 ) -> std::result::Result<(), String> {
     if report.len() < SNP_REPORT_MIN_LEN {
         return Err(format!(
@@ -1845,7 +1717,13 @@ fn verify_snp_report_with_aux_certs(
             })?,
         };
 
-    verify_amd_snp_cert_chain(ark, ask, vek, trusted_amd_ark_roots)?;
+    verify_amd_snp_cert_chain(
+        ark,
+        ask,
+        vek,
+        trusted_amd_ark_roots,
+        trusted_amd_ark_root_hashes,
+    )?;
     verify_snp_vek_extensions(vek, report, signer)?;
     verify_snp_report_signature(vek, report)?;
     Ok(())
@@ -1931,12 +1809,20 @@ fn verify_amd_snp_cert_chain(
     ask_der: &[u8],
     vek_der: &[u8],
     trusted_amd_ark_roots: &[Vec<u8>],
+    trusted_amd_ark_root_hashes: &[[u8; 32]],
 ) -> std::result::Result<(), String> {
+    let ark_hash: [u8; 32] = Sha256::digest(ark_der).into();
     if !trusted_amd_ark_roots
         .iter()
         .any(|trusted| trusted.as_slice() == ark_der)
+        && !trusted_amd_ark_root_hashes
+            .iter()
+            .any(|trusted| *trusted == ark_hash)
     {
-        return Err("SNP ARK certificate is not in trusted AMD ARK roots".to_string());
+        return Err(format!(
+            "SNP ARK certificate is not in trusted AMD ARK roots; sha256(ark_der)=0x{}",
+            hex::encode(ark_hash)
+        ));
     }
 
     let (_, ark) = X509Certificate::from_der(ark_der)
@@ -3326,17 +3212,6 @@ mod tests {
         quote
     }
 
-    fn fake_automata_dcap_output_for_quote(quote: &[u8], tcb_status: u8) -> Vec<u8> {
-        let body = gcp_tdx_quote_body(quote).expect("TDX quote body");
-        let mut output = Vec::with_capacity(AUTOMATA_DCAP_OUTPUT_HEADER_LEN + body.len());
-        output.extend_from_slice(&4u16.to_be_bytes());
-        output.extend_from_slice(&TDX_BODY_TD_REPORT10_TYPE.to_be_bytes());
-        output.push(tcb_status);
-        output.extend_from_slice(&[0u8; 6]);
-        output.extend_from_slice(body);
-        output
-    }
-
     fn fixture_gcp_snp_report_and_certs() -> (&'static [u8], &'static [u8], Vec<u8>) {
         let report = include_bytes!(
             "../../../../automata-tee-workload-measurement/evidence/fedora-oci-gcp-n2d-standard-4/report.bin"
@@ -3732,8 +3607,17 @@ mod tests {
     fn verifies_gcp_snp_vendor_report_fixture() {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
 
-        verify_snp_report_with_aux_certs(report, &auxblob, &[ark.to_vec()])
+        verify_snp_report_with_aux_certs(report, &auxblob, &[ark.to_vec()], &[])
             .expect("GCP SEV-SNP fixture report should verify under fixture ARK");
+    }
+
+    #[test]
+    fn verifies_gcp_snp_vendor_report_fixture_with_ark_hash() {
+        let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let ark_hash: [u8; 32] = Sha256::digest(ark).into();
+
+        verify_snp_report_with_aux_certs(report, &auxblob, &[], &[ark_hash])
+            .expect("GCP SEV-SNP fixture report should verify under fixture ARK hash");
     }
 
     #[test]
@@ -3770,7 +3654,7 @@ mod tests {
     #[test]
     fn rejects_gcp_snp_vendor_report_without_trusted_ark() {
         let (report, _, auxblob) = fixture_gcp_snp_report_and_certs();
-        let err = verify_snp_report_with_aux_certs(report, &auxblob, &[])
+        let err = verify_snp_report_with_aux_certs(report, &auxblob, &[], &[])
             .expect_err("missing trusted ARK root must fail closed");
 
         assert!(err.contains("trusted AMD ARK roots"), "{err}");
@@ -3782,7 +3666,7 @@ mod tests {
         let mut tampered = report.to_vec();
         tampered[16] ^= 0x01;
 
-        let err = verify_snp_report_with_aux_certs(&tampered, &auxblob, &[ark.to_vec()])
+        let err = verify_snp_report_with_aux_certs(&tampered, &auxblob, &[ark.to_vec()], &[])
             .expect_err("tampered SNP report must fail signature verification");
 
         assert!(err.contains("signature"), "{err}");
@@ -3822,6 +3706,7 @@ mod tests {
         let cert = b"cert";
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        let gcp_root_hash: [u8; 32] = Keccak256::digest(&gcp_roots[0]).into();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -3829,7 +3714,7 @@ mod tests {
             response,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
-                gcp_roots,
+                gcp_root_hashes: vec![gcp_root_hash],
                 ..TrustAnchors::default()
             },
         })
@@ -3904,76 +3789,6 @@ mod tests {
 
         assert_only_gcp_vendor_gap(&failure);
         assert_check_passed(&failure, "pcr-4-static");
-    }
-
-    #[test]
-    fn verifier_accepts_gcp_tdx_automata_onchain_dcap_output() {
-        let nonce = [1u8; 32];
-        let cert = b"cert";
-        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
-        let quote = URL_SAFE_NO_PAD
-            .decode(&response.tee_evidence.as_ref().expect("TEE evidence").report)
-            .expect("quote");
-        let output = fake_automata_dcap_output_for_quote(
-            &quote,
-            AUTOMATA_DCAP_TCB_STATUS_SW_HARDENING_NEEDED,
-        );
-        response.collateral = serde_json::json!({
-            "gcpTdxAutomataOnchain": {
-                "chain": "hoodi",
-                "rpcUrl": "https://1rpc.io/hoodi",
-                "contract": "0xaDdeC7e85c2182202b66E331f2a4A0bBB2cEEa1F",
-                "output": URL_SAFE_NO_PAD.encode(output)
-            }
-        });
-
-        let identity = verify_tls_attestation(VerificationInputs {
-            nonce,
-            live_peer_cert_der: cert.to_vec(),
-            response,
-            measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
-            trust_anchors: TrustAnchors {
-                gcp_roots,
-                ..TrustAnchors::default()
-            },
-        })
-        .expect("Automata on-chain DCAP output should satisfy GCP TDX vendor check");
-
-        assert_eq!(identity.cert_der, cert);
-    }
-
-    #[test]
-    fn verifier_rejects_gcp_tdx_automata_onchain_bad_tcb_status() {
-        let nonce = [1u8; 32];
-        let cert = b"cert";
-        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
-        let quote = URL_SAFE_NO_PAD
-            .decode(&response.tee_evidence.as_ref().expect("TEE evidence").report)
-            .expect("quote");
-        let output = fake_automata_dcap_output_for_quote(&quote, 9);
-        response.collateral = serde_json::json!({
-            "gcpTdxAutomataOnchain": {
-                "chain": "hoodi",
-                "rpcUrl": "https://1rpc.io/hoodi",
-                "contract": "0xaDdeC7e85c2182202b66E331f2a4A0bBB2cEEa1F",
-                "output": URL_SAFE_NO_PAD.encode(output)
-            }
-        });
-
-        let failure = verify_tls_attestation(VerificationInputs {
-            nonce,
-            live_peer_cert_der: cert.to_vec(),
-            response,
-            measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
-            trust_anchors: TrustAnchors {
-                gcp_roots,
-                ..TrustAnchors::default()
-            },
-        })
-        .expect_err("unaccepted Automata DCAP TCB status must fail closed");
-
-        assert_only_gcp_vendor_gap(&failure);
-        assert!(failure.errors[0].detail.contains("unaccepted TCB status 9"));
     }
 
     #[test]

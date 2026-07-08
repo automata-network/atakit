@@ -918,8 +918,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
                     args.tdx_dcap_collateral.clone(),
                     args.tdx_dcap_pccs_url.clone(),
-                    args.tdx_dcap_automata_pccs_rpc_url.clone(),
-                    args.tdx_dcap_automata_pccs_contract.clone(),
+                    args.tdx_dcap_automata_collateral_rpc_url.clone(),
+                    args.tdx_dcap_automata_pcs_dao.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let verified_tls = init::bootstrap_portal_tls_with_trust_config(

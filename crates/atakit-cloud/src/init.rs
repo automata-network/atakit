@@ -8,16 +8,29 @@ use atakit_attestation::{
     MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
     VerificationReport, VerifiedTlsIdentity,
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use dcap_qvl::config::PckCa;
+use dcap_qvl::quote::Quote;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 
 use crate::error::CloudError;
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
-const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://1rpc.io/hoodi";
-const DEFAULT_TDX_DCAP_AUTOMATA_CONTRACT: &str = "0xaDdeC7e85c2182202b66E331f2a4A0bBB2cEEa1F";
+const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
+const DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO: &str = "0xb6d715f2f630314cDC1EdE1a550F14822c38b245";
+const DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO: &str = "0x399c1927C72A3913B10f399D383ae4Ff1083aC24";
+const DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO: &str = "0x63eF330eAaadA189861144FCbc9176dae41A5BAf";
+const DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO: &str =
+    "0xc3ea5Ff40263E16cD2f4413152A77e7A6b10B0C9";
+const DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION: u64 = 3;
+const DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION: u64 = 4;
+const AUTOMATA_PCS_CA_ROOT: u64 = 0;
+const AUTOMATA_PCS_CA_PROCESSOR: u64 = 1;
+const AUTOMATA_PCS_CA_PLATFORM: u64 = 2;
+const AUTOMATA_TCB_ID_TDX: u64 = 1;
+const AUTOMATA_ENCLAVE_ID_TD_QE: u64 = 2;
 
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
@@ -68,7 +81,10 @@ pub enum TdxDcapCollateralSource {
     AutomataOnchainPccs {
         chain: Option<String>,
         rpc_url: Option<String>,
-        contract: Option<String>,
+        pcs_dao: Option<String>,
+        pck_dao: Option<String>,
+        fmspc_tcb_dao: Option<String>,
+        enclave_identity_dao: Option<String>,
     },
 }
 
@@ -100,12 +116,12 @@ pub enum AzureMaaTrustSource {
 pub fn tdx_dcap_collateral_config(
     collateral_file: Option<PathBuf>,
     pccs_url: Option<String>,
-    automata_rpc_url: Option<String>,
-    automata_contract: Option<String>,
+    automata_collateral_rpc_url: Option<String>,
+    automata_pcs_dao: Option<String>,
 ) -> Result<TdxDcapCollateralConfig, CloudError> {
     let selected = usize::from(collateral_file.is_some())
         + usize::from(pccs_url.is_some())
-        + usize::from(automata_rpc_url.is_some() || automata_contract.is_some());
+        + usize::from(automata_collateral_rpc_url.is_some() || automata_pcs_dao.is_some());
     if selected > 1 {
         return Err(CloudError::Config {
             message: "choose only one TDX DCAP collateral source: --tdx-dcap-collateral, --tdx-dcap-pccs-url, or --tdx-dcap-automata-*".to_string(),
@@ -115,17 +131,23 @@ pub fn tdx_dcap_collateral_config(
         TdxDcapCollateralSource::File(path)
     } else if let Some(url) = pccs_url {
         TdxDcapCollateralSource::HttpPccs { url }
-    } else if automata_rpc_url.is_some() || automata_contract.is_some() {
+    } else if automata_collateral_rpc_url.is_some() || automata_pcs_dao.is_some() {
         TdxDcapCollateralSource::AutomataOnchainPccs {
             chain: Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN.to_string()),
-            rpc_url: automata_rpc_url,
-            contract: automata_contract,
+            rpc_url: automata_collateral_rpc_url,
+            pcs_dao: automata_pcs_dao,
+            pck_dao: None,
+            fmspc_tcb_dao: None,
+            enclave_identity_dao: None,
         }
     } else {
         TdxDcapCollateralSource::AutomataOnchainPccs {
             chain: Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN.to_string()),
             rpc_url: Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL.to_string()),
-            contract: Some(DEFAULT_TDX_DCAP_AUTOMATA_CONTRACT.to_string()),
+            pcs_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO.to_string()),
+            pck_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO.to_string()),
+            fmspc_tcb_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO.to_string()),
+            enclave_identity_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO.to_string()),
         }
     };
     Ok(TdxDcapCollateralConfig { source })
@@ -721,6 +743,25 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
+    if let Err(detail) =
+        resolve_chain_trust_anchors(&response, &azure_maa_trust, &mut trust_anchors).await
+    {
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report = tls_preverification_failure_report(
+            &response,
+            &live_hash,
+            "automata-onchain-trust",
+            detail,
+        );
+        return handle_tls_attestation_failure(
+            report,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+        );
+    }
+
     match verify_tls_attestation(VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
@@ -794,37 +835,52 @@ async fn resolve_tdx_dcap_collateral(
         TdxDcapCollateralSource::AutomataOnchainPccs {
             chain,
             rpc_url,
-            contract,
+            pcs_dao,
+            pck_dao,
+            fmspc_tcb_dao,
+            enclave_identity_dao,
         } => {
             let chain = chain.as_deref().unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN);
             let rpc_url = rpc_url
                 .as_deref()
                 .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL);
-            let contract = contract
+            let pcs_dao = pcs_dao
                 .as_deref()
-                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_CONTRACT);
+                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO);
+            let pck_dao = pck_dao
+                .as_deref()
+                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO);
+            let fmspc_tcb_dao = fmspc_tcb_dao
+                .as_deref()
+                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO);
+            let enclave_identity_dao = enclave_identity_dao
+                .as_deref()
+                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO);
             let evidence = response
                 .tee_evidence
                 .as_ref()
                 .ok_or_else(|| "GCP TDX response is missing teeEvidence".to_string())?;
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
-                .map_err(|e| format!("decode teeEvidence.report for Automata DCAP call: {e}"))?;
-            let output = automata_dcap_verify_and_attest(rpc_url, contract, &quote).await?;
-            serde_json::json!({
-                "chain": chain,
-                "rpcUrl": rpc_url,
-                "contract": contract,
-                "output": URL_SAFE_NO_PAD.encode(output),
-            })
+                .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
+            let collateral = automata_dcap_quote_collateral(
+                rpc_url,
+                AutomataPccsDaos {
+                    pcs_dao,
+                    pck_dao,
+                    fmspc_tcb_dao,
+                    enclave_identity_dao,
+                },
+                &quote,
+            )
+            .await
+            .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
+            serde_json::to_value(collateral)
+                .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
         }
     };
-    let key = match &config.source {
-        TdxDcapCollateralSource::AutomataOnchainPccs { .. } => "gcpTdxAutomataOnchain",
-        _ => "gcpTdxDcap",
-    };
     let mut object = response.collateral.as_object().cloned().unwrap_or_default();
-    object.insert(key.to_string(), collateral);
+    object.insert("gcpTdxDcap".to_string(), collateral);
     response.collateral = serde_json::Value::Object(object);
     Ok(())
 }
@@ -888,6 +944,57 @@ async fn resolve_azure_maa_trust(
     Ok(())
 }
 
+async fn resolve_chain_trust_anchors(
+    response: &TlsAttestationResponse,
+    config: &AzureMaaTrustConfig,
+    trust_anchors: &mut TrustAnchors,
+) -> Result<(), String> {
+    let AzureMaaTrustSource::OnchainRegistry {
+        rpc_url,
+        session_registry,
+    } = &config.source
+    else {
+        return Ok(());
+    };
+    if !response.platform.cloud.eq_ignore_ascii_case("gcp") {
+        return Ok(());
+    }
+
+    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
+
+    if trust_anchors.gcp_roots.is_empty() && trust_anchors.gcp_root_hashes.is_empty() {
+        let root = extract_gcp_ak_root_cert(response)?;
+        let root_hash = keccak256(&root);
+        let tpm_attestation = resolve_tpm_attestation(rpc_url, &ak_collateral_verifier).await?;
+        if !resolve_verified_ca(rpc_url, &tpm_attestation, root_hash).await? {
+            return Err(format!(
+                "TpmAttestation {tpm_attestation} does not trust GCP AK root keccak256(root_der)=0x{}",
+                hex::encode(root_hash)
+            ));
+        }
+        trust_anchors.gcp_root_hashes.push(root_hash);
+    }
+
+    if response.platform.tee.eq_ignore_ascii_case("sev-snp")
+        && trust_anchors.amd_ark_roots.is_empty()
+        && trust_anchors.amd_ark_root_hashes.is_empty()
+    {
+        let ark = extract_snp_ark_cert(response)?;
+        let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
+        let tee_verifier = resolve_tee_verifier(rpc_url, session_registry).await?;
+        let snp_attestation = resolve_snp_attestation(rpc_url, &tee_verifier).await?;
+        if !resolve_snp_root_hash(rpc_url, &snp_attestation, ark_hash).await? {
+            return Err(format!(
+                "SnpAttestation {snp_attestation} does not trust AMD ARK sha256(ark_der)=0x{}",
+                hex::encode(ark_hash)
+            ));
+        }
+        trust_anchors.amd_ark_root_hashes.push(ark_hash);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct AzureMaaJwtInfo {
     kid: String,
@@ -946,6 +1053,94 @@ async fn resolve_maa_signing_key(
     )
     .await?;
     decode_maa_signing_key_return(&result)
+}
+
+async fn resolve_tpm_attestation(
+    rpc_url: &str,
+    ak_collateral_verifier: &str,
+) -> Result<String, String> {
+    let calldata = encode_no_arg_call("tpmAttestation()");
+    let result = eth_call_bytes(
+        rpc_url,
+        ak_collateral_verifier,
+        &calldata,
+        "AkCollateralVerifier.tpmAttestation",
+    )
+    .await?;
+    decode_address_return(&result, "AkCollateralVerifier.tpmAttestation")
+}
+
+async fn resolve_tee_verifier(rpc_url: &str, session_registry: &str) -> Result<String, String> {
+    let calldata = encode_no_arg_call("teeVerifier()");
+    let result = eth_call_bytes(
+        rpc_url,
+        session_registry,
+        &calldata,
+        "SessionRegistry.teeVerifier",
+    )
+    .await?;
+    decode_address_return(&result, "SessionRegistry.teeVerifier")
+}
+
+async fn resolve_snp_attestation(rpc_url: &str, tee_verifier: &str) -> Result<String, String> {
+    let calldata = encode_no_arg_call("snpAttestation()");
+    let result = eth_call_bytes(
+        rpc_url,
+        tee_verifier,
+        &calldata,
+        "TeeVerifier.snpAttestation",
+    )
+    .await?;
+    decode_address_return(&result, "TeeVerifier.snpAttestation")
+}
+
+async fn resolve_verified_ca(
+    rpc_url: &str,
+    tpm_attestation: &str,
+    root_hash: [u8; 32],
+) -> Result<bool, String> {
+    let calldata = encode_bytes32_arg_call("verifiedCA(bytes32)", root_hash);
+    let result = eth_call_bytes(
+        rpc_url,
+        tpm_attestation,
+        &calldata,
+        "TpmAttestation.verifiedCA",
+    )
+    .await?;
+    if result.len() != 32 {
+        return Err(format!(
+            "TpmAttestation.verifiedCA return has invalid length: got {}, need 32",
+            result.len()
+        ));
+    }
+    abi_word_bool(&result)
+}
+
+async fn resolve_snp_root_hash(
+    rpc_url: &str,
+    snp_attestation: &str,
+    ark_hash: [u8; 32],
+) -> Result<bool, String> {
+    for processor_model in 0..8u64 {
+        let calldata = encode_uint_arg_call("rootCerts(uint8)", processor_model);
+        let result = eth_call_bytes(
+            rpc_url,
+            snp_attestation,
+            &calldata,
+            "SnpAttestation.rootCerts",
+        )
+        .await?;
+        if result.len() != 32 {
+            return Err(format!(
+                "SnpAttestation.rootCerts return has invalid length: got {}, need 32",
+                result.len()
+            ));
+        }
+        if result.as_slice() == ark_hash {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn eth_call_bytes(
@@ -1047,61 +1242,177 @@ fn extract_azure_maa_jwt_info(
     })
 }
 
-async fn automata_dcap_verify_and_attest(
-    rpc_url: &str,
-    contract: &str,
-    quote: &[u8],
-) -> Result<Vec<u8>, String> {
-    let calldata = encode_verify_and_attest_on_chain_call(quote);
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [
-            {
-                "to": contract,
-                "data": format!("0x{}", hex::encode(calldata)),
-                "value": "0x0"
-            },
-            "latest"
-        ]
-    });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("build Automata PCCS RPC client: {e}"))?;
-    let response: serde_json::Value = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("call Automata DCAP verifier at {rpc_url}: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("decode Automata DCAP RPC response from {rpc_url}: {e}"))?;
-    if let Some(error) = response.get("error") {
+fn extract_gcp_ak_root_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+    let binding = response
+        .ak_binding
+        .as_ref()
+        .ok_or_else(|| "GCP response is missing akBinding".to_string())?;
+    if !binding.kind.eq_ignore_ascii_case("gcp-cert-chain") {
         return Err(format!(
-            "Automata DCAP verifier RPC error from {rpc_url}: {error}"
+            "GCP response akBinding kind is {}, expected gcp-cert-chain",
+            binding.kind
         ));
     }
-    let result = response
-        .get("result")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| format!("Automata DCAP verifier RPC response missing result: {response}"))?;
-    decode_verify_and_attest_on_chain_return(result)
+    let raw = URL_SAFE_NO_PAD
+        .decode(&binding.data)
+        .map_err(|e| format!("decode GCP AK cert-chain binding: {e}"))?;
+    let encoded_chain: Vec<String> = serde_json::from_slice(&raw)
+        .map_err(|e| format!("parse GCP AK cert-chain binding JSON: {e}"))?;
+    let mut chain = Vec::with_capacity(encoded_chain.len());
+    for (index, encoded) in encoded_chain.iter().enumerate() {
+        chain.push(
+            URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|e| format!("decode GCP AK cert-chain certificate {index}: {e}"))?,
+        );
+    }
+    chain
+        .pop()
+        .ok_or_else(|| "GCP AK cert-chain binding is empty".to_string())
 }
 
-fn encode_verify_and_attest_on_chain_call(input: &[u8]) -> Vec<u8> {
-    let mut selector = Keccak256::digest(b"verifyAndAttestOnChain(bytes)");
-    let mut out = Vec::with_capacity(4 + 64 + input.len().div_ceil(32) * 32);
-    out.extend_from_slice(&selector[..4]);
-    out.extend_from_slice(&abi_word_u64(32));
-    out.extend_from_slice(&abi_word_u64(input.len() as u64));
-    out.extend_from_slice(input);
-    let padding = (32 - (input.len() % 32)) % 32;
-    out.extend(std::iter::repeat(0).take(padding));
-    selector.fill(0);
-    out
+fn extract_snp_ark_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "GCP SNP response is missing teeEvidence".to_string())?;
+    let auxiliary = evidence
+        .auxiliary
+        .as_ref()
+        .ok_or_else(|| "GCP SNP response is missing teeEvidence.auxiliary".to_string())?;
+    let auxblob = URL_SAFE_NO_PAD
+        .decode(auxiliary)
+        .map_err(|e| format!("decode GCP SNP auxiliary cert table: {e}"))?;
+    let mut offset = 0usize;
+    while offset + 24 <= auxblob.len() {
+        let guid_bytes = &auxblob[offset..offset + 16];
+        if guid_bytes.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let cert_offset = u32::from_le_bytes(
+            auxblob[offset + 16..offset + 20]
+                .try_into()
+                .expect("slice length"),
+        ) as usize;
+        let cert_len = u32::from_le_bytes(
+            auxblob[offset + 20..offset + 24]
+                .try_into()
+                .expect("slice length"),
+        ) as usize;
+        let cert_end = cert_offset
+            .checked_add(cert_len)
+            .ok_or_else(|| "SNP cert table entry overflows usize".to_string())?;
+        if cert_end > auxblob.len() {
+            return Err(format!(
+                "SNP cert table entry extends past auxblob: offset={cert_offset} len={cert_len} auxblob={}",
+                auxblob.len()
+            ));
+        }
+        if amd_guid_string(guid_bytes) == "c0b406a4-a803-4952-9743-3fb6014cd0ae" {
+            return Ok(auxblob[cert_offset..cert_end].to_vec());
+        }
+        offset += 24;
+    }
+    Err("GCP SNP auxiliary cert table is missing ARK certificate".to_string())
+}
+
+fn amd_guid_string(bytes: &[u8]) -> String {
+    debug_assert_eq!(bytes.len(), 16);
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[3], bytes[2], bytes[1], bytes[0],
+        bytes[5], bytes[4],
+        bytes[7], bytes[6],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AutomataPccsDaos<'a> {
+    pcs_dao: &'a str,
+    pck_dao: &'a str,
+    fmspc_tcb_dao: &'a str,
+    enclave_identity_dao: &'a str,
+}
+
+async fn automata_dcap_quote_collateral(
+    rpc_url: &str,
+    daos: AutomataPccsDaos<'_>,
+    quote: &[u8],
+) -> Result<dcap_qvl::QuoteCollateralV3, String> {
+    let parsed = Quote::parse(quote).map_err(|e| format!("parse TDX quote: {e:#}"))?;
+    let quote_pck_chain = dcap_qvl::intel::extract_cert_chain(&parsed)
+        .map_err(|e| format!("extract PCK certificate chain from quote: {e:#}"))?;
+    let pck_ca = dcap_qvl::intel::quote_ca(&parsed)
+        .map_err(|e| format!("determine quote PCK CA type: {e:#}"))?;
+    let pck_ca_id = match pck_ca {
+        PckCa::Processor => AUTOMATA_PCS_CA_PROCESSOR,
+        PckCa::Platform => AUTOMATA_PCS_CA_PLATFORM,
+    };
+    let fmspc =
+        dcap_qvl::intel::quote_fmspc(&parsed).map_err(|e| format!("extract quote FMSPC: {e:#}"))?;
+    let fmspc = hex::encode_upper(fmspc);
+
+    let (root_ca_cert, root_ca_crl) =
+        automata_get_certificate_by_id(rpc_url, daos.pcs_dao, AUTOMATA_PCS_CA_ROOT).await?;
+    let (pck_ca_cert, pck_crl) =
+        automata_get_certificate_by_id(rpc_url, daos.pcs_dao, pck_ca_id).await?;
+    let pck_certificate_chain = if quote_pck_chain.len() > 1 {
+        pem_chain_from_der(&quote_pck_chain)?
+    } else {
+        let (intermediate, root) =
+            automata_get_pck_cert_chain(rpc_url, daos.pck_dao, pck_ca_id).await?;
+        let mut full_chain = quote_pck_chain;
+        full_chain.push(intermediate);
+        full_chain.push(root);
+        pem_chain_from_der(&full_chain)?
+    };
+
+    let (tcb_info, tcb_info_signature) = automata_get_tcb_info(
+        rpc_url,
+        daos.fmspc_tcb_dao,
+        AUTOMATA_TCB_ID_TDX,
+        &fmspc,
+        DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION,
+    )
+    .await?;
+    if tcb_info.is_empty() || tcb_info_signature.is_empty() {
+        return Err(format!(
+            "Automata FMSPC TCB DAO {} returned empty TDX TCB info for FMSPC {fmspc} version {}",
+            daos.fmspc_tcb_dao, DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION
+        ));
+    }
+    let (tcb_signing_cert, tcb_root_cert) =
+        automata_get_tcb_issuer_chain(rpc_url, daos.fmspc_tcb_dao).await?;
+    let (qe_identity, qe_identity_signature) = automata_get_enclave_identity(
+        rpc_url,
+        daos.enclave_identity_dao,
+        AUTOMATA_ENCLAVE_ID_TD_QE,
+        DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION,
+    )
+    .await?;
+    if qe_identity.is_empty() || qe_identity_signature.is_empty() {
+        return Err(format!(
+            "Automata enclave identity DAO {} returned empty TD_QE identity version {}",
+            daos.enclave_identity_dao, DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION
+        ));
+    }
+    let (qe_signing_cert, qe_root_cert) =
+        automata_get_enclave_identity_issuer_chain(rpc_url, daos.enclave_identity_dao).await?;
+
+    Ok(dcap_qvl::QuoteCollateralV3 {
+        pck_crl_issuer_chain: pem_chain_from_der(&[pck_ca_cert, root_ca_cert.clone()])?,
+        root_ca_crl,
+        pck_crl,
+        tcb_info_issuer_chain: pem_chain_from_der(&[tcb_signing_cert, tcb_root_cert])?,
+        tcb_info,
+        tcb_info_signature,
+        qe_identity_issuer_chain: pem_chain_from_der(&[qe_signing_cert, qe_root_cert])?,
+        qe_identity,
+        qe_identity_signature,
+        pck_certificate_chain: Some(pck_certificate_chain),
+    })
 }
 
 fn encode_no_arg_call(signature: &str) -> Vec<u8> {
@@ -1117,45 +1428,207 @@ fn encode_bytes32_arg_call(signature: &str, arg: [u8; 32]) -> Vec<u8> {
     out
 }
 
+fn encode_uint_arg_call(signature: &str, arg: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&function_selector(signature));
+    out.extend_from_slice(&abi_word_u64(arg));
+    out
+}
+
+fn encode_two_uint_args_call(signature: &str, first: u64, second: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(68);
+    out.extend_from_slice(&function_selector(signature));
+    out.extend_from_slice(&abi_word_u64(first));
+    out.extend_from_slice(&abi_word_u64(second));
+    out
+}
+
+fn encode_get_tcb_info_call(tcb_type: u64, fmspc: &str, version: u64) -> Vec<u8> {
+    let fmspc = fmspc.as_bytes();
+    let mut out = Vec::with_capacity(4 + 96 + 32 + fmspc.len().div_ceil(32) * 32);
+    out.extend_from_slice(&function_selector("getTcbInfo(uint256,string,uint256)"));
+    out.extend_from_slice(&abi_word_u64(tcb_type));
+    out.extend_from_slice(&abi_word_u64(96));
+    out.extend_from_slice(&abi_word_u64(version));
+    out.extend_from_slice(&abi_word_u64(fmspc.len() as u64));
+    out.extend_from_slice(fmspc);
+    let padding = (32 - (fmspc.len() % 32)) % 32;
+    out.extend(std::iter::repeat(0).take(padding));
+    out
+}
+
 fn function_selector(signature: &str) -> [u8; 4] {
     let hash = Keccak256::digest(signature.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
-fn decode_verify_and_attest_on_chain_return(result: &str) -> Result<Vec<u8>, String> {
-    let bytes = decode_hex_result(result, "Automata DCAP verifier return")?;
-    if bytes.len() < 96 {
+async fn automata_get_certificate_by_id(
+    rpc_url: &str,
+    pcs_dao: &str,
+    ca: u64,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let calldata = encode_uint_arg_call("getCertificateById(uint8)", ca);
+    let result = eth_call_bytes(rpc_url, pcs_dao, &calldata, "PcsDao.getCertificateById").await?;
+    decode_two_bytes_return(&result, "PcsDao.getCertificateById")
+}
+
+async fn automata_get_pck_cert_chain(
+    rpc_url: &str,
+    pck_dao: &str,
+    ca: u64,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let calldata = encode_uint_arg_call("getPckCertChain(uint8)", ca);
+    let result = eth_call_bytes(rpc_url, pck_dao, &calldata, "PckDao.getPckCertChain").await?;
+    decode_two_bytes_return(&result, "PckDao.getPckCertChain")
+}
+
+async fn automata_get_tcb_info(
+    rpc_url: &str,
+    fmspc_tcb_dao: &str,
+    tcb_type: u64,
+    fmspc: &str,
+    version: u64,
+) -> Result<(String, Vec<u8>), String> {
+    let calldata = encode_get_tcb_info_call(tcb_type, fmspc, version);
+    let result =
+        eth_call_bytes(rpc_url, fmspc_tcb_dao, &calldata, "FmspcTcbDao.getTcbInfo").await?;
+    decode_string_bytes_struct_return(&result, "FmspcTcbDao.getTcbInfo")
+}
+
+async fn automata_get_tcb_issuer_chain(
+    rpc_url: &str,
+    fmspc_tcb_dao: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let calldata = encode_no_arg_call("getTcbIssuerChain()");
+    let result = eth_call_bytes(
+        rpc_url,
+        fmspc_tcb_dao,
+        &calldata,
+        "FmspcTcbDao.getTcbIssuerChain",
+    )
+    .await?;
+    decode_two_bytes_return(&result, "FmspcTcbDao.getTcbIssuerChain")
+}
+
+async fn automata_get_enclave_identity(
+    rpc_url: &str,
+    enclave_identity_dao: &str,
+    id: u64,
+    version: u64,
+) -> Result<(String, Vec<u8>), String> {
+    let calldata = encode_two_uint_args_call("getEnclaveIdentity(uint256,uint256)", id, version);
+    let result = eth_call_bytes(
+        rpc_url,
+        enclave_identity_dao,
+        &calldata,
+        "EnclaveIdentityDao.getEnclaveIdentity",
+    )
+    .await?;
+    decode_string_bytes_struct_return(&result, "EnclaveIdentityDao.getEnclaveIdentity")
+}
+
+async fn automata_get_enclave_identity_issuer_chain(
+    rpc_url: &str,
+    enclave_identity_dao: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let calldata = encode_no_arg_call("getEnclaveIdentityIssuerChain()");
+    let result = eth_call_bytes(
+        rpc_url,
+        enclave_identity_dao,
+        &calldata,
+        "EnclaveIdentityDao.getEnclaveIdentityIssuerChain",
+    )
+    .await?;
+    decode_two_bytes_return(&result, "EnclaveIdentityDao.getEnclaveIdentityIssuerChain")
+}
+
+fn decode_two_bytes_return(bytes: &[u8], label: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if bytes.len() < 64 {
         return Err(format!(
-            "Automata DCAP verifier return is too short: got {}, need at least 96",
+            "{label} return is too short: got {}, need at least 64",
             bytes.len()
         ));
     }
-    let success = abi_word_bool(&bytes[0..32])?;
-    let offset = abi_word_usize(&bytes[32..64])?;
+    let first_offset = abi_word_usize(&bytes[0..32])?;
+    let second_offset = abi_word_usize(&bytes[32..64])?;
+    Ok((
+        abi_dynamic_bytes(bytes, first_offset, label)?.to_vec(),
+        abi_dynamic_bytes(bytes, second_offset, label)?.to_vec(),
+    ))
+}
+
+fn decode_string_bytes_struct_return(
+    bytes: &[u8],
+    label: &str,
+) -> Result<(String, Vec<u8>), String> {
+    if bytes.len() < 32 {
+        return Err(format!(
+            "{label} return is too short: got {}, need at least 32",
+            bytes.len()
+        ));
+    }
+    let tuple_offset = abi_word_usize(&bytes[0..32])?;
+    if tuple_offset + 64 > bytes.len() {
+        return Err(format!(
+            "{label} tuple offset {tuple_offset} is out of bounds for {} bytes",
+            bytes.len()
+        ));
+    }
+    let tuple = &bytes[tuple_offset..];
+    let string_offset = abi_word_usize(&tuple[0..32])?;
+    let bytes_offset = abi_word_usize(&tuple[32..64])?;
+    let string_start = tuple_offset + string_offset;
+    let bytes_start = tuple_offset + bytes_offset;
+    let raw_string = abi_dynamic_bytes(bytes, string_start, label)?;
+    let string = String::from_utf8(raw_string.to_vec())
+        .map_err(|e| format!("{label} string field is not valid UTF-8: {e}"))?;
+    Ok((
+        string,
+        abi_dynamic_bytes(bytes, bytes_start, label)?.to_vec(),
+    ))
+}
+
+fn abi_dynamic_bytes<'a>(bytes: &'a [u8], offset: usize, label: &str) -> Result<&'a [u8], String> {
     if offset + 32 > bytes.len() {
         return Err(format!(
-            "Automata DCAP verifier return bytes offset {offset} is out of bounds for {} bytes",
+            "{label} dynamic bytes offset {offset} is out of bounds for {} bytes",
             bytes.len()
         ));
     }
-    let output_len = abi_word_usize(&bytes[offset..offset + 32])?;
-    let output_start = offset + 32;
-    let output_end = output_start + output_len;
-    if output_end > bytes.len() {
+    let len = abi_word_usize(&bytes[offset..offset + 32])?;
+    let start = offset + 32;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| format!("{label} dynamic bytes length overflows usize"))?;
+    if end > bytes.len() {
         return Err(format!(
-            "Automata DCAP verifier output length {output_len} is out of bounds for {} bytes",
+            "{label} dynamic bytes length {len} is out of bounds for {} bytes",
             bytes.len()
         ));
     }
-    let output = bytes[output_start..output_end].to_vec();
-    if !success {
-        let detail = String::from_utf8(output.clone())
-            .unwrap_or_else(|_| format!("0x{}", hex::encode(&output)));
-        return Err(format!(
-            "Automata DCAP verifier returned success=false: {detail}"
-        ));
+    Ok(&bytes[start..end])
+}
+
+fn pem_chain_from_der(certs: &[Vec<u8>]) -> Result<String, String> {
+    if certs.is_empty() {
+        return Err("cannot build PEM chain from empty certificate list".to_string());
     }
-    Ok(output)
+    let mut out = String::new();
+    for cert in certs {
+        out.push_str(&pem_cert_from_der(cert));
+    }
+    Ok(out)
+}
+
+fn pem_cert_from_der(cert: &[u8]) -> String {
+    let b64 = STANDARD.encode(cert);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 fn decode_address_return(bytes: &[u8], label: &str) -> Result<String, String> {
@@ -1300,13 +1773,9 @@ fn is_zero_eth_address(value: &str) -> bool {
 }
 
 fn has_gcp_tdx_collateral(collateral: &serde_json::Value) -> bool {
-    ["gcpTdxDcap", "gcpTdxAutomataOnchain"]
-        .into_iter()
-        .any(|key| {
-            collateral.get(key).is_some_and(|value| {
-                !value.is_null() && !value.as_object().is_some_and(|o| o.is_empty())
-            })
-        })
+    collateral
+        .get("gcpTdxDcap")
+        .is_some_and(|value| !value.is_null() && !value.as_object().is_some_and(|o| o.is_empty()))
 }
 
 fn tls_preverification_failure_report(
@@ -1787,25 +2256,45 @@ mod tests {
     }
 
     #[test]
-    fn automata_dcap_abi_encoding_and_return_decoding() {
-        let calldata = encode_verify_and_attest_on_chain_call(&[0xaa, 0xbb, 0xcc]);
-        assert_eq!(&calldata[0..4], &[0x38, 0xd8, 0x48, 0x0a]);
-        assert_eq!(&calldata[4..36], &abi_word_u64(32));
-        assert_eq!(&calldata[36..68], &abi_word_u64(3));
-        assert_eq!(&calldata[68..71], &[0xaa, 0xbb, 0xcc]);
-        assert_eq!(calldata.len(), 100);
+    fn automata_pccs_abi_encoding_and_return_decoding() {
+        let calldata = encode_uint_arg_call("getCertificateById(uint8)", 1);
+        assert_eq!(
+            &calldata[0..4],
+            &function_selector("getCertificateById(uint8)")
+        );
+        assert_eq!(&calldata[4..36], &abi_word_u64(1));
 
         let mut returned = Vec::new();
-        returned.extend_from_slice(&abi_word_u64(1));
         returned.extend_from_slice(&abi_word_u64(64));
+        returned.extend_from_slice(&abi_word_u64(128));
         returned.extend_from_slice(&abi_word_u64(3));
         returned.extend_from_slice(&[0x11, 0x22, 0x33]);
         returned.extend_from_slice(&[0u8; 29]);
+        returned.extend_from_slice(&abi_word_u64(2));
+        returned.extend_from_slice(&[0x44, 0x55]);
+        returned.extend_from_slice(&[0u8; 30]);
 
-        let decoded =
-            decode_verify_and_attest_on_chain_return(&format!("0x{}", hex::encode(returned)))
-                .expect("decode Automata return");
-        assert_eq!(decoded, vec![0x11, 0x22, 0x33]);
+        let decoded = decode_two_bytes_return(&returned, "test").expect("decode tuple");
+        assert_eq!(decoded.0, vec![0x11, 0x22, 0x33]);
+        assert_eq!(decoded.1, vec![0x44, 0x55]);
+    }
+
+    #[test]
+    fn automata_pccs_decodes_dynamic_string_bytes_struct() {
+        let mut returned = Vec::new();
+        returned.extend_from_slice(&abi_word_u64(32));
+        returned.extend_from_slice(&abi_word_u64(64));
+        returned.extend_from_slice(&abi_word_u64(128));
+        returned.extend_from_slice(&abi_word_u64(5));
+        returned.extend_from_slice(b"{json");
+        returned.extend_from_slice(&[0u8; 27]);
+        returned.extend_from_slice(&abi_word_u64(3));
+        returned.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        returned.extend_from_slice(&[0u8; 29]);
+
+        let decoded = decode_string_bytes_struct_return(&returned, "test").expect("decode struct");
+        assert_eq!(decoded.0, "{json");
+        assert_eq!(decoded.1, vec![0xaa, 0xbb, 0xcc]);
     }
 
     #[test]

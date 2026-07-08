@@ -241,18 +241,23 @@ and a chain is configured, then falls back to the local cache at
 `<data-dir>/baseimage/measurements/<safe-name>/<safe-version>/measurement-pack.json`.
 Chain-derived lookup requires platform profile names that encode cloud/TEE, such
 as `gcp-tdx`, `gcp-sev-snp`, `azure-tdx`, `azure-sev-snp`, or `aws-sev-snp`.
-GCP SEV-SNP can complete automatic trust when GCP AK roots, AMD ARK roots, and
-measurements are supplied. GCP TDX can complete automatic trust when GCP AK
-roots, measurements, and verifier-side DCAP collateral are supplied. DCAP
-collateral is resolved by the client, not the portal. If no explicit source is
-provided, the CLI defaults to Automata on-chain DCAP/PCCS on Hoodi using
-`https://1rpc.io/hoodi` and contract
-`0xaDdeC7e85c2182202b66E331f2a4A0bBB2cEEa1F`. Operators can override with
+When registration is on and a SessionRegistry is configured, the CLI can resolve
+GCP AK root hashes, Azure MAA signing keys, and AMD SEV-SNP ARK root hashes from
+Automata contracts before local verification. When registration is off, those
+trust roots must be supplied explicitly. GCP TDX still needs verifier-side DCAP
+collateral; that collateral is resolved by the client, not the portal. If no
+explicit source is provided, the CLI defaults to Automata on-chain PCCS on Hoodi
+using `https://ethereum-hoodi-rpc.publicnode.com` and the default Automata PCS
+DAO, PCK DAO, FMSPC TCB DAO, and Enclave Identity DAO recorded in the TLS
+attestation spec. The CLI uses those DAO reads to assemble canonical
+`QuoteCollateralV3` and then runs local DCAP quote verification. Operators can
+override with
 `--tdx-dcap-collateral <path>` for an offline `QuoteCollateralV3` JSON file,
 `--tdx-dcap-pccs-url <url>` for direct HTTP PCCS/PCS access such as Intel PCS,
-CSP PCCS, or an operator PCCS, or `--tdx-dcap-automata-pccs-rpc-url` plus
-`--tdx-dcap-automata-pccs-contract` for a different Automata-compatible chain
-RPC and contract. Missing or invalid DCAP collateral fails closed at
+CSP PCCS, or an operator PCCS, or
+`--tdx-dcap-automata-collateral-rpc-url` plus
+`--tdx-dcap-automata-pcs-dao` to override the Automata RPC URL and PCS DAO
+address. Missing, stale, or invalid DCAP collateral fails closed at
 `gcp-tee-vendor-report`. The full protocol is specified in
 [`../../docs/specs/tls-attestation-spec.md`](../../docs/specs/tls-attestation-spec.md).
 

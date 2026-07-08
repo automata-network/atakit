@@ -352,13 +352,13 @@ pub struct InitArgs {
     #[arg(long, value_name = "URL")]
     pub tdx_dcap_pccs_url: Option<String>,
 
-    /// Automata on-chain PCCS RPC URL for verifier-side GCP TDX DCAP collateral lookup.
-    #[arg(long, value_name = "URL")]
-    pub tdx_dcap_automata_pccs_rpc_url: Option<String>,
+    /// Automata on-chain collateral RPC URL for verifier-side GCP TDX DCAP lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
 
-    /// Automata on-chain PCCS contract address for verifier-side GCP TDX DCAP collateral lookup.
-    #[arg(long, value_name = "ADDRESS")]
-    pub tdx_dcap_automata_pccs_contract: Option<String>,
+    /// Automata PCS DAO address override for verifier-side GCP TDX DCAP collateral lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
 
     /// One-shot override: trust only this live TLS certificate SHA-256.
     #[arg(long, value_name = "0xSHA256")]
