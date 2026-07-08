@@ -1,0 +1,24 @@
+[package]
+name = "atakit-attestation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+dcap-qvl.workspace = true
+hex.workspace = true
+k256.workspace = true
+p256.workspace = true
+p384.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+signature.workspace = true
+thiserror.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

@@ -15,6 +15,9 @@ use std::time::Duration;
 use alloy_ext::core::primitives::Address;
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
+use atakit_attestation::{
+    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrSpec,
+};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
@@ -29,7 +32,11 @@ use atakit_cloud::{
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
+use automata_tee_workload_measurement::base_image_registry::{
+    BaseImageHierarchy, BaseImageRegistry,
+};
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
+use automata_tee_workload_measurement::types::AppRef;
 
 use crate::config::{ChainConfig, KeyMode, KeySpec};
 
@@ -107,6 +114,212 @@ pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
         key_type: "es256k".to_string(),
         private_key: None,
     }
+}
+
+pub(crate) async fn resolve_tls_measurement_policy(
+    measurements: Option<&std::path::Path>,
+    base_image: Option<&str>,
+    measurement_publisher_keys: &[String],
+    data_dir: &std::path::Path,
+    init_chain: &InitChainConfig,
+) -> Result<Option<MeasurementPolicy>> {
+    if measurements.is_some() {
+        return atakit_cloud::init::load_measurement_policy(
+            measurements,
+            base_image,
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
+    }
+
+    let Some(base_image_ref) = base_image else {
+        return Ok(None);
+    };
+
+    if !registration_is_off(init_chain.registration.as_deref())
+        && init_chain.base_image_registry != ZERO_ADDR
+        && !init_chain.rpc_url.is_empty()
+    {
+        return Ok(Some(
+            load_measurement_policy_from_chain(base_image_ref, init_chain).await?,
+        ));
+    }
+
+    atakit_cloud::init::load_measurement_policy(
+        None,
+        Some(base_image_ref),
+        measurement_publisher_keys,
+        Some(data_dir),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+async fn load_measurement_policy_from_chain(
+    base_image: &str,
+    init_chain: &InitChainConfig,
+) -> Result<MeasurementPolicy> {
+    let app_ref: AppRef = base_image.parse()?;
+    let base_image_id = BaseImageRegistry::get_image_id(&app_ref);
+    let registry_addr: Address = init_chain.base_image_registry.parse().with_context(|| {
+        format!(
+            "invalid base_image_registry address for TLS measurement lookup: {}",
+            init_chain.base_image_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &init_chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url for TLS measurement lookup: {}",
+            init_chain.rpc_url
+        )
+    })?;
+    let hierarchy = BaseImageRegistry::new(registry_addr, provider)
+        .get_hierarchy(base_image_id)
+        .await
+        .with_context(|| format!("failed to fetch BaseImageRegistry hierarchy for {base_image}"))?;
+
+    chain_hierarchy_to_measurement_policy(&hierarchy, &init_chain.base_image_registry)
+}
+
+fn chain_hierarchy_to_measurement_policy(
+    hierarchy: &BaseImageHierarchy,
+    registry: &str,
+) -> Result<MeasurementPolicy> {
+    let profiles = hierarchy
+        .profiles
+        .iter()
+        .map(|profile| {
+            let (cloud, tee) = infer_cloud_tee_from_profile_name(&profile.profile.name)?;
+            let variants = profile
+                .variants
+                .iter()
+                .map(|(variant_id, variant)| MeasurementVariant {
+                    name: variant.name.clone(),
+                    id: hex0x(variant_id),
+                    machine_types: vec![variant.name.clone()],
+                    override_pcrs: variant
+                        .overridePcrs
+                        .iter()
+                        .map(chain_pcr_spec_to_measurement)
+                        .collect(),
+                    attributes: variant
+                        .attributes
+                        .iter()
+                        .map(|attr| {
+                            serde_json::json!({
+                                "key": hex0x(&attr.key),
+                                "value": hex0x(&attr.value),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok(MeasurementProfile {
+                name: profile.profile.name.clone(),
+                id: hex0x(&profile.profile_id),
+                cloud: cloud.to_string(),
+                tee: tee.to_string(),
+                invariants: profile
+                    .profile
+                    .invariants
+                    .iter()
+                    .map(chain_pcr_spec_to_measurement)
+                    .collect(),
+                variants,
+                attributes: profile
+                    .profile
+                    .attributes
+                    .iter()
+                    .map(|attr| {
+                        serde_json::json!({
+                            "key": hex0x(&attr.key),
+                            "value": hex0x(&attr.value),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(MeasurementPolicy {
+        source: format!("chain:{registry}:{}", hex0x(&hierarchy.base_image_id)),
+        pack: MeasurementPack {
+            schema: "atakit.measurement-pack.v1".to_string(),
+            revision: 1,
+            published_at: chrono::Utc::now().to_rfc3339(),
+            base_image: BaseImage {
+                name: hierarchy.spec.name.clone(),
+                version: hierarchy.spec.version.clone(),
+                id: hex0x(&hierarchy.base_image_id),
+                uri: if hierarchy.spec.uri.is_empty() {
+                    None
+                } else {
+                    Some(hierarchy.spec.uri.clone())
+                },
+                archive_sha256: None,
+            },
+            profiles,
+        },
+    })
+}
+
+fn chain_pcr_spec_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec,
+) -> PcrSpec {
+    PcrSpec {
+        pcr_index: spec.pcrIndex,
+        verify_type: match spec.verifyType {
+            0 => "static".to_string(),
+            1 => "dynamicSubset".to_string(),
+            2 => "dynamicSubsequence".to_string(),
+            other => format!("unknown-{other}"),
+        },
+        match_data: spec.matchData.iter().map(hex0x).collect(),
+        event_indices: Vec::new(),
+        total_events: None,
+    }
+}
+
+fn infer_cloud_tee_from_profile_name(name: &str) -> Result<(&'static str, &'static str)> {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    let cloud = if normalized.starts_with("gcp-") || normalized.contains("-gcp-") {
+        "gcp"
+    } else if normalized.starts_with("azure-") || normalized.contains("-azure-") {
+        "azure"
+    } else if normalized.starts_with("aws-") || normalized.contains("-aws-") {
+        "aws"
+    } else {
+        bail!(
+            "cannot infer cloud from BaseImageRegistry platform profile name {:?}; \
+             expected names like gcp-tdx, gcp-sev-snp, azure-tdx, azure-sev-snp, or aws-sev-snp",
+            name
+        );
+    };
+    let tee = if normalized.contains("tdx") {
+        "tdx"
+    } else if normalized.contains("sev-snp") || normalized.contains("snp") {
+        "sev-snp"
+    } else if normalized.contains("nitro") {
+        "nitro"
+    } else {
+        bail!(
+            "cannot infer TEE from BaseImageRegistry platform profile name {:?}; \
+             expected names containing tdx, sev-snp, snp, or nitro",
+            name
+        );
+    };
+    Ok((cloud, tee))
+}
+
+fn hex0x(bytes: impl AsRef<[u8]>) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 pub(crate) fn init_key_from_config(
@@ -1357,5 +1570,57 @@ mod portal_endpoint_tests {
         let got = portal_endpoints(&state).unwrap();
 
         assert_eq!(got, ("203.0.113.10".to_string(), 6024, 5024));
+    }
+}
+
+#[cfg(test)]
+mod tls_measurement_policy_tests {
+    use super::*;
+    use alloy_ext::core::primitives::B256;
+
+    #[test]
+    fn infers_cloud_and_tee_from_supported_profile_names() {
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("gcp-tdx").unwrap(),
+            ("gcp", "tdx")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("gcp-sev-snp").unwrap(),
+            ("gcp", "sev-snp")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("azure_snp_westus").unwrap(),
+            ("azure", "sev-snp")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("aws-nitro").unwrap(),
+            ("aws", "nitro")
+        );
+    }
+
+    #[test]
+    fn rejects_unmappable_chain_profile_names() {
+        let err = infer_cloud_tee_from_profile_name("production-profile").unwrap_err();
+        assert!(err.to_string().contains("cannot infer cloud"), "{err}");
+
+        let err = infer_cloud_tee_from_profile_name("gcp-production").unwrap_err();
+        assert!(err.to_string().contains("cannot infer TEE"), "{err}");
+    }
+
+    #[test]
+    fn converts_chain_pcr_spec_to_measurement_pack_shape() {
+        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec {
+            pcrIndex: 4,
+            verifyType: 0,
+            matchData: vec![B256::repeat_byte(0xaa)],
+        };
+
+        let got = chain_pcr_spec_to_measurement(&spec);
+
+        assert_eq!(got.pcr_index, 4);
+        assert_eq!(got.verify_type, "static");
+        assert_eq!(got.match_data, vec![format!("0x{}", "aa".repeat(32))]);
+        assert!(got.event_indices.is_empty());
+        assert_eq!(got.total_events, None);
     }
 }

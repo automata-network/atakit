@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 use super::{
     effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
     init_key_from_config, parse_metadata, portal_endpoints, registration_is_off, resolve_image,
-    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
-    synthesize_self_generated_key, validate_base_image, InitEnvResolver,
+    resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
+    synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
 
@@ -901,7 +901,48 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     disks: disk_passphrases.clone(),
                 };
 
-                match init::post_portal_init(
+                let measurement_policy = resolve_tls_measurement_policy(
+                    args.measurements.as_deref(),
+                    args.base_image.as_deref(),
+                    &args.measurement_publisher_key,
+                    &env.data_dir,
+                    &init_config.chain,
+                )
+                .await?;
+                let tls_trust_anchors = init::load_tls_trust_anchors(
+                    &args.gcp_ak_root_cert,
+                    &args.azure_maa_key,
+                    &args.amd_ark_root_cert,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
+                    args.tdx_dcap_collateral.clone(),
+                    args.tdx_dcap_pccs_url.clone(),
+                    args.tdx_dcap_automata_pccs_rpc_url.clone(),
+                    args.tdx_dcap_automata_pccs_contract.clone(),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let verified_tls = init::bootstrap_portal_tls(
+                    &ip,
+                    status_port,
+                    measurement_policy,
+                    tls_trust_anchors,
+                    tdx_dcap_collateral,
+                    args.trust_tls_cert_sha256.as_deref(),
+                    Some(&init::cloud_tls_attestation_report_path(
+                        &env.data_dir,
+                        target_name,
+                        &instance_name,
+                    )),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+                    eprintln!("{message}");
+                }
+
+                match init::post_portal_init_with_client(
+                    &verified_tls.client,
                     &ip,
                     init_port,
                     ap,
@@ -917,7 +958,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         // portal reaches a terminal state. "Deployment
                         // complete!" can only be claimed when state=Running.
                         eprintln!();
-                        let outcome = init::wait_for_portal_terminal(
+                        let outcome = init::wait_for_portal_terminal_with_client(
+                            &verified_tls.client,
                             &ip,
                             status_port,
                             portal_wait_timeout_secs,

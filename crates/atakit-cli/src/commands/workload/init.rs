@@ -8,8 +8,9 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::commands::cloud::{
-    init_chain_from_config, init_key_from_config, registration_is_off, resolve_unmeasured_tar,
-    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
+    init_chain_from_config, init_key_from_config, registration_is_off,
+    resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
+    synthesize_off_init_chain, synthesize_self_generated_key,
 };
 use crate::config::Config;
 
@@ -158,15 +159,60 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // 6. Wait for portal.
-    eprint!("  [1/2] Wait for CVM portal... ");
+    eprint!("  [1/3] Wait for CVM portal... ");
     init::wait_for_portal(&host, status_port, args.timeout)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
 
+    eprint!("  [2/3] Verify portal TLS... ");
+    let measurement_policy = resolve_tls_measurement_policy(
+        args.measurements.as_deref(),
+        args.base_image.as_deref(),
+        &args.measurement_publisher_key,
+        &env.data_dir,
+        &init_config.chain,
+    )
+    .await?;
+    let tls_trust_anchors = init::load_tls_trust_anchors(
+        &args.gcp_ak_root_cert,
+        &args.azure_maa_key,
+        &args.amd_ark_root_cert,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
+        args.tdx_dcap_collateral.clone(),
+        args.tdx_dcap_pccs_url.clone(),
+        args.tdx_dcap_automata_pccs_rpc_url.clone(),
+        args.tdx_dcap_automata_pccs_contract.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let verified_tls = init::bootstrap_portal_tls(
+        &host,
+        status_port,
+        measurement_policy,
+        tls_trust_anchors,
+        tdx_dcap_collateral,
+        args.trust_tls_cert_sha256.as_deref(),
+        Some(&init::workload_tls_attestation_report_path(
+            &env.cache_dir,
+            &host,
+            status_port,
+        )),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+        eprintln!("{}", "overridden".yellow());
+        eprintln!("{message}");
+    } else {
+        eprintln!("{}", "done".green());
+    }
+
     // 7. Initialize workload.
-    eprint!("  [2/2] Initialize workload... ");
-    init::post_portal_init(
+    eprint!("  [3/3] Initialize workload... ");
+    init::post_portal_init_with_client(
+        &verified_tls.client,
         &host,
         init_port,
         &archive_path.display().to_string(),

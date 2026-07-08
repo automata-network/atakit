@@ -169,7 +169,8 @@ staging      azure      deploy-failed   (step 5: instance)    -
 
 ## Deploy Pipeline
 
-7 phases. Old atakit had 5 (check_deps through create_instance). We add **wait for agent** and **initialize workload**.
+8 phases. Old atakit had 5 (check_deps through create_instance). We add
+**wait for portal**, **verify TLS**, and **initialize workload**.
 
 ```
 1. check_deps           -- verify CLI tools on PATH
@@ -177,29 +178,97 @@ staging      azure      deploy-failed   (step 5: instance)    -
 3. open_ports           -- configure cloud firewall / NSG
 4. create_disks         -- provision persistent data disks
 5. create_instance      -- launch the CVM
-6. wait_for_agent       -- poll CVM agent on port 1024 until reachable
-7. initialize_workload  -- POST /init with .atawl + unmeasured-data + config
+6. wait_for_agent       -- poll portal status on port 2024 until reachable
+7. verify_tls           -- fetch /tls-attestation, verify evidence, pin cert
+8. initialize_workload  -- POST /init with .atawl + unmeasured-data + config
 ```
 
-### Phase 6: Wait for Agent
+### Phase 6: Wait for Portal
 
-After the VM is created, wait for the CVM agent HTTPS server to become reachable:
+After the VM is created, wait for the portal HTTPS server to become reachable:
 
 ```
 1. Fetch public IP from cloud (recorded in state)
-2. Poll https://{ip}:1024/ with exponential backoff
+2. Poll https://{ip}:2024/status with exponential backoff
    - Start: 5s interval
    - Max: 30s interval
    - Timeout: 5 minutes (configurable)
-3. Accept self-signed certs (always, or with -k flag)
+3. Use bootstrap TLS handling only until TLS attestation succeeds
 ```
 
 Display:
 ```
-Waiting for CVM agent at 34.126.100.42:1024... ready (47s)
+Waiting for portal at 34.126.100.42:2024... ready (47s)
 ```
 
-### Phase 7: Initialize Workload
+### Phase 7: Verify TLS
+
+Before sending secrets or workload archives to `/init`, the deploy client must
+replace broad invalid-certificate bypass with certificate pinning derived from
+TLS attestation:
+
+```
+1. Generate a 32-byte random nonce.
+2. Fetch GET /tls-attestation?nonce=<base64url> with a bootstrap client.
+3. Capture the live peer TLS certificate from that connection.
+4. Verify the response with the reusable atakit-attestation library.
+5. Build a pinned TLS client for the verified certificate.
+6. Use the pinned client for POST /init and later portal calls.
+```
+
+The target verifier proves that the live TLS certificate hash is signed inside
+a TPM quote and that the quote-signing AK is bound to the attested CVM. The
+first implementation slice verifies nonce freshness, cert hash binding,
+qualifying-data construction, platform support, explicit offline measurement
+pack selection, basic evidence-field presence/encoding, TPM quote type,
+TPM quote challenge, TPM quote PCR digest, GCP-style ECDSA P-256 quote
+signatures, GCP AK certificate chain validation when trusted roots are supplied,
+GCP PCR15 TEE/vTPM binding for TDX and SEV-SNP, Azure HCLAk
+RSASSA/SHA-256 quote signatures from `akBinding`, Azure MAA JWT
+signature/report-data binding when trusted MAA keys are supplied,
+measurement-pack base-image/profile/variant ID derivation, and static PCR policy
+checks. Explicit measurement packs must be canonical JSON and must verify
+against a trusted ES256K publisher key supplied by
+`--measurement-publisher-key`. GCP AK roots are supplied with repeatable
+`--gcp-ak-root-cert <hex-x509-der>`. Azure MAA keys are supplied with repeatable
+`--azure-maa-key <hex-pkcs1-rsa-pubkey-or-hex-jwk-json>`. AMD SEV-SNP ARK roots
+for GCP SNP raw report validation are supplied with repeatable
+`--amd-ark-root-cert <hex-x509-der>`. It fails closed when no trusted
+measurement policy is supplied. Operators may pass `--measurements <path>`.
+When `--measurements` is omitted and `--base-image <name:version>` is supplied,
+the CLI first tries on-chain `BaseImageRegistry` lookup if registration is on
+and a chain is configured, then falls back to the local cache at
+`<data-dir>/baseimage/measurements/<safe-name>/<safe-version>/measurement-pack.json`.
+Chain-derived lookup requires platform profile names that encode cloud/TEE, such
+as `gcp-tdx`, `gcp-sev-snp`, `azure-tdx`, `azure-sev-snp`, or `aws-sev-snp`.
+GCP SEV-SNP can complete automatic trust when GCP AK roots, AMD ARK roots, and
+measurements are supplied. GCP TDX can complete automatic trust when GCP AK
+roots, measurements, and verifier-side DCAP collateral are supplied. DCAP
+collateral is resolved by the client, not the portal. If no explicit source is
+provided, the CLI defaults to Automata on-chain DCAP/PCCS on Hoodi using
+`https://1rpc.io/hoodi` and contract
+`0xaDdeC7e85c2182202b66E331f2a4A0bBB2cEEa1F`. Operators can override with
+`--tdx-dcap-collateral <path>` for an offline `QuoteCollateralV3` JSON file,
+`--tdx-dcap-pccs-url <url>` for direct HTTP PCCS/PCS access such as Intel PCS,
+CSP PCCS, or an operator PCCS, or `--tdx-dcap-automata-pccs-rpc-url` plus
+`--tdx-dcap-automata-pccs-contract` for a different Automata-compatible chain
+RPC and contract. Missing or invalid DCAP collateral fails closed at
+`gcp-tee-vendor-report`. The full protocol is specified in
+[`../../docs/specs/tls-attestation-spec.md`](../../docs/specs/tls-attestation-spec.md).
+
+On failure, the CLI prints a full JSON verification report including the check
+results, live/response certificate hashes, nonce, qualifying data, TPM quote,
+PCRs, TEE evidence, and AK binding material.
+The one-shot override is:
+
+```text
+--trust-tls-cert-sha256 <0xsha256>
+```
+
+The override must exactly match the live peer certificate hash, does not persist
+trust state, and continues only with a pinned client for that exact certificate.
+
+### Phase 8: Initialize Workload
 
 The CVM agent exposes `POST /init` (HTTPS, port 1024). One-shot endpoint - only accepts a single call on a fresh VM. If the CVM already has a workload on disk, `/init` is never exposed.
 

@@ -319,4 +319,48 @@ pub struct InitArgs {
     /// init time rather than persisting in config.
     #[arg(long, value_name = "NAME=VALUE")]
     pub disk_passphrase: Vec<String>,
+
+    /// Expected base image for TLS attestation measurement policy (name:version).
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Signed measurement pack JSON file or directory.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
+    #[arg(long, value_name = "HEX")]
+    pub azure_maa_key: Vec<String>,
+
+    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub gcp_ak_root_cert: Vec<String>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_ark_root_cert: Vec<String>,
+
+    /// TDX DCAP QuoteCollateralV3 JSON file for offline GCP TDX TLS verification.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for verifier-side GCP TDX DCAP collateral fetch.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain PCCS RPC URL for verifier-side GCP TDX DCAP collateral lookup.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_automata_pccs_rpc_url: Option<String>,
+
+    /// Automata on-chain PCCS contract address for verifier-side GCP TDX DCAP collateral lookup.
+    #[arg(long, value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pccs_contract: Option<String>,
+
+    /// One-shot override: trust only this live TLS certificate SHA-256.
+    #[arg(long, value_name = "0xSHA256")]
+    pub trust_tls_cert_sha256: Option<String>,
 }
