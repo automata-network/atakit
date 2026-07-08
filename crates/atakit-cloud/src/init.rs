@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atakit_attestation::{
     verify_measurement_pack, verify_tls_attestation, CheckResult, EvidenceSummary,
@@ -72,6 +72,30 @@ pub enum TdxDcapCollateralSource {
     },
 }
 
+/// Verifier-side source for Azure MAA signing keys.
+///
+/// The portal includes the Azure MAA JWT in `/tls-attestation`, but the
+/// verifier still needs a trust anchor for the JWT signing key. For the CLI
+/// default path this is derived from the configured SessionRegistry, matching
+/// the on-chain registration verifier's MAA key registry rather than requiring
+/// operators to pass `--azure-maa-key` manually.
+#[derive(Debug, Clone, Default)]
+pub struct AzureMaaTrustConfig {
+    pub source: AzureMaaTrustSource,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum AzureMaaTrustSource {
+    /// Do not resolve Azure MAA signing keys automatically.
+    #[default]
+    None,
+    /// Resolve MaaKeyRegistry through SessionRegistry -> AkCollateralVerifier.
+    OnchainRegistry {
+        rpc_url: String,
+        session_registry: String,
+    },
+}
+
 /// Build a verifier-side TDX DCAP collateral config from CLI-style options.
 pub fn tdx_dcap_collateral_config(
     collateral_file: Option<PathBuf>,
@@ -105,6 +129,26 @@ pub fn tdx_dcap_collateral_config(
         }
     };
     Ok(TdxDcapCollateralConfig { source })
+}
+
+/// Build verifier-side Azure MAA trust config from the same chain config used
+/// for portal registration.
+pub fn azure_maa_trust_config_from_init_chain(chain: &InitChainConfig) -> AzureMaaTrustConfig {
+    if chain
+        .registration
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+        || chain.rpc_url.trim().is_empty()
+        || is_zero_eth_address(&chain.session_registry)
+    {
+        return AzureMaaTrustConfig::default();
+    }
+    AzureMaaTrustConfig {
+        source: AzureMaaTrustSource::OnchainRegistry {
+            rpc_url: chain.rpc_url.clone(),
+            session_registry: chain.session_registry.clone(),
+        },
+    }
 }
 
 /// Parse `--disk-passphrase NAME=VALUE` entries into a name→passphrase map,
@@ -548,6 +592,31 @@ pub async fn bootstrap_portal_tls(
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, CloudError> {
+    bootstrap_portal_tls_with_trust_config(
+        host,
+        status_port,
+        measurement_policy,
+        trust_anchors,
+        AzureMaaTrustConfig::default(),
+        tdx_dcap_collateral,
+        trust_tls_cert_sha256,
+        report_path,
+    )
+    .await
+}
+
+/// Fetch and verify the portal's TLS attestation with verifier-side trust
+/// material resolved from configured sources before the attestation checks run.
+pub async fn bootstrap_portal_tls_with_trust_config(
+    host: &str,
+    status_port: u16,
+    measurement_policy: Option<MeasurementPolicy>,
+    mut trust_anchors: TrustAnchors,
+    azure_maa_trust: AzureMaaTrustConfig,
+    tdx_dcap_collateral: TdxDcapCollateralConfig,
+    trust_tls_cert_sha256: Option<&str>,
+    report_path: Option<&Path>,
+) -> Result<VerifiedPortalTls, CloudError> {
     let nonce = random_nonce()?;
     let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
     let url = format!("https://{host}:{status_port}/tls-attestation?nonce={nonce_b64}");
@@ -619,8 +688,31 @@ pub async fn bootstrap_portal_tls(
     if let Err(detail) = resolve_tdx_dcap_collateral(&mut response, &tdx_dcap_collateral).await {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report =
-            tdx_collateral_failure_report(&response, &live_hash, "gcp-tdx-dcap-collateral", detail);
+        let report = tls_preverification_failure_report(
+            &response,
+            &live_hash,
+            "gcp-tdx-dcap-collateral",
+            detail,
+        );
+        return handle_tls_attestation_failure(
+            report,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+        );
+    }
+
+    if let Err(detail) =
+        resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await
+    {
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report = tls_preverification_failure_report(
+            &response,
+            &live_hash,
+            "azure-maa-onchain-trust",
+            detail,
+        );
         return handle_tls_attestation_failure(
             report,
             live_peer_cert_der,
@@ -737,6 +829,224 @@ async fn resolve_tdx_dcap_collateral(
     Ok(())
 }
 
+async fn resolve_azure_maa_trust(
+    response: &TlsAttestationResponse,
+    config: &AzureMaaTrustConfig,
+    trust_anchors: &mut TrustAnchors,
+) -> Result<(), String> {
+    if !is_azure_maa_response(response) || !trust_anchors.azure_maa_keys.is_empty() {
+        return Ok(());
+    }
+    let AzureMaaTrustSource::OnchainRegistry {
+        rpc_url,
+        session_registry,
+    } = &config.source
+    else {
+        return Ok(());
+    };
+
+    let jwt = extract_azure_maa_jwt_info(response)?;
+    let kid_hash = keccak256(jwt.kid.as_bytes());
+    let expected_issuer_hash = keccak256(jwt.issuer.as_bytes());
+    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
+    let maa_key_registry = resolve_maa_key_registry(rpc_url, &ak_collateral_verifier).await?;
+    let entry = resolve_maa_signing_key(rpc_url, &maa_key_registry, kid_hash).await?;
+    if entry.pkcs1_pubkey.is_empty() {
+        return Err(format!(
+            "MaaKeyRegistry {maa_key_registry} has no signing key for kid hash 0x{}",
+            hex::encode(kid_hash)
+        ));
+    }
+    if entry.revoked {
+        return Err(format!(
+            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} is revoked",
+            hex::encode(kid_hash)
+        ));
+    }
+    if entry.issuer_hash != expected_issuer_hash {
+        return Err(format!(
+            "MaaKeyRegistry {maa_key_registry} issuer hash mismatch for kid hash 0x{}: JWT issuer {} hashes to 0x{}, registry has 0x{}",
+            hex::encode(kid_hash),
+            jwt.issuer,
+            hex::encode(expected_issuer_hash),
+            hex::encode(entry.issuer_hash)
+        ));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before Unix epoch: {e}"))?
+        .as_secs();
+    if entry.not_after < now {
+        return Err(format!(
+            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} expired at Unix time {} (now {now})",
+            hex::encode(kid_hash),
+            entry.not_after
+        ));
+    }
+
+    trust_anchors.azure_maa_keys.push(entry.pkcs1_pubkey);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AzureMaaJwtInfo {
+    kid: String,
+    issuer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaaSigningKeyEntry {
+    pkcs1_pubkey: Vec<u8>,
+    issuer_hash: [u8; 32],
+    not_after: u64,
+    revoked: bool,
+}
+
+async fn resolve_ak_collateral_verifier(
+    rpc_url: &str,
+    session_registry: &str,
+) -> Result<String, String> {
+    let calldata = encode_no_arg_call("akCollateralVerifier()");
+    let result = eth_call_bytes(
+        rpc_url,
+        session_registry,
+        &calldata,
+        "SessionRegistry.akCollateralVerifier",
+    )
+    .await?;
+    decode_address_return(&result, "SessionRegistry.akCollateralVerifier")
+}
+
+async fn resolve_maa_key_registry(
+    rpc_url: &str,
+    ak_collateral_verifier: &str,
+) -> Result<String, String> {
+    let calldata = encode_no_arg_call("maaKeyRegistry()");
+    let result = eth_call_bytes(
+        rpc_url,
+        ak_collateral_verifier,
+        &calldata,
+        "AkCollateralVerifier.maaKeyRegistry",
+    )
+    .await?;
+    decode_address_return(&result, "AkCollateralVerifier.maaKeyRegistry")
+}
+
+async fn resolve_maa_signing_key(
+    rpc_url: &str,
+    maa_key_registry: &str,
+    kid_hash: [u8; 32],
+) -> Result<MaaSigningKeyEntry, String> {
+    let calldata = encode_bytes32_arg_call("getMaaSigningKey(bytes32)", kid_hash);
+    let result = eth_call_bytes(
+        rpc_url,
+        maa_key_registry,
+        &calldata,
+        "MaaKeyRegistry.getMaaSigningKey",
+    )
+    .await?;
+    decode_maa_signing_key_return(&result)
+}
+
+async fn eth_call_bytes(
+    rpc_url: &str,
+    contract: &str,
+    calldata: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [
+            {
+                "to": contract,
+                "data": format!("0x{}", hex::encode(calldata)),
+                "value": "0x0"
+            },
+            "latest"
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("build {label} RPC client: {e}"))?;
+    let response: serde_json::Value = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("call {label} at {rpc_url}: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("decode {label} RPC response from {rpc_url}: {e}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("{label} RPC error from {rpc_url}: {error}"));
+    }
+    let result = response
+        .get("result")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{label} RPC response missing result: {response}"))?;
+    decode_hex_result(result, label)
+}
+
+fn extract_azure_maa_jwt_info(
+    response: &TlsAttestationResponse,
+) -> Result<AzureMaaJwtInfo, String> {
+    let binding = response
+        .ak_binding
+        .as_ref()
+        .ok_or_else(|| "Azure response is missing akBinding".to_string())?;
+    if !binding.kind.eq_ignore_ascii_case("azure-maa-jwt") {
+        return Err(format!(
+            "Azure response akBinding kind is {}, expected azure-maa-jwt",
+            binding.kind
+        ));
+    }
+    let binding_bytes = URL_SAFE_NO_PAD
+        .decode(&binding.data)
+        .map_err(|e| format!("decode Azure MAA akBinding data: {e}"))?;
+    let binding_json: serde_json::Value = serde_json::from_slice(&binding_bytes)
+        .map_err(|e| format!("parse Azure MAA akBinding JSON: {e}"))?;
+    let jwt = binding_json
+        .get("jwt")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Azure MAA akBinding JSON is missing non-empty jwt".to_string())?;
+
+    let mut parts = jwt.split('.');
+    let header = parts
+        .next()
+        .ok_or_else(|| "Azure MAA JWT is missing header".to_string())?;
+    let claims = parts
+        .next()
+        .ok_or_else(|| "Azure MAA JWT is missing claims".to_string())?;
+    let signature = parts
+        .next()
+        .ok_or_else(|| "Azure MAA JWT is missing signature".to_string())?;
+    if parts.next().is_some() || signature.is_empty() {
+        return Err("Azure MAA JWT must have exactly three non-empty parts".to_string());
+    }
+
+    let header_json = decode_jwt_json(header, "Azure MAA JWT header")?;
+    let claims_json = decode_jwt_json(claims, "Azure MAA JWT claims")?;
+    let kid = header_json
+        .get("kid")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Azure MAA JWT header is missing non-empty kid".to_string())?;
+    let issuer = claims_json
+        .get("iss")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Azure MAA JWT claims are missing non-empty iss".to_string())?;
+
+    Ok(AzureMaaJwtInfo {
+        kid: kid.to_string(),
+        issuer: issuer.to_string(),
+    })
+}
+
 async fn automata_dcap_verify_and_attest(
     rpc_url: &str,
     contract: &str,
@@ -794,10 +1104,26 @@ fn encode_verify_and_attest_on_chain_call(input: &[u8]) -> Vec<u8> {
     out
 }
 
+fn encode_no_arg_call(signature: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    out.extend_from_slice(&function_selector(signature));
+    out
+}
+
+fn encode_bytes32_arg_call(signature: &str, arg: [u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&function_selector(signature));
+    out.extend_from_slice(&arg);
+    out
+}
+
+fn function_selector(signature: &str) -> [u8; 4] {
+    let hash = Keccak256::digest(signature.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
 fn decode_verify_and_attest_on_chain_return(result: &str) -> Result<Vec<u8>, String> {
-    let raw_hex = result.strip_prefix("0x").unwrap_or(result);
-    let bytes = hex::decode(raw_hex)
-        .map_err(|e| format!("decode Automata DCAP verifier return hex: {e}"))?;
+    let bytes = decode_hex_result(result, "Automata DCAP verifier return")?;
     if bytes.len() < 96 {
         return Err(format!(
             "Automata DCAP verifier return is too short: got {}, need at least 96",
@@ -832,10 +1158,100 @@ fn decode_verify_and_attest_on_chain_return(result: &str) -> Result<Vec<u8>, Str
     Ok(output)
 }
 
+fn decode_address_return(bytes: &[u8], label: &str) -> Result<String, String> {
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{label} return has invalid ABI address length: got {}, need 32",
+            bytes.len()
+        ));
+    }
+    if bytes[..12].iter().any(|byte| *byte != 0) {
+        return Err(format!("{label} return has non-zero address padding"));
+    }
+    let address = &bytes[12..32];
+    if address.iter().all(|byte| *byte == 0) {
+        return Err(format!("{label} returned the zero address"));
+    }
+    Ok(format!("0x{}", hex::encode(address)))
+}
+
+fn decode_maa_signing_key_return(bytes: &[u8]) -> Result<MaaSigningKeyEntry, String> {
+    if bytes.len() < 32 {
+        return Err(format!(
+            "MaaKeyRegistry.getMaaSigningKey return is too short: got {}, need at least 32",
+            bytes.len()
+        ));
+    }
+    let tuple_offset = abi_word_usize(&bytes[0..32])?;
+    if tuple_offset + 128 > bytes.len() {
+        return Err(format!(
+            "MaaKeyRegistry.getMaaSigningKey tuple offset {tuple_offset} is out of bounds for {} bytes",
+            bytes.len()
+        ));
+    }
+    let tuple = &bytes[tuple_offset..];
+    let pkcs1_offset = abi_word_usize(&tuple[0..32])?;
+    let mut issuer_hash = [0u8; 32];
+    issuer_hash.copy_from_slice(&tuple[32..64]);
+    let not_after = abi_word_to_u64(&tuple[64..96])?;
+    let revoked = abi_word_bool(&tuple[96..128])?;
+    if tuple_offset + pkcs1_offset + 32 > bytes.len() {
+        return Err(format!(
+            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey offset {pkcs1_offset} is out of bounds for {} bytes",
+            bytes.len()
+        ));
+    }
+    let pkcs1_start = tuple_offset + pkcs1_offset;
+    let pkcs1_len = abi_word_usize(&bytes[pkcs1_start..pkcs1_start + 32])?;
+    let data_start = pkcs1_start + 32;
+    let data_end = data_start + pkcs1_len;
+    if data_end > bytes.len() {
+        return Err(format!(
+            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey length {pkcs1_len} is out of bounds for {} bytes",
+            bytes.len()
+        ));
+    }
+    Ok(MaaSigningKeyEntry {
+        pkcs1_pubkey: bytes[data_start..data_end].to_vec(),
+        issuer_hash,
+        not_after,
+        revoked,
+    })
+}
+
+fn decode_hex_result(result: &str, label: &str) -> Result<Vec<u8>, String> {
+    let raw_hex = result.strip_prefix("0x").unwrap_or(result);
+    hex::decode(raw_hex).map_err(|e| format!("decode {label} hex: {e}"))
+}
+
+fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, String> {
+    let raw = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|e| format!("decode {label}: {e}"))?;
+    serde_json::from_slice(&raw).map_err(|e| format!("parse {label} JSON: {e}"))
+}
+
+fn keccak256(input: &[u8]) -> [u8; 32] {
+    let digest = Keccak256::digest(input);
+    digest.into()
+}
+
 fn abi_word_u64(value: u64) -> [u8; 32] {
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&value.to_be_bytes());
     word
+}
+
+fn abi_word_to_u64(word: &[u8]) -> Result<u64, String> {
+    if word.len() != 32 {
+        return Err("ABI uint word has invalid length".to_string());
+    }
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return Err("ABI uint word is too large for u64".to_string());
+    }
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&word[24..32]);
+    Ok(u64::from_be_bytes(value))
 }
 
 fn abi_word_bool(word: &[u8]) -> Result<bool, String> {
@@ -870,6 +1286,19 @@ fn is_gcp_tdx(response: &TlsAttestationResponse) -> bool {
         && response.platform.tee.eq_ignore_ascii_case("tdx")
 }
 
+fn is_azure_maa_response(response: &TlsAttestationResponse) -> bool {
+    response.platform.cloud.eq_ignore_ascii_case("azure")
+        && response
+            .ak_binding
+            .as_ref()
+            .is_some_and(|binding| binding.kind.eq_ignore_ascii_case("azure-maa-jwt"))
+}
+
+fn is_zero_eth_address(value: &str) -> bool {
+    let raw = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    raw.len() == 40 && raw.bytes().all(|byte| byte == b'0')
+}
+
 fn has_gcp_tdx_collateral(collateral: &serde_json::Value) -> bool {
     ["gcpTdxDcap", "gcpTdxAutomataOnchain"]
         .into_iter()
@@ -880,7 +1309,7 @@ fn has_gcp_tdx_collateral(collateral: &serde_json::Value) -> bool {
         })
 }
 
-fn tdx_collateral_failure_report(
+fn tls_preverification_failure_report(
     response: &TlsAttestationResponse,
     live_hash: &str,
     check_name: &str,
@@ -1377,6 +1806,102 @@ mod tests {
             decode_verify_and_attest_on_chain_return(&format!("0x{}", hex::encode(returned)))
                 .expect("decode Automata return");
         assert_eq!(decoded, vec![0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn azure_maa_trust_config_uses_chain_when_registration_enabled() {
+        let mut cfg = sample_config();
+        cfg.chain.rpc_url = "https://rpc.example.com".to_string();
+        cfg.chain.session_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        let trust = azure_maa_trust_config_from_init_chain(&cfg.chain);
+        match trust.source {
+            AzureMaaTrustSource::OnchainRegistry {
+                rpc_url,
+                session_registry,
+            } => {
+                assert_eq!(rpc_url, "https://rpc.example.com");
+                assert_eq!(
+                    session_registry,
+                    "0x1111111111111111111111111111111111111111"
+                );
+            }
+            AzureMaaTrustSource::None => panic!("expected on-chain Azure MAA trust config"),
+        }
+    }
+
+    #[test]
+    fn azure_maa_trust_config_is_disabled_for_off_registration() {
+        let mut cfg = sample_config();
+        cfg.chain.registration = Some("off".to_string());
+        cfg.chain.session_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        let trust = azure_maa_trust_config_from_init_chain(&cfg.chain);
+        assert!(matches!(trust.source, AzureMaaTrustSource::None));
+    }
+
+    #[test]
+    fn azure_maa_jwt_info_is_extracted_from_binding() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"kid-1"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(r#"{"iss":"https://issuer.example"}"#);
+        let jwt = format!("{header}.{claims}.signature");
+        let binding = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "jwt": jwt,
+                "hclVarData": ""
+            })
+            .to_string(),
+        );
+        let response = TlsAttestationResponse {
+            format: 1,
+            nonce: String::new(),
+            tls_cert_der: String::new(),
+            tls_cert_sha256: String::new(),
+            qualifying_data: String::new(),
+            platform: atakit_attestation::PlatformEvidence {
+                cloud: "azure".to_string(),
+                tee: "tdx".to_string(),
+                machine_type: String::new(),
+            },
+            tpm: atakit_attestation::TpmEvidence {
+                ak_public: String::new(),
+                quote: String::new(),
+                signature: String::new(),
+                pcrs: vec![],
+                event_log_hashes: vec![],
+            },
+            tee_evidence: None,
+            ak_binding: Some(atakit_attestation::AkBinding {
+                kind: "azure-maa-jwt".to_string(),
+                data: binding,
+            }),
+            collateral: serde_json::Value::Null,
+        };
+
+        let info = extract_azure_maa_jwt_info(&response).unwrap();
+        assert_eq!(info.kid, "kid-1");
+        assert_eq!(info.issuer, "https://issuer.example");
+    }
+
+    #[test]
+    fn maa_signing_key_return_decodes_dynamic_struct() {
+        let pkcs1 = vec![0x30, 0x82, 0x01, 0x0a];
+        let issuer_hash = [0x42u8; 32];
+        let mut returned = Vec::new();
+        returned.extend_from_slice(&abi_word_u64(32));
+        returned.extend_from_slice(&abi_word_u64(128));
+        returned.extend_from_slice(&issuer_hash);
+        returned.extend_from_slice(&abi_word_u64(1_811_611_165));
+        returned.extend_from_slice(&abi_word_u64(0));
+        returned.extend_from_slice(&abi_word_u64(pkcs1.len() as u64));
+        returned.extend_from_slice(&pkcs1);
+        returned.extend(std::iter::repeat(0).take(28));
+
+        let decoded = decode_maa_signing_key_return(&returned).unwrap();
+        assert_eq!(decoded.pkcs1_pubkey, pkcs1);
+        assert_eq!(decoded.issuer_hash, issuer_hash);
+        assert_eq!(decoded.not_after, 1_811_611_165);
+        assert!(!decoded.revoked);
     }
 
     #[test]

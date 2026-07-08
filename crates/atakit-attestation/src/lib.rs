@@ -2678,6 +2678,16 @@ fn verify_tpm_quote_signature(
 }
 
 fn tpm2b_attest_body(tpm2b_attest: &[u8]) -> std::result::Result<&[u8], String> {
+    if tpm2b_attest.len() >= 4
+        && u32::from_be_bytes([
+            tpm2b_attest[0],
+            tpm2b_attest[1],
+            tpm2b_attest[2],
+            tpm2b_attest[3],
+        ]) == TPM_GENERATED_VALUE
+    {
+        return Ok(tpm2b_attest);
+    }
     if tpm2b_attest.len() < 2 {
         return Err("TPM2B_ATTEST is shorter than its size prefix".to_string());
     }
@@ -2818,17 +2828,7 @@ struct ParsedTpmQuote {
 }
 
 fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
-    if tpm2b_attest.len() < 2 {
-        return Err("TPM2B_ATTEST is shorter than its size prefix".to_string());
-    }
-    let declared = u16::from_be_bytes([tpm2b_attest[0], tpm2b_attest[1]]) as usize;
-    let body = &tpm2b_attest[2..];
-    if declared != body.len() {
-        return Err(format!(
-            "TPM2B_ATTEST size prefix declares {declared} bytes, got {}",
-            body.len()
-        ));
-    }
+    let body = tpm2b_attest_body(tpm2b_attest)?;
 
     let mut reader = ByteReader::new(body);
     let magic = reader.read_u32("magic")?;
@@ -4167,6 +4167,33 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.check == "tpm-quote-pcr-digest"));
+    }
+
+    #[test]
+    fn verifier_accepts_raw_tpms_attest_without_tpm2b_size_prefix() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "gcp");
+        let prefixed_quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([prefixed_quote[0], prefixed_quote[1]]) as usize,
+            prefixed_quote.len() - 2
+        );
+        response.tpm.quote = URL_SAFE_NO_PAD.encode(&prefixed_quote[2..]);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
+            trust_anchors: TrustAnchors::default(),
+        })
+        .expect_err("GCP response still lacks production AK/vendor trust anchors");
+
+        assert_check_passed(&failure, "tpm-quote-structure");
+        assert_check_passed(&failure, "tpm-quote-challenge");
+        assert_check_passed(&failure, "tpm-quote-pcr-digest");
+        assert_check_passed(&failure, "tpm-quote-signature");
     }
 
     #[test]

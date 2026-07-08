@@ -922,11 +922,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     args.tdx_dcap_automata_pccs_contract.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let verified_tls = init::bootstrap_portal_tls(
+                let verified_tls = init::bootstrap_portal_tls_with_trust_config(
                     &ip,
                     status_port,
                     measurement_policy,
                     tls_trust_anchors,
+                    init::azure_maa_trust_config_from_init_chain(&init_config.chain),
                     tdx_dcap_collateral,
                     args.trust_tls_cert_sha256.as_deref(),
                     Some(&init::cloud_tls_attestation_report_path(
