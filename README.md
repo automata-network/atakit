@@ -426,7 +426,7 @@ Use `--measured-data-root` on `workload build` or `workload info --dir` to read
 measured data from another root. Use `--unmeasured-data-root` on
 `workload build` / `workload info --dir` to expand and validate unmeasured
 declarations from another root, and on `cloud deploy`, `cloud init`, or
-`workload init` to supply the exact operator-specific unmeasured file set.
+`workload init` to supply an operator-specific allowlisted subset.
 `--unmeasured-data-dir` remains as a deprecated alias for the deploy/init
 commands.
 

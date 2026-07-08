@@ -236,18 +236,19 @@ for GCP SNP raw report validation are supplied with repeatable
 `--amd-ark-root-cert <hex-x509-der>`. It fails closed when no trusted
 measurement policy is supplied. Operators may pass `--measurements <path>`.
 When `--measurements` is omitted and `--base-image <name:version>` is supplied,
-the CLI first tries on-chain `BaseImageRegistry` lookup if registration is on
-and a chain is configured, then falls back to the local cache at
+the CLI first tries on-chain `BaseImageRegistry` lookup if a chain is configured
+and usable, then falls back to the local cache at
 `<data-dir>/baseimage/measurements/<safe-name>/<safe-version>/measurement-pack.json`.
 Chain-derived lookup requires platform profile names that encode cloud/TEE, such
 as `gcp-tdx`, `gcp-sev-snp`, `azure-tdx`, `azure-sev-snp`, or `aws-sev-snp`.
-When registration is on and a SessionRegistry is configured, the CLI can resolve
-GCP AK root hashes, Azure MAA signing keys, and AMD SEV-SNP ARK root hashes from
-Automata contracts before local verification. When registration is off, those
-trust roots must be supplied explicitly. GCP TDX still needs verifier-side DCAP
-collateral; that collateral is resolved by the client, not the portal. If no
-explicit source is provided, the CLI defaults to Automata on-chain PCCS on Hoodi
-using `https://ethereum-hoodi-rpc.publicnode.com` and the default Automata PCS
+When a SessionRegistry is configured, the CLI can resolve GCP AK root hashes,
+Azure MAA signing keys, and AMD SEV-SNP ARK root hashes from Automata contracts
+before local verification. This is independent of `registration`: `off` disables
+session submission, not verifier reads from a configured chain/collateral
+source. GCP TDX still needs verifier-side DCAP collateral; that collateral is
+resolved by the client, not the portal. If no explicit source is provided, the
+CLI defaults to Automata on-chain PCCS on Hoodi using
+`https://ethereum-hoodi-rpc.publicnode.com` and the default Automata PCS
 DAO, PCK DAO, FMSPC TCB DAO, and Enclave Identity DAO recorded in the TLS
 attestation spec. The CLI uses those DAO reads to assemble canonical
 `QuoteCollateralV3` and then runs local DCAP quote verification. Operators can
@@ -346,31 +347,31 @@ Gap: no mechanism delivers the actual files to the CVM.
 
 ### Solution
 
-Deploy collects the unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the workload's default `unmeasured-data/` root in dir mode or an explicit `--unmeasured-data-root`.
+Deploy collects any present allowlisted unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the workload's default `unmeasured-data/` root in dir mode or an explicit `--unmeasured-data-root`.
 
 **During deploy (atakit-ng side):**
 
 1. Read the declared `unmeasured-data` paths from `manifest.json` (strip the `unmeasured-data/` prefix to get paths relative to the unmeasured-data root).
-2. Resolve them under `--unmeasured-data-root` (or `<workload-dir>/unmeasured-data` in dir mode).
-3. Verify the directory contains **exactly** that set — error on any missing or extra file. Then tar the declared files into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`).
+2. Resolve them under `--unmeasured-data-root` (or `<workload-dir>/unmeasured-data` in dir mode). If the manifest declares unmeasured-data and no source root is available, fail before provisioning; otherwise an operator who deploys an archive/store reference and forgets the flag would silently upload nothing.
+3. Tar the declared files that are present into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`). Missing declared files are allowed. Undeclared files under the source root are not uploaded.
 4. Add as the `unmeasured-data` multipart field in the `POST /init` request.
 
 **Portal side:**
 
 1. Accept the optional `unmeasured-data` multipart field in `POST /init`.
 2. Extract to `<WorkloadTempDir>/unmeasured-data/` (bind-mounted into the container at `/atakit-portal/unmeasured-data/`).
-3. Verify the extracted file set equals the manifest's `unmeasured-data` array exactly (no missing, no extra) before the workload runs. Contents are not hashed — only the path set is, via PCR23.
+3. Verify the extracted file set is a subset of the manifest's `unmeasured-data` array before the workload runs. Contents are not hashed, and missing declared paths are allowed. The path set is an attested allowlist via PCR23.
 
 ### Validation at Deploy Time
 
-The path set is committed to PCR23, so it must match exactly on both the CLI and portal sides:
+The path set is committed to PCR23 as an allowlist. The CLI uploads only declared paths that are present, and the portal rejects undeclared uploads. Neither layer requires every declared path to be present:
 
 ```
 - manifest declares unmeasured-data: ["unmeasured-data/runtime-data/key.pem", "unmeasured-data/runtime-data/config.json"]
 - --unmeasured-data-root has:
   - runtime-data/key.pem       -> included in POST
-  - runtime-data/config.json   -> MISSING => deploy errors (must match the manifest exactly)
-  - runtime-data/extra.txt     -> EXTRA   => deploy errors (not declared in the manifest)
+  - runtime-data/config.json   -> MISSING => allowed; workload must validate if it needs it
+  - runtime-data/extra.txt     -> EXTRA   => ignored by the CLI; rejected by the portal if uploaded by another client
 ```
 
 ### `--unmeasured-data-root`
@@ -381,7 +382,7 @@ For cases where unmeasured-data lives outside the workload directory (e.g., secr
 atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-root /path/to/secrets/
 ```
 
-The `--unmeasured-data-root` must contain exactly the files the manifest's unmeasured-data paths declare — no more, no less. `--unmeasured-data-dir` remains as a deprecated alias.
+The `--unmeasured-data-root` may contain any subset of the files the manifest's unmeasured-data paths declare. Files outside the declared set are ignored by the CLI and are not uploaded. `--unmeasured-data-dir` remains as a deprecated alias.
 
 ---
 

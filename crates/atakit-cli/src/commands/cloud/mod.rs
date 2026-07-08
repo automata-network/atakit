@@ -8,7 +8,7 @@ pub mod serial;
 pub mod ssh;
 pub mod status;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -137,10 +137,7 @@ pub(crate) async fn resolve_tls_measurement_policy(
         return Ok(None);
     };
 
-    if !registration_is_off(init_chain.registration.as_deref())
-        && init_chain.base_image_registry != ZERO_ADDR
-        && !init_chain.rpc_url.is_empty()
-    {
+    if chain_measurement_policy_available(init_chain) {
         return Ok(Some(
             load_measurement_policy_from_chain(base_image_ref, init_chain).await?,
         ));
@@ -153,6 +150,10 @@ pub(crate) async fn resolve_tls_measurement_policy(
         Some(data_dir),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
+    init_chain.base_image_registry != ZERO_ADDR && !init_chain.rpc_url.trim().is_empty()
 }
 
 async fn load_measurement_policy_from_chain(
@@ -621,9 +622,9 @@ pub(crate) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// Declared unmeasured-data file paths from the manifest, as deploy-relative
-    /// paths (the `unmeasured-data/` prefix stripped). The operator must supply
-    /// exactly this set at `/init`.
+    /// Declared unmeasured-data allowlist paths from the manifest, as
+    /// deploy-relative paths (the `unmeasured-data/` prefix stripped). The
+    /// operator may supply any subset of this set at `/init`.
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
@@ -957,14 +958,14 @@ pub(super) fn validate_base_image(
 }
 
 /// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
-/// given the manifest's declared path set.
+/// given the manifest's declared allowlist.
 ///
 /// Gated on the **declared path set** (not the per-container mount boolean),
-/// because the portal verifies the uploaded set against the manifest's
-/// `unmeasured-data` array unconditionally. When the manifest declares paths but
-/// no `--unmeasured-data-root` (and no workload source dir) is available, this is
-/// a hard **error**, not a warning: the portal would reject `/init` for the
-/// missing set, and failing here avoids provisioning a VM that can never init.
+/// because the portal enforces the manifest's `unmeasured-data` array as an
+/// allowlist. Missing declared paths are allowed once a root is supplied; the
+/// workload must validate every unmeasured file it consumes. When the manifest
+/// declares an allowlist but no root is available, this is a hard error because
+/// the operator likely forgot `--unmeasured-data-root`.
 pub(crate) fn resolve_unmeasured_tar(
     declared_paths: &[String],
     unmeasured_data_root: Option<&PathBuf>,
@@ -974,9 +975,8 @@ pub(crate) fn resolve_unmeasured_tar(
     }
     let Some(dir) = unmeasured_data_root else {
         bail!(
-            "workload declares {} unmeasured-data file(s) but no source directory is available; \
-             pass --unmeasured-data-root with the declared files (the portal requires exactly the \
-             declared set at /init)",
+            "workload declares {} unmeasured-data path(s) but no source directory is available; \
+             pass --unmeasured-data-root to upload an allowlisted subset",
             declared_paths.len(),
         );
     };
@@ -998,15 +998,16 @@ pub(crate) fn effective_unmeasured_data_root(
 }
 
 /// Collect the operator-provided unmeasured-data files into a gzipped tar,
-/// after verifying the directory contains *exactly* the set the manifest
-/// declares.
+/// by selecting the declared files that are present under the source root.
 ///
 /// `declared` are paths relative to the unmeasured-data root (for example
 /// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
 /// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
-/// `--unmeasured-data-root`. Bails if any declared file is missing, or if the
-/// directory holds files the manifest does not declare: the set is committed to
-/// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
+/// `--unmeasured-data-root`. Missing declared files are allowed: the manifest
+/// commits to the permitted path set, not to file presence or contents.
+/// Undeclared files under the root are ignored by the CLI and therefore are
+/// not uploaded. The portal still rejects undeclared paths if they appear in
+/// the uploaded tar. Returns `None` when nothing declared is present.
 pub(crate) fn collect_unmeasured_tar(
     declared: &[String],
     data_dir: &std::path::Path,
@@ -1019,45 +1020,36 @@ pub(crate) fn collect_unmeasured_tar(
         .canonicalize()
         .with_context(|| format!("--unmeasured-data-root not found: {}", data_dir.display()))?;
 
-    // Enumerate what's actually present, then diff against the declared set.
-    let mut actual: BTreeSet<String> = BTreeSet::new();
-    enumerate_files(&canon_base, &canon_base, &mut actual)?;
-    let declared_set: BTreeSet<String> = declared.iter().cloned().collect();
-
-    let missing: Vec<&str> = declared_set
-        .difference(&actual)
-        .map(String::as_str)
-        .collect();
-    let extra: Vec<&str> = actual
-        .difference(&declared_set)
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() || !extra.is_empty() {
-        let mut msg = format!(
-            "unmeasured-data in {} does not match the manifest's declared set",
-            data_dir.display()
-        );
-        if !missing.is_empty() {
-            msg.push_str(&format!(
-                "\n  missing (declared in manifest, not found): {}",
-                missing.join(", ")
-            ));
+    let mut upload_paths = Vec::new();
+    for rel_path in declared {
+        let src = canon_base.join(rel_path);
+        match std::fs::metadata(&src) {
+            Ok(metadata) if metadata.is_file() => upload_paths.push(rel_path.clone()),
+            Ok(metadata) if metadata.is_dir() => bail!(
+                "unmeasured-data path {} resolves to a directory; manifest paths must be concrete files",
+                rel_path,
+            ),
+            Ok(_) => bail!(
+                "unmeasured-data path {} is not a regular file",
+                rel_path,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read unmeasured-data file {rel_path}"));
+            }
         }
-        if !extra.is_empty() {
-            msg.push_str(&format!(
-                "\n  extra (present but not declared in manifest): {}",
-                extra.join(", ")
-            ));
-        }
-        bail!(msg);
+    }
+    if upload_paths.is_empty() {
+        return Ok(None);
     }
 
-    // Set matches: build the tar from exactly the declared files.
+    // Build the tar from the declared files that are actually present.
     let buf = Vec::new();
     let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(encoder);
-    for rel_path in declared {
-        let src = canon_base.join(rel_path);
+    for rel_path in upload_paths {
+        let src = canon_base.join(&rel_path);
         let metadata = std::fs::metadata(&src)
             .with_context(|| format!("read unmeasured-data file {rel_path}"))?;
         let mut header = tar::Header::new_gnu();
@@ -1068,7 +1060,7 @@ pub(crate) fn collect_unmeasured_tar(
         header.set_mode(0o644);
         header.set_cksum();
         let file = std::fs::File::open(&src)?;
-        tar.append_data(&mut header, rel_path, file)?;
+        tar.append_data(&mut header, &rel_path, file)?;
     }
 
     let encoder = tar.into_inner()?;
@@ -1076,37 +1068,71 @@ pub(crate) fn collect_unmeasured_tar(
     Ok(Some(bytes))
 }
 
-/// Recursively collect file paths under `dir`, relative to `base`, joined with
-/// `/`. Symlinked files are resolved and verified to stay within `base`.
-fn enumerate_files(
-    dir: &std::path::Path,
-    base: &std::path::Path,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            enumerate_files(&path, base, out)?;
-        } else if path.is_file() {
-            let canon = path.canonicalize()?;
-            if !canon.starts_with(base) {
-                bail!(
-                    "unmeasured-data file resolves outside the data directory: {}",
-                    path.display(),
-                );
-            }
-            let rel = path
-                .strip_prefix(base)
-                .expect("path is under base")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.insert(rel);
+#[cfg(test)]
+mod unmeasured_data_tests {
+    use super::*;
+
+    fn write(path: &std::path::Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
         }
+        std::fs::write(path, bytes).unwrap();
     }
-    Ok(())
+
+    fn tar_entries(bytes: &[u8]) -> Vec<String> {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut out = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn resolve_unmeasured_tar_without_root_errors() {
+        let declared = vec!["runtime.env".to_string()];
+        let err = resolve_unmeasured_tar(&declared, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no source directory is available"), "{msg}");
+        assert!(msg.contains("--unmeasured-data-root"), "{msg}");
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_allows_missing_declared_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+
+        let declared = vec!["runtime.env".to_string(), "missing.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_ignores_undeclared_source_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+        write(tmp.path().join("extra.env").as_path(), b"BAD=1\n");
+
+        let declared = vec!["runtime.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
 }
 
 /// Build a `CloudImage` record for the given platform.
@@ -1622,5 +1648,15 @@ mod tls_measurement_policy_tests {
         assert_eq!(got.match_data, vec![format!("0x{}", "aa".repeat(32))]);
         assert!(got.event_indices.is_empty());
         assert_eq!(got.total_events, None);
+    }
+
+    #[test]
+    fn chain_measurement_policy_is_available_with_registration_off() {
+        let mut chain = synthesize_off_init_chain();
+        chain.registration = Some("off".to_string());
+        chain.rpc_url = "https://rpc.example.com".to_string();
+        chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        assert!(chain_measurement_policy_available(&chain));
     }
 }

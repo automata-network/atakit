@@ -165,16 +165,12 @@ pub fn tdx_dcap_collateral_config(
     Ok(TdxDcapCollateralConfig { source })
 }
 
-/// Build verifier-side Azure MAA trust config from the same chain config used
-/// for portal registration.
+/// Build verifier-side Automata on-chain trust config from the available chain
+/// config. This is independent of portal registration policy: registration
+/// controls session submission, while the verifier may still read collateral
+/// and trust roots from the chain as a data source.
 pub fn azure_maa_trust_config_from_init_chain(chain: &InitChainConfig) -> AzureMaaTrustConfig {
-    if chain
-        .registration
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
-        || chain.rpc_url.trim().is_empty()
-        || is_zero_eth_address(&chain.session_registry)
-    {
+    if chain.rpc_url.trim().is_empty() || is_zero_eth_address(&chain.session_registry) {
         return AzureMaaTrustConfig::default();
     }
     AzureMaaTrustConfig {
@@ -2466,13 +2462,28 @@ mod tests {
     }
 
     #[test]
-    fn azure_maa_trust_config_is_disabled_for_off_registration() {
+    fn azure_maa_trust_config_uses_chain_even_for_off_registration() {
         let mut cfg = sample_config();
         cfg.chain.registration = Some("off".to_string());
+        cfg.chain.rpc_url = "https://rpc.example.com".to_string();
         cfg.chain.session_registry = "0x1111111111111111111111111111111111111111".to_string();
 
         let trust = azure_maa_trust_config_from_init_chain(&cfg.chain);
-        assert!(matches!(trust.source, AzureMaaTrustSource::None));
+        match trust.source {
+            AzureMaaTrustSource::OnchainRegistry {
+                rpc_url,
+                session_registry,
+            } => {
+                assert_eq!(rpc_url, "https://rpc.example.com");
+                assert_eq!(
+                    session_registry,
+                    "0x1111111111111111111111111111111111111111"
+                );
+            }
+            AzureMaaTrustSource::None => {
+                panic!("expected on-chain trust config despite registration=off")
+            }
+        }
     }
 
     #[test]
