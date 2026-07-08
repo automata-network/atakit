@@ -21,9 +21,21 @@ const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
 const DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO: &str = "0xb6d715f2f630314cDC1EdE1a550F14822c38b245";
 const DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO: &str = "0x399c1927C72A3913B10f399D383ae4Ff1083aC24";
-const DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO: &str = "0x63eF330eAaadA189861144FCbc9176dae41A5BAf";
-const DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO: &str =
-    "0xc3ea5Ff40263E16cD2f4413152A77e7A6b10B0C9";
+const DEFAULT_TDX_DCAP_AUTOMATA_TCB_EVAL_DAO: &str = "0x7a675f882ba46a4F2ae95DFc9f07cBD16AF1fd9B";
+const DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL: &[(u64, &str)] = &[
+    (17, "0x3A1fDF33420026d145C59bC6b3129bA81E9bF68e"),
+    (18, "0xc6f31a3c102d7c2C43a9972BA8B1409278D41fF5"),
+    (19, "0x74A0b849030BC8afaAfFf8F46126E3c13E365C7b"),
+    (20, "0x34cE5cfD6472c5759cC9451ed2Cb13A0b2c8d1f3"),
+    (21, "0xf5536eB1Aa53CF9e1cfA11498749f151278D04bf"),
+];
+const DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL: &[(u64, &str)] = &[
+    (17, "0xE6fE85B78cb82e3b9C8AE57d754C86fe6774aF64"),
+    (18, "0x07ea7bD47684A331e012CFb9a797dF48C8Cb7DA7"),
+    (19, "0x299c1ae8101aF3d3483793dAfFe8ea9E098D7E17"),
+    (20, "0x63191CE92eA7d42998B2EDC5573a948b3c441Ae7"),
+    (21, "0x1649dd096557f5d2c317127F81F31Df98c43D6D4"),
+];
 const DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION: u64 = 3;
 const DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION: u64 = 4;
 const AUTOMATA_PCS_CA_ROOT: u64 = 0;
@@ -146,8 +158,8 @@ pub fn tdx_dcap_collateral_config(
             rpc_url: Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL.to_string()),
             pcs_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO.to_string()),
             pck_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO.to_string()),
-            fmspc_tcb_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO.to_string()),
-            enclave_identity_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO.to_string()),
+            fmspc_tcb_dao: None,
+            enclave_identity_dao: None,
         }
     };
     Ok(TdxDcapCollateralConfig { source })
@@ -844,18 +856,6 @@ async fn resolve_tdx_dcap_collateral(
             let rpc_url = rpc_url
                 .as_deref()
                 .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL);
-            let pcs_dao = pcs_dao
-                .as_deref()
-                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO);
-            let pck_dao = pck_dao
-                .as_deref()
-                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO);
-            let fmspc_tcb_dao = fmspc_tcb_dao
-                .as_deref()
-                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAO);
-            let enclave_identity_dao = enclave_identity_dao
-                .as_deref()
-                .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAO);
             let evidence = response
                 .tee_evidence
                 .as_ref()
@@ -863,18 +863,18 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
-            let collateral = automata_dcap_quote_collateral(
+            let daos = resolve_automata_pccs_daos(
                 rpc_url,
-                AutomataPccsDaos {
-                    pcs_dao,
-                    pck_dao,
-                    fmspc_tcb_dao,
-                    enclave_identity_dao,
-                },
-                &quote,
+                pcs_dao.as_deref(),
+                pck_dao.as_deref(),
+                fmspc_tcb_dao.as_deref(),
+                enclave_identity_dao.as_deref(),
             )
             .await
-            .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
+            .map_err(|e| format!("resolve Automata {chain} PCCS DAO set: {e}"))?;
+            let collateral = automata_dcap_quote_collateral(rpc_url, daos, &quote)
+                .await
+                .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
             serde_json::to_value(collateral)
                 .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
         }
@@ -1328,17 +1328,88 @@ fn amd_guid_string(bytes: &[u8]) -> String {
     )
 }
 
-#[derive(Clone, Copy)]
-struct AutomataPccsDaos<'a> {
-    pcs_dao: &'a str,
-    pck_dao: &'a str,
-    fmspc_tcb_dao: &'a str,
-    enclave_identity_dao: &'a str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutomataPccsDaos {
+    pcs_dao: String,
+    pck_dao: String,
+    fmspc_tcb_dao: String,
+    enclave_identity_dao: String,
+}
+
+async fn resolve_automata_pccs_daos(
+    rpc_url: &str,
+    pcs_dao: Option<&str>,
+    pck_dao: Option<&str>,
+    fmspc_tcb_dao: Option<&str>,
+    enclave_identity_dao: Option<&str>,
+) -> Result<AutomataPccsDaos, String> {
+    let standard_tcb_eval = if fmspc_tcb_dao.is_none() || enclave_identity_dao.is_none() {
+        Some(
+            automata_get_standard_tcb_eval(
+                rpc_url,
+                DEFAULT_TDX_DCAP_AUTOMATA_TCB_EVAL_DAO,
+                AUTOMATA_TCB_ID_TDX,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let fmspc_tcb_dao = match fmspc_tcb_dao {
+        Some(value) => value.to_string(),
+        None => {
+            let tcb_eval = standard_tcb_eval.expect("standard TCB eval resolved above");
+            automata_default_dao_for_eval(
+                DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL,
+                tcb_eval,
+                "FMSPC TCB",
+            )?
+            .to_string()
+        }
+    };
+    let enclave_identity_dao = match enclave_identity_dao {
+        Some(value) => value.to_string(),
+        None => {
+            let tcb_eval = standard_tcb_eval.expect("standard TCB eval resolved above");
+            automata_default_dao_for_eval(
+                DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL,
+                tcb_eval,
+                "enclave identity",
+            )?
+            .to_string()
+        }
+    };
+
+    Ok(AutomataPccsDaos {
+        pcs_dao: pcs_dao
+            .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO)
+            .to_string(),
+        pck_dao: pck_dao
+            .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO)
+            .to_string(),
+        fmspc_tcb_dao,
+        enclave_identity_dao,
+    })
+}
+
+fn automata_default_dao_for_eval<'a>(
+    daos: &'a [(u64, &'a str)],
+    tcb_eval: u64,
+    label: &str,
+) -> Result<&'a str, String> {
+    daos.iter()
+        .find_map(|(eval, addr)| (*eval == tcb_eval).then_some(*addr))
+        .ok_or_else(|| {
+            format!(
+                "no default Automata {label} DAO for standard TDX TCB evaluation number {tcb_eval}"
+            )
+        })
 }
 
 async fn automata_dcap_quote_collateral(
     rpc_url: &str,
-    daos: AutomataPccsDaos<'_>,
+    daos: AutomataPccsDaos,
     quote: &[u8],
 ) -> Result<dcap_qvl::QuoteCollateralV3, String> {
     let parsed = Quote::parse(quote).map_err(|e| format!("parse TDX quote: {e:#}"))?;
@@ -1355,14 +1426,14 @@ async fn automata_dcap_quote_collateral(
     let fmspc = hex::encode_upper(fmspc);
 
     let (root_ca_cert, root_ca_crl) =
-        automata_get_certificate_by_id(rpc_url, daos.pcs_dao, AUTOMATA_PCS_CA_ROOT).await?;
+        automata_get_certificate_by_id(rpc_url, &daos.pcs_dao, AUTOMATA_PCS_CA_ROOT).await?;
     let (pck_ca_cert, pck_crl) =
-        automata_get_certificate_by_id(rpc_url, daos.pcs_dao, pck_ca_id).await?;
+        automata_get_certificate_by_id(rpc_url, &daos.pcs_dao, pck_ca_id).await?;
     let pck_certificate_chain = if quote_pck_chain.len() > 1 {
         pem_chain_from_der(&quote_pck_chain)?
     } else {
         let (intermediate, root) =
-            automata_get_pck_cert_chain(rpc_url, daos.pck_dao, pck_ca_id).await?;
+            automata_get_pck_cert_chain(rpc_url, &daos.pck_dao, pck_ca_id).await?;
         let mut full_chain = quote_pck_chain;
         full_chain.push(intermediate);
         full_chain.push(root);
@@ -1371,7 +1442,7 @@ async fn automata_dcap_quote_collateral(
 
     let (tcb_info, tcb_info_signature) = automata_get_tcb_info(
         rpc_url,
-        daos.fmspc_tcb_dao,
+        &daos.fmspc_tcb_dao,
         AUTOMATA_TCB_ID_TDX,
         &fmspc,
         DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION,
@@ -1384,10 +1455,10 @@ async fn automata_dcap_quote_collateral(
         ));
     }
     let (tcb_signing_cert, tcb_root_cert) =
-        automata_get_tcb_issuer_chain(rpc_url, daos.fmspc_tcb_dao).await?;
+        automata_get_tcb_issuer_chain(rpc_url, &daos.fmspc_tcb_dao).await?;
     let (qe_identity, qe_identity_signature) = automata_get_enclave_identity(
         rpc_url,
-        daos.enclave_identity_dao,
+        &daos.enclave_identity_dao,
         AUTOMATA_ENCLAVE_ID_TD_QE,
         DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION,
     )
@@ -1399,7 +1470,7 @@ async fn automata_dcap_quote_collateral(
         ));
     }
     let (qe_signing_cert, qe_root_cert) =
-        automata_get_enclave_identity_issuer_chain(rpc_url, daos.enclave_identity_dao).await?;
+        automata_get_enclave_identity_issuer_chain(rpc_url, &daos.enclave_identity_dao).await?;
 
     Ok(dcap_qvl::QuoteCollateralV3 {
         pck_crl_issuer_chain: pem_chain_from_der(&[pck_ca_cert, root_ca_cert.clone()])?,
@@ -1482,6 +1553,16 @@ async fn automata_get_pck_cert_chain(
     decode_two_bytes_return(&result, "PckDao.getPckCertChain")
 }
 
+async fn automata_get_standard_tcb_eval(
+    rpc_url: &str,
+    tcb_eval_dao: &str,
+    tcb_id: u64,
+) -> Result<u64, String> {
+    let calldata = encode_uint_arg_call("standard(uint8)", tcb_id);
+    let result = eth_call_bytes(rpc_url, tcb_eval_dao, &calldata, "TcbEvalDao.standard").await?;
+    decode_uint_return(&result, "TcbEvalDao.standard")
+}
+
 async fn automata_get_tcb_info(
     rpc_url: &str,
     fmspc_tcb_dao: &str,
@@ -1555,6 +1636,17 @@ fn decode_two_bytes_return(bytes: &[u8], label: &str) -> Result<(Vec<u8>, Vec<u8
         abi_dynamic_bytes(bytes, first_offset, label)?.to_vec(),
         abi_dynamic_bytes(bytes, second_offset, label)?.to_vec(),
     ))
+}
+
+fn decode_uint_return(bytes: &[u8], label: &str) -> Result<u64, String> {
+    if bytes.len() < 32 {
+        return Err(format!(
+            "{label} return is too short: got {}, need at least 32",
+            bytes.len()
+        ));
+    }
+    let value = abi_word_usize(&bytes[0..32])?;
+    u64::try_from(value).map_err(|_| format!("{label} return does not fit u64: {value}"))
 }
 
 fn decode_string_bytes_struct_return(
@@ -2295,6 +2387,60 @@ mod tests {
         let decoded = decode_string_bytes_struct_return(&returned, "test").expect("decode struct");
         assert_eq!(decoded.0, "{json");
         assert_eq!(decoded.1, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn automata_pccs_default_config_defers_versioned_daos_to_tcb_eval() {
+        let cfg = tdx_dcap_collateral_config(None, None, None, None).expect("collateral config");
+        match cfg.source {
+            TdxDcapCollateralSource::AutomataOnchainPccs {
+                chain,
+                rpc_url,
+                pcs_dao,
+                pck_dao,
+                fmspc_tcb_dao,
+                enclave_identity_dao,
+            } => {
+                assert_eq!(chain.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN));
+                assert_eq!(rpc_url.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL));
+                assert_eq!(pcs_dao.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO));
+                assert_eq!(pck_dao.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO));
+                assert!(fmspc_tcb_dao.is_none());
+                assert!(enclave_identity_dao.is_none());
+            }
+            other => panic!("expected Automata on-chain PCCS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automata_pccs_eval_19_defaults_to_current_hoodi_versioned_daos() {
+        assert_eq!(
+            automata_default_dao_for_eval(
+                DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL,
+                19,
+                "FMSPC TCB",
+            )
+            .expect("fmspc dao"),
+            "0x74A0b849030BC8afaAfFf8F46126E3c13E365C7b",
+        );
+        assert_eq!(
+            automata_default_dao_for_eval(
+                DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL,
+                19,
+                "enclave identity",
+            )
+            .expect("enclave identity dao"),
+            "0x299c1ae8101aF3d3483793dAfFe8ea9E098D7E17",
+        );
+    }
+
+    #[test]
+    fn automata_pccs_decode_uint_return() {
+        let returned = abi_word_u64(19);
+        assert_eq!(decode_uint_return(&returned, "standard").unwrap(), 19);
+        assert!(decode_uint_return(&returned[..31], "standard")
+            .unwrap_err()
+            .contains("too short"));
     }
 
     #[test]

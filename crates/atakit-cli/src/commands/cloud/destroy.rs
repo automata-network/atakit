@@ -253,12 +253,14 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
         }
     }
 
+    let original_status = state.status.clone();
     state
         .set_status(DeployStatus::Destroying, &env.data_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let runner = ProcessRunner::default();
     let total = plan.steps.len();
+    let mut failures = Vec::new();
 
     for (i, step) in plan.steps.iter().enumerate() {
         eprint!("  [{}/{}] {step}... ", i + 1, total);
@@ -289,9 +291,22 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
             }
             Err(e) => {
                 eprintln!("{}", "failed".red());
-                eprintln!("  warning: {e}");
+                eprintln!("  error: {e}");
+                failures.push(format!("{step}: {e}"));
             }
         }
+    }
+
+    if !failures.is_empty() {
+        state
+            .set_status(original_status, &env.data_dir)
+            .map_err(|e| {
+                anyhow::anyhow!("destroy failed and failed to restore local state: {e}")
+            })?;
+        bail!(
+            "destroy failed for {target_name}/{instance_name}; local state preserved. Failed step(s): {}",
+            failures.join("; ")
+        );
     }
 
     DeployState::delete(&env.data_dir, &target_name, &instance_name)
