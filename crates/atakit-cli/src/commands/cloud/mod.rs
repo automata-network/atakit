@@ -37,6 +37,7 @@ use automata_tee_workload_measurement::base_image_registry::{
 };
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::types::AppRef;
+use owo_colors::OwoColorize;
 
 use crate::config::{ChainConfig, KeyMode, KeySpec};
 
@@ -114,6 +115,14 @@ pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
         key_type: "es256k".to_string(),
         private_key: None,
     }
+}
+
+pub(crate) fn warn_unsafe_skip_tls_attestation() {
+    eprintln!(
+        "{}",
+        "WARNING: --unsafe-skip-tls-attestation disables portal TLS attestation and accepts the self-signed certificate without verification."
+            .yellow()
+    );
 }
 
 pub(crate) async fn resolve_tls_measurement_policy(

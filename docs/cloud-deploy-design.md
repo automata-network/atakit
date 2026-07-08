@@ -274,6 +274,17 @@ The one-shot override is:
 The override must exactly match the live peer certificate hash, does not persist
 trust state, and continues only with a pinned client for that exact certificate.
 
+The break-glass compatibility flag is:
+
+```text
+--unsafe-skip-tls-attestation
+```
+
+This skips `GET /tls-attestation`, measurement-policy lookup, collateral
+resolution, report generation, and certificate pinning. The CLI uses the legacy
+invalid-certificate client for `POST /init` and subsequent portal polling in
+that command invocation, and prints an explicit warning.
+
 ### Phase 8: Initialize Workload
 
 The CVM agent exposes `POST /init` (HTTPS, port 1024). One-shot endpoint - only accepts a single call on a fresh VM. If the CVM already has a workload on disk, `/init` is never exposed.
@@ -295,11 +306,15 @@ Multipart form:
 Display:
 ```
 Initializing workload on 34.126.100.42:1024...
-  Uploading secure-signer-v0.0.1.atawl (4.2 MB)
-  Uploading unmeasured-data (2 files, 1.1 KB)
-  Sending agent config
+  Uploading /init multipart payload (541351936 payload bytes)
+  [========================================] 516.3 MiB (2.0 MiB/s, 04:18)
   Workload initialized successfully.
 ```
+
+The client defaults the `POST /init` upload timeout to 300 seconds. Operators
+uploading large unmeasured-data payloads can raise only this request timeout
+with `--init-upload-timeout <seconds>`; `--timeout` remains the portal readiness
+wait timeout for commands that expose it.
 
 ### Agent Config (`config` field)
 

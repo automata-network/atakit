@@ -1062,6 +1062,7 @@ dependencies = [
  "chrono",
  "clap",
  "dcap-qvl",
+ "futures-util",
  "hex",
  "k256",
  "reqwest 0.12.28",

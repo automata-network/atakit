@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atakit_attestation::{
@@ -8,10 +9,12 @@ use atakit_attestation::{
     MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
     VerificationReport, VerifiedTlsIdentity,
 };
+use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use dcap_qvl::config::PckCa;
 use dcap_qvl::quote::Quote;
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 
@@ -2022,6 +2025,22 @@ fn pinned_client(cert_der: &[u8], timeout: Duration) -> Result<reqwest::Client, 
         })
 }
 
+/// Build the legacy portal client that accepts any self-signed TLS certificate.
+///
+/// This is intentionally explicit and should only be used by callers that have
+/// surfaced an unsafe operator override. It performs no TLS attestation, no
+/// certificate pinning, and no hostname validation.
+pub fn unsafe_portal_client(timeout: Duration) -> Result<reqwest::Client, CloudError> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .timeout(timeout)
+        .build()
+        .map_err(|e| CloudError::Http {
+            message: e.to_string(),
+        })
+}
+
 fn random_nonce() -> Result<[u8; 32], CloudError> {
     let mut nonce = [0u8; 32];
     let mut file = std::fs::File::open("/dev/urandom").map_err(|e| CloudError::IoPath {
@@ -2206,6 +2225,7 @@ pub async fn post_portal_init(
         .map_err(|e| CloudError::Http {
             message: e.to_string(),
         })?;
+    let progress = NullReporter;
     post_portal_init_with_client(
         &client,
         host,
@@ -2213,6 +2233,8 @@ pub async fn post_portal_init(
         archive_path,
         unmeasured_tar,
         init_config,
+        Duration::from_secs(300),
+        &progress,
     )
     .await
 }
@@ -2224,6 +2246,8 @@ pub async fn post_portal_init_with_client(
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
+    upload_timeout: Duration,
+    progress: &dyn ProgressReporter,
 ) -> Result<(), CloudError> {
     let url = format!("https://{host}:{init_port}/init");
     // Read archive file.
@@ -2236,6 +2260,10 @@ pub async fn post_portal_init_with_client(
 
     // Build config JSON.
     let config_json = build_portal_config_json(init_config);
+    let config_bytes = config_json.to_string().into_bytes();
+    let payload_bytes = archive_bytes.len() as u64
+        + config_bytes.len() as u64
+        + unmeasured_tar.map_or(0, |u| u.len() as u64);
 
     // Build multipart form.
     let mut form = reqwest::multipart::Form::new()
@@ -2250,7 +2278,7 @@ pub async fn post_portal_init_with_client(
         )
         .part(
             "config",
-            reqwest::multipart::Part::bytes(config_json.to_string().into_bytes())
+            reqwest::multipart::Part::bytes(config_bytes)
                 .file_name("config.json")
                 .mime_str("application/json")
                 .map_err(|e| CloudError::Http {
@@ -2270,14 +2298,36 @@ pub async fn post_portal_init_with_client(
         );
     }
 
-    let resp = client
+    let boundary = form.boundary().to_string();
+    let progress_handle: Arc<dyn ProgressHandle> = progress
+        .create(
+            &format!(
+                "Uploading /init multipart payload ({} payload bytes)",
+                payload_bytes
+            ),
+            0,
+        )
+        .into();
+    let stream_progress = Arc::clone(&progress_handle);
+    let body_stream = form.into_stream().inspect_ok(move |chunk| {
+        stream_progress.inc(chunk.len() as u64);
+    });
+
+    let send_result = client
         .post(&url)
-        .multipart(form)
+        .timeout(upload_timeout)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(reqwest::Body::wrap_stream(body_stream))
         .send()
-        .await
-        .map_err(|e| CloudError::PortalInitFailed {
-            message: format!("request failed: {e}"),
-        })?;
+        .await;
+    progress_handle.finish();
+
+    let resp = send_result.map_err(|e| CloudError::PortalInitFailed {
+        message: format!("request failed: {e}"),
+    })?;
 
     if !resp.status().is_success() {
         let status = resp.status();

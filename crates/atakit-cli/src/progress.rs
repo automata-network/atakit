@@ -11,7 +11,9 @@ impl ProgressReporter for IndicatifReporter {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
-                    .template("{msg}\n  {spinner:.cyan} {elapsed_precise}")
+                    .template(
+                        "{msg}\n  {spinner:.cyan} {bytes} ({bytes_per_sec}, {elapsed_precise})",
+                    )
                     .expect("valid template"),
             );
             pb.set_message(message.to_string());

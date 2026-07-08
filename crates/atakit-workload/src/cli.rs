@@ -297,6 +297,10 @@ pub struct InitArgs {
     #[arg(long, default_value = "300")]
     pub timeout: u64,
 
+    /// Timeout in seconds for the POST /init multipart upload.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub init_upload_timeout: u64,
+
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -363,4 +367,8 @@ pub struct InitArgs {
     /// One-shot override: trust only this live TLS certificate SHA-256.
     #[arg(long, value_name = "0xSHA256")]
     pub trust_tls_cert_sha256: Option<String>,
+
+    /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
+    #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
+    pub unsafe_skip_tls_attestation: bool,
 }

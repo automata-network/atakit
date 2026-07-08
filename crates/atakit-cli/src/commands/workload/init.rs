@@ -13,6 +13,7 @@ use crate::commands::cloud::{
     synthesize_off_init_chain, synthesize_self_generated_key,
 };
 use crate::config::Config;
+use crate::progress::IndicatifReporter;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 1. Parse address into (host, init_port). Default port 1024; status = init + 1000.
@@ -166,63 +167,73 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!("{}", "done".green());
 
     eprint!("  [2/3] Verify portal TLS... ");
-    let measurement_policy = resolve_tls_measurement_policy(
-        args.measurements.as_deref(),
-        args.base_image.as_deref(),
-        &args.measurement_publisher_key,
-        &env.data_dir,
-        &init_config.chain,
-    )
-    .await?;
-    let tls_trust_anchors = init::load_tls_trust_anchors(
-        &args.gcp_ak_root_cert,
-        &args.azure_maa_key,
-        &args.amd_ark_root_cert,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
-        args.tdx_dcap_collateral.clone(),
-        args.tdx_dcap_pccs_url.clone(),
-        args.tdx_dcap_automata_collateral_rpc_url.clone(),
-        args.tdx_dcap_automata_pcs_dao.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
-        &host,
-        status_port,
-        measurement_policy,
-        tls_trust_anchors,
-        init::azure_maa_trust_config_from_init_chain(&init_config.chain),
-        tdx_dcap_collateral,
-        args.trust_tls_cert_sha256.as_deref(),
-        Some(&init::workload_tls_attestation_report_path(
-            &env.cache_dir,
+    let portal_client = if args.unsafe_skip_tls_attestation {
+        eprintln!("{}", "unsafe bypass".yellow());
+        crate::commands::cloud::warn_unsafe_skip_tls_attestation();
+        init::unsafe_portal_client(std::time::Duration::from_secs(300))
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        let measurement_policy = resolve_tls_measurement_policy(
+            args.measurements.as_deref(),
+            args.base_image.as_deref(),
+            &args.measurement_publisher_key,
+            &env.data_dir,
+            &init_config.chain,
+        )
+        .await?;
+        let tls_trust_anchors = init::load_tls_trust_anchors(
+            &args.gcp_ak_root_cert,
+            &args.azure_maa_key,
+            &args.amd_ark_root_cert,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
+            args.tdx_dcap_collateral.clone(),
+            args.tdx_dcap_pccs_url.clone(),
+            args.tdx_dcap_automata_collateral_rpc_url.clone(),
+            args.tdx_dcap_automata_pcs_dao.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let verified_tls = init::bootstrap_portal_tls_with_trust_config(
             &host,
             status_port,
-        )),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if let Some(message) = init::tls_manual_override_message(&verified_tls) {
-        eprintln!("{}", "overridden".yellow());
-        eprintln!("{message}");
-    } else {
-        eprintln!("{}", "done".green());
-    }
+            measurement_policy,
+            tls_trust_anchors,
+            init::azure_maa_trust_config_from_init_chain(&init_config.chain),
+            tdx_dcap_collateral,
+            args.trust_tls_cert_sha256.as_deref(),
+            Some(&init::workload_tls_attestation_report_path(
+                &env.cache_dir,
+                &host,
+                status_port,
+            )),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+            eprintln!("{}", "overridden".yellow());
+            eprintln!("{message}");
+        } else {
+            eprintln!("{}", "done".green());
+        }
+        verified_tls.client
+    };
 
     // 7. Initialize workload.
-    eprint!("  [3/3] Initialize workload... ");
+    eprintln!("  [3/3] Initialize workload...");
     init::post_portal_init_with_client(
-        &verified_tls.client,
+        &portal_client,
         &host,
         init_port,
         &archive_path.display().to_string(),
         unmeasured_tar.as_deref(),
         &init_config,
+        std::time::Duration::from_secs(args.init_upload_timeout),
+        &IndicatifReporter,
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
-    eprintln!("{}", "done".green());
+    eprintln!("  {}", "done".green());
 
     // 8. Summary.
     eprintln!();

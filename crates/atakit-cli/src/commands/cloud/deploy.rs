@@ -25,6 +25,7 @@ use super::{
     synthesize_off_init_chain, synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
+use crate::progress::IndicatifReporter;
 
 /// Per-(provider, image_ref) upload metadata kept while fanning out
 /// multi-target deploys. Boxed under a type alias so clippy does not flag
@@ -901,54 +902,63 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     disks: disk_passphrases.clone(),
                 };
 
-                let measurement_policy = resolve_tls_measurement_policy(
-                    args.measurements.as_deref(),
-                    args.base_image.as_deref(),
-                    &args.measurement_publisher_key,
-                    &env.data_dir,
-                    &init_config.chain,
-                )
-                .await?;
-                let tls_trust_anchors = init::load_tls_trust_anchors(
-                    &args.gcp_ak_root_cert,
-                    &args.azure_maa_key,
-                    &args.amd_ark_root_cert,
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
-                    args.tdx_dcap_collateral.clone(),
-                    args.tdx_dcap_pccs_url.clone(),
-                    args.tdx_dcap_automata_collateral_rpc_url.clone(),
-                    args.tdx_dcap_automata_pcs_dao.clone(),
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let verified_tls = init::bootstrap_portal_tls_with_trust_config(
-                    &ip,
-                    status_port,
-                    measurement_policy,
-                    tls_trust_anchors,
-                    init::azure_maa_trust_config_from_init_chain(&init_config.chain),
-                    tdx_dcap_collateral,
-                    args.trust_tls_cert_sha256.as_deref(),
-                    Some(&init::cloud_tls_attestation_report_path(
+                let portal_client = if args.unsafe_skip_tls_attestation {
+                    super::warn_unsafe_skip_tls_attestation();
+                    init::unsafe_portal_client(std::time::Duration::from_secs(300))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                } else {
+                    let measurement_policy = resolve_tls_measurement_policy(
+                        args.measurements.as_deref(),
+                        args.base_image.as_deref(),
+                        &args.measurement_publisher_key,
                         &env.data_dir,
-                        target_name,
-                        &instance_name,
-                    )),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                if let Some(message) = init::tls_manual_override_message(&verified_tls) {
-                    eprintln!("{message}");
-                }
+                        &init_config.chain,
+                    )
+                    .await?;
+                    let tls_trust_anchors = init::load_tls_trust_anchors(
+                        &args.gcp_ak_root_cert,
+                        &args.azure_maa_key,
+                        &args.amd_ark_root_cert,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
+                        args.tdx_dcap_collateral.clone(),
+                        args.tdx_dcap_pccs_url.clone(),
+                        args.tdx_dcap_automata_collateral_rpc_url.clone(),
+                        args.tdx_dcap_automata_pcs_dao.clone(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
+                        &ip,
+                        status_port,
+                        measurement_policy,
+                        tls_trust_anchors,
+                        init::azure_maa_trust_config_from_init_chain(&init_config.chain),
+                        tdx_dcap_collateral,
+                        args.trust_tls_cert_sha256.as_deref(),
+                        Some(&init::cloud_tls_attestation_report_path(
+                            &env.data_dir,
+                            target_name,
+                            &instance_name,
+                        )),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+                        eprintln!("{message}");
+                    }
+                    verified_tls.client
+                };
 
                 match init::post_portal_init_with_client(
-                    &verified_tls.client,
+                    &portal_client,
                     &ip,
                     init_port,
                     ap,
                     unmeasured_tar.as_deref(),
                     &init_config,
+                    std::time::Duration::from_secs(args.init_upload_timeout),
+                    &IndicatifReporter,
                 )
                 .await
                 {
@@ -960,7 +970,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         // complete!" can only be claimed when state=Running.
                         eprintln!();
                         let outcome = init::wait_for_portal_terminal_with_client(
-                            &verified_tls.client,
+                            &portal_client,
                             &ip,
                             status_port,
                             portal_wait_timeout_secs,
