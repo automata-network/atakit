@@ -57,6 +57,18 @@ const SNP_REPORT_KEY_SETTINGS_OFFSET: usize = 0x48;
 const SNP_REPORT_REPORTED_TCB_OFFSET: usize = 0x180;
 const SNP_REPORT_CHIP_ID_OFFSET: usize = 0x1a0;
 const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
+const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
+    0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0, 0xae,
+];
+const SNP_CERT_TABLE_ASK_GUID: [u8; 16] = [
+    0x4a, 0xb7, 0xb3, 0x79, 0xbb, 0xac, 0x4f, 0xe4, 0xa0, 0x2f, 0x05, 0xae, 0xf3, 0x27, 0xc7, 0x82,
+];
+const SNP_CERT_TABLE_VCEK_GUID: [u8; 16] = [
+    0x63, 0xda, 0x75, 0x8d, 0xe6, 0x64, 0x45, 0x64, 0xad, 0xc5, 0xf4, 0xb9, 0x3b, 0xe8, 0xac, 0xcd,
+];
+const SNP_CERT_TABLE_VLEK_GUID: [u8; 16] = [
+    0xa8, 0x07, 0x4b, 0xc2, 0xa2, 0x5a, 0x48, 0x3e, 0xaa, 0xe6, 0x39, 0xc0, 0x45, 0xa0, 0xb8, 0xa1,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1780,28 +1792,18 @@ fn parse_amd_snp_cert_table(auxblob: &[u8]) -> std::result::Result<AmdSnpCertTab
             ));
         }
         let cert = auxblob[cert_offset..cert_end].to_vec();
-        match amd_guid_string(guid_bytes).as_str() {
-            "c0b406a4-a803-4952-9743-3fb6014cd0ae" => table.ark = Some(cert),
-            "4ab7b379-bbac-4fe4-a02f-05aef327c782" => table.ask = Some(cert),
-            "63da758d-e664-4564-adc5-f4b93be8accd" => table.vcek = Some(cert),
-            "a8074bc2-a25a-483e-aae6-39c045a0b8a1" => table.vlek = Some(cert),
-            _ => {}
+        if guid_bytes == SNP_CERT_TABLE_ARK_GUID {
+            table.ark = Some(cert);
+        } else if guid_bytes == SNP_CERT_TABLE_ASK_GUID {
+            table.ask = Some(cert);
+        } else if guid_bytes == SNP_CERT_TABLE_VCEK_GUID {
+            table.vcek = Some(cert);
+        } else if guid_bytes == SNP_CERT_TABLE_VLEK_GUID {
+            table.vlek = Some(cert);
         }
         offset += 24;
     }
     Ok(table)
-}
-
-fn amd_guid_string(bytes: &[u8]) -> String {
-    debug_assert_eq!(bytes.len(), 16);
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[3], bytes[2], bytes[1], bytes[0],
-        bytes[5], bytes[4],
-        bytes[7], bytes[6],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-    )
 }
 
 fn verify_amd_snp_cert_chain(
@@ -3233,20 +3235,11 @@ mod tests {
     }
 
     fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
-        const ARK_GUID: [u8; 16] = [
-            0xa4, 0x06, 0xb4, 0xc0, 0x03, 0xa8, 0x52, 0x49, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c,
-            0xd0, 0xae,
+        let entries = [
+            (SNP_CERT_TABLE_ARK_GUID, ark),
+            (SNP_CERT_TABLE_ASK_GUID, ask),
+            (SNP_CERT_TABLE_VCEK_GUID, vcek),
         ];
-        const ASK_GUID: [u8; 16] = [
-            0x79, 0xb3, 0xb7, 0x4a, 0xac, 0xbb, 0xe4, 0x4f, 0xa0, 0x2f, 0x05, 0xae, 0xf3, 0x27,
-            0xc7, 0x82,
-        ];
-        const VCEK_GUID: [u8; 16] = [
-            0x8d, 0x75, 0xda, 0x63, 0x64, 0xe6, 0x64, 0x45, 0xad, 0xc5, 0xf4, 0xb9, 0x3b, 0xe8,
-            0xac, 0xcd,
-        ];
-
-        let entries = [(ARK_GUID, ark), (ASK_GUID, ask), (VCEK_GUID, vcek)];
         let table_len = 24 * (entries.len() + 1);
         let mut out = vec![0u8; table_len];
         let mut cert_offset = table_len;
@@ -3263,6 +3256,19 @@ mod tests {
             out.extend_from_slice(cert);
         }
         out
+    }
+
+    #[test]
+    fn parses_amd_snp_auxblob_raw_cert_table_guids() {
+        let ark = b"ark";
+        let ask = b"ask";
+        let vcek = b"vcek";
+        let certs =
+            parse_amd_snp_cert_table(&fake_amd_snp_auxblob(ark, ask, vcek)).expect("SNP certs");
+
+        assert_eq!(certs.ark.as_deref(), Some(ark.as_slice()));
+        assert_eq!(certs.ask.as_deref(), Some(ask.as_slice()));
+        assert_eq!(certs.vcek.as_deref(), Some(vcek.as_slice()));
     }
 
     fn expected_gcp_tdx_pcr15_for_uuid(uuid: &[u8; 16]) -> [u8; 32] {
