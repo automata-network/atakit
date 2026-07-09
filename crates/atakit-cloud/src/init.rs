@@ -1271,6 +1271,11 @@ fn extract_gcp_ak_root_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>
 }
 
 fn extract_snp_ark_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+    const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
+        0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0,
+        0xae,
+    ];
+
     let evidence = response
         .tee_evidence
         .as_ref()
@@ -1307,24 +1312,12 @@ fn extract_snp_ark_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, St
                 auxblob.len()
             ));
         }
-        if amd_guid_string(guid_bytes) == "c0b406a4-a803-4952-9743-3fb6014cd0ae" {
+        if guid_bytes == SNP_CERT_TABLE_ARK_GUID {
             return Ok(auxblob[cert_offset..cert_end].to_vec());
         }
         offset += 24;
     }
     Err("GCP SNP auxiliary cert table is missing ARK certificate".to_string())
-}
-
-fn amd_guid_string(bytes: &[u8]) -> String {
-    debug_assert_eq!(bytes.len(), 16);
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[3], bytes[2], bytes[1], bytes[0],
-        bytes[5], bytes[4],
-        bytes[7], bytes[6],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
