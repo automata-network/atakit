@@ -169,7 +169,8 @@ staging      azure      deploy-failed   (step 5: instance)    -
 
 ## Deploy Pipeline
 
-7 phases. Old atakit had 5 (check_deps through create_instance). We add **wait for agent** and **initialize workload**.
+8 phases. Old atakit had 5 (check_deps through create_instance). We add
+**wait for portal**, **verify TLS**, and **initialize workload**.
 
 ```
 1. check_deps           -- verify CLI tools on PATH
@@ -177,29 +178,114 @@ staging      azure      deploy-failed   (step 5: instance)    -
 3. open_ports           -- configure cloud firewall / NSG
 4. create_disks         -- provision persistent data disks
 5. create_instance      -- launch the CVM
-6. wait_for_agent       -- poll CVM agent on port 1024 until reachable
-7. initialize_workload  -- POST /init with .atawl + unmeasured-data + config
+6. wait_for_agent       -- poll portal status on port 2024 until reachable
+7. verify_tls           -- fetch /tls-attestation, verify evidence, pin cert
+8. initialize_workload  -- POST /init with .atawl + unmeasured-data + config
 ```
 
-### Phase 6: Wait for Agent
+### Phase 6: Wait for Portal
 
-After the VM is created, wait for the CVM agent HTTPS server to become reachable:
+After the VM is created, wait for the portal HTTPS server to become reachable:
 
 ```
 1. Fetch public IP from cloud (recorded in state)
-2. Poll https://{ip}:1024/ with exponential backoff
+2. Poll https://{ip}:2024/status with exponential backoff
    - Start: 5s interval
    - Max: 30s interval
    - Timeout: 5 minutes (configurable)
-3. Accept self-signed certs (always, or with -k flag)
+3. Use bootstrap TLS handling only until TLS attestation succeeds
 ```
 
 Display:
 ```
-Waiting for CVM agent at 34.126.100.42:1024... ready (47s)
+Waiting for portal at 34.126.100.42:2024... ready (47s)
 ```
 
-### Phase 7: Initialize Workload
+### Phase 7: Verify TLS
+
+Before sending secrets or workload archives to `/init`, the deploy client must
+replace broad invalid-certificate bypass with certificate pinning derived from
+TLS attestation:
+
+```
+1. Generate a 32-byte random nonce.
+2. Fetch GET /tls-attestation?nonce=<base64url> with a bootstrap client.
+3. Capture the live peer TLS certificate from that connection.
+4. Verify the response with the reusable atakit-attestation library.
+5. Build a pinned TLS client for the verified certificate.
+6. Use the pinned client for POST /init and later portal calls.
+```
+
+The target verifier proves that the live TLS certificate hash is signed inside
+a TPM quote and that the quote-signing AK is bound to the attested CVM. The
+first implementation slice verifies nonce freshness, cert hash binding,
+qualifying-data construction, platform support, explicit offline measurement
+pack selection, basic evidence-field presence/encoding, TPM quote type,
+TPM quote challenge, TPM quote PCR digest, GCP-style ECDSA P-256 quote
+signatures, GCP AK certificate chain validation when trusted roots are supplied,
+GCP PCR15 TEE/vTPM binding for TDX and SEV-SNP, Azure HCLAk
+RSASSA/SHA-256 quote signatures from `akBinding`, Azure MAA JWT
+signature/report-data binding when trusted MAA keys are supplied,
+measurement-pack base-image/profile/variant ID derivation, and static PCR policy
+checks. Explicit measurement packs must be canonical JSON and must verify
+against a trusted ES256K publisher key supplied by
+`--measurement-publisher-key`. GCP AK roots are supplied with repeatable
+`--gcp-ak-root-cert <hex-x509-der>`. Azure MAA keys are supplied with repeatable
+`--azure-maa-key <hex-pkcs1-rsa-pubkey-or-hex-jwk-json>`. AMD SEV-SNP ARK roots
+for GCP SNP raw report validation are supplied with repeatable
+`--amd-ark-root-cert <hex-x509-der>`. It fails closed when no trusted
+measurement policy is supplied. Operators may pass `--measurements <path>`.
+When `--measurements` is omitted and `--base-image <name:version>` is supplied,
+the CLI first tries on-chain `BaseImageRegistry` lookup if a chain is configured
+and usable, then falls back to the local cache at
+`<data-dir>/baseimage/measurements/<safe-name>/<safe-version>/measurement-pack.json`.
+Chain-derived lookup requires platform profile names that encode cloud/TEE, such
+as `gcp-tdx`, `gcp-sev-snp`, `azure-tdx`, `azure-sev-snp`, or `aws-sev-snp`.
+When a SessionRegistry is configured, the CLI can resolve GCP AK root hashes,
+Azure MAA signing keys, and AMD SEV-SNP ARK root hashes from Automata contracts
+before local verification. This is independent of `registration`: `off` disables
+session submission, not verifier reads from a configured chain/collateral
+source. GCP TDX still needs verifier-side DCAP collateral; that collateral is
+resolved by the client, not the portal. If no explicit source is provided, the
+CLI defaults to Automata on-chain PCCS on Hoodi using
+`https://ethereum-hoodi-rpc.publicnode.com` and the default Automata PCS
+DAO, PCK DAO, FMSPC TCB DAO, and Enclave Identity DAO recorded in the TLS
+attestation spec. The CLI uses those DAO reads to assemble canonical
+`QuoteCollateralV3` and then runs local DCAP quote verification. Operators can
+override with
+`--tdx-dcap-collateral <path>` for an offline `QuoteCollateralV3` JSON file,
+`--tdx-dcap-pccs-url <url>` for direct HTTP PCCS/PCS access such as Intel PCS,
+CSP PCCS, or an operator PCCS, or
+`--tdx-dcap-automata-collateral-rpc-url` plus
+`--tdx-dcap-automata-pcs-dao` to override the Automata RPC URL and PCS DAO
+address. Missing, stale, or invalid DCAP collateral fails closed at
+`gcp-tee-vendor-report`. The full protocol is specified in
+[`../../docs/specs/tls-attestation-spec.md`](../../docs/specs/tls-attestation-spec.md).
+
+On failure, the CLI prints a full JSON verification report including the check
+results, live/response certificate hashes, nonce, qualifying data, TPM quote,
+PCRs, TEE evidence, and AK binding material.
+The one-shot override is:
+
+```text
+--trust-tls-cert-sha256 <0xsha256>
+```
+
+The override must exactly match the live peer certificate hash, does not persist
+trust state, and continues only with a pinned client for that exact certificate.
+
+The break-glass compatibility flag is:
+
+```text
+--unsafe-skip-tls-attestation
+```
+
+This skips `GET /tls-attestation`, measurement-policy lookup, collateral
+resolution, report generation, and certificate pinning. The CLI uses the legacy
+invalid-certificate client for `POST /init` and subsequent portal polling in
+that command invocation, and prints an explicit warning.
+
+### Phase 8: Initialize Workload
 
 The CVM agent exposes `POST /init` (HTTPS, port 1024). One-shot endpoint - only accepts a single call on a fresh VM. If the CVM already has a workload on disk, `/init` is never exposed.
 
@@ -220,11 +306,15 @@ Multipart form:
 Display:
 ```
 Initializing workload on 34.126.100.42:1024...
-  Uploading secure-signer-v0.0.1.atawl (4.2 MB)
-  Uploading unmeasured-data (2 files, 1.1 KB)
-  Sending agent config
+  Uploading /init multipart payload (541351936 payload bytes)
+  [========================================] 516.3 MiB (2.0 MiB/s, 04:18)
   Workload initialized successfully.
 ```
+
+The client defaults the `POST /init` upload timeout to 300 seconds. Operators
+uploading large unmeasured-data payloads can raise only this request timeout
+with `--init-upload-timeout <seconds>`; `--timeout` remains the portal readiness
+wait timeout for commands that expose it.
 
 ### Agent Config (`config` field)
 
@@ -272,31 +362,31 @@ Gap: no mechanism delivers the actual files to the CVM.
 
 ### Solution
 
-Deploy collects the unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the workload's default `unmeasured-data/` root in dir mode or an explicit `--unmeasured-data-root`.
+Deploy collects any present allowlisted unmeasured-data files and includes them in the init POST. The declared path set is read from the **manifest** (the `unmeasured-data` array), not the source TOML, so it is available in every deploy mode (dir, store-ref, file). The file *contents* come from the workload's default `unmeasured-data/` root in dir mode or an explicit `--unmeasured-data-root`.
 
 **During deploy (atakit-ng side):**
 
 1. Read the declared `unmeasured-data` paths from `manifest.json` (strip the `unmeasured-data/` prefix to get paths relative to the unmeasured-data root).
-2. Resolve them under `--unmeasured-data-root` (or `<workload-dir>/unmeasured-data` in dir mode).
-3. Verify the directory contains **exactly** that set — error on any missing or extra file. Then tar the declared files into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`).
+2. Resolve them under `--unmeasured-data-root` (or `<workload-dir>/unmeasured-data` in dir mode). If the manifest declares unmeasured-data and no source root is available, fail before provisioning; otherwise an operator who deploys an archive/store reference and forgets the flag would silently upload nothing.
+3. Tar the declared files that are present into an in-memory archive preserving directory structure (same layout as measured-data in the `.atawl`). Missing declared files are allowed. Undeclared files under the source root are not uploaded.
 4. Add as the `unmeasured-data` multipart field in the `POST /init` request.
 
 **Portal side:**
 
 1. Accept the optional `unmeasured-data` multipart field in `POST /init`.
 2. Extract to `<WorkloadTempDir>/unmeasured-data/` (bind-mounted into the container at `/atakit-portal/unmeasured-data/`).
-3. Verify the extracted file set equals the manifest's `unmeasured-data` array exactly (no missing, no extra) before the workload runs. Contents are not hashed — only the path set is, via PCR23.
+3. Verify the extracted file set is a subset of the manifest's `unmeasured-data` array before the workload runs. Contents are not hashed, and missing declared paths are allowed. The path set is an attested allowlist via PCR23.
 
 ### Validation at Deploy Time
 
-The path set is committed to PCR23, so it must match exactly on both the CLI and portal sides:
+The path set is committed to PCR23 as an allowlist. The CLI uploads only declared paths that are present, and the portal rejects undeclared uploads. Neither layer requires every declared path to be present:
 
 ```
 - manifest declares unmeasured-data: ["unmeasured-data/runtime-data/key.pem", "unmeasured-data/runtime-data/config.json"]
 - --unmeasured-data-root has:
   - runtime-data/key.pem       -> included in POST
-  - runtime-data/config.json   -> MISSING => deploy errors (must match the manifest exactly)
-  - runtime-data/extra.txt     -> EXTRA   => deploy errors (not declared in the manifest)
+  - runtime-data/config.json   -> MISSING => allowed; workload must validate if it needs it
+  - runtime-data/extra.txt     -> EXTRA   => ignored by the CLI; rejected by the portal if uploaded by another client
 ```
 
 ### `--unmeasured-data-root`
@@ -307,7 +397,7 @@ For cases where unmeasured-data lives outside the workload directory (e.g., secr
 atakit cloud deploy --image automata-linux:v0.1.6 --unmeasured-data-root /path/to/secrets/
 ```
 
-The `--unmeasured-data-root` must contain exactly the files the manifest's unmeasured-data paths declare — no more, no less. `--unmeasured-data-dir` remains as a deprecated alias.
+The `--unmeasured-data-root` may contain any subset of the files the manifest's unmeasured-data paths declare. Files outside the declared set are ignored by the CLI and are not uploaded. `--unmeasured-data-dir` remains as a deprecated alias.
 
 ---
 

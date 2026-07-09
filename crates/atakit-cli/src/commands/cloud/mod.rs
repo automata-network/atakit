@@ -8,13 +8,16 @@ pub mod serial;
 pub mod ssh;
 pub mod status;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy_ext::core::primitives::Address;
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
+use atakit_attestation::{
+    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrSpec,
+};
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
@@ -29,7 +32,12 @@ use atakit_cloud::{
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
+use automata_tee_workload_measurement::base_image_registry::{
+    BaseImageHierarchy, BaseImageRegistry,
+};
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
+use automata_tee_workload_measurement::types::AppRef;
+use owo_colors::OwoColorize;
 
 use crate::config::{ChainConfig, KeyMode, KeySpec};
 
@@ -107,6 +115,221 @@ pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
         key_type: "es256k".to_string(),
         private_key: None,
     }
+}
+
+pub(crate) fn warn_unsafe_skip_tls_attestation() {
+    eprintln!(
+        "{}",
+        "WARNING: --unsafe-skip-tls-attestation disables portal TLS attestation and accepts the self-signed certificate without verification."
+            .yellow()
+    );
+}
+
+pub(crate) async fn resolve_tls_measurement_policy(
+    measurements: Option<&std::path::Path>,
+    base_image: Option<&str>,
+    measurement_publisher_keys: &[String],
+    data_dir: &std::path::Path,
+    init_chain: &InitChainConfig,
+) -> Result<Option<MeasurementPolicy>> {
+    if measurements.is_some() {
+        return atakit_cloud::init::load_measurement_policy(
+            measurements,
+            base_image,
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
+    }
+
+    let Some(base_image_ref) = base_image else {
+        return Ok(None);
+    };
+
+    if chain_measurement_policy_available(init_chain) {
+        return Ok(Some(
+            load_measurement_policy_from_chain(base_image_ref, init_chain).await?,
+        ));
+    }
+
+    atakit_cloud::init::load_measurement_policy(
+        None,
+        Some(base_image_ref),
+        measurement_publisher_keys,
+        Some(data_dir),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
+    init_chain.base_image_registry != ZERO_ADDR && !init_chain.rpc_url.trim().is_empty()
+}
+
+async fn load_measurement_policy_from_chain(
+    base_image: &str,
+    init_chain: &InitChainConfig,
+) -> Result<MeasurementPolicy> {
+    let app_ref: AppRef = base_image.parse()?;
+    let base_image_id = BaseImageRegistry::get_image_id(&app_ref);
+    let registry_addr: Address = init_chain.base_image_registry.parse().with_context(|| {
+        format!(
+            "invalid base_image_registry address for TLS measurement lookup: {}",
+            init_chain.base_image_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &init_chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url for TLS measurement lookup: {}",
+            init_chain.rpc_url
+        )
+    })?;
+    let hierarchy = BaseImageRegistry::new(registry_addr, provider)
+        .get_hierarchy(base_image_id)
+        .await
+        .with_context(|| format!("failed to fetch BaseImageRegistry hierarchy for {base_image}"))?;
+
+    chain_hierarchy_to_measurement_policy(&hierarchy, &init_chain.base_image_registry)
+}
+
+fn chain_hierarchy_to_measurement_policy(
+    hierarchy: &BaseImageHierarchy,
+    registry: &str,
+) -> Result<MeasurementPolicy> {
+    let profiles = hierarchy
+        .profiles
+        .iter()
+        .map(|profile| {
+            let (cloud, tee) = infer_cloud_tee_from_profile_name(&profile.profile.name)?;
+            let variants = profile
+                .variants
+                .iter()
+                .map(|(variant_id, variant)| MeasurementVariant {
+                    name: variant.name.clone(),
+                    id: hex0x(variant_id),
+                    machine_types: vec![variant.name.clone()],
+                    override_pcrs: variant
+                        .overridePcrs
+                        .iter()
+                        .map(chain_pcr_spec_to_measurement)
+                        .collect(),
+                    attributes: variant
+                        .attributes
+                        .iter()
+                        .map(|attr| {
+                            serde_json::json!({
+                                "key": hex0x(&attr.key),
+                                "value": hex0x(&attr.value),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok(MeasurementProfile {
+                name: profile.profile.name.clone(),
+                id: hex0x(&profile.profile_id),
+                cloud: cloud.to_string(),
+                tee: tee.to_string(),
+                invariants: profile
+                    .profile
+                    .invariants
+                    .iter()
+                    .map(chain_pcr_spec_to_measurement)
+                    .collect(),
+                variants,
+                attributes: profile
+                    .profile
+                    .attributes
+                    .iter()
+                    .map(|attr| {
+                        serde_json::json!({
+                            "key": hex0x(&attr.key),
+                            "value": hex0x(&attr.value),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(MeasurementPolicy {
+        source: format!("chain:{registry}:{}", hex0x(&hierarchy.base_image_id)),
+        pack: MeasurementPack {
+            schema: "atakit.measurement-pack.v1".to_string(),
+            revision: 1,
+            published_at: chrono::Utc::now().to_rfc3339(),
+            base_image: BaseImage {
+                name: hierarchy.spec.name.clone(),
+                version: hierarchy.spec.version.clone(),
+                id: hex0x(&hierarchy.base_image_id),
+                uri: if hierarchy.spec.uri.is_empty() {
+                    None
+                } else {
+                    Some(hierarchy.spec.uri.clone())
+                },
+                archive_sha256: None,
+            },
+            profiles,
+        },
+    })
+}
+
+fn chain_pcr_spec_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec,
+) -> PcrSpec {
+    PcrSpec {
+        pcr_index: spec.pcrIndex,
+        verify_type: match spec.verifyType {
+            0 => "static".to_string(),
+            1 => "dynamicSubset".to_string(),
+            2 => "dynamicSubsequence".to_string(),
+            other => format!("unknown-{other}"),
+        },
+        match_data: spec.matchData.iter().map(hex0x).collect(),
+        event_indices: Vec::new(),
+        total_events: None,
+    }
+}
+
+fn infer_cloud_tee_from_profile_name(name: &str) -> Result<(&'static str, &'static str)> {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    let cloud = if normalized.starts_with("gcp-") || normalized.contains("-gcp-") {
+        "gcp"
+    } else if normalized.starts_with("azure-") || normalized.contains("-azure-") {
+        "azure"
+    } else if normalized.starts_with("aws-") || normalized.contains("-aws-") {
+        "aws"
+    } else {
+        bail!(
+            "cannot infer cloud from BaseImageRegistry platform profile name {:?}; \
+             expected names like gcp-tdx, gcp-sev-snp, azure-tdx, azure-sev-snp, or aws-sev-snp",
+            name
+        );
+    };
+    let tee = if normalized.contains("tdx") {
+        "tdx"
+    } else if normalized.contains("sev-snp") || normalized.contains("snp") {
+        "sev-snp"
+    } else if normalized.contains("nitro") {
+        "nitro"
+    } else {
+        bail!(
+            "cannot infer TEE from BaseImageRegistry platform profile name {:?}; \
+             expected names containing tdx, sev-snp, snp, or nitro",
+            name
+        );
+    };
+    Ok((cloud, tee))
+}
+
+fn hex0x(bytes: impl AsRef<[u8]>) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 pub(crate) fn init_key_from_config(
@@ -408,9 +631,9 @@ pub(crate) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// Declared unmeasured-data file paths from the manifest, as deploy-relative
-    /// paths (the `unmeasured-data/` prefix stripped). The operator must supply
-    /// exactly this set at `/init`.
+    /// Declared unmeasured-data allowlist paths from the manifest, as
+    /// deploy-relative paths (the `unmeasured-data/` prefix stripped). The
+    /// operator may supply any subset of this set at `/init`.
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
@@ -744,14 +967,14 @@ pub(super) fn validate_base_image(
 }
 
 /// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
-/// given the manifest's declared path set.
+/// given the manifest's declared allowlist.
 ///
 /// Gated on the **declared path set** (not the per-container mount boolean),
-/// because the portal verifies the uploaded set against the manifest's
-/// `unmeasured-data` array unconditionally. When the manifest declares paths but
-/// no `--unmeasured-data-root` (and no workload source dir) is available, this is
-/// a hard **error**, not a warning: the portal would reject `/init` for the
-/// missing set, and failing here avoids provisioning a VM that can never init.
+/// because the portal enforces the manifest's `unmeasured-data` array as an
+/// allowlist. Missing declared paths are allowed once a root is supplied; the
+/// workload must validate every unmeasured file it consumes. When the manifest
+/// declares an allowlist but no root is available, this is a hard error because
+/// the operator likely forgot `--unmeasured-data-root`.
 pub(crate) fn resolve_unmeasured_tar(
     declared_paths: &[String],
     unmeasured_data_root: Option<&PathBuf>,
@@ -761,9 +984,8 @@ pub(crate) fn resolve_unmeasured_tar(
     }
     let Some(dir) = unmeasured_data_root else {
         bail!(
-            "workload declares {} unmeasured-data file(s) but no source directory is available; \
-             pass --unmeasured-data-root with the declared files (the portal requires exactly the \
-             declared set at /init)",
+            "workload declares {} unmeasured-data path(s) but no source directory is available; \
+             pass --unmeasured-data-root to upload an allowlisted subset",
             declared_paths.len(),
         );
     };
@@ -785,15 +1007,16 @@ pub(crate) fn effective_unmeasured_data_root(
 }
 
 /// Collect the operator-provided unmeasured-data files into a gzipped tar,
-/// after verifying the directory contains *exactly* the set the manifest
-/// declares.
+/// by selecting the declared files that are present under the source root.
 ///
 /// `declared` are paths relative to the unmeasured-data root (for example
 /// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
 /// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
-/// `--unmeasured-data-root`. Bails if any declared file is missing, or if the
-/// directory holds files the manifest does not declare: the set is committed to
-/// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
+/// `--unmeasured-data-root`. Missing declared files are allowed: the manifest
+/// commits to the permitted path set, not to file presence or contents.
+/// Undeclared files under the root are ignored by the CLI and therefore are
+/// not uploaded. The portal still rejects undeclared paths if they appear in
+/// the uploaded tar. Returns `None` when nothing declared is present.
 pub(crate) fn collect_unmeasured_tar(
     declared: &[String],
     data_dir: &std::path::Path,
@@ -806,45 +1029,36 @@ pub(crate) fn collect_unmeasured_tar(
         .canonicalize()
         .with_context(|| format!("--unmeasured-data-root not found: {}", data_dir.display()))?;
 
-    // Enumerate what's actually present, then diff against the declared set.
-    let mut actual: BTreeSet<String> = BTreeSet::new();
-    enumerate_files(&canon_base, &canon_base, &mut actual)?;
-    let declared_set: BTreeSet<String> = declared.iter().cloned().collect();
-
-    let missing: Vec<&str> = declared_set
-        .difference(&actual)
-        .map(String::as_str)
-        .collect();
-    let extra: Vec<&str> = actual
-        .difference(&declared_set)
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() || !extra.is_empty() {
-        let mut msg = format!(
-            "unmeasured-data in {} does not match the manifest's declared set",
-            data_dir.display()
-        );
-        if !missing.is_empty() {
-            msg.push_str(&format!(
-                "\n  missing (declared in manifest, not found): {}",
-                missing.join(", ")
-            ));
+    let mut upload_paths = Vec::new();
+    for rel_path in declared {
+        let src = canon_base.join(rel_path);
+        match std::fs::metadata(&src) {
+            Ok(metadata) if metadata.is_file() => upload_paths.push(rel_path.clone()),
+            Ok(metadata) if metadata.is_dir() => bail!(
+                "unmeasured-data path {} resolves to a directory; manifest paths must be concrete files",
+                rel_path,
+            ),
+            Ok(_) => bail!(
+                "unmeasured-data path {} is not a regular file",
+                rel_path,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read unmeasured-data file {rel_path}"));
+            }
         }
-        if !extra.is_empty() {
-            msg.push_str(&format!(
-                "\n  extra (present but not declared in manifest): {}",
-                extra.join(", ")
-            ));
-        }
-        bail!(msg);
+    }
+    if upload_paths.is_empty() {
+        return Ok(None);
     }
 
-    // Set matches: build the tar from exactly the declared files.
+    // Build the tar from the declared files that are actually present.
     let buf = Vec::new();
     let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(encoder);
-    for rel_path in declared {
-        let src = canon_base.join(rel_path);
+    for rel_path in upload_paths {
+        let src = canon_base.join(&rel_path);
         let metadata = std::fs::metadata(&src)
             .with_context(|| format!("read unmeasured-data file {rel_path}"))?;
         let mut header = tar::Header::new_gnu();
@@ -855,7 +1069,7 @@ pub(crate) fn collect_unmeasured_tar(
         header.set_mode(0o644);
         header.set_cksum();
         let file = std::fs::File::open(&src)?;
-        tar.append_data(&mut header, rel_path, file)?;
+        tar.append_data(&mut header, &rel_path, file)?;
     }
 
     let encoder = tar.into_inner()?;
@@ -863,37 +1077,71 @@ pub(crate) fn collect_unmeasured_tar(
     Ok(Some(bytes))
 }
 
-/// Recursively collect file paths under `dir`, relative to `base`, joined with
-/// `/`. Symlinked files are resolved and verified to stay within `base`.
-fn enumerate_files(
-    dir: &std::path::Path,
-    base: &std::path::Path,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            enumerate_files(&path, base, out)?;
-        } else if path.is_file() {
-            let canon = path.canonicalize()?;
-            if !canon.starts_with(base) {
-                bail!(
-                    "unmeasured-data file resolves outside the data directory: {}",
-                    path.display(),
-                );
-            }
-            let rel = path
-                .strip_prefix(base)
-                .expect("path is under base")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.insert(rel);
+#[cfg(test)]
+mod unmeasured_data_tests {
+    use super::*;
+
+    fn write(path: &std::path::Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
         }
+        std::fs::write(path, bytes).unwrap();
     }
-    Ok(())
+
+    fn tar_entries(bytes: &[u8]) -> Vec<String> {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut out = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn resolve_unmeasured_tar_without_root_errors() {
+        let declared = vec!["runtime.env".to_string()];
+        let err = resolve_unmeasured_tar(&declared, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no source directory is available"), "{msg}");
+        assert!(msg.contains("--unmeasured-data-root"), "{msg}");
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_allows_missing_declared_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+
+        let declared = vec!["runtime.env".to_string(), "missing.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_ignores_undeclared_source_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+        write(tmp.path().join("extra.env").as_path(), b"BAD=1\n");
+
+        let declared = vec!["runtime.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
 }
 
 /// Build a `CloudImage` record for the given platform.
@@ -1357,5 +1605,67 @@ mod portal_endpoint_tests {
         let got = portal_endpoints(&state).unwrap();
 
         assert_eq!(got, ("203.0.113.10".to_string(), 6024, 5024));
+    }
+}
+
+#[cfg(test)]
+mod tls_measurement_policy_tests {
+    use super::*;
+    use alloy_ext::core::primitives::B256;
+
+    #[test]
+    fn infers_cloud_and_tee_from_supported_profile_names() {
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("gcp-tdx").unwrap(),
+            ("gcp", "tdx")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("gcp-sev-snp").unwrap(),
+            ("gcp", "sev-snp")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("azure_snp_westus").unwrap(),
+            ("azure", "sev-snp")
+        );
+        assert_eq!(
+            infer_cloud_tee_from_profile_name("aws-nitro").unwrap(),
+            ("aws", "nitro")
+        );
+    }
+
+    #[test]
+    fn rejects_unmappable_chain_profile_names() {
+        let err = infer_cloud_tee_from_profile_name("production-profile").unwrap_err();
+        assert!(err.to_string().contains("cannot infer cloud"), "{err}");
+
+        let err = infer_cloud_tee_from_profile_name("gcp-production").unwrap_err();
+        assert!(err.to_string().contains("cannot infer TEE"), "{err}");
+    }
+
+    #[test]
+    fn converts_chain_pcr_spec_to_measurement_pack_shape() {
+        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec {
+            pcrIndex: 4,
+            verifyType: 0,
+            matchData: vec![B256::repeat_byte(0xaa)],
+        };
+
+        let got = chain_pcr_spec_to_measurement(&spec);
+
+        assert_eq!(got.pcr_index, 4);
+        assert_eq!(got.verify_type, "static");
+        assert_eq!(got.match_data, vec![format!("0x{}", "aa".repeat(32))]);
+        assert!(got.event_indices.is_empty());
+        assert_eq!(got.total_events, None);
+    }
+
+    #[test]
+    fn chain_measurement_policy_is_available_with_registration_off() {
+        let mut chain = synthesize_off_init_chain();
+        chain.registration = Some("off".to_string());
+        chain.rpc_url = "https://rpc.example.com".to_string();
+        chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        assert!(chain_measurement_policy_available(&chain));
     }
 }

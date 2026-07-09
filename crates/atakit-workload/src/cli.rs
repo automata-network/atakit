@@ -297,6 +297,10 @@ pub struct InitArgs {
     #[arg(long, default_value = "300")]
     pub timeout: u64,
 
+    /// Timeout in seconds for the POST /init multipart upload.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub init_upload_timeout: u64,
+
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -319,4 +323,52 @@ pub struct InitArgs {
     /// init time rather than persisting in config.
     #[arg(long, value_name = "NAME=VALUE")]
     pub disk_passphrase: Vec<String>,
+
+    /// Expected base image for TLS attestation measurement policy (name:version).
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Signed measurement pack JSON file or directory.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
+    #[arg(long, value_name = "HEX")]
+    pub azure_maa_key: Vec<String>,
+
+    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub gcp_ak_root_cert: Vec<String>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_ark_root_cert: Vec<String>,
+
+    /// TDX DCAP QuoteCollateralV3 JSON file for offline GCP TDX TLS verification.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for verifier-side GCP TDX DCAP collateral fetch.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for verifier-side GCP TDX DCAP lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for verifier-side GCP TDX DCAP collateral lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// One-shot override: trust only this live TLS certificate SHA-256.
+    #[arg(long, value_name = "0xSHA256")]
+    pub trust_tls_cert_sha256: Option<String>,
+
+    /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
+    #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
+    pub unsafe_skip_tls_attestation: bool,
 }

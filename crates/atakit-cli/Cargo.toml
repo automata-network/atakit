@@ -12,11 +12,13 @@ atakit-core.workspace = true
 atakit-image = { workspace = true, features = ["cli"] }
 atakit-workload = { workspace = true, features = ["cli"] }
 atakit-cloud = { workspace = true, features = ["cli"] }
+atakit-attestation.workspace = true
 
 chrono.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 indicatif.workspace = true
 shell-escape.workspace = true
