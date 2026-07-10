@@ -384,7 +384,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         cli_gas_wallet: args.gas_wallet.as_deref(),
         target: &target,
     };
-    let init_env = init_env_resolver.build_optional();
+    let mut init_env = init_env_resolver.build_optional();
     let is_qemu = matches!(provider_config.platform, PlatformKind::Qemu);
     let effective_registration = if is_qemu {
         Some("off".to_string())
@@ -392,6 +392,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         target.registration.clone()
     };
     let registration_off = registration_is_off(effective_registration.as_deref());
+    init_env.sp1_payer = super::effective_prover_credential(
+        config,
+        (!init_env.chain.is_empty()).then_some(init_env.chain.as_str()),
+        init_env.sp1_payer.take(),
+        (!init_env.gas_wallet.is_empty()).then_some(init_env.gas_wallet.clone()),
+        registration_off,
+    );
     if !image_only && !args.skip_init && !matches!(provider_config.platform, PlatformKind::Qemu) {
         if init_env.chain.is_empty() && !registration_off {
             bail!(
@@ -851,7 +858,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 // synthesized off-chain payload.
                 let chain_name = &init_env.chain;
                 let init_chain = match config.chains.get(chain_name) {
-                    Some(chain) => init_chain_from_config(chain_name, chain, registration).await?,
+                    Some(chain) => {
+                        let prover = chain
+                            .prover
+                            .as_ref()
+                            .and_then(|name| config.provers.get(name));
+                        init_chain_from_config(chain_name, chain, registration, prover).await?
+                    }
                     None if registration_is_off(registration) => synthesize_off_init_chain(),
                     None if chain_name.is_empty() => bail!(
                         "chain must be set on target or via --chain when /init is sent \
@@ -883,14 +896,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     None => bail!("key '{gas_wallet_name}' not found in [keys]"),
                 };
 
-                // SP1 prover-network key (same shape as gas_wallet). Defaults
-                // to the gas-wallet key when no separate sp1_payer is set.
-                let sp1_payer_name = init_env.sp1_payer.as_deref().unwrap_or(gas_wallet_name);
-                let sp1_init = match config.keys.get(sp1_payer_name) {
-                    Some(spec) => init_key_from_config(sp1_payer_name, spec, false)?,
-                    None if sp1_payer_name.is_empty() => synthesize_self_generated_key(),
-                    None if registration_off => synthesize_self_generated_key(),
-                    None => bail!("key '{sp1_payer_name}' not found in [keys]"),
+                // The effective name was resolved and persisted before any
+                // provider resources were created. Off-chain deployments do
+                // not resolve or transmit configured prover secrets.
+                let prover_init = if registration_off {
+                    synthesize_self_generated_key()
+                } else {
+                    match init_env.sp1_payer.as_deref() {
+                        Some(name) => match config.keys.get(name) {
+                            Some(spec) => init_key_from_config(name, spec, false)?,
+                            None => bail!("key '{name}' not found in [keys]"),
+                        },
+                        None => synthesize_self_generated_key(),
+                    }
                 };
 
                 let init_config = InitConfig {
@@ -898,7 +916,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     chain: init_chain,
                     owner_key: owner_init,
                     gas_wallet: gas_init,
-                    sp1_payer: sp1_init,
+                    prover_credential: prover_init,
                     disks: disk_passphrases.clone(),
                 };
 
@@ -1463,7 +1481,7 @@ mod tests {
             registration: None,
             owner_key: Some("test-owner".to_string()),
             gas_wallet: Some("test-gas".to_string()),
-            sp1_payer: None,
+            prover_credential: None,
         }
     }
 

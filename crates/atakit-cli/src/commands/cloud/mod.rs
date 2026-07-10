@@ -23,7 +23,7 @@ use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{InitChainConfig, InitKeyConfig};
+use atakit_cloud::init::{InitChainConfig, InitKeyConfig, InitProverConfig};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
@@ -39,7 +39,7 @@ use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryIn
 use automata_tee_workload_measurement::types::AppRef;
 use owo_colors::OwoColorize;
 
-use crate::config::{ChainConfig, KeyMode, KeySpec};
+use crate::config::{ChainConfig, Config, KeyMode, KeySpec, ProverSpec};
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -57,11 +57,10 @@ impl<'a> InitEnvResolver<'a> {
             .filter(|value| !value.is_empty())
     }
 
-    /// Optional SP1 prover-network key name. Read from the target (already
-    /// merged with `[cloud.defaults] sp1_payer` via `apply_defaults`); `None`
-    /// when no separate SP1 key is configured (portal reuses gas_wallet).
-    pub fn sp1_payer(&self) -> Option<String> {
-        self.target.sp1_payer.clone()
+    /// Optional backend-neutral prover credential. Read from the target after
+    /// `[cloud.defaults]` has been applied.
+    pub fn prover_credential(&self) -> Option<String> {
+        self.target.prover_credential.clone()
     }
 
     /// Resolve persisted init references without panicking on missing fields.
@@ -79,8 +78,106 @@ impl<'a> InitEnvResolver<'a> {
                 .map(String::from)
                 .or_else(|| self.target.gas_wallet.clone())
                 .unwrap_or_default(),
-            sp1_payer: self.sp1_payer(),
+            // Persisted state retains the old field name for compatibility.
+            sp1_payer: self.prover_credential(),
         }
+    }
+}
+
+/// Resolve the credential name used by a prover with one precedence rule for
+/// initial deploys and recovery: chain profile, persisted/target fallback, gas
+/// wallet. Registration-off never selects a prover credential.
+pub(crate) fn effective_prover_credential(
+    config: &Config,
+    chain_name: Option<&str>,
+    fallback: Option<String>,
+    gas_wallet: Option<String>,
+    registration_off: bool,
+) -> Option<String> {
+    if registration_off {
+        return None;
+    }
+    chain_name
+        .and_then(|name| config.chains.get(name))
+        .and_then(|chain| chain.prover.as_deref())
+        .and_then(|name| config.provers.get(name))
+        .and_then(|prover| prover.credential.clone())
+        .or_else(|| fallback.filter(|value| !value.is_empty()))
+        .or_else(|| gas_wallet.filter(|value| !value.is_empty()))
+}
+
+#[cfg(test)]
+mod prover_credential_tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config::load_from_str(
+            r#"
+            [keys.profile]
+            type = "es256k"
+            mode = "self_generated"
+
+            [keys.target]
+            type = "es256k"
+            mode = "self_generated"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [provers.sp1]
+            backend = "sp1"
+            credential = "profile"
+
+            [chains.primary]
+            rpc_url = "https://rpc.example"
+            session_registry = "0x1"
+            prover = "sp1"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn profile_precedes_persisted_target_and_gas() {
+        let config = config();
+        assert_eq!(
+            effective_prover_credential(
+                &config,
+                Some("primary"),
+                Some("target".into()),
+                Some("gas".into()),
+                false,
+            )
+            .as_deref(),
+            Some("profile")
+        );
+    }
+
+    #[test]
+    fn fallback_and_registration_off_are_deterministic() {
+        let config = config();
+        assert_eq!(
+            effective_prover_credential(
+                &config,
+                Some("unknown"),
+                Some("target".into()),
+                Some("gas".into()),
+                false,
+            )
+            .as_deref(),
+            Some("target")
+        );
+        assert_eq!(
+            effective_prover_credential(
+                &config,
+                Some("primary"),
+                Some("target".into()),
+                Some("gas".into()),
+                true,
+            ),
+            None
+        );
     }
 }
 
@@ -101,6 +198,8 @@ pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
         expire_offset: 3600,
         registration: Some("off".to_string()),
         chain_id: None,
+        tee_backend: "auto".to_string(),
+        prover: None,
         proving_strategy: None,
     }
 }
@@ -358,13 +457,14 @@ pub(crate) async fn init_chain_from_config(
     chain_name: &str,
     chain: &ChainConfig,
     registration: Option<&str>,
+    prover: Option<&ProverSpec>,
 ) -> Result<InitChainConfig> {
     let registries = if registration_is_off(registration) {
         None
     } else {
         Some(derive_registries_from_session(chain_name, chain).await?)
     };
-    build_init_chain_config(chain_name, chain, registration, registries.as_ref())
+    build_init_chain_config(chain_name, chain, registration, registries.as_ref(), prover)
 }
 
 async fn derive_registries_from_session(
@@ -424,6 +524,7 @@ fn build_init_chain_config(
     chain: &ChainConfig,
     registration: Option<&str>,
     registries: Option<&ChainRegistries>,
+    prover: Option<&ProverSpec>,
 ) -> Result<InitChainConfig> {
     let placeholder_ok = registration_is_off(registration);
     let workload_registry = resolve_registry_address(
@@ -449,6 +550,18 @@ fn build_init_chain_config(
         expire_offset: chain.expire_offset,
         registration: registration.map(str::to_string),
         chain_id: chain.chain_id,
+        tee_backend: chain.tee_backend.clone(),
+        prover: prover.map(|prover| InitProverConfig {
+            backend: prover.backend.clone(),
+            execution: prover.execution.clone(),
+            endpoint: prover.endpoint.clone(),
+            credential: prover.credential.clone(),
+            options: prover
+                .options
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }),
         proving_strategy: chain.proving_strategy.clone(),
     })
 }
@@ -1405,6 +1518,8 @@ fn test_chain_config() -> ChainConfig {
         base_image_registry: None,
         expire_offset: 300,
         chain_id: None,
+        tee_backend: "auto".to_string(),
+        prover: None,
         proving_strategy: None,
     }
 }
@@ -1427,7 +1542,7 @@ mod chain_init_tests {
     #[test]
     fn registration_off_does_not_require_derived_registries() {
         let chain = test_chain_config();
-        let got = build_init_chain_config("offchain", &chain, Some("off"), None).unwrap();
+        let got = build_init_chain_config("offchain", &chain, Some("off"), None, None).unwrap();
         assert_eq!(got.registration.as_deref(), Some("off"));
         assert_eq!(got.workload_registry, ZERO_ADDR);
         assert_eq!(got.base_image_registry, ZERO_ADDR);
@@ -1441,8 +1556,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let got =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+        let got = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap();
 
         assert_eq!(got.workload_registry, derived.workload_registry);
         assert_eq!(got.base_image_registry, derived.base_image_registry);
@@ -1458,8 +1573,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let got =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+        let got = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap();
 
         assert_eq!(got.workload_registry, chain.workload_registry.unwrap());
         assert_eq!(got.base_image_registry, chain.base_image_registry.unwrap());
@@ -1474,8 +1589,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let err =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap_err();
+        let err = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap_err();
 
         assert!(err.to_string().contains("workload_registry"), "{err}");
         assert!(err.to_string().contains("does not match"), "{err}");
@@ -1484,7 +1599,7 @@ mod chain_init_tests {
     #[test]
     fn qemu_forces_registration_off() {
         let chain = test_chain_config();
-        let got = build_init_chain_config("local", &chain, Some("off"), None).unwrap();
+        let got = build_init_chain_config("local", &chain, Some("off"), None, None).unwrap();
         assert_eq!(got.registration.as_deref(), Some("off"));
         assert_eq!(got.workload_registry, ZERO_ADDR);
         assert_eq!(got.base_image_registry, ZERO_ADDR);

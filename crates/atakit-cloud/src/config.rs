@@ -177,8 +177,8 @@ impl CloudConfig {
             if target.gas_wallet.is_none() {
                 target.gas_wallet = defaults.gas_wallet.clone();
             }
-            if target.sp1_payer.is_none() {
-                target.sp1_payer = defaults.sp1_payer.clone();
+            if target.prover_credential.is_none() {
+                target.prover_credential = defaults.prover_credential.clone();
             }
             if target.image.is_none() {
                 target.image = defaults.image.clone();
@@ -198,9 +198,10 @@ pub struct CloudTargetDefaults {
     pub registration: Option<String>,
     pub owner_key: Option<String>,
     pub gas_wallet: Option<String>,
-    /// Default SP1 prover-network key name (references `[keys.<name>]`),
-    /// inherited by targets that omit `sp1_payer`. Optional.
-    pub sp1_payer: Option<String>,
+    /// Default prover credential key name (references `[keys.<name>]`).
+    /// `sp1_payer` is accepted as a deprecated TOML alias.
+    #[serde(alias = "sp1_payer")]
+    pub prover_credential: Option<String>,
     pub image: Option<String>,
 }
 
@@ -270,11 +271,12 @@ pub struct CloudTarget {
     /// Falls back to `[cloud.defaults] gas_wallet`.
     #[serde(default)]
     pub gas_wallet: Option<String>,
-    /// Optional SP1 prover-network key name (references a key in `[keys]`).
-    /// Falls back to `[cloud.defaults] sp1_payer`. When unset, the portal
-    /// reuses the gas wallet for SP1 signing. Only relevant for SNP CVMs.
+    /// Optional backend-neutral prover credential key name (references a key
+    /// in `[keys]`). Falls back to `[cloud.defaults] prover_credential`.
+    /// `sp1_payer` is accepted as a deprecated TOML alias.
     #[serde(default)]
-    pub sp1_payer: Option<String>,
+    #[serde(alias = "sp1_payer")]
+    pub prover_credential: Option<String>,
 }
 
 impl CloudTarget {
@@ -643,7 +645,7 @@ mod tests {
             registration: None,
             owner_key: Some("test-owner".to_string()),
             gas_wallet: Some("test-gas".to_string()),
-            sp1_payer: None,
+            prover_credential: None,
         }
     }
 
@@ -1221,6 +1223,29 @@ mod tests {
         }
         let w: W = toml::from_str(toml).unwrap();
         assert_eq!(w.targets["my-tdx"].boot_disk_size.as_deref(), Some("100GB"));
+    }
+
+    #[test]
+    fn cloud_target_accepts_neutral_and_legacy_prover_credential_names() {
+        for field in ["prover_credential", "sp1_payer"] {
+            let toml = format!(
+                r#"
+                [targets.test]
+                provider = "gcp"
+                vmtype = "n2d-standard-2"
+                {field} = "prover-key"
+                "#
+            );
+            #[derive(Deserialize)]
+            struct W {
+                targets: BTreeMap<String, CloudTarget>,
+            }
+            let parsed: W = toml::from_str(&toml).unwrap();
+            assert_eq!(
+                parsed.targets["test"].prover_credential.as_deref(),
+                Some("prover-key")
+            );
+        }
     }
 
     #[test]

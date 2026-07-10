@@ -79,6 +79,7 @@ session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 expire_offset       = 3600
+tee_backend         = "auto"       # SNP -> ZK, TDX -> Solidity
 
 # secp256k1 private keys, read from the files created in step 1.
 [keys.owner]
@@ -314,6 +315,8 @@ session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 expire_offset       = 3600
+tee_backend         = "auto"       # "auto" | "solidity" | "zk"
+# prover             = "sp1-network" # required when selecting ZK explicitly
 
 # ─── Keys ─────────────────────────────────────────────────────────────
 # `provisioned` keys supply the private key via exactly one of
@@ -330,6 +333,13 @@ mode = "provisioned"
 file = "~/.config/atakit/gas.key"
 # command = ["pass", "show", "atakit/gas"]   # alternative source
 # env     = "ATAKIT_GAS_KEY"                  # alternative source
+
+# Prover profiles are deployment policy, separate from workload manifests.
+# Reference this profile from a chain that uses ZK.
+[provers.sp1-network]
+backend    = "sp1"
+execution  = "network"
+credential = "gas"                 # may reference a dedicated key instead
 
 # ─── GitHub credentials ───────────────────────────────────────────────
 # Token sources for private repos. Each sets exactly one of
@@ -361,11 +371,10 @@ owner_key = "owner"
 # Providers hold the account + region; targets reference a provider, chain,
 # and keys by name. [cloud.defaults] fills in fields a target omits.
 # Active registration requires owner_key, but it may be provisioned or
-# self_generated when an ephemeral owner is acceptable. gas_wallet and
-# sp1_payer identify keys the CVM uses for relay/prover submissions: they may
-# be provisioned keys supplied by the relay owner, or self_generated keys whose
-# public keys are accepted or registered by the relay. registration = "off"
-# can omit chain and keys entirely.
+# self_generated when an ephemeral owner is acceptable. gas_wallet identifies
+# the chain relayer. ZK prover credentials are selected by a named [provers]
+# profile referenced from [chains]. registration = "off" can omit chain and
+# keys entirely.
 [cloud.providers.gcp]
 platform = "gcp"
 project  = "my-gcp-project"

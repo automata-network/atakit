@@ -791,7 +791,7 @@ mod tests {
             registration: None,
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
-            sp1_payer: None,
+            prover_credential: None,
         }
     }
 

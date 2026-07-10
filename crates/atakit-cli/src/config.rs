@@ -26,6 +26,7 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[serde(default)]
 pub struct Config {
     pub chains: IndexMap<String, ChainConfig>,
+    pub provers: IndexMap<String, ProverSpec>,
     pub keys: IndexMap<String, KeySpec>,
     pub image: ImageConfig,
     pub github: GithubConfig,
@@ -420,6 +421,12 @@ pub struct ChainConfig {
     /// post manually.
     #[serde(default)]
     pub chain_id: Option<u64>,
+    /// On-chain TEE verification policy: `auto`, `solidity`, or `zk`.
+    #[serde(default = "default_tee_backend")]
+    pub tee_backend: String,
+    /// Named profile under `[provers.<name>]`.
+    #[serde(default)]
+    pub prover: Option<String>,
     /// Portal-side SNP ZK prover selection. One of:
     /// - `"network"` — remote proving on the Succinct network (reuses
     ///   the `gas_wallet` key); the validated path.
@@ -433,6 +440,29 @@ pub struct ChainConfig {
     /// `"network"` default.
     #[serde(default)]
     pub proving_strategy: Option<String>,
+}
+
+fn default_tee_backend() -> String {
+    "auto".to_string()
+}
+
+/// A named in-CVM prover service profile: `[provers.<name>]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProverSpec {
+    pub backend: String,
+    #[serde(default = "default_prover_execution")]
+    pub execution: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub credential: Option<String>,
+    #[serde(default)]
+    pub options: IndexMap<String, String>,
+}
+
+fn default_prover_execution() -> String {
+    "network".to_string()
 }
 
 fn default_expire_offset() -> u64 {
@@ -974,11 +1004,76 @@ impl Config {
             spec.validate(name)?;
         }
 
+        for (name, prover) in &self.provers {
+            if prover.backend.is_empty() {
+                bail!("prover profile '{name}' has an empty backend");
+            }
+            if !matches!(prover.execution.as_str(), "network" | "local_cpu" | "dev") {
+                bail!(
+                    "prover profile '{name}' has unsupported execution '{}'; expected network, local_cpu, or dev",
+                    prover.execution
+                );
+            }
+            if let Some(credential) = &prover.credential {
+                match self.keys.get(credential) {
+                    None => {
+                        bail!("prover profile '{name}' references unknown key '{credential}'")
+                    }
+                    Some(key) if key.key_type != KeyType::Es256k => bail!(
+                        "prover profile '{name}' credential '{credential}' must have type = \"es256k\""
+                    ),
+                    Some(_) => {}
+                }
+            }
+        }
+
+        for (name, chain) in &self.chains {
+            if !matches!(chain.tee_backend.as_str(), "auto" | "solidity" | "zk") {
+                bail!(
+                    "chain '{name}' has invalid tee_backend '{}'; expected auto, solidity, or zk",
+                    chain.tee_backend
+                );
+            }
+            if let Some(prover) = &chain.prover {
+                if !self.provers.contains_key(prover) {
+                    bail!("chain '{name}' references unknown prover profile '{prover}'");
+                }
+            }
+            if chain.prover.is_some() && chain.proving_strategy.is_some() {
+                bail!("chain '{name}' cannot set both `prover` and deprecated `proving_strategy`");
+            }
+            if let Some(strategy) = &chain.proving_strategy {
+                if !matches!(
+                    strategy.as_str(),
+                    "network"
+                        | "local"
+                        | "dev"
+                        | "risc_zero_boundless"
+                        | "risc_zero_local"
+                        | "risc_zero_dev"
+                ) {
+                    bail!("chain '{name}' has unsupported proving_strategy '{strategy}'");
+                }
+            }
+        }
+
         // Cloud target chain/key references must point to defined entries.
         let chain_names: Vec<&str> = self.chains.keys().map(|k| k.as_str()).collect();
         let key_names: Vec<&str> = self.keys.keys().map(|k| k.as_str()).collect();
         if let Some(ref registration) = self.cloud.defaults.registration {
             validate_registration_policy(registration, "[cloud.defaults]")?;
+        }
+        if let Some(ref credential) = self.cloud.defaults.prover_credential {
+            match self.keys.get(credential) {
+                None => bail!(
+                    "[cloud.defaults] references unknown key '{credential}' for prover_credential; defined: [{}]",
+                    key_names.join(", ")
+                ),
+                Some(key) if key.key_type != KeyType::Es256k => bail!(
+                    "[cloud.defaults] prover_credential '{credential}' must have type = \"es256k\""
+                ),
+                Some(_) => {}
+            }
         }
         for (tname, target) in &self.cloud.targets {
             if let Some(ref registration) = target.registration {
@@ -1009,6 +1104,19 @@ impl Config {
                          gas_wallet; defined: [{}]",
                         key_names.join(", ")
                     );
+                }
+            }
+            if let Some(ref credential) = target.prover_credential {
+                match self.keys.get(credential) {
+                    None => bail!(
+                        "cloud target '{tname}' references unknown key '{credential}' for \
+                         prover_credential; defined: [{}]",
+                        key_names.join(", ")
+                    ),
+                    Some(key) if key.key_type != KeyType::Es256k => bail!(
+                        "cloud target '{tname}' prover_credential '{credential}' must have type = \"es256k\""
+                    ),
+                    Some(_) => {}
                 }
             }
         }
@@ -2944,6 +3052,122 @@ mod tests {
             config.cloud.targets["t1"].owner_key.as_deref(),
             Some("owner")
         );
+    }
+
+    #[test]
+    fn chain_resolves_backend_neutral_prover_profile() {
+        let config = Config::load_from_str(
+            r#"
+            [keys.prover]
+            type = "es256k"
+            mode = "provisioned"
+            env = "ATAKIT_TEST_PROVER_KEY"
+
+            [provers.risc0-network]
+            backend = "risc0"
+            execution = "network"
+            credential = "prover"
+
+            [chains.hoodi]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            tee_backend = "zk"
+            prover = "risc0-network"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.chains["hoodi"].tee_backend, "zk");
+        assert_eq!(
+            config.chains["hoodi"].prover.as_deref(),
+            Some("risc0-network")
+        );
+        assert_eq!(config.provers["risc0-network"].backend, "risc0");
+    }
+
+    #[test]
+    fn prover_profile_rejects_non_es256k_credential() {
+        let error = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "es256"
+            mode = "self_generated"
+
+            [provers.sp1]
+            backend = "sp1"
+            credential = "bad"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must have type = \"es256k\""));
+    }
+
+    #[test]
+    fn cloud_target_rejects_unknown_prover_credential() {
+        let error = Config::load_from_str(
+            r#"
+            [cloud.providers.gcp]
+            platform = "gcp"
+            region = "us-central1-a"
+            project = "test"
+
+            [cloud.targets.t1]
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            image = "img:v1"
+            prover_credential = "missing"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown key 'missing' for prover_credential"));
+    }
+
+    #[test]
+    fn cloud_default_rejects_non_es256k_prover_credential() {
+        let error = Config::load_from_str(
+            r#"
+            [keys.bad]
+            type = "rs256"
+            mode = "self_generated"
+
+            [cloud.defaults]
+            prover_credential = "bad"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must have type = \"es256k\""));
+    }
+
+    #[test]
+    fn unknown_chain_prover_profile_is_rejected() {
+        let error = Config::load_from_str(
+            r#"
+            [chains.hoodi]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            prover = "missing"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown prover profile 'missing'"));
+    }
+
+    #[test]
+    fn chain_rejects_profile_and_legacy_strategy_together() {
+        let error = Config::load_from_str(
+            r#"
+            [provers.sp1]
+            backend = "sp1"
+
+            [chains.hoodi]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            prover = "sp1"
+            proving_strategy = "network"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot set both"));
     }
 
     #[test]

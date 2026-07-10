@@ -47,6 +47,54 @@ GCP requires a zone (`asia-southeast1-b`), Azure requires a region (`eastus`). T
 
 ## Config Changes
 
+### Modular prover profiles
+
+Prover selection is operator deployment policy and remains outside
+`atakit-workload.toml`. Named profiles separate zkVM/backend choice from chain
+and cloud target selection:
+
+```toml
+[keys.prover]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/prover.key"
+
+[provers.sp1-network]
+backend = "sp1"
+execution = "network"
+credential = "prover"
+# endpoint = "https://..."          # optional backend endpoint
+# [provers.sp1-network.options]      # backend-specific string values
+
+[chains.hoodi]
+rpc_url = "https://..."
+session_registry = "0x..."
+tee_backend = "auto"                # auto | solidity | zk
+prover = "sp1-network"
+```
+
+The CLI validates profile references, execution-mode spelling, ES256K prover
+credentials, target/default credential references, and `tee_backend` before any
+provider operation. All local/cloud init paths resolve the named profile into
+the portal wire field `prover`; the profile name itself is not sent into the
+CVM. Format-1 requests deliberately emit the credential under the legacy
+`sp1_payer` key until wire-version negotiation exists. New portals accept that
+alias and old portal images require it.
+
+`auto` selects ZK for AMD SEV-SNP and Solidity/DCAP for Intel TDX. `zk` forces
+the prover path for either TEE, which allows TDX ZK without changing a workload
+archive. The deprecated `chain.proving_strategy` remains a compatibility input
+and is emitted by itself for the portal to translate. It is never paired with a
+top-level `prover` field.
+
+Deploy and recovery use one credential precedence rule: chain profile,
+persisted/target fallback, then gas wallet. Deploy persists the effective name,
+so recovery and `--chain` overrides cannot silently select a different prover
+identity.
+
+There is no workload-manifest schema change: choosing SP1, a future RISC Zero
+daemon, or another prover must not change workload identity.
+
 ### `atakit-workload.toml`: Remove `[deployments]`
 
 The `[deployments]` section is removed entirely. Fields that remain workload-scoped:
@@ -1137,11 +1185,12 @@ Concrete shape of the implementation:
 - **Zero-config chain/keys** — when a qemu target has no `chain`
   configured, an implicit local chain is synthesized at `/init` time with
   placeholder registry addresses and `registration = "off"`; unset
-  `owner_key` / `gas_wallet` / `sp1_payer` fall back to `self_generated` so
+  `owner_key` / `gas_wallet` fall back to `self_generated` so
   the portal never needs a private key for a registration-off deploy.
-  (`sp1_payer`, the SP1 prover-network signing key threaded through `/init`
-  alongside `gas_wallet`, defaults to the gas-wallet key when no separate
-  one is configured.)
+  No prover profile is resolved because registration-off does not produce an
+  on-chain attestation proof. The current format-1 producer may still carry its
+  self-generated fallback `sp1_payer` for legacy wire compatibility;
+  the portal does not launch a daemon or use that key when registration is off.
 - **Firmware (OVMF)** is path-driven, not bundled: `ATAKIT_QEMU_UEFI` >
   `[cloud.targets.<n>] uefi` > `[cloud.providers.<n>] uefi`. Stock distro
   OVMF lacks the TPM-measuring build; it needs to be separately built.
