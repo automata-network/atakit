@@ -9,9 +9,9 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    init_chain_from_config, init_key_from_config, portal_endpoints, registration_is_off,
-    resolve_instance, resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
-    synthesize_off_init_chain, synthesize_self_generated_key, InitEnvResolver,
+    effective_prover_credential, init_chain_from_config, init_key_from_config, portal_endpoints,
+    registration_is_off, resolve_instance, resolve_tls_measurement_policy, resolve_unmeasured_tar,
+    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key, InitEnvResolver,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -139,7 +139,13 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let registration = target.registration.as_deref();
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => init_chain_from_config(name, chain, registration).await?,
+            Some(chain) => {
+                let prover = chain
+                    .prover
+                    .as_ref()
+                    .and_then(|name| config.provers.get(name));
+                init_chain_from_config(name, chain, registration, prover).await?
+            }
             None if registration_is_off(registration) => synthesize_off_init_chain(),
             None => bail!("chain '{name}' not found in [chains]"),
         },
@@ -174,24 +180,32 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         None => synthesize_self_generated_key(),
     };
     let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
-    // SP1 prover-network key: state override > target config > default to the
-    // gas-wallet key. Missing gas/sp1 synthesizes an ephemeral self-generated
-    // key; configured provisioned keys are also valid.
-    let sp1_payer_name = state
+    // Resolve with the same precedence as deploy. A selected chain profile
+    // wins over persisted/target fallback, including under --chain recovery.
+    let fallback_credential = state
         .init_env
         .sp1_payer
         .clone()
         .filter(|s| !s.is_empty())
-        .or_else(|| resolver.sp1_payer())
-        .or_else(|| gas_wallet_name.clone());
+        .or_else(|| resolver.prover_credential());
+    let sp1_payer_name = effective_prover_credential(
+        config,
+        chain_name.as_deref(),
+        fallback_credential,
+        gas_wallet_name.clone(),
+        registration_off,
+    );
     let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
-    let sp1_init = match sp1_payer_name.as_deref() {
-        Some(name) => match config.keys.get(name) {
-            Some(spec) => init_key_from_config(name, spec, false)?,
-            None if registration_off => synthesize_self_generated_key(),
-            None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
-        },
-        None => synthesize_self_generated_key(),
+    let prover_init = if registration_off {
+        synthesize_self_generated_key()
+    } else {
+        match sp1_payer_name.as_deref() {
+            Some(name) => match config.keys.get(name) {
+                Some(spec) => init_key_from_config(name, spec, false)?,
+                None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
+            },
+            None => synthesize_self_generated_key(),
+        }
     };
 
     // Resolve provider platform for the InitConfig.
@@ -221,7 +235,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         chain: init_chain,
         owner_key: owner_init,
         gas_wallet: gas_init,
-        sp1_payer: sp1_init,
+        prover_credential: prover_init,
         disks: disk_passphrases,
     };
 

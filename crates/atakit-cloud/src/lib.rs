@@ -21,7 +21,7 @@ pub use config::{
 };
 pub use error::CloudError;
 pub use exec::{CommandOutput, CommandRunner, ProcessRunner};
-pub use init::{InitChainConfig, InitConfig, InitKeyConfig};
+pub use init::{InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig};
 pub use naming::{AzureResourceNames, ResourceNames};
 pub use plan::{
     DeployPlan, DeployStep, DestroyPlan, DestroyStep, DiskSpec, ResourceUpdates, StepResult,

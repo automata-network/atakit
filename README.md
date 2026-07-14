@@ -79,6 +79,7 @@ session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 expire_offset       = 3600
+tee_backend         = "auto"       # SNP -> ZK, TDX -> Solidity
 
 # secp256k1 private keys, read from the files created in step 1.
 [keys.owner]
@@ -161,14 +162,14 @@ atakit image ls --remote
 atakit image ls --remote --repo automata-network/debug-linux
 
 # Pull an image for a specific platform
-atakit image pull automata-linux:v0.1.6 gcp
+atakit image pull automata-linux:v0.2.6-debug gcp
 
 # Remove a local image
-atakit image rm automata-linux:v0.1.6
+atakit image rm automata-linux:v0.2.6-debug
 
 # Export/import portable .atabi archives
-atakit image export automata-linux:v0.1.6
-atakit image import automata-linux-v0.1.6-gcp.atabi
+atakit image export automata-linux:v0.2.6-debug
+atakit image import automata-linux-v0.2.6-debug-gcp.atabi
 ```
 
 ### Workload management
@@ -207,20 +208,20 @@ Requires a configured target in `config.toml` (see [Configuration](#configuratio
 
 ```sh
 # Deploy a workload to a cloud CVM
-atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.2.6-debug
 
 # Deploy with a custom instance name
-atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.1.6 --name my-instance
+atakit cloud deploy my-service:v0.0.1 --target my-gcp --image automata-linux:v0.2.6-debug --name my-instance
 
 # Upload a base image to the cloud without deploying
-atakit cloud upload-image automata-linux:v0.1.6 --target my-gcp
+atakit cloud image upload automata-linux:v0.2.6-debug --provider gcp
 
 # Initialize an already-deployed instance with a workload
 atakit cloud init my-instance my-service:v0.0.1 --target my-gcp
 
 # Supply unmeasured data at deploy/init time when the workload declares it.
 atakit cloud deploy my-service:v0.0.1 --target my-gcp \
-  --image automata-linux:v0.1.6 \
+  --image automata-linux:v0.2.6-debug \
   --unmeasured-data-root ./unmeasured-data
 atakit cloud init my-instance my-service:v0.0.1 --target my-gcp \
   --unmeasured-data-root ./unmeasured-data
@@ -257,22 +258,40 @@ Requirements on the host:
 - A TPM-enabled OVMF (ie, compiled with `TPM2_ENABLE=TRUE` and `TPM2_CONFIG_ENABLE=TRUE`)
 - `socat` (only needed for `atakit cloud ssh` to attach to the serial console)
 
-Minimal config:
+The portal currently requires a provisioned owner key even when registration is
+off. Create a development-only key (keep it outside the repository), then use
+this minimal config:
+
+```sh
+umask 077
+openssl rand -hex 32 > ~/.config/atakit/qemu-owner.key
+```
 
 ```toml
+[keys.qemu-owner]
+type = "es256k"
+mode = "provisioned"
+file = "~/.config/atakit/qemu-owner.key"
+
 [cloud.providers.qemu]
 platform = "qemu"
 uefi     = "~/.local/share/atakit/firmware/ovmf.fd"
 
 [cloud.targets.qemu-local]
-provider = "qemu"
-image    = "automata-linux:v0.1.6"   # uses qemu_disk.qcow2 from the image store
+provider  = "qemu"
+image     = "automata-linux:v0.2.6-debug"   # uses qemu_disk.qcow2 from the image store
+owner_key = "qemu-owner"
 ```
+
+Without `owner_key`, the CLI currently sends a self-generated owner descriptor
+that the portal rejects because it has no private key. This is a known
+producer/consumer mismatch; the explicit development key above is the working
+path.
 
 Then:
 
 ```sh
-atakit image pull automata-linux:v0.1.6 qemu
+atakit image pull automata-linux:v0.2.6-debug qemu
 atakit cloud deploy my-service:v0.0.1 --target qemu-local
 
 atakit cloud ls                              # qemu deployments listed alongside cloud
@@ -314,11 +333,14 @@ session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
 expire_offset       = 3600
+tee_backend         = "auto"       # "auto" | "solidity" | "zk"
+# prover             = "sp1-network" # required when selecting ZK explicitly
 
 # ─── Keys ─────────────────────────────────────────────────────────────
 # `provisioned` keys supply the private key via exactly one of
 # file / command / env. `self_generated` keys are created by the portal
-# at init time (no source). type: es256k | es256 | rs256.
+# at init time (no source), but the owner key must currently be provisioned.
+# type: es256k | es256 | rs256.
 [keys.owner]
 type = "es256k"
 mode = "provisioned"
@@ -330,6 +352,13 @@ mode = "provisioned"
 file = "~/.config/atakit/gas.key"
 # command = ["pass", "show", "atakit/gas"]   # alternative source
 # env     = "ATAKIT_GAS_KEY"                  # alternative source
+
+# Prover profiles are deployment policy, separate from workload manifests.
+# Reference this profile from a chain that uses ZK.
+[provers.sp1-network]
+backend    = "sp1"
+execution  = "network"
+credential = "gas"                 # may reference a dedicated key instead
 
 # ─── GitHub credentials ───────────────────────────────────────────────
 # Token sources for private repos. Each sets exactly one of
@@ -360,12 +389,12 @@ owner_key = "owner"
 # ─── Cloud ────────────────────────────────────────────────────────────
 # Providers hold the account + region; targets reference a provider, chain,
 # and keys by name. [cloud.defaults] fills in fields a target omits.
-# Active registration requires owner_key, but it may be provisioned or
-# self_generated when an ephemeral owner is acceptable. gas_wallet and
-# sp1_payer identify keys the CVM uses for relay/prover submissions: they may
-# be provisioned keys supplied by the relay owner, or self_generated keys whose
-# public keys are accepted or registered by the relay. registration = "off"
-# can omit chain and keys entirely.
+# Every current /init request requires a provisioned owner_key. gas_wallet
+# identifies the chain relayer and may be self_generated. ZK prover credentials
+# are selected by a named [provers] profile referenced from [chains]. With
+# registration = "off", chain, gas_wallet, and prover credentials may be
+# omitted, but the owner-key producer/consumer mismatch described above still
+# requires an owner_key until the implementation is fixed.
 [cloud.providers.gcp]
 platform = "gcp"
 project  = "my-gcp-project"
@@ -385,12 +414,12 @@ gas_wallet   = "gas"
 [cloud.targets.gcp-tdx]
 provider = "gcp"
 vmtype   = "c3-standard-4"          # c3-standard-* → TDX, n2d-standard-* → SEV-SNP
-image    = "automata-linux:v0.1.6"
+image    = "automata-linux:v0.2.6-debug"
 
 [cloud.targets.azure-snp]
 provider = "azure"
 vmtype   = "Standard_DC4as_v5"      # *as_v5/v6 → SEV-SNP, *es_v6 → TDX
-image    = "automata-linux:v0.1.6"
+image    = "automata-linux:v0.2.6-debug"
 ```
 
 ### Workload config (`atakit-workload.toml`)
@@ -436,15 +465,18 @@ See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for
 
 ```
 crates/
-  atakit-core/       # Shared types (Env, ProgressReporter trait)
-  atakit-image/      # Image domain logic (GitHub Releases, local store)
-  atakit-workload/   # Workload domain logic (build, registry, on-chain)
-  atakit-cloud/      # Cloud deployment logic (GCP + Azure providers, state management)
-  atakit-cli/        # Binary crate (presentation, progress bars, error display)
+  atakit-core/         # Shared types and progress-reporting abstractions
+  atakit-github/       # GitHub Releases client
+  atakit-image/        # Base-image download, cache, and metadata
+  atakit-workload/     # Workload build, registry, and on-chain operations
+  atakit-attestation/  # Attestation verification and measurement handling
+  atakit-cloud/        # GCP, Azure, AWS, and QEMU deployment backends
+  atakit-cli/          # CLI parsing, presentation, and external subcommands
 ```
 
 Library crates are frontend-agnostic -- the CLI binary owns all terminal presentation. See [`docs/architecture.md`](docs/architecture.md) for details.
 
 ## License
 
-TODO
+This repository does not currently include a license file or Cargo package
+license metadata. Add both before distributing the source or published crates.
