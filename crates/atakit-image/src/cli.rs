@@ -51,11 +51,11 @@ pub struct LsArgs {
 /// Arguments for `image pull`.
 #[derive(Args)]
 pub struct PullArgs {
-    /// Release tag to pull (e.g. "automata-linux:v0.5.0").
+    /// Release tag to pull (e.g. "automata-linux:v0.2.6-debug").
     /// If omitted, the latest release containing disk images is used.
     pub image: Option<ImageRef>,
 
-    /// Comma-separated list of platforms: gcp,aws,azure.
+    /// Comma-separated list of platforms: gcp,aws,azure,qemu.
     /// If omitted, all platforms are pulled.
     pub csps: Option<String>,
 }
@@ -63,14 +63,14 @@ pub struct PullArgs {
 /// Arguments for `image rm`.
 #[derive(Args)]
 pub struct RmArgs {
-    /// Release tag to remove (e.g. "automata-linux:v0.5.0")
+    /// Release tag to remove (e.g. "automata-linux:v0.2.6-debug")
     pub tag: ImageRef,
 }
 
 /// Arguments for `image export`.
 #[derive(Args)]
 pub struct ExportArgs {
-    /// Image reference to export (e.g. "automata-linux:v0.1.6")
+    /// Image reference to export (e.g. "automata-linux:v0.2.6-debug")
     pub image: ImageRef,
 
     /// Output directory (default: current directory)

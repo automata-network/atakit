@@ -22,7 +22,7 @@
 #   export ATAKIT_SESSION_REGISTRY=0x1234...5678
 #   export ATAKIT_OWNER_PRIVATE_KEY=0xabc...
 #   export ATAKIT_RELAY_PRIVATE_KEY=0xdef...
-#   ./push-workload.sh 34.126.100.42 my-workload-v0.0.1.atawl
+#   ./push-workload.sh 192.0.2.10 my-workload-v0.0.1.atawl
 
 set -euo pipefail
 

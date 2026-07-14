@@ -1037,7 +1037,7 @@ pub(super) fn validate_base_image(
         if entry.parse::<ImageRef>().is_err() {
             bail!(
                 "invalid base-image entry '{}': must be repository:tag format \
-                 (e.g. 'automata-linux:v0.1.6')",
+                 (e.g. 'automata-linux:v0.2.6-debug')",
                 entry,
             );
         }

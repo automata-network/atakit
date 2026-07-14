@@ -309,7 +309,7 @@ atakit workload pull secure-signer:v0.0.1 --verify
 atakit workload info secure-signer:v0.0.1
 
 # 4. Deploy to CVM
-atakit cloud deploy secure-signer:v0.0.1 --target my-gcp --image automata-linux:v0.1.6
+atakit cloud deploy secure-signer:v0.0.1 --target my-gcp --image automata-linux:v0.2.6-debug
 ```
 
 ### Tracking on-chain workloads
