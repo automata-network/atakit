@@ -17,8 +17,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
 
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => Some(
-            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        None if config.build.container_engine != crate::config::ContainerEngine::Auto => Some(
+            atakit_workload::ContainerEngine::from_str_opt(config.build.container_engine.as_str())?,
         ),
         None => None,
     };

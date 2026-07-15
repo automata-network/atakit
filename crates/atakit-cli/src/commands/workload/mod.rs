@@ -193,7 +193,7 @@ pub fn resolve_owner_key(
             key_spec.key_type
         );
     }
-    key_spec.resolve(key_name)
+    Ok(key_spec.resolve(key_name)?)
 }
 
 /// Resolve relay key for on-chain workload commands.
@@ -219,7 +219,7 @@ pub fn resolve_relay_key(
             key_spec.key_type
         );
     }
-    key_spec.resolve(key_name)
+    Ok(key_spec.resolve(key_name)?)
 }
 
 /// On-chain workload data returned by `query_chain_data`.

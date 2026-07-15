@@ -1,22 +1,18 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Component, Path};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use anyhow::{bail, Context, Result};
 use atakit_cloud::CloudConfig;
+#[cfg(test)]
+use atakit_config::CredentialSpec;
+pub use atakit_config::{
+    repo_local_name, BuildConfig, ChainConfig, ContainerEngine, GithubConfig, ImageConfig,
+    ImageRepositorySpec, KeyMode, KeySpec, KeyType, ProverSpec, PublishConfig,
+};
 use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
 use indexmap::IndexMap;
 use serde::Deserialize;
-
-const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// Poll interval for the credential-command timeout loop. Chosen so
-/// that short-lived helpers finish within one or two ticks and the
-/// observed wall-time overhead is < 100 ms while the timeout bound
-/// is still tight (user-facing `timeout_secs` is in seconds anyway).
-const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Application configuration loaded from `config.toml`.
 ///
@@ -34,632 +30,6 @@ pub struct Config {
     pub publish: PublishConfig,
     pub workload: WorkloadConfig,
     pub cloud: CloudConfig,
-}
-
-// ── [image] section ────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct ImageConfig {
-    /// Named image repositories. Each entry points at a GitHub
-    /// `owner/repo`, optionally referencing a credential and/or
-    /// overriding `list_limit`.
-    ///
-    /// Declaration order is preserved by `IndexMap`; the first entry is
-    /// the implicit default for `image pull` when no image ref is
-    /// given.
-    pub repositories: IndexMap<String, ImageRepositorySpec>,
-    /// Default platforms for `image pull`.
-    pub platforms: Option<Vec<String>>,
-    /// Global default limit for `image ls`. Overridable per-repo via
-    /// `ImageRepositorySpec::list_limit` and per-invocation via
-    /// `--limit`. Precedence: `--limit` > per-repo > global.
-    pub list_limit: u32,
-}
-
-impl Default for ImageConfig {
-    fn default() -> Self {
-        // No hardcoded default repository. Symmetric with
-        // `[workload.repositories]`, which also defaults to empty.
-        // Commands that need a repository (`image pull`,
-        // `image ls --remote`, etc.) error at their own call site
-        // when the map is empty; `image ls` (local-only) works fine
-        // against an empty map.
-        Self {
-            repositories: IndexMap::new(),
-            platforms: None,
-            list_limit: 10,
-        }
-    }
-}
-
-impl ImageConfig {
-    /// The primary (first-declared) entry -- both the config name and
-    /// the full spec -- so callers can read its credential and
-    /// `list_limit` override.
-    pub fn primary_entry(&self) -> Option<(&str, &ImageRepositorySpec)> {
-        self.repositories.first().map(|(k, v)| (k.as_str(), v))
-    }
-
-    /// Find a configured GitHub repository whose local name (portion
-    /// after the last `/`) matches `name`. Returns the entry name and
-    /// its spec so callers can resolve the credential and list_limit
-    /// override for that entry.
-    ///
-    /// Rejects ambiguity: if multiple configured entries share the
-    /// same local name suffix (e.g. `owner-a/debug-linux` and
-    /// `owner-b/debug-linux`), returns an error instead of silently
-    /// picking the first match. Matches the "prefer canonical /
-    /// accept one non-canonical / error on multiple" pattern used
-    /// for release asset lookup in `find_atawl_asset`.
-    pub fn find_by_local_name(&self, name: &str) -> Result<Option<(&str, &ImageRepositorySpec)>> {
-        let matches: Vec<(&str, &ImageRepositorySpec)> = self
-            .repositories
-            .iter()
-            .filter(|(_, s)| repo_local_name(&s.repo) == name)
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
-        match matches.as_slice() {
-            [] => Ok(None),
-            [single] => Ok(Some(*single)),
-            many => {
-                let entries: Vec<String> = many
-                    .iter()
-                    .map(|(k, s)| format!("{k} ({})", s.repo))
-                    .collect();
-                bail!(
-                    "local name '{name}' matches multiple configured image \
-                     repositories: [{}]; pass `--repo <owner/repo>` or rename \
-                     one of the entries to disambiguate",
-                    entries.join(", ")
-                )
-            }
-        }
-    }
-}
-
-/// One configured image repository.
-///
-/// TOML form (canonical inline):
-///
-/// ```toml
-/// [image.repositories]
-/// automata = { repo = "automata-network/automata-linux" }
-/// private  = { repo = "myorg/private-images", credential = "private" }
-/// fast-dev = { repo = "myorg/dev-mirror", list_limit = 3 }
-/// ```
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageRepositorySpec {
-    /// GitHub `owner/repo` path.
-    pub repo: String,
-    /// Name of the credential under `[github.credentials]` to use when
-    /// talking to this repository. `None` = anonymous requests
-    /// (public repos only).
-    pub credential: Option<String>,
-    /// Per-repo override for `image ls` page size. Precedence at the
-    /// call site: `--limit` > per-repo `list_limit` > `[image]
-    /// list_limit`.
-    pub list_limit: Option<u32>,
-}
-
-/// Extract the local image name from a GitHub `owner/repo` string.
-///
-/// Returns the part after the last `/`, or the whole string if no `/`.
-pub fn repo_local_name(repo: &str) -> &str {
-    repo.rsplit_once('/').map_or(repo, |(_, name)| name)
-}
-
-// ── [github] section ───────────────────────────────────────────────
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct GithubConfig {
-    /// Named credentials. Each entry sets exactly one of `file` /
-    /// `command` / `env`. Referenced per-repo via `credential =
-    /// "<name>"` on image or workload repository entries.
-    pub credentials: IndexMap<String, CredentialSpec>,
-}
-
-/// One credential source.
-///
-/// Exactly one of `file` / `command` / `env` must be set. `timeout_secs`
-/// is only valid alongside `command`; setting it on a `file` or `env`
-/// credential is a config error (caught at load time).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialSpec {
-    /// Path to a file containing the token. `~/` is expanded via
-    /// `HOME`. Whitespace is trimmed. Reuse of the same path pattern as
-    /// `[publish] owner_key_file` / `relay_key_file`.
-    pub file: Option<String>,
-    /// Command to exec (no shell) whose stdout yields the token.
-    /// Vec-of-strings form avoids shell-escaping bugs.
-    pub command: Option<Vec<String>>,
-    /// Name of an environment variable holding the token.
-    pub env: Option<String>,
-    /// Optional timeout for `command` credentials, in seconds.
-    /// Defaults to 30s when unset. Only valid with `command`.
-    pub timeout_secs: Option<u64>,
-}
-
-impl CredentialSpec {
-    /// Eager validation at config-load time.
-    ///
-    /// 1. Exactly one of `file` / `command` / `env` must be set.
-    /// 2. `timeout_secs` is only valid with `command`.
-    /// 3. `timeout_secs`, when set, must be > 0.
-    pub fn validate(&self, name: &str) -> Result<()> {
-        let set_count = [
-            self.file.is_some(),
-            self.command.is_some(),
-            self.env.is_some(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
-        match set_count {
-            0 => bail!("credential '{name}': must set exactly one of `file`, `command`, `env`"),
-            1 => {}
-            _ => bail!(
-                "credential '{name}': sets more than one of `file` / `command` / `env`; pick one"
-            ),
-        }
-
-        if self.timeout_secs.is_some() && self.command.is_none() {
-            bail!(
-                "credential '{name}': `timeout_secs` is only valid with `command`; \
-                 `file` and `env` do not spawn subprocesses"
-            );
-        }
-        if let Some(0) = self.timeout_secs {
-            bail!("credential '{name}': `timeout_secs` must be greater than 0");
-        }
-        if let Some(ref cmd) = self.command {
-            if cmd.is_empty() {
-                bail!("credential '{name}': `command` must not be empty");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Lazily resolve this credential to a token string.
-    ///
-    /// All three source kinds apply identical whitespace handling:
-    /// the raw value is `.trim()`-ed and a whitespace-only result is
-    /// rejected as empty. This keeps behavior consistent across
-    /// `file` (which already trimmed via [`read_key_file`]), `env`
-    /// (which previously let `GH_TOKEN=""` slip through and fail at
-    /// the API with a cryptic 401), and `command` (which previously
-    /// only trimmed trailing newlines, so leading whitespace from a
-    /// `pass show` output would leak into the Bearer header).
-    ///
-    /// Errors always name the credential so users can find the
-    /// offending entry immediately.
-    pub fn resolve(&self, name: &str) -> Result<String> {
-        if let Some(ref path) = self.file {
-            return read_key_file(path).with_context(|| {
-                format!("credential '{name}': failed to read token from `{path}`")
-            });
-        }
-        if let Some(ref env_name) = self.env {
-            return match env::var(env_name) {
-                Ok(v) => {
-                    let trimmed = v.trim().to_string();
-                    if trimmed.is_empty() {
-                        Err(anyhow::anyhow!(
-                            "credential '{name}': env var '{env_name}' is set but \
-                             empty or whitespace-only"
-                        ))
-                    } else {
-                        Ok(trimmed)
-                    }
-                }
-                Err(_) => Err(anyhow::anyhow!(
-                    "credential '{name}': env var '{env_name}' is not set"
-                )),
-            };
-        }
-        if let Some(ref argv) = self.command {
-            return resolve_command(name, argv, self.timeout_secs);
-        }
-        // `validate` runs at config load so this is unreachable in
-        // practice. Guard against misuse if someone constructs a spec
-        // programmatically without validating first.
-        bail!("credential '{name}': no source set (internal error: validate not called)")
-    }
-}
-
-fn resolve_command(cred_name: &str, argv: &[String], timeout_secs: Option<u64>) -> Result<String> {
-    let timeout_secs = timeout_secs.unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS);
-    let program = argv
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("credential '{cred_name}': command is empty"))?;
-
-    let mut child = Command::new(program)
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("credential '{cred_name}': failed to spawn `{}`", program,))?;
-
-    // Drain stdout and stderr on background threads CONCURRENTLY
-    // with the wait loop. Reading pipes only after the child has
-    // exited (the obvious approach) deadlocks when the helper
-    // writes more than the kernel pipe buffer can hold (~64 KiB on
-    // Linux): the child blocks on write() waiting for a reader,
-    // never exits, and the timeout fires -- so a helper that
-    // spews debug output to stderr before printing the token would
-    // look like a timeout when the real problem is backpressure.
-    // Spawning drainers up front prevents the deadlock.
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("credential '{cred_name}': child stdout unavailable"))?;
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("credential '{cred_name}': child stderr unavailable"))?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut pipe = stdout_pipe;
-        let _ = pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut pipe = stderr_pipe;
-        let _ = pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    // Bound the child's lifetime via a polling loop on `try_wait`.
-    // We previously used the `wait-timeout` crate, but its
-    // SIGCHLD + self-pipe machinery panics in sandboxed /
-    // seccomp-restricted Linux environments with "bad error on
-    // write fd: Operation not permitted", which aborts the whole
-    // process instead of surfacing a clean credential error. A
-    // plain `waitpid(pid, WNOHANG)` poll loop touches none of that
-    // machinery and works everywhere `kill(pid, SIGKILL)` does.
-    //
-    // Overhead is negligible: ~20 wakeups/sec during the wait, and
-    // credential resolution happens once per CLI invocation.
-    let timeout = Duration::from_secs(timeout_secs);
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => {
-                if start.elapsed() >= timeout {
-                    // Best-effort cleanup; we're already erroring
-                    // so ignore secondary failures. The kill
-                    // closes the child's pipe ends, which
-                    // releases the drainer threads from their
-                    // blocking reads.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    bail!(
-                        "credential '{cred_name}': command timed out after {timeout_secs}s \
-                         (command: `{}`)",
-                        program
-                    );
-                }
-                std::thread::sleep(COMMAND_POLL_INTERVAL);
-            }
-        }
-    };
-
-    // Child exited; its pipe ends are closed, so the drainers have
-    // already seen EOF. Joining gives us whatever they buffered.
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string());
-        bail!(
-            "credential '{cred_name}': command exited with status {code} \
-             (command: `{}`): {}",
-            program,
-            stderr.trim()
-        );
-    }
-
-    // Full whitespace trim (not just trailing newlines) so that
-    // `pass show` output with a leading blank line or helpers that
-    // wrap the token in `echo "  $TOKEN  "` don't leak whitespace
-    // into the Bearer header. Matches the behavior of the `file`
-    // source, which has always used `read_key_file`'s `.trim()`.
-    let token = stdout.trim().to_string();
-    if token.is_empty() {
-        bail!(
-            "credential '{cred_name}': command produced no token \
-             (empty or whitespace-only output)"
-        );
-    }
-    Ok(token)
-}
-
-// ── [chains] section ──────────────────────────────────────────────
-
-/// A named chain configuration: `[chains.<name>]`.
-///
-/// ```toml
-/// [chains.mainnet]
-/// rpc_url = "https://..."
-/// session_registry = "0x..."
-/// expire_offset = 300
-/// # chain_id = 11155111   # only when rpc_url absent (air-gapped)
-/// # proving_strategy = "network" | "local" | "dev"   # SNP CVMs only
-/// ```
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainConfig {
-    pub rpc_url: String,
-    pub session_registry: String,
-    /// Derived from `session_registry` via on-chain call if omitted.
-    pub workload_registry: Option<String>,
-    /// Derived from `session_registry` via on-chain call if omitted.
-    pub base_image_registry: Option<String>,
-    /// Validity window (seconds) for owner-key-signed messages submitted
-    /// to the on-chain registries. Default for the portal's `registerCvm`
-    /// message and for the operator's `workload publish`,
-    /// `workload deactivate`, and `imgbuild publish` signature offsets.
-    /// CLI `--expire-offset` overrides this per call.
-    #[serde(default = "default_expire_offset")]
-    pub expire_offset: u64,
-    /// EIP-155 chain id. Only meaningful under air-gapped operation
-    /// (`rpc_url` not set on the portal side, which atakit-ng doesn't
-    /// support yet — every chain entry here has `rpc_url`). Kept for
-    /// forward compat with portal configs that the operator might
-    /// post manually.
-    #[serde(default)]
-    pub chain_id: Option<u64>,
-    /// On-chain TEE verification policy: `auto`, `solidity`, or `zk`.
-    #[serde(default = "default_tee_backend")]
-    pub tee_backend: String,
-    /// Named profile under `[provers.<name>]`.
-    #[serde(default)]
-    pub prover: Option<String>,
-    /// Portal-side SNP ZK prover selection. One of:
-    /// - `"network"` — remote proving on the Succinct network (reuses
-    ///   the `gas_wallet` key); the validated path.
-    /// - `"local"` — on-device CPU proving (needs a proving-capable
-    ///   image; heavyweight).
-    /// - `"dev"` — mock proof; will not verify on-chain (testing only).
-    ///
-    /// Only consulted for AMD SEV-SNP CVMs — TDX uses the on-chain
-    /// Solidity/DCAP path and ignores this. When `None`, the field is
-    /// omitted from the `/init` JSON and the portal applies its
-    /// `"network"` default.
-    #[serde(default)]
-    pub proving_strategy: Option<String>,
-}
-
-fn default_tee_backend() -> String {
-    "auto".to_string()
-}
-
-/// A named in-CVM prover service profile: `[provers.<name>]`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProverSpec {
-    pub backend: String,
-    #[serde(default = "default_prover_execution")]
-    pub execution: String,
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default)]
-    pub credential: Option<String>,
-    #[serde(default)]
-    pub options: IndexMap<String, String>,
-}
-
-fn default_prover_execution() -> String {
-    "network".to_string()
-}
-
-fn default_expire_offset() -> u64 {
-    300
-}
-
-// ── [keys] section ───────────────────────────────────────────────
-
-/// Key algorithm type, matching on-chain `PublicIdentity.typeId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum KeyType {
-    Es256k,
-    Es256,
-    Rs256,
-}
-
-impl std::fmt::Display for KeyType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeyType::Es256k => write!(f, "es256k"),
-            KeyType::Es256 => write!(f, "es256"),
-            KeyType::Rs256 => write!(f, "rs256"),
-        }
-    }
-}
-
-/// Key provisioning mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyMode {
-    /// Operator provides the private key via file/command/env.
-    Provisioned,
-    /// Portal generates the key at init time.
-    SelfGenerated,
-}
-
-impl std::fmt::Display for KeyMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeyMode::Provisioned => write!(f, "provisioned"),
-            KeyMode::SelfGenerated => write!(f, "self_generated"),
-        }
-    }
-}
-
-/// A named key configuration: `[keys.<name>]`.
-///
-/// ```toml
-/// [keys.owner]
-/// type = "es256k"
-/// mode = "provisioned"
-/// file = "~/.config/atakit/owner.key"
-///
-/// [keys.gas]
-/// type = "es256k"
-/// mode = "self_generated"
-/// ```
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeySpec {
-    #[serde(rename = "type")]
-    pub key_type: KeyType,
-    pub mode: KeyMode,
-    /// Path to a file containing the private key. `~/` is expanded.
-    pub file: Option<String>,
-    /// Command to exec (no shell) whose stdout yields the key.
-    pub command: Option<Vec<String>>,
-    /// Name of an environment variable holding the key.
-    pub env: Option<String>,
-    /// Optional timeout for `command` keys, in seconds. Default: 30s.
-    pub timeout_secs: Option<u64>,
-}
-
-impl KeySpec {
-    /// Eager validation at config-load time.
-    ///
-    /// - `mode = provisioned`: exactly one of file/command/env must be set.
-    /// - `mode = self_generated`: all of file/command/env/timeout_secs must be None.
-    pub fn validate(&self, name: &str) -> Result<()> {
-        let set_count = [
-            self.file.is_some(),
-            self.command.is_some(),
-            self.env.is_some(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
-
-        match self.mode {
-            KeyMode::Provisioned => match set_count {
-                0 => bail!(
-                    "key '{name}': mode = \"provisioned\" requires exactly one of \
-                         `file`, `command`, `env`"
-                ),
-                1 => {}
-                _ => bail!(
-                    "key '{name}': sets more than one of `file` / `command` / `env`; pick one"
-                ),
-            },
-            KeyMode::SelfGenerated => {
-                if set_count > 0 {
-                    bail!(
-                        "key '{name}': mode = \"self_generated\" must not set \
-                         `file`, `command`, or `env`"
-                    );
-                }
-                if self.timeout_secs.is_some() {
-                    bail!("key '{name}': mode = \"self_generated\" must not set `timeout_secs`");
-                }
-            }
-        }
-
-        if self.timeout_secs.is_some() && self.command.is_none() {
-            bail!("key '{name}': `timeout_secs` is only valid with `command`");
-        }
-        if let Some(0) = self.timeout_secs {
-            bail!("key '{name}': `timeout_secs` must be greater than 0");
-        }
-        if let Some(ref cmd) = self.command {
-            if cmd.is_empty() {
-                bail!("key '{name}': `command` must not be empty");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Lazily resolve this key to a private key string.
-    ///
-    /// Only valid for `mode = provisioned`. Returns an error if called
-    /// on a `self_generated` key.
-    pub fn resolve(&self, name: &str) -> Result<String> {
-        if self.mode != KeyMode::Provisioned {
-            bail!(
-                "key '{name}': cannot resolve a self_generated key; \
-                 it must be mode = \"provisioned\" with a file/command/env source"
-            );
-        }
-        if let Some(ref path) = self.file {
-            return read_key_file(path)
-                .with_context(|| format!("key '{name}': failed to read key from `{path}`"));
-        }
-        if let Some(ref env_name) = self.env {
-            return match env::var(env_name) {
-                Ok(v) => {
-                    let trimmed = v.trim().to_string();
-                    if trimmed.is_empty() {
-                        Err(anyhow::anyhow!(
-                            "key '{name}': env var '{env_name}' is set but \
-                             empty or whitespace-only"
-                        ))
-                    } else {
-                        Ok(trimmed)
-                    }
-                }
-                Err(_) => Err(anyhow::anyhow!(
-                    "key '{name}': env var '{env_name}' is not set"
-                )),
-            };
-        }
-        if let Some(ref argv) = self.command {
-            return resolve_command(name, argv, self.timeout_secs);
-        }
-        bail!("key '{name}': no source set (internal error: validate not called)")
-    }
-}
-
-// ── [build] section ────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct BuildConfig {
-    /// Container engine preference: "docker", "podman", or "auto".
-    pub container_engine: String,
-}
-
-impl Default for BuildConfig {
-    fn default() -> Self {
-        Self {
-            container_engine: "auto".to_string(),
-        }
-    }
-}
-
-// ── [publish] section ──────────────────────────────────────────────
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct PublishConfig {
-    /// Chain config name (references a key in `[chains]`).
-    pub chain: Option<String>,
-    /// Owner key name (references a key in `[keys]`, must be provisioned).
-    pub owner_key: Option<String>,
-    /// Relay key name (references a key in `[keys]`, must be provisioned).
-    /// Used for submitting on-chain transactions (pays gas).
-    pub relay_key: Option<String>,
 }
 
 // ── [workload] section ─────────────────────────────────────────────
@@ -875,7 +245,7 @@ impl Config {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let mut config = Config::default();
-                config.apply_env_overrides();
+                config.apply_env_overrides()?;
                 config.validate()?;
                 return Ok(config);
             }
@@ -893,7 +263,7 @@ impl Config {
         check_legacy_fields(content)?;
         let mut config: Config = toml::from_str(content).context("failed to parse config")?;
         config.cloud.apply_defaults();
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
     }
@@ -903,7 +273,7 @@ impl Config {
     /// token.
     pub fn resolve_credential(&self, name: &str) -> Result<String> {
         match self.github.credentials.get(name) {
-            Some(spec) => spec.resolve(name),
+            Some(spec) => Ok(spec.resolve(name)?),
             None => {
                 let defined: Vec<&str> =
                     self.github.credentials.keys().map(|k| k.as_str()).collect();
@@ -1204,7 +574,7 @@ impl Config {
         Ok(())
     }
 
-    fn apply_env_overrides(&mut self) {
+    fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(v) = env::var("ATAKIT_DEFAULT_PLATFORMS") {
             if !v.is_empty() {
                 let parsed: Vec<String> = v
@@ -1224,7 +594,9 @@ impl Config {
         }
         if let Ok(v) = env::var("ATAKIT_CONTAINER_ENGINE") {
             if !v.is_empty() {
-                self.build.container_engine = v;
+                self.build.container_engine = v
+                    .parse::<ContainerEngine>()
+                    .context("invalid ATAKIT_CONTAINER_ENGINE")?;
             }
         }
         // ATAKIT_RPC_URL and ATAKIT_SESSION_REGISTRY env overrides
@@ -1240,6 +612,7 @@ impl Config {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1474,19 +847,6 @@ fn check_legacy_fields(content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read a hex key from a file, trimming whitespace.
-pub fn read_key_file(path: &str) -> Result<String> {
-    let expanded = if path.starts_with("~/") {
-        let home = env::var("HOME").context("HOME not set")?;
-        format!("{}{}", home, &path[1..])
-    } else {
-        path.to_string()
-    };
-    let content = fs::read_to_string(&expanded)
-        .with_context(|| format!("failed to read key file {}", expanded))?;
-    Ok(content.trim().to_string())
-}
-
 /// Write a template `config.toml` if one doesn't exist yet.
 pub fn ensure_template(config_dir: &Path) {
     let path = config_dir.join("config.toml");
@@ -1503,6 +863,7 @@ pub fn ensure_template(config_dir: &Path) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     // ── baseline / parsing ───────────────────────────────────────
@@ -1527,7 +888,7 @@ mod tests {
         assert_eq!(config.image.list_limit, 10);
         assert!(config.image.platforms.is_none());
         assert!(config.github.credentials.is_empty());
-        assert_eq!(config.build.container_engine, "auto");
+        assert_eq!(config.build.container_engine, ContainerEngine::Auto);
     }
 
     #[test]
@@ -1564,7 +925,7 @@ mod tests {
         );
         assert_eq!(config.image.list_limit, 25);
         assert_eq!(config.github.credentials.len(), 1);
-        assert_eq!(config.build.container_engine, "podman");
+        assert_eq!(config.build.container_engine, ContainerEngine::Podman);
     }
 
     #[test]

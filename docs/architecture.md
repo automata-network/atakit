@@ -11,12 +11,13 @@ The workspace separates reusable domain logic from terminal presentation:
 ```text
 crates/
   atakit-core/          XDG paths and progress abstractions
+  atakit-config/        shared operator-config schema and secret resolution
   atakit-github/        generic GitHub Releases client
   atakit-image/         base-image distribution and local image store
   atakit-workload/      workload schema, build, stores, and repositories
   atakit-attestation/   verifier-side TLS and TEE attestation logic
   atakit-cloud/         provider plans, execution, state, and portal client
-  atakit-cli/           clap surface, config resolution, and presentation
+  atakit-cli/           clap surface, top-level config composition, and presentation
 ```
 
 Library crates expose their clap types only behind a `cli` feature. The binary
@@ -44,7 +45,9 @@ The operator config lives at `$XDG_CONFIG_HOME/atakit/config.toml` (normally
 credential sources, chains, prover profiles, keys, cloud providers, defaults,
 and targets. Secret values are resolved lazily from a file, an argv-only
 command, or an environment variable; deployment state stores only the selected
-entry names.
+entry names. `atakit-config` owns the sections shared with external tools such
+as `atakit-imgbuild`; each binary composes its own top-level view so it can
+ignore unrelated sections.
 
 ## Domain boundaries
 
@@ -102,10 +105,13 @@ flow and safety invariants.
 
 ```text
 atakit-cli
+  ├── atakit-config
   ├── atakit-image ──────┐
   ├── atakit-workload ───┼── atakit-github ── atakit-core
   ├── atakit-cloud ──────┤
   └── atakit-attestation ┘
+
+atakit-imgbuild (separate repository) ── atakit-config
 ```
 
 Domain crates use typed errors; `anyhow` is reserved for the CLI boundary.
