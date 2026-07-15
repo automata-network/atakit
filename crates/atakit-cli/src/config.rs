@@ -1571,9 +1571,9 @@ mod tests {
         // The child blocked on write(), never exited, and the
         // command was misreported as a timeout.
         //
-        // Drainer threads now read both pipes concurrently with
-        // wait, so a helper that dumps 200 KiB of debug to stderr
-        // and then prints a small token must succeed cleanly.
+        // Bounded nonblocking reads now drain both pipes while the
+        // helper runs, so a helper that dumps 200 KiB of debug to
+        // stderr and then prints a small token must succeed cleanly.
         let spec = CredentialSpec {
             file: None,
             command: Some(vec![
