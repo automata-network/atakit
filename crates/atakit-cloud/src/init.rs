@@ -664,6 +664,8 @@ pub async fn bootstrap_portal_tls(
 
 /// Fetch and verify the portal's TLS attestation with verifier-side trust
 /// material resolved from configured sources before the attestation checks run.
+// Keep the independently sourced trust inputs explicit at this protocol boundary.
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_portal_tls_with_trust_config(
     host: &str,
     status_port: u16,
@@ -1540,7 +1542,7 @@ fn encode_get_tcb_info_call(tcb_type: u64, fmspc: &str, version: u64) -> Vec<u8>
     out.extend_from_slice(&abi_word_u64(fmspc.len() as u64));
     out.extend_from_slice(fmspc);
     let padding = (32 - (fmspc.len() % 32)) % 32;
-    out.extend(std::iter::repeat(0).take(padding));
+    out.resize(out.len() + padding, 0);
     out
 }
 
@@ -2256,6 +2258,8 @@ pub async fn post_portal_init(
     .await
 }
 
+// Keep transport, payload, timeout, and progress controls explicit for callers.
+#[allow(clippy::too_many_arguments)]
 pub async fn post_portal_init_with_client(
     client: &reqwest::Client,
     host: &str,
@@ -2616,7 +2620,7 @@ mod tests {
         returned.extend_from_slice(&abi_word_u64(0));
         returned.extend_from_slice(&abi_word_u64(pkcs1.len() as u64));
         returned.extend_from_slice(&pkcs1);
-        returned.extend(std::iter::repeat(0).take(28));
+        returned.extend_from_slice(&[0; 28]);
 
         let decoded = decode_maa_signing_key_return(&returned).unwrap();
         assert_eq!(decoded.pkcs1_pubkey, pkcs1);

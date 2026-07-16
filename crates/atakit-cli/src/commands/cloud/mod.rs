@@ -323,8 +323,8 @@ fn chain_hierarchy_to_measurement_policy(
                         .iter()
                         .map(|attr| {
                             serde_json::json!({
-                                "key": hex0x(&attr.key),
-                                "value": hex0x(&attr.value),
+                                "key": hex0x(attr.key),
+                                "value": hex0x(attr.value),
                             })
                         })
                         .collect(),
@@ -332,7 +332,7 @@ fn chain_hierarchy_to_measurement_policy(
                 .collect();
             Ok(MeasurementProfile {
                 name: profile.profile.name.clone(),
-                id: hex0x(&profile.profile_id),
+                id: hex0x(profile.profile_id),
                 cloud: cloud.to_string(),
                 tee: tee.to_string(),
                 invariants: profile
@@ -348,8 +348,8 @@ fn chain_hierarchy_to_measurement_policy(
                     .iter()
                     .map(|attr| {
                         serde_json::json!({
-                            "key": hex0x(&attr.key),
-                            "value": hex0x(&attr.value),
+                            "key": hex0x(attr.key),
+                            "value": hex0x(attr.value),
                         })
                     })
                     .collect(),
@@ -358,7 +358,7 @@ fn chain_hierarchy_to_measurement_policy(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(MeasurementPolicy {
-        source: format!("chain:{registry}:{}", hex0x(&hierarchy.base_image_id)),
+        source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
             schema: "atakit.measurement-pack.v1".to_string(),
             revision: 1,
@@ -366,7 +366,7 @@ fn chain_hierarchy_to_measurement_policy(
             base_image: BaseImage {
                 name: hierarchy.spec.name.clone(),
                 version: hierarchy.spec.version.clone(),
-                id: hex0x(&hierarchy.base_image_id),
+                id: hex0x(hierarchy.base_image_id),
                 uri: if hierarchy.spec.uri.is_empty() {
                     None
                 } else {

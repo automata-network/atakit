@@ -3149,7 +3149,7 @@ mod tests {
         let cert_sha: [u8; 32] = Sha256::digest(cert).into();
         let qd = compute_tls_bootstrap_qualifying_data(&nonce, &cert_sha);
         let pcr = [0xaau8; 32];
-        let pcr15 = expected_gcp_snp_pcr15(snp_report).expect("fixture SNP PCR15");
+        let pcr15 = expected_gcp_snp_pcr15(&snp_report).expect("fixture SNP PCR15");
         let quote = fake_tpm_quote(&qd, &[(4, pcr), (15, pcr15)]);
         let (ak_public, signature, cert_chain, roots) = fake_gcp_ak_chain_and_signature(&quote);
         (
@@ -3227,24 +3227,27 @@ mod tests {
         quote
     }
 
-    fn fixture_gcp_snp_report_and_certs() -> (&'static [u8], &'static [u8], Vec<u8>) {
-        let report = include_bytes!(
-            "../../../../automata-tee-workload-measurement/evidence/fedora-oci-gcp-n2d-standard-4/report.bin"
-        );
-        let ark = include_bytes!(
-            "../../../../automata-tee-workload-measurement/evidence/fedora-oci-gcp-n2d-standard-4/ark.der"
-        );
-        let ask = include_bytes!(
-            "../../../../automata-tee-workload-measurement/evidence/fedora-oci-gcp-n2d-standard-4/ask.der"
-        );
-        let vcek = include_bytes!(
-            "../../../../automata-tee-workload-measurement/evidence/fedora-oci-gcp-n2d-standard-4/vcek.der"
-        );
-        (
-            report.as_slice(),
-            ark.as_slice(),
-            fake_amd_snp_auxblob(ark, ask, vcek),
-        )
+    fn fixture_gcp_snp_report_and_certs() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        fn decode_fixture(encoded: &str) -> Vec<u8> {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .expect("embedded GCP SNP fixture must be valid base64")
+        }
+
+        let report = decode_fixture(include_str!(
+            "../testdata/fedora-oci-gcp-n2d-standard-4/report.bin.b64"
+        ));
+        let ark = decode_fixture(include_str!(
+            "../testdata/fedora-oci-gcp-n2d-standard-4/ark.der.b64"
+        ));
+        let ask = decode_fixture(include_str!(
+            "../testdata/fedora-oci-gcp-n2d-standard-4/ask.der.b64"
+        ));
+        let vcek = decode_fixture(include_str!(
+            "../testdata/fedora-oci-gcp-n2d-standard-4/vcek.der.b64"
+        ));
+        let auxblob = fake_amd_snp_auxblob(&ark, &ask, &vcek);
+        (report, ark, auxblob)
     }
 
     fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
@@ -3292,9 +3295,9 @@ mod tests {
         Sha256::digest(&pcr_input).into()
     }
 
-    fn fake_gcp_ak_chain_and_signature(
-        tpm2b_attest: &[u8],
-    ) -> (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    type FakeGcpAkChain = (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    fn fake_gcp_ak_chain_and_signature(tpm2b_attest: &[u8]) -> FakeGcpAkChain {
         let mut ca_params =
             CertificateParams::new(Vec::new()).expect("empty subject alt names are valid");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -3626,16 +3629,16 @@ mod tests {
     fn verifies_gcp_snp_vendor_report_fixture() {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
 
-        verify_snp_report_with_aux_certs(report, &auxblob, &[ark.to_vec()], &[])
+        verify_snp_report_with_aux_certs(&report, &auxblob, &[ark.to_vec()], &[])
             .expect("GCP SEV-SNP fixture report should verify under fixture ARK");
     }
 
     #[test]
     fn verifies_gcp_snp_vendor_report_fixture_with_ark_hash() {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
-        let ark_hash: [u8; 32] = Sha256::digest(ark).into();
+        let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
 
-        verify_snp_report_with_aux_certs(report, &auxblob, &[], &[ark_hash])
+        verify_snp_report_with_aux_certs(&report, &auxblob, &[], &[ark_hash])
             .expect("GCP SEV-SNP fixture report should verify under fixture ARK hash");
     }
 
@@ -3673,7 +3676,7 @@ mod tests {
     #[test]
     fn rejects_gcp_snp_vendor_report_without_trusted_ark() {
         let (report, _, auxblob) = fixture_gcp_snp_report_and_certs();
-        let err = verify_snp_report_with_aux_certs(report, &auxblob, &[], &[])
+        let err = verify_snp_report_with_aux_certs(&report, &auxblob, &[], &[])
             .expect_err("missing trusted ARK root must fail closed");
 
         assert!(err.contains("trusted AMD ARK roots"), "{err}");
