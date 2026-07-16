@@ -305,7 +305,7 @@ pub struct EvidenceSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationFailure {
-    pub report: VerificationReport,
+    pub report: Box<VerificationReport>,
     pub errors: Vec<VerificationError>,
 }
 
@@ -871,7 +871,10 @@ pub fn verify_tls_attestation(
                         inputs.response.platform.cloud, inputs.response.platform.tee
                     ),
                 );
-                return Err(VerificationFailure { report, errors });
+                return Err(VerificationFailure {
+                    report: Box::new(report),
+                    errors,
+                });
             }
             profiles => {
                 let names = profiles
@@ -888,7 +891,10 @@ pub fn verify_tls_attestation(
                         inputs.response.platform.cloud, inputs.response.platform.tee
                     ),
                 );
-                return Err(VerificationFailure { report, errors });
+                return Err(VerificationFailure {
+                    report: Box::new(report),
+                    errors,
+                });
             }
         };
         pass(&mut report, "measurement-profile");
@@ -942,7 +948,10 @@ pub fn verify_tls_attestation(
                         inputs.response.platform.machine_type
                     ),
                 );
-                return Err(VerificationFailure { report, errors });
+                return Err(VerificationFailure {
+                    report: Box::new(report),
+                    errors,
+                });
             }
             variants => {
                 let names = variants
@@ -959,7 +968,10 @@ pub fn verify_tls_attestation(
                         inputs.response.platform.machine_type
                     ),
                 );
-                return Err(VerificationFailure { report, errors });
+                return Err(VerificationFailure {
+                    report: Box::new(report),
+                    errors,
+                });
             }
         };
         pass(&mut report, "measurement-variant");
@@ -1017,7 +1029,10 @@ pub fn verify_tls_attestation(
             variant_id: verified_variant_id,
         })
     } else {
-        Err(VerificationFailure { report, errors })
+        Err(VerificationFailure {
+            report: Box::new(report),
+            errors,
+        })
     }
 }
 
@@ -1817,9 +1832,7 @@ fn verify_amd_snp_cert_chain(
     if !trusted_amd_ark_roots
         .iter()
         .any(|trusted| trusted.as_slice() == ark_der)
-        && !trusted_amd_ark_root_hashes
-            .iter()
-            .any(|trusted| *trusted == ark_hash)
+        && !trusted_amd_ark_root_hashes.contains(&ark_hash)
     {
         return Err(format!(
             "SNP ARK certificate is not in trusted AMD ARK roots; sha256(ark_der)=0x{}",

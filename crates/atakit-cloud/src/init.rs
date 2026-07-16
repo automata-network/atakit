@@ -813,7 +813,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             })
         }
         Err(failure) => handle_tls_attestation_failure(
-            failure.report,
+            *failure.report,
             live_peer_cert_der,
             trust_tls_cert_sha256,
             report_path,
