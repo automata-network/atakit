@@ -33,7 +33,7 @@ pub enum WorkloadCommand {
     Rm(RmArgs),
     /// Initialize a CVM portal directly (e.g. local QEMU)
     #[command(arg_required_else_help = true)]
-    Init(InitArgs),
+    Init(Box<InitArgs>),
 }
 
 /// Arguments for `workload create`.

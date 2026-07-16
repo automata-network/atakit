@@ -1274,10 +1274,8 @@ fn parse_size_mb(s: &str) -> Option<u64> {
         (n, "TB")
     } else if let Some(n) = s.strip_suffix("GB") {
         (n, "GB")
-    } else if let Some(n) = s.strip_suffix("MB") {
-        (n, "MB")
     } else {
-        return None;
+        (s.strip_suffix("MB")?, "MB")
     };
     let num: u64 = num_str.trim().parse().ok()?;
     match suffix {

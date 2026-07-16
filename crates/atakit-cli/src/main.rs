@@ -33,7 +33,7 @@ enum Command {
     Workload(WorkloadCommand),
     /// Manage cloud deployments
     #[command(subcommand)]
-    Cloud(CloudCommand),
+    Cloud(Box<CloudCommand>),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -124,9 +124,11 @@ async fn main() -> Result<()> {
             WorkloadCommand::Export(args) => commands::workload::export::run(args, &env),
             WorkloadCommand::Add(args) => commands::workload::add::run(args, &env, &config).await,
             WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env),
-            WorkloadCommand::Init(args) => commands::workload::init::run(args, &env, &config).await,
+            WorkloadCommand::Init(args) => {
+                commands::workload::init::run(*args, &env, &config).await
+            }
         },
-        Command::Cloud(cmd) => match cmd {
+        Command::Cloud(cmd) => match *cmd {
             CloudCommand::Deploy(args) => {
                 commands::cloud::deploy::run(args, &env, &config, cli.verbose).await
             }
