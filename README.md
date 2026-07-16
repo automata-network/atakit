@@ -466,6 +466,7 @@ See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for
 ```
 crates/
   atakit-core/         # Shared types and progress-reporting abstractions
+  atakit-config/       # Shared operator-config schema and secret resolution
   atakit-github/       # GitHub Releases client
   atakit-image/        # Base-image download, cache, and metadata
   atakit-workload/     # Workload build, registry, and on-chain operations

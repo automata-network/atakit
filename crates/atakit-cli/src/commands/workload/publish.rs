@@ -36,8 +36,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // Inspect workload to get PCR23 and manifest
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => Some(
-            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        None if config.build.container_engine != crate::config::ContainerEngine::Auto => Some(
+            atakit_workload::ContainerEngine::from_str_opt(config.build.container_engine.as_str())?,
         ),
         None => None,
     };

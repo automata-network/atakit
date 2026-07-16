@@ -1,0 +1,13 @@
+[package]
+name = "atakit-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+libc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

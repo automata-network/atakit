@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/atakit-core",
+    "crates/atakit-config",
     "crates/atakit-github",
     "crates/atakit-image",
     "crates/atakit-workload",
@@ -9,6 +10,7 @@ members = [
     "crates/atakit-cloud",
     "crates/atakit-cli",
 ]
+exclude = ["vendor/lazy_static"]
 
 [workspace.package]
 version = "0.5.5"
@@ -22,6 +24,7 @@ serde_json = "1"
 base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
+libc = "0.2"
 
 # Network
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
@@ -64,11 +67,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Internal
 atakit-core = { path = "crates/atakit-core" }
+atakit-config = { path = "crates/atakit-config" }
 atakit-github = { path = "crates/atakit-github" }
 atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
 atakit-attestation = { path = "crates/atakit-attestation" }
 atakit-cloud = { path = "crates/atakit-cloud" }
+
+[patch.crates-io]
+# lazy_static 1.5.0 pins the yanked spin 0.9.8 release. Keep its public API
+# unchanged while moving the optional no_std backend to the compatible current
+# spin release. See vendor/lazy_static/README.md.
+lazy_static = { path = "vendor/lazy_static" }
 
 
 # Optimize compression and crypto in dev builds -- decompression
