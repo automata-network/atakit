@@ -9,11 +9,13 @@ use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::qemu::QemuProvider;
+use atakit_cloud::session::{self, TrustedWorkloadSessionPolicy};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{
     AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, PortalPorts,
     ProcessRunner, QemuResources,
 };
+use atakit_config::{KeyMode, KeyType, TransactionSubmitter};
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
@@ -392,6 +394,17 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         target.registration.clone()
     };
     let registration_off = registration_is_off(effective_registration.as_deref());
+    let verify_offchain_session = registration_off && !is_qemu;
+    if registration_off
+        && !is_qemu
+        && args.unsafe_skip_tls_attestation
+        && !image_only
+        && !args.skip_init
+    {
+        bail!(
+            "registration-off deployment requires full TLS attestation so the current session can be verified off-chain; remove --unsafe-skip-tls-attestation"
+        );
+    }
     init_env.sp1_payer = super::effective_prover_credential(
         config,
         (!init_env.chain.is_empty()).then_some(init_env.chain.as_str()),
@@ -880,6 +893,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 // signing is load-bearing.
                 let owner_key_name = &init_env.owner_key;
                 let registration_off = registration_is_off(registration);
+                let cli_submits = !registration_off
+                    && init_chain.transaction_submitter == TransactionSubmitter::AtakitCli;
                 let owner_init = match config.keys.get(owner_key_name) {
                     Some(spec) => init_key_from_config(owner_key_name, spec, false)?,
                     None if registration_off => synthesize_self_generated_key(),
@@ -894,6 +909,27 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     None if gas_wallet_name.is_empty() => synthesize_self_generated_key(),
                     None if registration_off => synthesize_self_generated_key(),
                     None => bail!("key '{gas_wallet_name}' not found in [keys]"),
+                };
+                let external_gas_signer = if !cli_submits {
+                    None
+                } else {
+                    let spec = config.keys.get(gas_wallet_name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "gas_wallet must name a provisioned es256k key for external session registration"
+                        )
+                    })?;
+                    if spec.key_type != KeyType::Es256k || spec.mode != KeyMode::Provisioned {
+                        bail!("gas wallet '{gas_wallet_name}' must be a provisioned es256k key");
+                    }
+                    let private_key = gas_init.private_key.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "gas wallet '{gas_wallet_name}' did not resolve to a private key"
+                        )
+                    })?;
+                    Some(super::register::parse_gas_wallet_private_key(
+                        gas_wallet_name,
+                        private_key,
+                    )?)
                 };
 
                 // The effective name was resolved and persisted before any
@@ -921,10 +957,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     disks: disk_passphrases.clone(),
                 };
 
-                let portal_client = if args.unsafe_skip_tls_attestation {
+                let verified_tls = if args.unsafe_skip_tls_attestation {
                     super::warn_unsafe_skip_tls_attestation();
-                    init::unsafe_portal_client(std::time::Duration::from_secs(300))
-                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                    None
                 } else {
                     let measurement_policy = resolve_tls_measurement_policy(
                         args.measurements.as_deref(),
@@ -966,7 +1001,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     if let Some(message) = init::tls_manual_override_message(&verified_tls) {
                         eprintln!("{message}");
                     }
-                    verified_tls.client
+                    Some(verified_tls)
+                };
+                let portal_client = match &verified_tls {
+                    Some(verified) => verified.client.clone(),
+                    None => init::unsafe_portal_client(std::time::Duration::from_secs(300))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
 
                 match init::post_portal_init_with_client(
@@ -982,12 +1022,59 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 .await
                 {
                     Ok(()) => {
-                        // /init returned 2xx; portal accepted the payload. The
-                        // actual chain submission and workload boot happen
-                        // async inside the CVM, so poll /status until the
-                        // portal reaches a terminal state. "Deployment
-                        // complete!" can only be claimed when state=Running.
+                        // /init returned 2xx. Only the explicit atakit-cli mode
+                        // uses the external signer here; the portal owns the
+                        // default submission path.
                         eprintln!();
+                        if let Some(signer) = external_gas_signer {
+                            let chain = config.chains.get(chain_name).expect(
+                                "active registration resolved a configured chain before /init",
+                            );
+                            match super::register::submit_prepared_registration(
+                                &portal_client,
+                                &ip,
+                                status_port,
+                                chain,
+                                signer,
+                                portal_wait_timeout_secs,
+                            )
+                            .await
+                            {
+                                Ok(super::register::RegistrationResult::LocalFallback {
+                                    session_id,
+                                }) => {
+                                    eprintln!("      local fallback session: {session_id}");
+                                }
+                                Ok(super::register::RegistrationResult::AlreadyActive {
+                                    session_id,
+                                }) => {
+                                    eprintln!("      session already active: {session_id}");
+                                }
+                                Ok(super::register::RegistrationResult::Submitted {
+                                    session_id,
+                                    tx_hash,
+                                }) => {
+                                    eprintln!("      session: {session_id}");
+                                    eprintln!("      tx:      {tx_hash}");
+                                }
+                                Err(error) => {
+                                    eprintln!("{}", "failed".red());
+                                    if !args.keep_going {
+                                        state.set_status(
+                                            DeployStatus::Failed {
+                                                step: step.to_string(),
+                                                message: error.to_string(),
+                                            },
+                                            &env.data_dir,
+                                        )?;
+                                        return Err(error);
+                                    }
+                                    eprintln!("  warning: {error}");
+                                }
+                            }
+                        }
+                        // Only Running means init and required registration
+                        // both completed.
                         let outcome = init::wait_for_portal_terminal_with_client(
                             &portal_client,
                             &ip,
@@ -1035,6 +1122,42 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                                 }
                                 eprintln!("  warning: {e}");
                             }
+                        }
+                        if verify_offchain_session {
+                            let verified_tls = verified_tls.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "off-chain session verification requires full TLS attestation"
+                                )
+                            })?;
+                            let workload_id = crate::commands::workload::compute_workload_id(
+                                &workload_name,
+                                &workload_version,
+                            );
+                            eprint!("      verifying current session... ");
+                            let verified = session::verify_current_session(
+                                verified_tls,
+                                &ip,
+                                status_port,
+                                TrustedWorkloadSessionPolicy {
+                                    workload_id: workload_id.0,
+                                    attribute_requirements: Vec::new(),
+                                },
+                                Some(atakit_attestation::BindingMode::Local),
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                            let report_path = super::verify_session::session_report_path(
+                                &env.data_dir,
+                                target_name,
+                                &instance_name,
+                            );
+                            if let Some(parent) = report_path.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            std::fs::write(&report_path, serde_json::to_vec_pretty(&verified)?)?;
+                            eprintln!("{}", "done".green());
+                            eprintln!("      session: 0x{}", hex::encode(verified.session_id));
+                            eprintln!("      report:  {}", report_path.display());
                         }
                     }
                     Err(e) => {

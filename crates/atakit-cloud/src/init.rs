@@ -9,6 +9,7 @@ use atakit_attestation::{
     MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
     VerificationReport, VerifiedTlsIdentity,
 };
+use atakit_config::TransactionSubmitter;
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -301,6 +302,8 @@ pub struct InitChainConfig {
     /// portal falls back to its `"network"` default. Only consulted for
     /// AMD SEV-SNP CVMs (TDX ignores it). Sent as `chain.proving_strategy`.
     pub proving_strategy: Option<String>,
+    /// Component that signs and submits chain transactions.
+    pub transaction_submitter: TransactionSubmitter,
 }
 
 #[derive(Debug, Clone)]
@@ -346,12 +349,11 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "base_image_registry": config.chain.base_image_registry,
         },
         "tee_backend": config.chain.tee_backend,
+        "transaction_submitter": config.chain.transaction_submitter,
     });
-    // `registration` and `chain_id` are only included when set so
-    // pre-existing configs that don't carry them keep producing the
-    // exact same JSON the portal saw before (and the portal's
-    // "section present, no registration field → required" default
-    // continues to apply).
+    // `registration` and `chain_id` are only included when set. The portal's
+    // "section present, no registration field → required" default continues
+    // to apply.
     if let Some(ref reg) = config.chain.registration {
         chain["registration"] = serde_json::Value::String(reg.clone());
     }
@@ -421,6 +423,9 @@ pub struct VerifiedPortalTls {
     pub client: reqwest::Client,
     pub identity: VerifiedTlsIdentity,
     pub manual_override: Option<TlsManualOverride>,
+    /// Independently trusted inputs retained for current-session
+    /// verification. This is absent for a manual TLS certificate override.
+    pub session_verification: Option<crate::session::PortalSessionVerificationContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +556,21 @@ pub fn load_measurement_policy(
     }
 
     Ok(Some(MeasurementPolicy { source, pack }))
+}
+
+/// Return whether both files for the automatic local pack lookup exist.
+///
+/// Callers use this only to choose local-versus-chain precedence. Once a local
+/// pack exists, loading or signature errors must fail closed instead of falling
+/// back to a different policy source.
+pub fn local_measurement_pack_exists(
+    data_dir: &Path,
+    base_image: &str,
+) -> Result<bool, CloudError> {
+    let (name, version) = parse_base_image_ref(base_image)?;
+    let dir = local_measurement_pack_dir(data_dir, name, version);
+    let (json, signature) = measurement_pack_dir_paths(&dir);
+    Ok(json.is_file() && signature.is_file())
 }
 
 fn parse_base_image_ref(value: &str) -> Result<(&str, &str), CloudError> {
@@ -720,6 +740,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                     report,
                     report_path: written_report_path,
                 }),
+                session_verification: None,
             });
         }
         let report_location = written_report_path
@@ -794,6 +815,14 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
+    let session_verification = measurement_policy.clone().map(|measurement_policy| {
+        crate::session::PortalSessionVerificationContext {
+            platform: response.platform.clone(),
+            measurement_policy,
+            trust_anchors: trust_anchors.clone(),
+            tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
+        }
+    });
     match verify_tls_attestation(VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
@@ -807,6 +836,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 client,
                 identity,
                 manual_override: None,
+                session_verification,
             })
         }
         Err(failure) => handle_tls_attestation_failure(
@@ -1965,6 +1995,7 @@ fn handle_tls_attestation_failure(
                 report,
                 report_path: written_report_path,
             }),
+            session_verification: None,
         });
     }
     let report_json = serde_json::to_string_pretty(&report)
@@ -2055,7 +2086,7 @@ pub fn unsafe_portal_client(timeout: Duration) -> Result<reqwest::Client, CloudE
         })
 }
 
-fn random_nonce() -> Result<[u8; 32], CloudError> {
+pub(crate) fn random_nonce() -> Result<[u8; 32], CloudError> {
     let mut nonce = [0u8; 32];
     let mut file = std::fs::File::open("/dev/urandom").map_err(|e| CloudError::IoPath {
         path: "/dev/urandom".into(),
@@ -2382,6 +2413,7 @@ mod tests {
                     options: BTreeMap::new(),
                 }),
                 proving_strategy: None,
+                transaction_submitter: TransactionSubmitter::AtakitPortal,
             },
             owner_operations: atakit_config::OwnerOperationsConfig::default(),
             owner_key: InitKeyConfig {
@@ -2634,6 +2666,7 @@ mod tests {
         assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
         assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
         assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
+        assert_eq!(json["chain"]["transaction_submitter"], "atakit-portal");
         assert!(json["chain"].get("expire_offset").is_none());
         assert_eq!(json["owner_operations"]["op_expiry_seconds"], 300);
         assert_eq!(json["owner_operations"]["challenge_expiry_seconds"], 60);
@@ -2857,6 +2890,25 @@ mod tests {
                 .contains("baseimage/measurements/base/v1/measurement-pack.json"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn local_measurement_pack_exists_requires_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir
+            .path()
+            .join("baseimage")
+            .join("measurements")
+            .join("base")
+            .join("v1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::write(pack_dir.join("measurement-pack.sig"), b"signature").unwrap();
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
     }
 
     #[test]

@@ -153,6 +153,12 @@ async fn main() -> Result<()> {
                 CloudProviderCommand::Ls => commands::cloud::provider::run(&config),
             },
             CloudCommand::Init(args) => commands::cloud::init::run(args, &env, &config).await,
+            CloudCommand::Register(args) => {
+                commands::cloud::register::run(args, &env, &config).await
+            }
+            CloudCommand::VerifySession(args) => {
+                commands::cloud::verify_session::run(args, &env, &config).await
+            }
         },
         Command::External(args) => {
             let subcmd = &args[0];

@@ -45,6 +45,45 @@ pub async fn create_firewall(
     Ok(())
 }
 
+/// Replace the allowed ports on an existing firewall rule.
+///
+/// Image-only deployments create the rule before a workload is known. `cloud
+/// init` calls this after it resolves the workload manifest.
+pub async fn update_firewall(
+    project: &str,
+    rule_name: &str,
+    ports: &[String],
+    runner: &dyn CommandRunner,
+) -> Result<(), CloudError> {
+    let rules: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let (port, proto) = p.split_once('/').unwrap_or((p, "tcp"));
+            format!("{proto}:{port}")
+        })
+        .collect();
+    let allow = rules.join(",");
+    runner
+        .run_capture(
+            "gcloud",
+            &[
+                "compute",
+                "firewall-rules",
+                "update",
+                rule_name,
+                "--project",
+                project,
+                &format!("--rules={allow}"),
+            ],
+        )
+        .await
+        .map_err(|e| CloudError::FirewallError {
+            message: format!("failed to update firewall rule: {e}"),
+        })?;
+
+    Ok(())
+}
+
 /// Check if a firewall rule exists.
 pub async fn check_firewall_exists(
     project: &str,

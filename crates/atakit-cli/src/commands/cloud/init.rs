@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use atakit_cloud::cli::InitArgs;
-use atakit_cloud::init::{self, InitConfig};
-use atakit_cloud::state::{DeployState, DeployStatus};
+use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
+use atakit_cloud::session::{self, TrustedWorkloadSessionPolicy};
+use atakit_cloud::state::{DeployState, DeployStatus, PortalPorts};
+use atakit_cloud::{PlatformKind, ProcessRunner};
+use atakit_config::{KeyMode, KeyType, TransactionSubmitter};
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
@@ -52,6 +55,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let archive_path = resolved.archive_path;
     let workload_name = resolved.name;
     let workload_version = resolved.version;
+    let workload_ports = resolved.ports;
 
     // Collect unmeasured-data files. Explicit root flags take precedence over
     // the default <workload-dir>/unmeasured-data root.
@@ -162,6 +166,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // Owner/gas/sp1 can be provisioned keys supplied by a relay/prover
     // operator or self-generated ephemeral keys.
     let registration_off = registration_is_off(registration);
+    let cli_submits =
+        !registration_off && init_chain.transaction_submitter == TransactionSubmitter::AtakitCli;
     let owner_init = match owner_key_name.as_deref() {
         Some(name) if config.keys.contains_key(name) => {
             init_key_from_config(name, &config.keys[name], false)?
@@ -178,6 +184,29 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             None => bail!("key '{name}' not found in [keys]"),
         },
         None => synthesize_self_generated_key(),
+    };
+    // Resolve an external signer only when the chain profile explicitly gives
+    // transaction submission to atakit-cli. atakit-portal is the default.
+    let external_gas_signer = if !cli_submits {
+        None
+    } else {
+        let name = gas_wallet_name.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("gas_wallet must be set for external session registration")
+        })?;
+        let spec = config
+            .keys
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("key '{name}' not found in [keys]"))?;
+        if spec.key_type != KeyType::Es256k || spec.mode != KeyMode::Provisioned {
+            bail!("gas wallet '{name}' must be a provisioned es256k key");
+        }
+        let private_key = gas_init.private_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("gas wallet '{name}' did not resolve to a private key")
+        })?;
+        Some(super::register::parse_gas_wallet_private_key(
+            name,
+            private_key,
+        )?)
     };
     let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
     // Resolve with the same precedence as deploy. A selected chain profile
@@ -219,6 +248,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 target.provider
             )
         })?;
+    let verify_offchain_session =
+        registration_off && !matches!(provider_config.platform, atakit_cloud::PlatformKind::Qemu);
+    let reconcile_gcp_firewall = matches!(provider_config.platform, PlatformKind::Gcp);
+    if registration_off
+        && args.unsafe_skip_tls_attestation
+        && !matches!(provider_config.platform, atakit_cloud::PlatformKind::Qemu)
+    {
+        bail!(
+            "registration-off initialization requires full TLS attestation so the current session can be verified off-chain; remove --unsafe-skip-tls-attestation"
+        );
+    }
 
     // Validate operator-supplied disk passphrases against what the workload
     // manifest declares (unknown / orphan / missing disks) before touching
@@ -242,8 +282,30 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     // 6. Show plan and confirm.
     eprintln!("{}", "Plan:".dimmed());
-    eprintln!("  1. Wait for CVM portal");
-    eprintln!("  2. Initialize workload");
+    if reconcile_gcp_firewall {
+        eprintln!("  1. Open the workload ports on the existing firewall");
+        eprintln!("  2. Wait for CVM portal");
+        eprintln!("  3. Initialize workload");
+    } else {
+        eprintln!("  1. Wait for CVM portal");
+        eprintln!("  2. Initialize workload");
+    }
+    if !registration_off {
+        let owner = if cli_submits {
+            "atakit-cli"
+        } else {
+            "atakit-portal"
+        };
+        eprintln!(
+            "  {}. Wait for session registration by {owner}",
+            if reconcile_gcp_firewall { 4 } else { 3 }
+        );
+    } else if verify_offchain_session {
+        eprintln!(
+            "  {}. Verify the local-bound session evidence off-chain",
+            if reconcile_gcp_firewall { 4 } else { 3 }
+        );
+    }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
     eprintln!(
@@ -274,18 +336,54 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // 7. Wait for portal.
-    eprint!("  [1/3] Wait for CVM portal... ");
+    let mut step_count = if verify_offchain_session || !registration_off {
+        4
+    } else {
+        3
+    };
+    if reconcile_gcp_firewall {
+        step_count += 1;
+    }
+    let mut step = 1;
+    if reconcile_gcp_firewall {
+        eprint!("  [{step}/{step_count}] Update firewall... ");
+        let gcp = state.resources.gcp.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("deployment has no saved GCP resources for firewall update")
+        })?;
+        let rule = gcp
+            .firewall_rule
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("deployment has no saved GCP firewall rule"))?;
+        let mut ports = state.portal_ports.firewall_entries();
+        for port in &workload_ports {
+            if PortalPorts::is_default_portal_entry(port) || ports.contains(port) {
+                continue;
+            }
+            ports.push(port.clone());
+        }
+        atakit_cloud::gcp::firewall::update_firewall(
+            &gcp.project,
+            rule,
+            &ports,
+            &ProcessRunner::default(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        eprintln!("{}", "done".green());
+        step += 1;
+    }
+    eprint!("  [{step}/{step_count}] Wait for CVM portal... ");
     init::wait_for_portal(&portal_host, status_port, args.timeout)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
+    step += 1;
 
-    eprint!("  [2/3] Verify portal TLS... ");
-    let portal_client = if args.unsafe_skip_tls_attestation {
+    eprint!("  [{step}/{step_count}] Verify portal TLS... ");
+    let verified_tls = if args.unsafe_skip_tls_attestation {
         eprintln!("{}", "unsafe bypass".yellow());
         super::warn_unsafe_skip_tls_attestation();
-        init::unsafe_portal_client(std::time::Duration::from_secs(300))
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+        None
     } else {
         let measurement_policy = resolve_tls_measurement_policy(
             args.measurements.as_deref(),
@@ -330,11 +428,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         } else {
             eprintln!("{}", "done".green());
         }
-        verified_tls.client
+        Some(verified_tls)
+    };
+    step += 1;
+    let portal_client = match &verified_tls {
+        Some(verified) => verified.client.clone(),
+        None => init::unsafe_portal_client(std::time::Duration::from_secs(300))
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
 
     // 8. Initialize workload.
-    eprintln!("  [3/3] Initialize workload...");
+    eprintln!("  [{step}/{step_count}] Initialize workload...");
     init::post_portal_init_with_client(
         &portal_client,
         &portal_host,
@@ -348,14 +452,16 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("  {}", "done".green());
+    step += 1;
 
-    // 9. Update state.
+    // 9. Save recovery inputs before the external transaction. If the CLI is
+    // interrupted after /init, `cloud register` can safely resume.
     state.workload_name = workload_name.clone();
     state.workload_version = workload_version.clone();
     state.archive_path = archive_path.display().to_string();
     state.archive_hash = archive_hash;
     state.init_env = atakit_cloud::PersistedInitEnv {
-        chain: chain_name.unwrap_or_default(),
+        chain: chain_name.clone().unwrap_or_default(),
         owner_key: owner_key_name.unwrap_or_default(),
         gas_wallet: gas_wallet_name.unwrap_or_default(),
         sp1_payer: sp1_payer_name,
@@ -364,7 +470,128 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .save(&env.data_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 10. Summary.
+    if verify_offchain_session {
+        match init::wait_for_portal_terminal_with_client(
+            &portal_client,
+            &portal_host,
+            status_port,
+            args.timeout,
+            |state| eprintln!("      state: {state}"),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            PortalTerminalState::Running => {}
+            PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
+                bail!("portal did not reach Running: {detail}")
+            }
+        }
+
+        eprint!("  [{step}/{step_count}] Verify current session... ");
+        let verified_tls = verified_tls.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "off-chain session verification requires full TLS attestation; remove --unsafe-skip-tls-attestation"
+            )
+        })?;
+        let workload_id =
+            crate::commands::workload::compute_workload_id(&workload_name, &workload_version);
+        let verified = session::verify_current_session(
+            verified_tls,
+            &portal_host,
+            status_port,
+            TrustedWorkloadSessionPolicy {
+                workload_id: workload_id.0,
+                attribute_requirements: Vec::new(),
+            },
+            Some(atakit_attestation::BindingMode::Local),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let report_path =
+            super::verify_session::session_report_path(&env.data_dir, &target_name, &instance_name);
+        if let Some(parent) = report_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&verified)?)?;
+        eprintln!("{}", "done".green());
+        eprintln!("      session: 0x{}", hex::encode(verified.session_id));
+        eprintln!("      report:  {}", report_path.display());
+    }
+
+    // 10. atakit-cli submission is an explicit compatibility path.
+    if let Some(signer) = external_gas_signer {
+        eprint!("  [{step}/{step_count}] Register session... ");
+        let chain_name = chain_name
+            .as_deref()
+            .expect("active registration resolved a chain name");
+        let chain = config
+            .chains
+            .get(chain_name)
+            .expect("active registration resolved a chain config");
+        let result = super::register::submit_prepared_registration(
+            &portal_client,
+            &portal_host,
+            status_port,
+            chain,
+            signer,
+            args.timeout,
+        )
+        .await?;
+        match result {
+            super::register::RegistrationResult::LocalFallback { session_id } => {
+                eprintln!(
+                    "{} ({session_id})",
+                    "local fallback; no transaction".yellow()
+                );
+            }
+            super::register::RegistrationResult::AlreadyActive { session_id } => {
+                eprintln!("{} ({session_id})", "already active".green());
+            }
+            super::register::RegistrationResult::Submitted {
+                session_id,
+                tx_hash,
+            } => {
+                eprintln!("{}", "confirmed".green());
+                eprintln!("      Session: {session_id}");
+                eprintln!("      Tx:      {tx_hash}");
+            }
+        }
+        match init::wait_for_portal_terminal_with_client(
+            &portal_client,
+            &portal_host,
+            status_port,
+            args.timeout,
+            |state| eprintln!("      state: {state}"),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            PortalTerminalState::Running => {}
+            PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
+                bail!("portal did not reach Running: {detail}")
+            }
+        }
+    }
+
+    if !registration_off && !cli_submits {
+        match init::wait_for_portal_terminal_with_client(
+            &portal_client,
+            &portal_host,
+            status_port,
+            args.timeout,
+            |state| eprintln!("      state: {state}"),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            PortalTerminalState::Running => {}
+            PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
+                bail!("portal did not reach Running: {detail}")
+            }
+        }
+    }
+
+    // 11. Summary.
     eprintln!();
     eprintln!("{}", "==> Workload initialized!".green().bold());
     eprintln!();

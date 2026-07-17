@@ -4,9 +4,11 @@ pub mod image;
 pub mod init;
 pub mod list;
 pub mod provider;
+pub mod register;
 pub mod serial;
 pub mod ssh;
 pub mod status;
+pub mod verify_session;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -200,6 +202,7 @@ pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
         tee_backend: "auto".to_string(),
         prover: None,
         proving_strategy: None,
+        transaction_submitter: atakit_config::TransactionSubmitter::AtakitPortal,
     }
 }
 
@@ -243,6 +246,18 @@ pub(crate) async fn resolve_tls_measurement_policy(
     let Some(base_image_ref) = base_image else {
         return Ok(None);
     };
+
+    if atakit_cloud::init::local_measurement_pack_exists(data_dir, base_image_ref)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        return atakit_cloud::init::load_measurement_policy(
+            None,
+            Some(base_image_ref),
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
+    }
 
     if chain_measurement_policy_available(init_chain) {
         return Ok(Some(
@@ -561,6 +576,7 @@ fn build_init_chain_config(
                 .collect(),
         }),
         proving_strategy: chain.proving_strategy.clone(),
+        transaction_submitter: chain.transaction_submitter,
     })
 }
 
@@ -1518,6 +1534,7 @@ fn test_chain_config() -> ChainConfig {
         tee_backend: "auto".to_string(),
         prover: None,
         proving_strategy: None,
+        transaction_submitter: atakit_config::TransactionSubmitter::AtakitPortal,
     }
 }
 

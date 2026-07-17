@@ -1204,8 +1204,12 @@ fn verify_pcr_spec(
     }
 
     let verify_type = match spec.verify_type.to_ascii_uppercase().as_str() {
-        "DYNAMIC_SUBSET" | "DYNAMIC-SUBSET" => SessionPcrVerifyType::DynamicSubset,
-        "DYNAMIC_SUBSEQUENCE" | "DYNAMIC-SUBSEQUENCE" => SessionPcrVerifyType::DynamicSubsequence,
+        "DYNAMICSUBSET" | "DYNAMIC_SUBSET" | "DYNAMIC-SUBSET" => {
+            SessionPcrVerifyType::DynamicSubset
+        }
+        "DYNAMICSUBSEQUENCE" | "DYNAMIC_SUBSEQUENCE" | "DYNAMIC-SUBSEQUENCE" => {
+            SessionPcrVerifyType::DynamicSubsequence
+        }
         other => {
             fail(
                 report,
@@ -2352,7 +2356,31 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "pcr-4-dynamicSubset"));
+            .any(|error| error.check == "pcr-4-dynamicSubset"
+                && error.detail.contains("measured event log is empty")));
+    }
+
+    #[test]
+    fn verifier_parses_camel_case_dynamic_subsequence() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let response = response_for(nonce, cert, "gcp");
+        let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
+        policy.pack.profiles[0].invariants[0].verify_type = "dynamicSubsequence".to_string();
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors::default(),
+        })
+        .expect_err("dynamic PCR without an event log should fail closed");
+
+        assert!(failure.errors.iter().any(|error| {
+            error.check == "pcr-4-dynamicSubsequence"
+                && error.detail.contains("measured event log is empty")
+        }));
     }
 
     #[test]
@@ -2832,11 +2860,12 @@ mod tests {
         binding_signature.push(recovery_id.to_byte());
 
         let inputs = SessionVerificationInputs {
-            bundle: bundle.clone(),
+            bundle: serde_json::to_value(&bundle).unwrap(),
             request_binding: SessionRequestBinding {
                 challenge: URL_SAFE_NO_PAD.encode(challenge),
                 signature: hex0x(&binding_signature),
             },
+            expected_challenge: challenge,
             trust: SessionTrust {
                 platform: SessionPlatformTrust::GcpSnp {
                     gcp_ak_roots: CertificateTrust {
@@ -2867,8 +2896,17 @@ mod tests {
         assert_eq!(verified.attestation_mode, SessionAttestationMode::Hardware);
         assert!(bundle.owner.contract_authorization.take().is_none());
 
+        let mut replayed = inputs.clone();
+        replayed.expected_challenge = [0x56; 32];
+        let failure = crate::session::verify_session_bundle(replayed)
+            .expect_err("a binding for an old challenge must not verify");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.contains("request-challenge")));
+
         let mut mislabeled = inputs.clone();
-        mislabeled.bundle.platform.attestation_mode = SessionAttestationMode::Emulation;
+        mislabeled.bundle["platform"]["attestation_mode"] = serde_json::json!("emulation");
         let failure = crate::session::verify_session_bundle(mislabeled)
             .expect_err("emulation classification must not enter the production verifier");
         assert!(failure

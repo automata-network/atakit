@@ -61,6 +61,9 @@ pub enum CloudError {
     #[error("portal TLS attestation failed: {message}")]
     PortalTlsAttestationFailed { message: String },
 
+    #[error("portal session verification failed: {message}")]
+    PortalSessionVerificationFailed { message: String },
+
     #[error("deploy failed at step '{step}': {message}")]
     DeployFailed { step: String, message: String },
 
