@@ -233,6 +233,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let init_config = InitConfig {
         platform: provider_config.platform.to_string(),
         chain: init_chain,
+        owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
         prover_credential: prover_init,

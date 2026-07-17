@@ -1058,6 +1058,7 @@ version = "0.5.5"
 dependencies = [
  "async-trait",
  "atakit-attestation",
+ "atakit-config",
  "atakit-core",
  "base64 0.22.1",
  "chrono",

@@ -108,10 +108,10 @@ pub struct DeactivateArgs {
     /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds. If omitted, falls back to
-    /// `[chains.<name>] expire_offset` (default 300).
+    /// Owner-operation validity window in seconds. If omitted, falls back to
+    /// `[owner_operations] op_expiry_seconds` (default 300).
     #[arg(long)]
-    pub expire_offset: Option<u64>,
+    pub op_expiry_seconds: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
@@ -134,10 +134,10 @@ pub struct PublishArgs {
     /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds. If omitted, falls back to
-    /// `[chains.<name>] expire_offset` (default 300).
+    /// Owner-operation validity window in seconds. If omitted, falls back to
+    /// `[owner_operations] op_expiry_seconds` (default 300).
     #[arg(long)]
-    pub expire_offset: Option<u64>,
+    pub op_expiry_seconds: Option<u64>,
     /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
     #[arg(long = "session-ttl")]
     pub session_ttl: Option<u64>,

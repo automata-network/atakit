@@ -206,7 +206,7 @@ impl ImageConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageRepositorySpec {
     pub repo: String,
@@ -269,8 +269,6 @@ pub struct ChainConfig {
     pub session_registry: String,
     pub workload_registry: Option<String>,
     pub base_image_registry: Option<String>,
-    #[serde(default = "default_expire_offset")]
-    pub expire_offset: u64,
     #[serde(default)]
     pub chain_id: Option<u64>,
     #[serde(default = "default_tee_backend")]
@@ -285,8 +283,29 @@ fn default_tee_backend() -> String {
     "auto".to_string()
 }
 
-fn default_expire_offset() -> u64 {
-    300
+/// Global limits for owner-authorized portal and registry operations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OwnerOperationsConfig {
+    pub op_expiry_seconds: u64,
+    pub challenge_expiry_seconds: u64,
+    pub max_request_body_bytes: usize,
+    pub max_waiting_requests: usize,
+    pub max_completed_request_statuses: usize,
+    pub request_status_retention_seconds: u64,
+}
+
+impl Default for OwnerOperationsConfig {
+    fn default() -> Self {
+        Self {
+            op_expiry_seconds: 300,
+            challenge_expiry_seconds: 60,
+            max_request_body_bytes: 1_048_576,
+            max_waiting_requests: 64,
+            max_completed_request_statuses: 256,
+            request_status_retention_seconds: 3_600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1301,6 +1320,7 @@ mod tests {
     #[serde(default)]
     struct SharedConfigFixture {
         chains: IndexMap<String, ChainConfig>,
+        owner_operations: OwnerOperationsConfig,
         provers: IndexMap<String, ProverSpec>,
         keys: IndexMap<String, KeySpec>,
         image: ImageConfig,
@@ -1313,6 +1333,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 chains: IndexMap::new(),
+                owner_operations: OwnerOperationsConfig::default(),
                 provers: IndexMap::new(),
                 keys: IndexMap::new(),
                 image: ImageConfig::default(),
@@ -1392,6 +1413,9 @@ mod tests {
             backend = "sp1"
             execution = "network"
 
+            [owner_operations]
+            op_expiry_seconds = 900
+
             [keys.owner]
             type = "es256k"
             mode = "provisioned"
@@ -1414,6 +1438,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.chains["hoodi"].tee_backend, "zk");
+        assert_eq!(config.owner_operations.op_expiry_seconds, 900);
         assert_eq!(
             config.chains["hoodi"].prover.as_deref(),
             Some("sp1-network")

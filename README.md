@@ -78,8 +78,10 @@ rpc_url             = "https://1rpc.io/hoodi"
 session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
-expire_offset       = 3600
 tee_backend         = "auto"       # SNP -> ZK, TDX -> Solidity
+
+[owner_operations]
+op_expiry_seconds   = 3600
 
 # secp256k1 private keys, read from the files created in step 1.
 [keys.owner]
@@ -332,9 +334,11 @@ rpc_url             = "https://1rpc.io/hoodi"
 session_registry    = "0xB247950fBBFCE245641e433AFd7d8884328CE5A1"
 workload_registry   = "0xda6430E06385F7516963f8A3B4e87beBb89860F8"
 base_image_registry = "0xCbe56f9B73c822679Cf36DcF8D99434E0f1588Ca"
-expire_offset       = 3600
 tee_backend         = "auto"       # "auto" | "solidity" | "zk"
 # prover             = "sp1-network" # required when selecting ZK explicitly
+
+[owner_operations]
+op_expiry_seconds   = 3600
 
 # ─── Keys ─────────────────────────────────────────────────────────────
 # `provisioned` keys supply the private key via exactly one of

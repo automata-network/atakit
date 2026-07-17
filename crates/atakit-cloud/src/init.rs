@@ -53,6 +53,7 @@ pub struct InitConfig {
     /// Sent verbatim as `platform.declared` in the init JSON (e.g. "gcp", "azure", "qemu").
     pub platform: String,
     pub chain: InitChainConfig,
+    pub owner_operations: atakit_config::OwnerOperationsConfig,
     pub owner_key: InitKeyConfig,
     pub gas_wallet: InitKeyConfig,
     /// Backend-neutral credential delegated to the selected prover daemon.
@@ -280,12 +281,6 @@ pub struct InitChainConfig {
     pub session_registry: String,
     pub workload_registry: String,
     pub base_image_registry: String,
-    /// Seconds. Validity window for owner-key-signed messages submitted to
-    /// the on-chain registries. Inside the CVM the portal applies it to
-    /// `registerCvm`; on the operator side the same chain default backs
-    /// the publish/deactivate/imgbuild publish signature offsets. Sent to
-    /// the portal as `chain.expire_offset`.
-    pub expire_offset: u64,
     /// Portal-side chain-registration policy (`"required"` |
     /// `"optional"` | `"off"`). `None` ⇒ field omitted from the
     /// `/init` JSON; the portal falls back to its `"required"`
@@ -350,7 +345,6 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "workload_registry": config.chain.workload_registry,
             "base_image_registry": config.chain.base_image_registry,
         },
-        "expire_offset": config.chain.expire_offset,
         "tee_backend": config.chain.tee_backend,
     });
     // `registration` and `chain_id` are only included when set so
@@ -384,6 +378,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "declared": &config.platform,
         },
         "chain": chain,
+        "owner_operations": config.owner_operations,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
         "sp1_payer": prover_credential,
@@ -2376,7 +2371,6 @@ mod tests {
                 session_registry: "0xSESS".to_string(),
                 workload_registry: "0xWORK".to_string(),
                 base_image_registry: "0xBASE".to_string(),
-                expire_offset: 300,
                 registration: None,
                 chain_id: None,
                 tee_backend: "auto".to_string(),
@@ -2389,6 +2383,7 @@ mod tests {
                 }),
                 proving_strategy: None,
             },
+            owner_operations: atakit_config::OwnerOperationsConfig::default(),
             owner_key: InitKeyConfig {
                 mode: "provisioned".to_string(),
                 key_type: "es256k".to_string(),
@@ -2639,7 +2634,9 @@ mod tests {
         assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
         assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
         assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
-        assert_eq!(json["chain"]["expire_offset"], 300);
+        assert!(json["chain"].get("expire_offset").is_none());
+        assert_eq!(json["owner_operations"]["op_expiry_seconds"], 300);
+        assert_eq!(json["owner_operations"]["challenge_expiry_seconds"], 60);
         assert_eq!(json["owner_key"]["mode"], "provisioned");
         assert_eq!(json["owner_key"]["type"], "es256k");
         assert_eq!(json["owner_key"]["private_key"], "0xOWNER");

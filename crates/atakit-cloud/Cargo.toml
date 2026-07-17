@@ -8,6 +8,7 @@ cli = ["clap"]
 
 [dependencies]
 atakit-core.workspace = true
+atakit-config.workspace = true
 atakit-attestation.workspace = true
 dcap-qvl.workspace = true
 thiserror.workspace = true

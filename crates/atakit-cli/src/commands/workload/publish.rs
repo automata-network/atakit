@@ -324,9 +324,9 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     }
 
     println!("Submitting registerWorkload transaction...");
-    let expire_offset = args.expire_offset.unwrap_or(chain.expire_offset);
+    let op_expiry_seconds = args.op_expiry_seconds.unwrap_or(chain.op_expiry_seconds);
     let result_id = registry
-        .register_workload(&signer, spec, expire_offset)
+        .register_workload(&signer, spec, op_expiry_seconds)
         .await
         .context("registerWorkload failed")?;
 
