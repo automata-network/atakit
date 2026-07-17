@@ -2653,11 +2653,11 @@ mod tests {
         use crate::session::{
             compute_key_fingerprint, compute_session_id, compute_session_qualifying_data,
             request_binding_digest, AkEvidence, BindingMode, CertificateTrust, RawEvidence,
-            SessionBinding, SessionEventHashes, SessionEvidenceBundle, SessionKeyDelegation,
-            SessionOwner, SessionPcrPolicy, SessionPcrValue, SessionPcrVerifyType, SessionPlatform,
-            SessionPlatformTrust, SessionPolicy, SessionPublicKey, SessionRecomputation,
-            SessionRequestBinding, SessionTrust, SessionVerificationInputs, TpmCertifyEvidence,
-            TpmQuoteEvidence, TrustedSessionPolicy,
+            SessionAttestationMode, SessionBinding, SessionEventHashes, SessionEvidenceBundle,
+            SessionKeyDelegation, SessionOwner, SessionPcrPolicy, SessionPcrValue,
+            SessionPcrVerifyType, SessionPlatform, SessionPlatformTrust, SessionPolicy,
+            SessionPublicKey, SessionRecomputation, SessionRequestBinding, SessionTrust,
+            SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence, TrustedSessionPolicy,
         };
 
         let (snp_report, amd_ark, snp_cert_table) = fixture_gcp_snp_report_and_certs();
@@ -2736,6 +2736,7 @@ mod tests {
             },
             platform: SessionPlatform {
                 cloud: "gcp".into(),
+                attestation_mode: SessionAttestationMode::Hardware,
                 tee: "sev-snp".into(),
                 machine_type: "n2d-standard-4".into(),
             },
@@ -2863,7 +2864,17 @@ mod tests {
 
         assert_eq!(verified.session_id, session_id);
         assert_eq!(verified.binding_mode, BindingMode::Local);
+        assert_eq!(verified.attestation_mode, SessionAttestationMode::Hardware);
         assert!(bundle.owner.contract_authorization.take().is_none());
+
+        let mut mislabeled = inputs.clone();
+        mislabeled.bundle.platform.attestation_mode = SessionAttestationMode::Emulation;
+        let failure = crate::session::verify_session_bundle(mislabeled)
+            .expect_err("emulation classification must not enter the production verifier");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.contains("attestation_mode=hardware")));
 
         let mut untrusted = inputs;
         let SessionPlatformTrust::GcpSnp {

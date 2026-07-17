@@ -65,8 +65,17 @@ pub enum BindingMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPlatform {
     pub cloud: String,
+    pub attestation_mode: SessionAttestationMode,
     pub tee: String,
     pub machine_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttestationMode {
+    Hardware,
+    Emulation,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +269,7 @@ pub struct VerifiedSession {
     pub session_id: [u8; 32],
     pub session_key_fingerprint: [u8; 32],
     pub binding_mode: BindingMode,
+    pub attestation_mode: SessionAttestationMode,
     pub checks: Vec<SessionVerificationCheck>,
 }
 
@@ -386,6 +396,7 @@ pub fn verify_session_bundle(
             session_id: session_id.expect("validated session id"),
             session_key_fingerprint: session_key_fingerprint.expect("validated session key"),
             binding_mode: bundle.binding.mode,
+            attestation_mode: SessionAttestationMode::Hardware,
             checks,
         })
     } else {
@@ -419,8 +430,17 @@ fn verify_production_evidence_kind(
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
+    record(
+        checks,
+        errors,
+        "attestation-mode",
+        bundle.platform.attestation_mode == SessionAttestationMode::Hardware,
+        "production session verification requires attestation_mode=hardware",
+    );
     let production = bundle.tee_evidence.kind != "emulation"
         && bundle.ak_evidence.kind != "emulation"
+        && bundle.platform.tee != "emulation"
+        && bundle.platform.tee != "none"
         && bundle.session_key_delegation.tpm_signing_key.type_id != 0;
     record(
         checks,
@@ -1820,6 +1840,7 @@ mod tests {
             },
             platform: SessionPlatform {
                 cloud: "qemu".into(),
+                attestation_mode: SessionAttestationMode::Emulation,
                 tee: "emulation".into(),
                 machine_type: "qemu".into(),
             },
