@@ -56,6 +56,8 @@ struct ChainSubmission {
 #[derive(Debug, Deserialize)]
 struct RequestBinding {
     challenge: String,
+    #[serde(default)]
+    signing_session_id: Option<String>,
     signature: String,
 }
 
@@ -185,7 +187,7 @@ pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
         verified.client
     };
 
-    eprint!("  Submit session registration... ");
+    eprint!("  Submit session transaction... ");
     let result = submit_prepared_registration(
         &portal_client,
         &portal_host,
@@ -227,7 +229,9 @@ pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
         PortalTerminalState::Running => {
             eprintln!(
                 "{}",
-                "Session registered; workload is running.".green().bold()
+                "Session transaction confirmed; workload is running."
+                    .green()
+                    .bold()
             );
             Ok(())
         }
@@ -354,6 +358,13 @@ pub(crate) async fn submit_prepared_registration(
         .await
         .context("check whether session is already active")?
     {
+        wait_for_portal_session_commit(
+            portal_client,
+            &session_url,
+            verified.session_id,
+            Duration::from_secs(timeout_secs),
+        )
+        .await?;
         return Ok(RegistrationResult::AlreadyActive {
             session_id: verified.session_id,
         });
@@ -367,19 +378,64 @@ pub(crate) async fn submit_prepared_registration(
     let mut pending = wallet_provider
         .send_transaction_ex(tx)
         .await
-        .context("broadcast session registration")?;
+        .context("broadcast session transaction")?;
     let tx_hash = pending.tx_hash();
     let receipt = pending
         .get_receipt()
         .await
-        .context("wait for session registration receipt")?;
+        .context("wait for session transaction receipt")?;
     if !receipt.status() {
-        bail!("session registration transaction {tx_hash} reverted");
+        bail!("session transaction {tx_hash} reverted");
     }
+    wait_for_portal_session_commit(
+        portal_client,
+        &session_url,
+        verified.session_id,
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
     Ok(RegistrationResult::Submitted {
         session_id: verified.session_id,
         tx_hash,
     })
+}
+
+async fn wait_for_portal_session_commit(
+    portal_client: &reqwest::Client,
+    session_url: &str,
+    expected_session_id: B256,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let response = portal_client
+            .get(session_url)
+            .send()
+            .await
+            .context("fetch portal session after transaction confirmation")?;
+        if response.status().is_success() {
+            let session: SessionResponse = response
+                .json()
+                .await
+                .context("decode portal session after transaction confirmation")?;
+            if parse_b256(&session.session_id, "committed portal session ID")?
+                == expected_session_id
+            {
+                return Ok(());
+            }
+        } else if !response.status().is_server_error() {
+            response
+                .error_for_status()
+                .context("portal session commit check failed")?;
+        }
+        if tokio::time::Instant::now() + Duration::from_secs(1) > deadline {
+            bail!(
+                "portal did not commit confirmed session {expected_session_id} within {} seconds",
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[derive(Debug)]
@@ -401,6 +457,17 @@ fn verify_chain_submission(
     if response.request_binding.challenge != challenge_text {
         bail!("portal returned a request binding for a different challenge");
     }
+    let current_session_id = parse_b256(&session.session_id, "current session ID")?;
+    let signing_session_id = response
+        .request_binding
+        .signing_session_id
+        .as_deref()
+        .map(|value| parse_b256(value, "request-binding signing session ID"))
+        .transpose()?
+        .unwrap_or(current_session_id);
+    if signing_session_id != current_session_id {
+        bail!("chain submission was not signed by the current session");
+    }
     if submission.chain_id != session.chain_id {
         bail!("chain submission chain ID differs from the current session");
     }
@@ -419,9 +486,6 @@ fn verify_chain_submission(
         bail!("chain submission must have zero value");
     }
     let session_id = parse_b256(&submission.session_id, "submission session ID")?;
-    if session_id != parse_b256(&session.session_id, "current session ID")? {
-        bail!("chain submission session ID differs from the current session");
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -490,13 +554,14 @@ mod tests {
         let challenge = [0x42; 32];
         let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
         let registry = "0x1111111111111111111111111111111111111111";
-        let session_id = format!("0x{}", "22".repeat(32));
+        let active_session_id = format!("0x{}", "22".repeat(32));
+        let candidate_session_id = format!("0x{}", "33".repeat(32));
         let submission = ChainSubmission {
             chain_id: 31337,
             to: registry.to_string(),
             value: "0x0".to_string(),
             data: "0x1234".to_string(),
-            session_id: session_id.clone(),
+            session_id: candidate_session_id,
             op_expires_at: u64::MAX,
         };
         let digest = chain_submission_request_binding_digest(
@@ -509,7 +574,7 @@ mod tests {
         let mut signature = signature.to_bytes().to_vec();
         signature.push(27 + recovery_id.to_byte());
         let session = SessionResponse {
-            session_id,
+            session_id: active_session_id.clone(),
             session_key: SessionKey {
                 key_type: "ES256K".to_string(),
                 bytes: format!("0x{}", hex::encode(public_key.as_bytes())),
@@ -522,6 +587,7 @@ mod tests {
             chain_submission: submission,
             request_binding: RequestBinding {
                 challenge: challenge_text.clone(),
+                signing_session_id: Some(active_session_id),
                 signature: format!("0x{}", hex::encode(signature)),
             },
         };
