@@ -469,6 +469,10 @@ pub struct RegisterArgs {
     #[arg(long, default_value = "300")]
     pub timeout: u64,
 
+    /// Wait for a future lifecycle successor instead of returning for the current active session.
+    #[arg(long)]
+    pub wait_for_successor: bool,
+
     /// Expected base image for TLS attestation measurement policy (name:version).
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,

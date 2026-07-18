@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use atakit_attestation::{
-    verify_session_bundle, BindingMode, CertificateTrust, SessionAttribute,
+    verify_session_bundle, AzureMaaTrustKey, BindingMode, CertificateTrust, SessionAttribute,
     SessionAttributeRequirement, SessionEvidenceBundle, SessionPcrPolicy, SessionPcrVerifyType,
     SessionPlatformTrust, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
     TrustedSessionPolicy, VerifiedSession,
@@ -21,6 +21,8 @@ pub struct PortalSessionVerificationContext {
     pub platform: PlatformEvidence,
     pub measurement_policy: MeasurementPolicy,
     pub trust_anchors: TrustAnchors,
+    pub azure_maa_signing_keys: Vec<AzureMaaTrustKey>,
+    pub azure_snp_cert_table: Option<Vec<u8>>,
     pub tdx_dcap_collateral: Option<serde_json::Value>,
 }
 
@@ -141,6 +143,22 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
+        },
+        ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
+            maa_signing_keys: context.azure_maa_signing_keys.clone(),
+            dcap_collateral: context.tdx_dcap_collateral.clone().ok_or_else(|| {
+                session_error("verified TLS context has no Azure TDX DCAP collateral")
+            })?,
+        },
+        ("azure", "sev-snp") => SessionPlatformTrust::AzureSnp {
+            maa_signing_keys: context.azure_maa_signing_keys.clone(),
+            amd_ark_roots: certificate_trust(
+                &context.trust_anchors.amd_ark_roots,
+                &context.trust_anchors.amd_ark_root_hashes,
+            ),
+            snp_cert_table: context.azure_snp_cert_table.clone().ok_or_else(|| {
+                session_error("verified TLS context has no Azure SNP certificate table")
+            })?,
         },
         (cloud, tee) => {
             return Err(session_error(format!(

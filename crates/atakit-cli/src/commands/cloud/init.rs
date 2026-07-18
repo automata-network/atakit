@@ -535,6 +535,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             chain,
             signer,
             args.timeout,
+            false,
         )
         .await?;
         match result {

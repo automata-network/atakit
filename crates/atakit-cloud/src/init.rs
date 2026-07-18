@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atakit_attestation::{
-    verify_measurement_pack, verify_tls_attestation, CheckResult, EvidenceSummary,
-    MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
-    VerificationReport, VerifiedTlsIdentity,
+    amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
+    verify_measurement_pack, verify_tls_attestation, AzureMaaTrustKey, CheckResult,
+    EvidenceSummary, MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck,
+    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_config::TransactionSubmitter;
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
@@ -777,27 +778,60 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
-    if let Err(detail) =
-        resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await
-    {
-        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-        let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report = tls_preverification_failure_report(
-            &response,
-            &live_hash,
-            "azure-maa-onchain-trust",
-            detail,
-        );
-        return handle_tls_attestation_failure(
-            report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-        );
-    }
+    let azure_maa_signing_keys =
+        match resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await {
+            Ok(keys) => keys,
+            Err(detail) => {
+                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+                let live_hash = format!("0x{}", hex::encode(live_sha));
+                let report = tls_preverification_failure_report(
+                    &response,
+                    &live_hash,
+                    "azure-maa-onchain-trust",
+                    detail,
+                );
+                return handle_tls_attestation_failure(
+                    report,
+                    live_peer_cert_der,
+                    trust_tls_cert_sha256,
+                    report_path,
+                );
+            }
+        };
 
-    if let Err(detail) =
-        resolve_chain_trust_anchors(&response, &azure_maa_trust, &mut trust_anchors).await
+    let azure_snp_cert_table = if response.platform.cloud.eq_ignore_ascii_case("azure")
+        && response.platform.tee.eq_ignore_ascii_case("sev-snp")
+    {
+        match fetch_azure_snp_cert_table(&response).await {
+            Ok(table) => Some(table),
+            Err(detail) => {
+                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+                let live_hash = format!("0x{}", hex::encode(live_sha));
+                let report = tls_preverification_failure_report(
+                    &response,
+                    &live_hash,
+                    "azure-snp-amd-collateral",
+                    detail,
+                );
+                return handle_tls_attestation_failure(
+                    report,
+                    live_peer_cert_der,
+                    trust_tls_cert_sha256,
+                    report_path,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(detail) = resolve_chain_trust_anchors(
+        &response,
+        &azure_maa_trust,
+        &mut trust_anchors,
+        azure_snp_cert_table.as_deref(),
+    )
+    .await
     {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
@@ -820,6 +854,8 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             platform: response.platform.clone(),
             measurement_policy,
             trust_anchors: trust_anchors.clone(),
+            azure_maa_signing_keys: azure_maa_signing_keys.clone(),
+            azure_snp_cert_table: azure_snp_cert_table.clone(),
             tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
         }
     });
@@ -852,7 +888,7 @@ async fn resolve_tdx_dcap_collateral(
     response: &mut TlsAttestationResponse,
     config: &TdxDcapCollateralConfig,
 ) -> Result<(), String> {
-    if !is_gcp_tdx(response) || has_gcp_tdx_collateral(&response.collateral) {
+    if !is_tdx(response) || has_gcp_tdx_collateral(&response.collateral) {
         return Ok(());
     }
     let collateral = match &config.source {
@@ -939,16 +975,16 @@ async fn resolve_azure_maa_trust(
     response: &TlsAttestationResponse,
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
-) -> Result<(), String> {
+) -> Result<Vec<AzureMaaTrustKey>, String> {
     if !is_azure_maa_response(response) || !trust_anchors.azure_maa_keys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
         session_registry,
     } = &config.source
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let jwt = extract_azure_maa_jwt_info(response)?;
@@ -990,14 +1026,111 @@ async fn resolve_azure_maa_trust(
         ));
     }
 
-    trust_anchors.azure_maa_keys.push(entry.pkcs1_pubkey);
-    Ok(())
+    trust_anchors
+        .azure_maa_keys
+        .push(entry.pkcs1_pubkey.clone());
+    Ok(vec![AzureMaaTrustKey {
+        kid: jwt.kid,
+        issuer: jwt.issuer,
+        not_after: entry.not_after,
+        public_key: entry.pkcs1_pubkey,
+    }])
+}
+
+async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "Azure SNP response is missing teeEvidence".to_string())?;
+    let report = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|error| format!("decode Azure SNP report: {error}"))?;
+    let request = amd_snp_vcek_request(&report)?;
+    let product = amd_kds_product(request.cpuid_family, request.cpuid_model)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build AMD KDS client: {error}"))?;
+    let chip_id = hex::encode(request.chip_id);
+    let vcek_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/{chip_id}");
+    let vcek = client
+        .get(&vcek_url)
+        .query(&[
+            ("blSPL", request.bootloader),
+            ("teeSPL", request.tee),
+            ("snpSPL", request.snp),
+            ("ucodeSPL", request.microcode),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("read AMD {product} VCEK: {error}"))?
+        .to_vec();
+    let chain_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/cert_chain");
+    let chain = client
+        .get(&chain_url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("read AMD {product} certificate chain: {error}"))?;
+    let certs = parse_pem_certificates(&chain)?;
+    let [ask, ark] = certs.as_slice() else {
+        return Err(format!(
+            "AMD {product} certificate chain contains {} certificates, expected ASK then ARK",
+            certs.len()
+        ));
+    };
+    amd_snp_vcek_cert_table(ark, ask, &vcek)
+}
+
+fn amd_kds_product(family: u8, model: u8) -> Result<&'static str, String> {
+    match (family, model) {
+        (0x19, 0x00..=0x0f) => Ok("Milan"),
+        (0x19, 0x10..=0x1f) => Ok("Genoa"),
+        _ => Err(format!(
+            "unsupported AMD SNP CPUID family 0x{family:02x}, model 0x{model:02x} for KDS lookup"
+        )),
+    }
+}
+
+fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = std::str::from_utf8(input)
+        .map_err(|error| format!("AMD certificate chain is not UTF-8 PEM: {error}"))?;
+    let mut remaining = text;
+    let mut certs = Vec::new();
+    while let Some(begin) = remaining.find(BEGIN) {
+        let body = &remaining[begin + BEGIN.len()..];
+        let end = body
+            .find(END)
+            .ok_or_else(|| "AMD certificate chain has an unterminated PEM block".to_string())?;
+        let encoded = body[..end].lines().map(str::trim).collect::<String>();
+        let der = STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("decode AMD certificate PEM: {error}"))?;
+        certs.push(der);
+        remaining = &body[end + END.len()..];
+    }
+    if certs.is_empty() {
+        return Err("AMD certificate chain has no PEM certificates".to_string());
+    }
+    Ok(certs)
 }
 
 async fn resolve_chain_trust_anchors(
     response: &TlsAttestationResponse,
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
+    azure_snp_cert_table: Option<&[u8]>,
 ) -> Result<(), String> {
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
@@ -1006,13 +1139,12 @@ async fn resolve_chain_trust_anchors(
     else {
         return Ok(());
     };
-    if !response.platform.cloud.eq_ignore_ascii_case("gcp") {
-        return Ok(());
-    }
-
     let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
 
-    if trust_anchors.gcp_roots.is_empty() && trust_anchors.gcp_root_hashes.is_empty() {
+    if response.platform.cloud.eq_ignore_ascii_case("gcp")
+        && trust_anchors.gcp_roots.is_empty()
+        && trust_anchors.gcp_root_hashes.is_empty()
+    {
         let root = extract_gcp_ak_root_cert(response)?;
         let root_hash = keccak256(&root);
         let tpm_attestation = resolve_tpm_attestation(rpc_url, &ak_collateral_verifier).await?;
@@ -1029,7 +1161,15 @@ async fn resolve_chain_trust_anchors(
         && trust_anchors.amd_ark_roots.is_empty()
         && trust_anchors.amd_ark_root_hashes.is_empty()
     {
-        let ark = extract_snp_ark_cert(response)?;
+        let ark = if response.platform.cloud.eq_ignore_ascii_case("gcp") {
+            extract_snp_ark_cert(response)?
+        } else if response.platform.cloud.eq_ignore_ascii_case("azure") {
+            amd_snp_ark_from_cert_table(azure_snp_cert_table.ok_or_else(|| {
+                "Azure SNP response is missing resolved AMD certificate table".to_string()
+            })?)?
+        } else {
+            return Ok(());
+        };
         let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
         let tee_verifier = resolve_tee_verifier(rpc_url, session_registry).await?;
         let snp_attestation = resolve_snp_attestation(rpc_url, &tee_verifier).await?;
@@ -1889,9 +2029,8 @@ fn abi_word_usize(word: &[u8]) -> Result<usize, String> {
         .map_err(|_| "ABI uint word does not fit in usize".to_string())
 }
 
-fn is_gcp_tdx(response: &TlsAttestationResponse) -> bool {
-    response.platform.cloud.eq_ignore_ascii_case("gcp")
-        && response.platform.tee.eq_ignore_ascii_case("tdx")
+fn is_tdx(response: &TlsAttestationResponse) -> bool {
+    response.platform.tee.eq_ignore_ascii_case("tdx")
 }
 
 fn is_azure_maa_response(response: &TlsAttestationResponse) -> bool {
@@ -2968,5 +3107,23 @@ mod tests {
             assert_eq!(json["chain"]["proving_strategy"], value);
             assert!(json.get("prover").is_none());
         }
+    }
+
+    #[test]
+    fn selects_amd_kds_product_for_supported_cpuid() {
+        assert_eq!(amd_kds_product(0x19, 0x01).unwrap(), "Milan");
+        assert_eq!(amd_kds_product(0x19, 0x11).unwrap(), "Genoa");
+        assert!(amd_kds_product(0x1a, 0x01).is_err());
+    }
+
+    #[test]
+    fn parses_amd_kds_pem_chain() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nYXNr\n-----END CERTIFICATE-----\n\
+                    -----BEGIN CERTIFICATE-----\nYXJr\n-----END CERTIFICATE-----\n";
+
+        assert_eq!(
+            parse_pem_certificates(pem).unwrap(),
+            vec![b"ask".to_vec(), b"ark".to_vec()]
+        );
     }
 }

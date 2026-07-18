@@ -74,6 +74,88 @@ const SNP_CERT_TABLE_VLEK_GUID: [u8; 16] = [
     0xa8, 0x07, 0x4b, 0xc2, 0xa2, 0x5a, 0x48, 0x3e, 0xaa, 0xe6, 0x39, 0xc0, 0x45, 0xa0, 0xb8, 0xa1,
 ];
 
+/// Fields needed to request the report's VCEK from AMD KDS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmdSnpVcekRequest {
+    pub chip_id: [u8; 64],
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
+    pub cpuid_family: u8,
+    pub cpuid_model: u8,
+}
+
+/// Parse the VCEK lookup fields from a raw SEV-SNP attestation report.
+pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequest, String> {
+    if report.len() < SNP_REPORT_MIN_LEN {
+        return Err(format!(
+            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            report.len()
+        ));
+    }
+    if verification_core::snp_signing_key_type(report)?
+        != verification_core::SnpSigningKeyType::Vcek
+    {
+        return Err("AMD KDS VCEK lookup cannot resolve a VLEK-signed SNP report".to_string());
+    }
+    let tcb = &report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8];
+    let chip_id = report[SNP_REPORT_CHIP_ID_OFFSET..SNP_REPORT_CHIP_ID_OFFSET + 64]
+        .try_into()
+        .expect("checked report length");
+    Ok(AmdSnpVcekRequest {
+        chip_id,
+        bootloader: tcb[0],
+        tee: tcb[1],
+        snp: tcb[6],
+        microcode: tcb[7],
+        cpuid_family: report[SNP_REPORT_REPORTED_TCB_OFFSET + 8],
+        cpuid_model: report[SNP_REPORT_REPORTED_TCB_OFFSET + 9],
+    })
+}
+
+/// Build the standard SNP certificate-table byte layout from DER certificates.
+pub fn amd_snp_vcek_cert_table(
+    ark: &[u8],
+    ask: &[u8],
+    vcek: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
+    let entries = [
+        (SNP_CERT_TABLE_ARK_GUID, ark),
+        (SNP_CERT_TABLE_ASK_GUID, ask),
+        (SNP_CERT_TABLE_VCEK_GUID, vcek),
+    ];
+    let table_len = 24usize
+        .checked_mul(entries.len() + 1)
+        .ok_or_else(|| "SNP certificate-table header length overflow".to_string())?;
+    let mut output = vec![0u8; table_len];
+    let mut cert_offset = table_len;
+    for (index, (guid, cert)) in entries.iter().enumerate() {
+        let entry_offset = index * 24;
+        let offset = u32::try_from(cert_offset)
+            .map_err(|_| "SNP certificate-table offset exceeds u32".to_string())?;
+        let length = u32::try_from(cert.len())
+            .map_err(|_| "SNP certificate length exceeds u32".to_string())?;
+        output[entry_offset..entry_offset + 16].copy_from_slice(guid);
+        output[entry_offset + 16..entry_offset + 20].copy_from_slice(&offset.to_le_bytes());
+        output[entry_offset + 20..entry_offset + 24].copy_from_slice(&length.to_le_bytes());
+        cert_offset = cert_offset
+            .checked_add(cert.len())
+            .ok_or_else(|| "SNP certificate-table length overflow".to_string())?;
+    }
+    for (_, cert) in entries {
+        output.extend_from_slice(cert);
+    }
+    Ok(output)
+}
+
+/// Return the ARK DER certificate from a standard SNP certificate table.
+pub fn amd_snp_ark_from_cert_table(table: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    verification_core::parse_amd_snp_cert_table(table)?
+        .ark
+        .ok_or_else(|| "SNP certificate table is missing the ARK certificate".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsAttestationResponse {
@@ -3165,5 +3247,35 @@ mod tests {
             verify_measurement_pack(bytes, &signature.to_bytes(), &[trusted_key]).unwrap_err();
 
         assert!(err.to_string().contains("not canonical"));
+    }
+
+    #[test]
+    fn extracts_amd_snp_vcek_request_fields() {
+        let mut report = vec![0u8; SNP_REPORT_MIN_LEN];
+        report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8]
+            .copy_from_slice(&[4, 0, 0, 0, 0, 0, 24, 219]);
+        report[SNP_REPORT_REPORTED_TCB_OFFSET + 8] = 0x19;
+        report[SNP_REPORT_REPORTED_TCB_OFFSET + 9] = 0x01;
+        report[SNP_REPORT_CHIP_ID_OFFSET..SNP_REPORT_CHIP_ID_OFFSET + 64].fill(0xa5);
+
+        let request = amd_snp_vcek_request(&report).expect("VCEK request");
+
+        assert_eq!(request.chip_id, [0xa5; 64]);
+        assert_eq!(request.bootloader, 4);
+        assert_eq!(request.tee, 0);
+        assert_eq!(request.snp, 24);
+        assert_eq!(request.microcode, 219);
+        assert_eq!(request.cpuid_family, 0x19);
+        assert_eq!(request.cpuid_model, 0x01);
+    }
+
+    #[test]
+    fn builds_amd_snp_vcek_cert_table() {
+        let table = amd_snp_vcek_cert_table(b"ark", b"ask", b"vcek").expect("cert table");
+
+        assert_eq!(amd_snp_ark_from_cert_table(&table).unwrap(), b"ark");
+        let parsed = verification_core::parse_amd_snp_cert_table(&table).unwrap();
+        assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
+        assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
     }
 }

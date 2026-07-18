@@ -1037,6 +1037,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                                 chain,
                                 signer,
                                 portal_wait_timeout_secs,
+                                false,
                             )
                             .await
                             {

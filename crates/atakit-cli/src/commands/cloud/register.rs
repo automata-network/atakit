@@ -67,6 +67,20 @@ struct ChainSubmissionResponse {
     request_binding: RequestBinding,
 }
 
+#[derive(Debug, Deserialize)]
+struct LifecycleStatusResponse {
+    state: String,
+    session_id: Option<String>,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LifecycleWaitDecision {
+    Proceed,
+    Wait,
+    Candidate(B256),
+}
+
 #[derive(Debug)]
 pub(crate) enum RegistrationResult {
     LocalFallback { session_id: B256 },
@@ -195,6 +209,7 @@ pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
         chain,
         signer,
         args.timeout,
+        args.wait_for_successor,
     )
     .await?;
     match result {
@@ -280,9 +295,17 @@ pub(crate) async fn submit_prepared_registration(
     chain: &ChainConfig,
     signer: PrivateKeySigner,
     timeout_secs: u64,
+    wait_for_successor: bool,
 ) -> Result<RegistrationResult> {
     let base_url = format!("https://{portal_host}:{status_port}");
     let session_url = format!("{base_url}/session");
+    let lifecycle_session_id = wait_for_lifecycle_candidate(
+        portal_client,
+        &base_url,
+        Duration::from_secs(timeout_secs),
+        wait_for_successor,
+    )
+    .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let session: SessionResponse = loop {
         let response = portal_client
@@ -336,6 +359,15 @@ pub(crate) async fn submit_prepared_registration(
         &challenge_text,
         &chain.session_registry,
     )?;
+    if let Some(expected_session_id) = lifecycle_session_id {
+        if verified.session_id != expected_session_id {
+            bail!(
+                "portal chain submission session {} does not match pending lifecycle session {}",
+                verified.session_id,
+                expected_session_id
+            );
+        }
+    }
     let receipt_timeout = Duration::from_secs(timeout_secs);
     let provider = NetworkProvider::with_http(
         &chain.rpc_url,
@@ -398,6 +430,65 @@ pub(crate) async fn submit_prepared_registration(
         session_id: verified.session_id,
         tx_hash,
     })
+}
+
+async fn wait_for_lifecycle_candidate(
+    portal_client: &reqwest::Client,
+    base_url: &str,
+    timeout: Duration,
+    wait_for_successor: bool,
+) -> Result<Option<B256>> {
+    let status_url = format!("{base_url}/session/status");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let response = portal_client
+            .get(&status_url)
+            .send()
+            .await
+            .context("fetch portal lifecycle status")?
+            .error_for_status()
+            .context("portal lifecycle status is unavailable")?;
+        let status: LifecycleStatusResponse = response
+            .json()
+            .await
+            .context("decode portal lifecycle status")?;
+        match lifecycle_wait_decision(&status, wait_for_successor)? {
+            LifecycleWaitDecision::Proceed => return Ok(None),
+            LifecycleWaitDecision::Candidate(session_id) => return Ok(Some(session_id)),
+            LifecycleWaitDecision::Wait => {}
+        }
+        if tokio::time::Instant::now() + Duration::from_secs(2) > deadline {
+            bail!(
+                "portal did not prepare a lifecycle successor within {} seconds",
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn lifecycle_wait_decision(
+    status: &LifecycleStatusResponse,
+    wait_for_successor: bool,
+) -> Result<LifecycleWaitDecision> {
+    match status.state.as_str() {
+        "idle" | "completed" if wait_for_successor => Ok(LifecycleWaitDecision::Wait),
+        "idle" | "completed" => Ok(LifecycleWaitDecision::Proceed),
+        "waiting" => Ok(LifecycleWaitDecision::Wait),
+        "running" => status
+            .session_id
+            .as_deref()
+            .map(|session_id| {
+                parse_b256(session_id, "pending lifecycle session ID")
+                    .map(LifecycleWaitDecision::Candidate)
+            })
+            .unwrap_or(Ok(LifecycleWaitDecision::Wait)),
+        "failed" => bail!(
+            "portal lifecycle request failed: {}",
+            status.error_code.as_deref().unwrap_or("unknown error")
+        ),
+        state => bail!("portal returned unknown lifecycle state '{state}'"),
+    }
 }
 
 async fn wait_for_portal_session_commit(
@@ -546,6 +637,56 @@ fn parse_b256(value: &str, field: &str) -> Result<B256> {
 mod tests {
     use super::*;
     use k256::ecdsa::SigningKey;
+
+    #[test]
+    fn lifecycle_status_waits_for_the_announced_successor() {
+        let waiting = LifecycleStatusResponse {
+            state: "running".into(),
+            session_id: None,
+            error_code: None,
+        };
+        assert_eq!(
+            lifecycle_wait_decision(&waiting, false).unwrap(),
+            LifecycleWaitDecision::Wait
+        );
+
+        let candidate = LifecycleStatusResponse {
+            state: "running".into(),
+            session_id: Some(format!("0x{}", "42".repeat(32))),
+            error_code: None,
+        };
+        assert_eq!(
+            lifecycle_wait_decision(&candidate, false).unwrap(),
+            LifecycleWaitDecision::Candidate(B256::repeat_byte(0x42))
+        );
+
+        let idle = LifecycleStatusResponse {
+            state: "idle".into(),
+            session_id: None,
+            error_code: None,
+        };
+        assert_eq!(
+            lifecycle_wait_decision(&idle, false).unwrap(),
+            LifecycleWaitDecision::Proceed
+        );
+        assert_eq!(
+            lifecycle_wait_decision(&idle, true).unwrap(),
+            LifecycleWaitDecision::Wait
+        );
+    }
+
+    #[test]
+    fn lifecycle_failure_is_not_reported_as_already_active() {
+        let failed = LifecycleStatusResponse {
+            state: "failed".into(),
+            session_id: None,
+            error_code: Some("proof_failed".into()),
+        };
+        assert!(lifecycle_wait_decision(&failed, false)
+            .unwrap_err()
+            .to_string()
+            .contains("proof_failed"));
+    }
 
     #[test]
     fn verifies_challenge_bound_submission_and_rejects_mutation() {
