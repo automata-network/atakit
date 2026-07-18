@@ -208,6 +208,8 @@ async fn inspect_dir(
         config.unmeasured_data_paths(),
         &data_roots.unmeasured,
     );
+    let unmeasured_env_files =
+        crate::manifest::resolve_unmeasured_env_allowlists(&config, &data_roots.unmeasured)?;
     let manifest = crate::manifest::build_manifest(
         &config,
         &resolved_image,
@@ -215,6 +217,7 @@ async fn inspect_dir(
         dep_environments,
         hashes,
         unmeasured_data,
+        unmeasured_env_files,
         images,
     );
     let manifest_raw = crate::manifest::serialize_canonical_json(&manifest)?;

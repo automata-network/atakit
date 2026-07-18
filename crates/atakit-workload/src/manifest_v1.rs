@@ -257,6 +257,8 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
         // v1 conversion is read-only (inspect only, never re-emitted), so an
         // empty set is correct.
         unmeasured_data: std::collections::BTreeSet::new(),
+        // Format 1 predates measured unmeasured-env variable allowlists.
+        unmeasured_env_files: BTreeMap::new(),
         // Format 1 archives predate per-service image metadata. We have no
         // way to reconstruct image-ids without re-staging the bundled tars,
         // and v1 conversion is read-only (used only for `inspect`, never

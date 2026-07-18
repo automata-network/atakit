@@ -200,7 +200,7 @@ async fn build_produces_valid_archive() {
     assert!(!result.archive_hash.is_empty());
     assert_eq!(
         read_manifest_json(&result.archive_path)["meta"]["format"],
-        4
+        5
     );
 
     // Verify archive contents
