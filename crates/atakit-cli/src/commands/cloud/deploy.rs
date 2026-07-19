@@ -924,7 +924,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                             "gas wallet '{gas_wallet_name}' did not resolve to a private key"
                         )
                     })?;
-                    Some(super::register::parse_gas_wallet_private_key(
+                    Some(super::relay_session::parse_gas_wallet_private_key(
                         gas_wallet_name,
                         private_key,
                     )?)
@@ -1028,7 +1028,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                             let chain = config.chains.get(chain_name).expect(
                                 "active registration resolved a configured chain before /init",
                             );
-                            match super::register::submit_prepared_registration(
+                            match super::relay_session::relay_prepared_session(
                                 &portal_client,
                                 &ip,
                                 status_port,
@@ -1039,22 +1039,33 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                             )
                             .await
                             {
-                                Ok(super::register::RegistrationResult::LocalFallback {
+                                Ok(super::relay_session::SessionRelayResult::LocalFallback {
                                     session_id,
                                 }) => {
                                     eprintln!("      local fallback session: {session_id}");
                                 }
-                                Ok(super::register::RegistrationResult::AlreadyActive {
+                                Ok(super::relay_session::SessionRelayResult::AlreadyActive {
                                     session_id,
                                 }) => {
                                     eprintln!("      session already active: {session_id}");
                                 }
-                                Ok(super::register::RegistrationResult::Submitted {
+                                Ok(super::relay_session::SessionRelayResult::Submitted {
                                     session_id,
                                     tx_hash,
                                 }) => {
                                     eprintln!("      session: {session_id}");
                                     eprintln!("      tx:      {tx_hash}");
+                                }
+                                Ok(
+                                    super::relay_session::SessionRelayResult::ActivatedByEarlierTransaction {
+                                        session_id,
+                                        reverted_tx_hash,
+                                    },
+                                ) => {
+                                    eprintln!(
+                                        "      session active through an earlier transaction: {session_id}"
+                                    );
+                                    eprintln!("      reverted tx: {reverted_tx_hash}");
                                 }
                                 Err(error) => {
                                     eprintln!("{}", "failed".red());

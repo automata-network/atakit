@@ -4,7 +4,7 @@ pub mod image;
 pub mod init;
 pub mod list;
 pub mod provider;
-pub mod register;
+pub mod relay_session;
 pub mod serial;
 pub mod ssh;
 pub mod status;

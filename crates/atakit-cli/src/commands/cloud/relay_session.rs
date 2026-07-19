@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use atakit_attestation::{
     chain_submission_request_binding_digest, recoverable_es256k_signature_matches,
 };
-use atakit_cloud::cli::RegisterArgs;
+use atakit_cloud::cli::RelaySessionArgs;
 use atakit_cloud::init::{self, PortalTerminalState};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_config::TransactionSubmitter;
@@ -22,6 +22,7 @@ use base64::Engine;
 use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
     init_chain_from_config, portal_endpoints, resolve_instance, resolve_tls_measurement_policy,
@@ -45,6 +46,8 @@ struct SessionKey {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChainSubmission {
+    submission_id: String,
+    lifecycle_request_hash: Option<String>,
     chain_id: u64,
     to: String,
     value: String,
@@ -69,6 +72,7 @@ struct ChainSubmissionResponse {
 
 #[derive(Debug, Deserialize)]
 struct LifecycleStatusResponse {
+    request_hash: Option<String>,
     state: String,
     session_id: Option<String>,
     error_code: Option<String>,
@@ -78,17 +82,40 @@ struct LifecycleStatusResponse {
 enum LifecycleWaitDecision {
     Proceed,
     Wait,
-    Candidate(B256),
+    Candidate {
+        request_hash: String,
+        session_id: B256,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubmissionExpectation {
+    CurrentSession,
+    LifecycleSuccessor {
+        request_hash: String,
+        session_id: B256,
+    },
 }
 
 #[derive(Debug)]
-pub(crate) enum RegistrationResult {
-    LocalFallback { session_id: B256 },
-    AlreadyActive { session_id: B256 },
-    Submitted { session_id: B256, tx_hash: B256 },
+pub(crate) enum SessionRelayResult {
+    LocalFallback {
+        session_id: B256,
+    },
+    AlreadyActive {
+        session_id: B256,
+    },
+    Submitted {
+        session_id: B256,
+        tx_hash: B256,
+    },
+    ActivatedByEarlierTransaction {
+        session_id: B256,
+        reverted_tx_hash: B256,
+    },
 }
 
-pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
+pub async fn run(args: RelaySessionArgs, env: &Env, config: &Config) -> Result<()> {
     let (target_name, instance_name) =
         resolve_instance(&env.data_dir, &args.instance, args.target.as_deref())?;
     let state = DeployState::load(&env.data_dir, &target_name, &instance_name)
@@ -202,7 +229,7 @@ pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     eprint!("  Submit session transaction... ");
-    let result = submit_prepared_registration(
+    let result = relay_prepared_session(
         &portal_client,
         &portal_host,
         status_port,
@@ -213,21 +240,29 @@ pub async fn run(args: RegisterArgs, env: &Env, config: &Config) -> Result<()> {
     )
     .await?;
     match result {
-        RegistrationResult::LocalFallback { session_id } => {
+        SessionRelayResult::LocalFallback { session_id } => {
             eprintln!("{}", "local fallback; no transaction".yellow());
             eprintln!("  Session: {session_id}");
         }
-        RegistrationResult::AlreadyActive { session_id } => {
+        SessionRelayResult::AlreadyActive { session_id } => {
             eprintln!("{}", "already active".green());
             eprintln!("  Session: {session_id}");
         }
-        RegistrationResult::Submitted {
+        SessionRelayResult::Submitted {
             session_id,
             tx_hash,
         } => {
             eprintln!("{}", "confirmed".green());
             eprintln!("  Session: {session_id}");
             eprintln!("  Tx:      {tx_hash}");
+        }
+        SessionRelayResult::ActivatedByEarlierTransaction {
+            session_id,
+            reverted_tx_hash,
+        } => {
+            eprintln!("{}", "active through an earlier transaction".yellow());
+            eprintln!("  Session:     {session_id}");
+            eprintln!("  Reverted tx: {reverted_tx_hash}");
         }
     }
 
@@ -288,7 +323,7 @@ pub(crate) fn parse_gas_wallet_private_key(
         .with_context(|| format!("invalid gas wallet private key '{gas_wallet_name}'"))
 }
 
-pub(crate) async fn submit_prepared_registration(
+pub(crate) async fn relay_prepared_session(
     portal_client: &reqwest::Client,
     portal_host: &str,
     status_port: u16,
@@ -296,10 +331,10 @@ pub(crate) async fn submit_prepared_registration(
     signer: PrivateKeySigner,
     timeout_secs: u64,
     wait_for_successor: bool,
-) -> Result<RegistrationResult> {
+) -> Result<SessionRelayResult> {
     let base_url = format!("https://{portal_host}:{status_port}");
     let session_url = format!("{base_url}/session");
-    let lifecycle_session_id = wait_for_lifecycle_candidate(
+    let submission_expectation = wait_for_lifecycle_candidate(
         portal_client,
         &base_url,
         Duration::from_secs(timeout_secs),
@@ -334,40 +369,13 @@ pub(crate) async fn submit_prepared_registration(
             .session_id
             .parse()
             .context("portal returned an invalid local session id")?;
-        return Ok(RegistrationResult::LocalFallback { session_id });
+        return Ok(SessionRelayResult::LocalFallback { session_id });
     }
 
-    let mut challenge = [0u8; 32];
-    OsRng.fill_bytes(&mut challenge);
-    let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
-    let response: ChainSubmissionResponse = portal_client
-        .get(format!("{base_url}/chain-submission"))
-        .query(&[("challenge", challenge_text.as_str())])
-        .send()
-        .await
-        .context("fetch portal chain submission")?
-        .error_for_status()
-        .context("portal chain submission is unavailable")?
-        .json()
-        .await
-        .context("decode portal chain submission")?;
-
-    let verified = verify_chain_submission(
-        &session,
-        &response,
-        challenge,
-        &challenge_text,
-        &chain.session_registry,
-    )?;
-    if let Some(expected_session_id) = lifecycle_session_id {
-        if verified.session_id != expected_session_id {
-            bail!(
-                "portal chain submission session {} does not match pending lifecycle session {}",
-                verified.session_id,
-                expected_session_id
-            );
-        }
-    }
+    let verified =
+        fetch_verified_submission(portal_client, &base_url, &session, &chain.session_registry)
+            .await?;
+    verify_submission_expectation(&session, &verified, &submission_expectation)?;
     let receipt_timeout = Duration::from_secs(timeout_secs);
     let provider = NetworkProvider::with_http(
         &chain.rpc_url,
@@ -397,10 +405,20 @@ pub(crate) async fn submit_prepared_registration(
             Duration::from_secs(timeout_secs),
         )
         .await?;
-        return Ok(RegistrationResult::AlreadyActive {
+        return Ok(SessionRelayResult::AlreadyActive {
             session_id: verified.session_id,
         });
     }
+
+    let verified = revalidate_submission_before_broadcast(
+        portal_client,
+        &base_url,
+        &session,
+        &chain.session_registry,
+        &submission_expectation,
+        verified.submission_id,
+    )
+    .await?;
 
     let wallet_provider = provider.with_signer(signer);
     let tx = TransactionRequest::default()
@@ -412,11 +430,55 @@ pub(crate) async fn submit_prepared_registration(
         .await
         .context("broadcast session transaction")?;
     let tx_hash = pending.tx_hash();
+    let mut notification_error = if verified.lifecycle_request_hash.is_some() {
+        notify_portal_of_submitted_transaction(
+            portal_client,
+            &base_url,
+            verified.submission_id,
+            tx_hash,
+        )
+        .await
+        .err()
+    } else {
+        None
+    };
     let receipt = pending
         .get_receipt()
         .await
         .context("wait for session transaction receipt")?;
     if !receipt.status() {
+        if verified.lifecycle_request_hash.is_some() && notification_error.is_some() {
+            notification_error = notify_portal_of_submitted_transaction(
+                portal_client,
+                &base_url,
+                verified.submission_id,
+                tx_hash,
+            )
+            .await
+            .err();
+        }
+        if registry
+            .is_session_active(verified.session_id)
+            .await
+            .context("recheck session activation after reverted transaction")?
+        {
+            wait_for_portal_session_commit(
+                portal_client,
+                &session_url,
+                verified.session_id,
+                Duration::from_secs(timeout_secs),
+            )
+            .await?;
+            return Ok(SessionRelayResult::ActivatedByEarlierTransaction {
+                session_id: verified.session_id,
+                reverted_tx_hash: tx_hash,
+            });
+        }
+        if let Some(error) = notification_error {
+            bail!(
+                "session transaction {tx_hash} reverted; the portal could not observe it: {error}"
+            );
+        }
         bail!("session transaction {tx_hash} reverted");
     }
     wait_for_portal_session_commit(
@@ -426,10 +488,162 @@ pub(crate) async fn submit_prepared_registration(
         Duration::from_secs(timeout_secs),
     )
     .await?;
-    Ok(RegistrationResult::Submitted {
+    Ok(SessionRelayResult::Submitted {
         session_id: verified.session_id,
         tx_hash,
     })
+}
+
+async fn fetch_verified_submission(
+    portal_client: &reqwest::Client,
+    base_url: &str,
+    session: &SessionResponse,
+    configured_registry: &str,
+) -> Result<VerifiedSubmission> {
+    let mut challenge = [0u8; 32];
+    OsRng.fill_bytes(&mut challenge);
+    let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
+    let response: ChainSubmissionResponse = portal_client
+        .get(format!("{base_url}/chain-submission"))
+        .query(&[("challenge", challenge_text.as_str())])
+        .send()
+        .await
+        .context("fetch portal chain submission")?
+        .error_for_status()
+        .context("portal chain submission is unavailable")?
+        .json()
+        .await
+        .context("decode portal chain submission")?;
+    verify_chain_submission(
+        session,
+        &response,
+        challenge,
+        &challenge_text,
+        configured_registry,
+    )
+}
+
+async fn revalidate_submission_before_broadcast(
+    portal_client: &reqwest::Client,
+    base_url: &str,
+    original_session: &SessionResponse,
+    configured_registry: &str,
+    expectation: &SubmissionExpectation,
+    expected_submission_id: B256,
+) -> Result<VerifiedSubmission> {
+    let status: LifecycleStatusResponse = portal_client
+        .get(format!("{base_url}/session/status"))
+        .send()
+        .await
+        .context("recheck portal lifecycle status before broadcast")?
+        .error_for_status()
+        .context("portal lifecycle status recheck is unavailable")?
+        .json()
+        .await
+        .context("decode portal lifecycle status recheck")?;
+    verify_lifecycle_status_expectation(&status, expectation)?;
+
+    let session: SessionResponse = portal_client
+        .get(format!("{base_url}/session"))
+        .send()
+        .await
+        .context("recheck portal session before broadcast")?
+        .error_for_status()
+        .context("portal session recheck is unavailable")?
+        .json()
+        .await
+        .context("decode portal session recheck")?;
+    if parse_b256(&session.session_id, "rechecked committed session ID")?
+        != parse_b256(
+            &original_session.session_id,
+            "original committed session ID",
+        )?
+    {
+        bail!("committed portal session changed before transaction broadcast");
+    }
+
+    let submission =
+        fetch_verified_submission(portal_client, base_url, &session, configured_registry).await?;
+    verify_submission_expectation(&session, &submission, expectation)?;
+    if submission.submission_id != expected_submission_id {
+        bail!("portal chain submission changed before transaction broadcast");
+    }
+    Ok(submission)
+}
+
+fn verify_lifecycle_status_expectation(
+    status: &LifecycleStatusResponse,
+    expectation: &SubmissionExpectation,
+) -> Result<()> {
+    match expectation {
+        SubmissionExpectation::CurrentSession => match status.state.as_str() {
+            "idle" | "completed" => Ok(()),
+            "failed" => bail!(
+                "portal lifecycle request failed before broadcast: {}",
+                status.error_code.as_deref().unwrap_or("unknown error")
+            ),
+            _ => bail!("portal lifecycle state changed before transaction broadcast"),
+        },
+        SubmissionExpectation::LifecycleSuccessor {
+            request_hash,
+            session_id,
+        } => {
+            if status.state != "running"
+                || status.request_hash.as_deref() != Some(request_hash.as_str())
+                || status
+                    .session_id
+                    .as_deref()
+                    .map(|value| parse_b256(value, "rechecked lifecycle successor session ID"))
+                    .transpose()?
+                    != Some(*session_id)
+            {
+                bail!("pending lifecycle submission changed before transaction broadcast");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SubmittedTransactionNotice {
+    submission_id: String,
+    tx_hash: String,
+}
+
+async fn notify_portal_of_submitted_transaction(
+    portal_client: &reqwest::Client,
+    base_url: &str,
+    submission_id: B256,
+    tx_hash: B256,
+) -> Result<()> {
+    let body = SubmittedTransactionNotice {
+        submission_id: submission_id.to_string(),
+        tx_hash: tx_hash.to_string(),
+    };
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        match portal_client
+            .post(format!("{base_url}/chain-submission/submitted"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                last_error = Some(format!("HTTP {status}: {detail}"));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if attempt < 5 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    bail!(
+        "POST /chain-submission/submitted failed: {}",
+        last_error.as_deref().unwrap_or("unknown error")
+    )
 }
 
 async fn wait_for_lifecycle_candidate(
@@ -437,7 +651,7 @@ async fn wait_for_lifecycle_candidate(
     base_url: &str,
     timeout: Duration,
     wait_for_successor: bool,
-) -> Result<Option<B256>> {
+) -> Result<SubmissionExpectation> {
     let status_url = format!("{base_url}/session/status");
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -453,8 +667,16 @@ async fn wait_for_lifecycle_candidate(
             .await
             .context("decode portal lifecycle status")?;
         match lifecycle_wait_decision(&status, wait_for_successor)? {
-            LifecycleWaitDecision::Proceed => return Ok(None),
-            LifecycleWaitDecision::Candidate(session_id) => return Ok(Some(session_id)),
+            LifecycleWaitDecision::Proceed => return Ok(SubmissionExpectation::CurrentSession),
+            LifecycleWaitDecision::Candidate {
+                request_hash,
+                session_id,
+            } => {
+                return Ok(SubmissionExpectation::LifecycleSuccessor {
+                    request_hash,
+                    session_id,
+                })
+            }
             LifecycleWaitDecision::Wait => {}
         }
         if tokio::time::Instant::now() + Duration::from_secs(2) > deadline {
@@ -475,14 +697,18 @@ fn lifecycle_wait_decision(
         "idle" | "completed" if wait_for_successor => Ok(LifecycleWaitDecision::Wait),
         "idle" | "completed" => Ok(LifecycleWaitDecision::Proceed),
         "waiting" => Ok(LifecycleWaitDecision::Wait),
-        "running" => status
-            .session_id
-            .as_deref()
-            .map(|session_id| {
-                parse_b256(session_id, "pending lifecycle session ID")
-                    .map(LifecycleWaitDecision::Candidate)
-            })
-            .unwrap_or(Ok(LifecycleWaitDecision::Wait)),
+        "running" => match status.session_id.as_deref() {
+            Some(session_id) => {
+                let request_hash = status.request_hash.clone().ok_or_else(|| {
+                    anyhow::anyhow!("running lifecycle status has no request hash")
+                })?;
+                Ok(LifecycleWaitDecision::Candidate {
+                    request_hash,
+                    session_id: parse_b256(session_id, "pending lifecycle session ID")?,
+                })
+            }
+            None => Ok(LifecycleWaitDecision::Wait),
+        },
         "failed" => bail!(
             "portal lifecycle request failed: {}",
             status.error_code.as_deref().unwrap_or("unknown error")
@@ -531,6 +757,8 @@ async fn wait_for_portal_session_commit(
 
 #[derive(Debug)]
 struct VerifiedSubmission {
+    submission_id: B256,
+    lifecycle_request_hash: Option<String>,
     chain_id: u64,
     to: Address,
     data: Vec<u8>,
@@ -576,6 +804,10 @@ fn verify_chain_submission(
     if submission.value != "0x0" {
         bail!("chain submission must have zero value");
     }
+    let submission_id = parse_b256(&submission.submission_id, "submission ID")?;
+    if submission_id != calculate_submission_id(submission, signing_session_id)? {
+        bail!("portal chain submission ID does not match its contents");
+    }
     let session_id = parse_b256(&submission.session_id, "submission session ID")?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -602,6 +834,8 @@ fn verify_chain_submission(
         bail!("chain submission data is empty");
     }
     Ok(VerifiedSubmission {
+        submission_id,
+        lifecycle_request_hash: submission.lifecycle_request_hash.clone(),
         chain_id: submission.chain_id,
         to,
         data,
@@ -609,15 +843,78 @@ fn verify_chain_submission(
     })
 }
 
+fn verify_submission_expectation(
+    session: &SessionResponse,
+    submission: &VerifiedSubmission,
+    expectation: &SubmissionExpectation,
+) -> Result<()> {
+    let committed_session_id = parse_b256(&session.session_id, "committed portal session ID")?;
+    match expectation {
+        SubmissionExpectation::CurrentSession => {
+            if submission.lifecycle_request_hash.is_some() {
+                bail!("portal exposed an unexpected lifecycle submission");
+            }
+            if submission.session_id != committed_session_id {
+                bail!(
+                    "portal chain submission session {} does not match committed session {}",
+                    submission.session_id,
+                    committed_session_id
+                );
+            }
+        }
+        SubmissionExpectation::LifecycleSuccessor {
+            request_hash,
+            session_id,
+        } => {
+            if submission.lifecycle_request_hash.as_deref() != Some(request_hash.as_str()) {
+                bail!(
+                    "portal chain submission lifecycle request does not match the observed request {request_hash}"
+                );
+            }
+            if submission.session_id != *session_id {
+                bail!(
+                    "portal chain submission session {} does not match pending lifecycle session {}",
+                    submission.session_id,
+                    session_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn canonical_submission(submission: &ChainSubmission) -> Result<Vec<u8>> {
+    let mut value = canonical_submission_identity(submission);
+    value.insert("submission_id", serde_json::json!(submission.submission_id));
+    serde_json::to_vec(&value).context("canonicalize chain submission")
+}
+
+fn canonical_submission_identity(
+    submission: &ChainSubmission,
+) -> BTreeMap<&'static str, serde_json::Value> {
     let mut value = BTreeMap::new();
     value.insert("chain_id", serde_json::json!(submission.chain_id));
     value.insert("data", serde_json::json!(submission.data));
+    value.insert(
+        "lifecycle_request_hash",
+        serde_json::json!(submission.lifecycle_request_hash),
+    );
     value.insert("op_expires_at", serde_json::json!(submission.op_expires_at));
     value.insert("session_id", serde_json::json!(submission.session_id));
     value.insert("to", serde_json::json!(submission.to));
     value.insert("value", serde_json::json!(submission.value));
-    serde_json::to_vec(&value).context("canonicalize chain submission")
+    value
+}
+
+fn calculate_submission_id(submission: &ChainSubmission, signing_session_id: B256) -> Result<B256> {
+    const DOMAIN: &str = "ATAKIT_PORTAL_CHAIN_SUBMISSION_ID_V1";
+    let identity = serde_json::to_vec(&canonical_submission_identity(submission))
+        .context("canonicalize chain submission identity")?;
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN.as_bytes());
+    hasher.update(signing_session_id.as_slice());
+    hasher.update(identity);
+    Ok(B256::from_slice(&hasher.finalize()))
 }
 
 fn parse_hex(value: &str, field: &str) -> Result<Vec<u8>> {
@@ -641,6 +938,7 @@ mod tests {
     #[test]
     fn lifecycle_status_waits_for_the_announced_successor() {
         let waiting = LifecycleStatusResponse {
+            request_hash: Some(format!("0x{}", "11".repeat(32))),
             state: "running".into(),
             session_id: None,
             error_code: None,
@@ -651,16 +949,21 @@ mod tests {
         );
 
         let candidate = LifecycleStatusResponse {
+            request_hash: Some(format!("0x{}", "11".repeat(32))),
             state: "running".into(),
             session_id: Some(format!("0x{}", "42".repeat(32))),
             error_code: None,
         };
         assert_eq!(
             lifecycle_wait_decision(&candidate, false).unwrap(),
-            LifecycleWaitDecision::Candidate(B256::repeat_byte(0x42))
+            LifecycleWaitDecision::Candidate {
+                request_hash: format!("0x{}", "11".repeat(32)),
+                session_id: B256::repeat_byte(0x42),
+            }
         );
 
         let idle = LifecycleStatusResponse {
+            request_hash: None,
             state: "idle".into(),
             session_id: None,
             error_code: None,
@@ -678,6 +981,7 @@ mod tests {
     #[test]
     fn lifecycle_failure_is_not_reported_as_already_active() {
         let failed = LifecycleStatusResponse {
+            request_hash: Some(format!("0x{}", "11".repeat(32))),
             state: "failed".into(),
             session_id: None,
             error_code: Some("proof_failed".into()),
@@ -697,7 +1001,9 @@ mod tests {
         let registry = "0x1111111111111111111111111111111111111111";
         let active_session_id = format!("0x{}", "22".repeat(32));
         let candidate_session_id = format!("0x{}", "33".repeat(32));
-        let submission = ChainSubmission {
+        let mut submission = ChainSubmission {
+            submission_id: String::new(),
+            lifecycle_request_hash: Some(format!("0x{}", "44".repeat(32))),
             chain_id: 31337,
             to: registry.to_string(),
             value: "0x0".to_string(),
@@ -705,6 +1011,9 @@ mod tests {
             session_id: candidate_session_id,
             op_expires_at: u64::MAX,
         };
+        submission.submission_id = calculate_submission_id(&submission, B256::repeat_byte(0x22))
+            .unwrap()
+            .to_string();
         let digest = chain_submission_request_binding_digest(
             challenge,
             &canonical_submission(&submission).unwrap(),
@@ -740,7 +1049,64 @@ mod tests {
             verify_chain_submission(&session, &response, challenge, &challenge_text, registry)
                 .unwrap_err()
                 .to_string()
-                .contains("signature is invalid")
+                .contains("ID does not match")
         );
+    }
+
+    #[test]
+    fn current_session_expectation_rejects_an_unobserved_lifecycle_successor() {
+        let session = SessionResponse {
+            session_id: B256::repeat_byte(0x22).to_string(),
+            session_key: SessionKey {
+                key_type: "ES256K".into(),
+                bytes: "0x04".into(),
+            },
+            chain_id: 31337,
+            registry: "0x1111111111111111111111111111111111111111".into(),
+            chain_submission_available: true,
+        };
+        let submission = VerifiedSubmission {
+            submission_id: B256::repeat_byte(0x55),
+            lifecycle_request_hash: Some(B256::repeat_byte(0x44).to_string()),
+            chain_id: 31337,
+            to: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            data: vec![1],
+            session_id: B256::repeat_byte(0x33),
+        };
+        assert!(verify_submission_expectation(
+            &session,
+            &submission,
+            &SubmissionExpectation::CurrentSession
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected lifecycle submission"));
+    }
+
+    #[test]
+    fn lifecycle_recheck_requires_the_exact_request_and_successor() {
+        let request_hash = B256::repeat_byte(0x44).to_string();
+        let session_id = B256::repeat_byte(0x33);
+        let status = LifecycleStatusResponse {
+            request_hash: Some(request_hash.clone()),
+            state: "running".into(),
+            session_id: Some(session_id.to_string()),
+            error_code: None,
+        };
+        let expectation = SubmissionExpectation::LifecycleSuccessor {
+            request_hash,
+            session_id,
+        };
+        verify_lifecycle_status_expectation(&status, &expectation).unwrap();
+
+        let changed = LifecycleStatusResponse {
+            request_hash: status.request_hash.clone(),
+            state: "running".into(),
+            session_id: Some(B256::repeat_byte(0x34).to_string()),
+            error_code: None,
+        };
+        assert!(verify_lifecycle_status_expectation(&changed, &expectation).is_err());
     }
 }

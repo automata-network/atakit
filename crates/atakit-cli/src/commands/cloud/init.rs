@@ -202,7 +202,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         let private_key = gas_init.private_key.as_deref().ok_or_else(|| {
             anyhow::anyhow!("gas wallet '{name}' did not resolve to a private key")
         })?;
-        Some(super::register::parse_gas_wallet_private_key(
+        Some(super::relay_session::parse_gas_wallet_private_key(
             name,
             private_key,
         )?)
@@ -454,7 +454,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     step += 1;
 
     // 9. Save recovery inputs before the external transaction. If the CLI is
-    // interrupted after /init, `cloud register` can safely resume.
+    // interrupted after /init, `cloud relay-session` can safely resume.
     state.workload_name = workload_name.clone();
     state.workload_version = workload_version.clone();
     state.archive_path = archive_path.display().to_string();
@@ -498,7 +498,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             .chains
             .get(chain_name)
             .expect("active registration resolved a chain config");
-        let result = super::register::submit_prepared_registration(
+        let result = super::relay_session::relay_prepared_session(
             &portal_client,
             &portal_host,
             status_port,
@@ -509,22 +509,30 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         )
         .await?;
         match result {
-            super::register::RegistrationResult::LocalFallback { session_id } => {
+            super::relay_session::SessionRelayResult::LocalFallback { session_id } => {
                 eprintln!(
                     "{} ({session_id})",
                     "local fallback; no transaction".yellow()
                 );
             }
-            super::register::RegistrationResult::AlreadyActive { session_id } => {
+            super::relay_session::SessionRelayResult::AlreadyActive { session_id } => {
                 eprintln!("{} ({session_id})", "already active".green());
             }
-            super::register::RegistrationResult::Submitted {
+            super::relay_session::SessionRelayResult::Submitted {
                 session_id,
                 tx_hash,
             } => {
                 eprintln!("{}", "confirmed".green());
                 eprintln!("      Session: {session_id}");
                 eprintln!("      Tx:      {tx_hash}");
+            }
+            super::relay_session::SessionRelayResult::ActivatedByEarlierTransaction {
+                session_id,
+                reverted_tx_hash,
+            } => {
+                eprintln!("{}", "active through an earlier transaction".yellow());
+                eprintln!("      Session:     {session_id}");
+                eprintln!("      Reverted tx: {reverted_tx_hash}");
             }
         }
         match init::wait_for_portal_terminal_with_client(

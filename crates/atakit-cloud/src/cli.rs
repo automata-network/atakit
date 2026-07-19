@@ -28,9 +28,9 @@ pub enum CloudCommand {
     /// Initialize a deployed instance with a workload
     #[command(arg_required_else_help = true)]
     Init(InitArgs),
-    /// Submit a prepared portal session with the operator gas wallet
-    #[command(arg_required_else_help = true)]
-    Register(RegisterArgs),
+    /// Relay a portal-prepared session transaction with the operator gas wallet
+    #[command(name = "relay-session", arg_required_else_help = true)]
+    RelaySession(RelaySessionArgs),
     /// Verify the current session evidence locally without registry state
     #[command(arg_required_else_help = true)]
     VerifySession(VerifySessionArgs),
@@ -447,9 +447,9 @@ pub struct InitArgs {
     pub unsafe_skip_tls_attestation: bool,
 }
 
-/// Arguments for `cloud register`.
+/// Arguments for `cloud relay-session`.
 #[derive(Args)]
-pub struct RegisterArgs {
+pub struct RelaySessionArgs {
     /// Instance name (or target/instance)
     pub instance: String,
 
@@ -617,5 +617,18 @@ mod tests {
             panic!("expected verify-session command");
         };
         assert_eq!(args.azure_maa_key, ["aa", "bb"]);
+    }
+
+    #[test]
+    fn relay_session_is_the_only_session_relay_command_name() {
+        let cli = TestCli::try_parse_from(["test", "relay-session", "example-vm"])
+            .expect("relay-session arguments");
+
+        let CloudCommand::RelaySession(args) = cli.command else {
+            panic!("expected relay-session command");
+        };
+        assert_eq!(args.instance, "example-vm");
+
+        assert!(TestCli::try_parse_from(["test", "register", "example-vm"]).is_err());
     }
 }
