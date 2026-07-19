@@ -62,9 +62,12 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &init_chain,
     )
     .await?;
-    let trust_anchors =
-        init::load_tls_trust_anchors(&args.gcp_ak_root_cert, &[], &args.amd_ark_root_cert)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let trust_anchors = init::load_tls_trust_anchors(
+        &args.gcp_ak_root_cert,
+        &args.azure_maa_key,
+        &args.amd_ark_root_cert,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     let tdx_dcap = init::tdx_dcap_collateral_config(
         args.tdx_dcap_collateral,
         args.tdx_dcap_pccs_url,

@@ -1063,6 +1063,7 @@ dependencies = [
  "atakit-attestation",
  "atakit-config",
  "atakit-core",
+ "atakit-image",
  "base64 0.22.1",
  "chrono",
  "clap",

@@ -1797,4 +1797,31 @@ mod tls_measurement_policy_tests {
 
         assert!(chain_measurement_policy_available(&chain));
     }
+
+    #[tokio::test]
+    async fn incomplete_local_pack_does_not_fallback_to_chain() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let pack_dir = data_dir
+            .path()
+            .join("baseimage")
+            .join("measurements")
+            .join(atakit_image::encode_image_ref_path_segment("base"))
+            .join(atakit_image::encode_image_ref_path_segment("v1"));
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+
+        let mut chain = synthesize_off_init_chain();
+        chain.rpc_url = "https://rpc.example.com".to_string();
+        chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        let error =
+            resolve_tls_measurement_policy(None, Some("base:v1"), &[], data_dir.path(), &chain)
+                .await
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("measurement-pack.sig"),
+            "{error}"
+        );
+    }
 }

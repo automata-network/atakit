@@ -9,7 +9,6 @@ use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::{CloudProvider, DeployOptions};
 use atakit_cloud::qemu::QemuProvider;
-use atakit_cloud::session::{self, TrustedWorkloadSessionPolicy};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::{
     AwsResources, AzureResourceNames, AzureResources, GcpResources, PlatformKind, PortalPorts,
@@ -394,7 +393,6 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         target.registration.clone()
     };
     let registration_off = registration_is_off(effective_registration.as_deref());
-    let verify_offchain_session = registration_off && !is_qemu;
     if registration_off
         && !is_qemu
         && args.unsafe_skip_tls_attestation
@@ -402,7 +400,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         && !args.skip_init
     {
         bail!(
-            "registration-off deployment requires full TLS attestation so the current session can be verified off-chain; remove --unsafe-skip-tls-attestation"
+            "registration-off deployment requires full TLS attestation; remove --unsafe-skip-tls-attestation"
         );
     }
     init_env.sp1_payer = super::effective_prover_credential(
@@ -1123,42 +1121,6 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                                 }
                                 eprintln!("  warning: {e}");
                             }
-                        }
-                        if verify_offchain_session {
-                            let verified_tls = verified_tls.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "off-chain session verification requires full TLS attestation"
-                                )
-                            })?;
-                            let workload_id = crate::commands::workload::compute_workload_id(
-                                &workload_name,
-                                &workload_version,
-                            );
-                            eprint!("      verifying current session... ");
-                            let verified = session::verify_current_session(
-                                verified_tls,
-                                &ip,
-                                status_port,
-                                TrustedWorkloadSessionPolicy {
-                                    workload_id: workload_id.0,
-                                    attribute_requirements: Vec::new(),
-                                },
-                                Some(atakit_attestation::BindingMode::Local),
-                            )
-                            .await
-                            .map_err(|error| anyhow::anyhow!("{error}"))?;
-                            let report_path = super::verify_session::session_report_path(
-                                &env.data_dir,
-                                target_name,
-                                &instance_name,
-                            );
-                            if let Some(parent) = report_path.parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            std::fs::write(&report_path, serde_json::to_vec_pretty(&verified)?)?;
-                            eprintln!("{}", "done".green());
-                            eprintln!("      session: 0x{}", hex::encode(verified.session_id));
-                            eprintln!("      report:  {}", report_path.display());
                         }
                     }
                     Err(e) => {

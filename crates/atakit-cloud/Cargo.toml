@@ -10,6 +10,7 @@ cli = ["clap"]
 atakit-core.workspace = true
 atakit-config.workspace = true
 atakit-attestation.workspace = true
+atakit-image.workspace = true
 dcap-qvl.workspace = true
 thiserror.workspace = true
 serde.workspace = true

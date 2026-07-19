@@ -6,12 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atakit_attestation::{
     amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
-    verify_measurement_pack, verify_tls_attestation, AzureMaaTrustKey, CheckResult,
-    EvidenceSummary, MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck,
-    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation,
+    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TlsAttestationResponse,
+    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_config::TransactionSubmitter;
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
+use atakit_image::encode_image_ref_path_segment;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use dcap_qvl::config::PckCa;
@@ -516,7 +517,7 @@ pub fn load_measurement_policy(
                     .to_string(),
             });
         };
-        let path = local_measurement_pack_dir(data_dir, name, version);
+        let path = select_local_measurement_pack_dir(data_dir, name, version)?.path;
         let (json_path, sig_path) = measurement_pack_dir_paths(&path);
         (json_path, sig_path, format!("local:{}", path.display()))
     } else {
@@ -559,19 +560,17 @@ pub fn load_measurement_policy(
     Ok(Some(MeasurementPolicy { source, pack }))
 }
 
-/// Return whether both files for the automatic local pack lookup exist.
+/// Return whether either file for the automatic local pack lookup exists.
 ///
 /// Callers use this only to choose local-versus-chain precedence. Once a local
-/// pack exists, loading or signature errors must fail closed instead of falling
-/// back to a different policy source.
+/// pack artifact exists, loading or signature errors must fail closed instead
+/// of falling back to a different policy source.
 pub fn local_measurement_pack_exists(
     data_dir: &Path,
     base_image: &str,
 ) -> Result<bool, CloudError> {
     let (name, version) = parse_base_image_ref(base_image)?;
-    let dir = local_measurement_pack_dir(data_dir, name, version);
-    let (json, signature) = measurement_pack_dir_paths(&dir);
-    Ok(json.is_file() && signature.is_file())
+    Ok(select_local_measurement_pack_dir(data_dir, name, version)?.detected)
 }
 
 fn parse_base_image_ref(value: &str) -> Result<(&str, &str), CloudError> {
@@ -640,11 +639,19 @@ fn local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> Pat
     data_dir
         .join("baseimage")
         .join("measurements")
-        .join(sanitize_measurement_path_segment(name))
-        .join(sanitize_measurement_path_segment(version))
+        .join(encode_image_ref_path_segment(name))
+        .join(encode_image_ref_path_segment(version))
 }
 
-fn sanitize_measurement_path_segment(value: &str) -> String {
+fn legacy_local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> PathBuf {
+    data_dir
+        .join("baseimage")
+        .join("measurements")
+        .join(legacy_measurement_path_segment(name))
+        .join(legacy_measurement_path_segment(version))
+}
+
+fn legacy_measurement_path_segment(value: &str) -> String {
     value
         .chars()
         .map(|ch| match ch {
@@ -652,6 +659,54 @@ fn sanitize_measurement_path_segment(value: &str) -> String {
             _ => '_',
         })
         .collect()
+}
+
+struct LocalMeasurementPackSelection {
+    path: PathBuf,
+    detected: bool,
+}
+
+fn select_local_measurement_pack_dir(
+    data_dir: &Path,
+    name: &str,
+    version: &str,
+) -> Result<LocalMeasurementPackSelection, CloudError> {
+    let new_path = local_measurement_pack_dir(data_dir, name, version);
+    if measurement_pack_artifact_exists(&new_path)? {
+        return Ok(LocalMeasurementPackSelection {
+            path: new_path,
+            detected: true,
+        });
+    }
+
+    let legacy_path = legacy_local_measurement_pack_dir(data_dir, name, version);
+    if measurement_pack_artifact_exists(&legacy_path)? {
+        return Ok(LocalMeasurementPackSelection {
+            path: legacy_path,
+            detected: true,
+        });
+    }
+
+    Ok(LocalMeasurementPackSelection {
+        path: new_path,
+        detected: false,
+    })
+}
+
+fn measurement_pack_artifact_exists(dir: &Path) -> Result<bool, CloudError> {
+    let (json, signature) = measurement_pack_dir_paths(dir);
+    Ok(path_exists(&json)? || path_exists(&signature)?)
+}
+
+fn path_exists(path: &Path) -> Result<bool, CloudError> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CloudError::IoPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Fetch and verify the portal's TLS attestation, then return a client pinned
@@ -787,7 +842,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 let report = tls_preverification_failure_report(
                     &response,
                     &live_hash,
-                    "azure-maa-onchain-trust",
+                    "azure-maa-trust",
                     detail,
                 );
                 return handle_tls_attestation_failure(
@@ -976,8 +1031,16 @@ async fn resolve_azure_maa_trust(
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
 ) -> Result<Vec<AzureMaaTrustKey>, String> {
-    if !is_azure_maa_response(response) || !trust_anchors.azure_maa_keys.is_empty() {
+    if !is_azure_maa_response(response) {
         return Ok(Vec::new());
+    }
+    if !trust_anchors.azure_maa_keys.is_empty() {
+        let binding = response
+            .ak_binding
+            .as_ref()
+            .ok_or_else(|| "Azure response is missing akBinding".to_string())?;
+        return select_azure_maa_manual_trust_key(binding, &trust_anchors.azure_maa_keys)
+            .map(|key| vec![key]);
     }
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
@@ -2955,6 +3018,15 @@ mod tests {
         (signature.to_bytes().to_vec(), vec![publisher_key])
     }
 
+    fn write_signed_measurement_pack(pack_dir: &Path, name: &str, version: &str) -> Vec<String> {
+        let json = measurement_pack_json(name, version);
+        let (signature, publisher_keys) = signed_measurement_pack(&json);
+        std::fs::create_dir_all(pack_dir).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.sig"), signature).unwrap();
+        publisher_keys
+    }
+
     #[test]
     fn load_measurement_policy_accepts_json_and_signature() {
         let dir = tempfile::tempdir().unwrap();
@@ -3000,8 +3072,8 @@ mod tests {
             .path()
             .join("baseimage")
             .join("measurements")
-            .join("base_image")
-            .join("v1");
+            .join(encode_image_ref_path_segment("base/image"))
+            .join(encode_image_ref_path_segment("v1"));
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.sig"), sig).unwrap();
@@ -3026,28 +3098,148 @@ mod tests {
             load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
         assert!(
             err.to_string()
-                .contains("baseimage/measurements/base/v1/measurement-pack.json"),
+                .contains("baseimage/measurements/ref~base/ref~v1/measurement-pack.json"),
             "got: {err}"
         );
     }
 
     #[test]
-    fn local_measurement_pack_exists_requires_both_files() {
+    fn local_measurement_pack_exists_when_either_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         let pack_dir = dir
             .path()
             .join("baseimage")
             .join("measurements")
-            .join("base")
-            .join("v1");
+            .join(encode_image_ref_path_segment("base"))
+            .join(encode_image_ref_path_segment("v1"));
         std::fs::create_dir_all(&pack_dir).unwrap();
         assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
 
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
-        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
 
+        std::fs::remove_file(pack_dir.join("measurement-pack.json")).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.sig"), b"signature").unwrap();
         assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+    }
+
+    #[test]
+    fn local_measurement_pack_paths_do_not_collapse_distinct_refs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_ne!(
+            local_measurement_pack_dir(dir.path(), "foo@bar", "v1"),
+            local_measurement_pack_dir(dir.path(), "foo_bar", "v1")
+        );
+    }
+
+    #[test]
+    fn load_measurement_policy_reads_legacy_safe_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "automata-linux", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "automata-linux", "v1");
+
+        let policy =
+            load_measurement_policy(None, Some("automata-linux:v1"), &keys, Some(dir.path()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(policy.source, format!("local:{}", legacy.display()));
+    }
+
+    #[test]
+    fn load_measurement_policy_reads_legacy_sanitized_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "foo@bar", "v1");
+
+        let policy = load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.pack.base_image.name, "foo@bar");
+    }
+
+    #[test]
+    fn load_measurement_policy_rejects_legacy_collision_identity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "foo_bar", "v1");
+
+        let error =
+            load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("measurement pack is for foo_bar:v1, not foo@bar:v1"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn incomplete_legacy_pack_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("measurement-pack.json"),
+            measurement_pack_json("base", "v1"),
+        )
+        .unwrap();
+
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        let error =
+            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("baseimage/measurements/base/v1/measurement-pack.sig"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn new_pack_path_takes_priority_over_legacy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        let keys = write_signed_measurement_pack(&new_path, "base", "v1");
+        write_signed_measurement_pack(&legacy, "wrong", "v1");
+
+        let policy = load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.source, format!("local:{}", new_path.display()));
+    }
+
+    #[test]
+    fn incomplete_new_pack_does_not_fall_back_to_legacy_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        std::fs::create_dir_all(&new_path).unwrap();
+        std::fs::write(
+            new_path.join("measurement-pack.json"),
+            measurement_pack_json("base", "v1"),
+        )
+        .unwrap();
+        let keys = write_signed_measurement_pack(&legacy, "base", "v1");
+
+        let error =
+            load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ref~base/ref~v1/measurement-pack.sig"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn no_local_pack_artifacts_remain_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
     }
 
     #[test]

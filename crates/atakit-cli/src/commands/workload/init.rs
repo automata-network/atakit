@@ -78,8 +78,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         }
     };
     let registration_off = registration_is_off(registration);
-    let cli_submits =
-        !registration_off && init_chain.transaction_submitter == TransactionSubmitter::AtakitCli;
+    reject_unsafe_direct_cli_submission(registration_off, init_chain.transaction_submitter)?;
     let owner_init = match owner_key_name.as_deref() {
         Some(name) => match config.keys.get(name) {
             Some(spec) => init_key_from_config(name, spec, false)?,
@@ -96,16 +95,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             None => bail!("key '{name}' not found in [keys]"),
         },
         None => synthesize_self_generated_key(),
-    };
-    let external_gas_signer = if cli_submits {
-        let name = gas_wallet_name.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("gas wallet is required when atakit-cli submits transactions")
-        })?;
-        Some(crate::commands::cloud::register::gas_wallet_signer(
-            config, name,
-        )?)
-    } else {
-        None
     };
     let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
     // Prover credential: profile override, then `[cloud.defaults]`, then the
@@ -155,12 +144,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!("  1. Wait for CVM portal");
     eprintln!("  2. Initialize workload");
     if !registration_off {
-        let submitter = if cli_submits {
-            "atakit-cli"
-        } else {
-            "atakit-portal"
-        };
-        eprintln!("  3. Wait for session registration by {submitter}");
+        eprintln!("  3. Wait for session registration by atakit-portal");
     }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
@@ -272,25 +256,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
 
     if !registration_off {
         eprint!("  [4/{step_count}] Register session... ");
-        if let Some(signer) = external_gas_signer {
-            let chain_name = chain_name
-                .as_deref()
-                .expect("active registration resolved a chain name");
-            let chain = config
-                .chains
-                .get(chain_name)
-                .expect("active registration resolved a chain config");
-            crate::commands::cloud::register::submit_prepared_registration(
-                &portal_client,
-                &host,
-                status_port,
-                chain,
-                signer,
-                args.timeout,
-                false,
-            )
-            .await?;
-        }
         match init::wait_for_portal_terminal_with_client(
             &portal_client,
             &host,
@@ -321,6 +286,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!();
 
+    Ok(())
+}
+
+fn reject_unsafe_direct_cli_submission(
+    registration_off: bool,
+    submitter: TransactionSubmitter,
+) -> Result<()> {
+    if !registration_off && submitter == TransactionSubmitter::AtakitCli {
+        bail!(
+            "direct workload initialization does not support transaction_submitter = \"atakit-cli\": \
+             it cannot resume safely after /init; use \"atakit-portal\" or redeploy the portal"
+        );
+    }
     Ok(())
 }
 
@@ -371,5 +349,18 @@ mod tests {
     fn parse_address_rejects_bad_port() {
         assert!(parse_address("host:notaport").is_err());
         assert!(parse_address("host:99999").is_err());
+    }
+
+    #[test]
+    fn direct_init_rejects_cli_submission_before_posting_init() {
+        let error = reject_unsafe_direct_cli_submission(false, TransactionSubmitter::AtakitCli)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot resume safely after /init"));
+        assert!(
+            reject_unsafe_direct_cli_submission(false, TransactionSubmitter::AtakitPortal).is_ok()
+        );
+        assert!(reject_unsafe_direct_cli_submission(true, TransactionSubmitter::AtakitCli).is_ok());
     }
 }

@@ -43,7 +43,6 @@ pub struct SessionEvidenceBundle {
     pub session_id: String,
     pub policy: SessionPolicy,
     pub owner: SessionOwner,
-    pub recomputation: SessionRecomputation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,14 +162,6 @@ pub struct SessionOwner {
     /// Optional on-chain transaction projection. It remains request-bound as
     /// part of the bundle JSON but is not an offline session-validity input.
     pub contract_authorization: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionRecomputation {
-    pub tee_report_bytes_hash: String,
-    pub tpm_signature_hash: String,
-    pub session_id: String,
-    pub quote_pcr_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,42 +343,14 @@ pub fn verify_session_bundle(
         "tpm_quote.tpm_signature",
         &mut errors,
     );
-    let tee_hash = decode_hex_32(
-        &bundle.recomputation.tee_report_bytes_hash,
-        "recomputation.tee_report_bytes_hash",
-        &mut errors,
-    );
     let tee_report = decode_b64(
         &bundle.tee_evidence.report,
         "tee_evidence.report",
         &mut errors,
     );
-    if let (Some(report), Some(expected)) = (tee_report.as_ref(), tee_hash) {
-        let actual: [u8; 32] = Keccak256::digest(report).into();
-        record(
-            &mut checks,
-            &mut errors,
-            "tee-report-bytes-hash",
-            actual == expected,
-            "TEE report bytes do not match recomputation.tee_report_bytes_hash",
-        );
-    }
-    if let (Some(actual), Some(expected)) = (
-        session_id,
-        decode_hex_32(
-            &bundle.recomputation.session_id,
-            "recomputation.session_id",
-            &mut errors,
-        ),
-    ) {
-        record(
-            &mut checks,
-            &mut errors,
-            "recomputation-session-id",
-            actual == expected,
-            "top-level session ID differs from recomputation.session_id",
-        );
-    }
+    let tee_hash = tee_report
+        .as_ref()
+        .map(|report| <[u8; 32]>::from(Keccak256::digest(report)));
     if let (Some(signature), Some(tee_hash), Some(expected_id)) =
         (tpm_signature.as_ref(), tee_hash, session_id)
     {
@@ -1007,19 +970,6 @@ fn verify_raw_quote(
             actual == supplied,
             "TPM Quote signature hash mismatch",
         );
-        if let Some(recomputed) = decode_hex_32(
-            &bundle.recomputation.tpm_signature_hash,
-            "recomputation.tpm_signature_hash",
-            errors,
-        ) {
-            record(
-                checks,
-                errors,
-                "recomputation-tpm-signature-hash",
-                actual == recomputed,
-                "TPM Quote signature hash differs from recomputation.tpm_signature_hash",
-            );
-        }
     }
     let (Some(quote), Some(_signature), Some(qualifying)) = (quote, signature, qualifying) else {
         return;
@@ -1086,28 +1036,6 @@ fn verify_quote_projection(
         bundle.pcr_values.iter().all(|pcr| pcr.sha384.is_none()),
         "session Quote projection currently supports only the SHA-256 PCR bank",
     );
-
-    let mut concat = Vec::with_capacity(bundle.pcr_values.len() * 32);
-    for pcr in &bundle.pcr_values {
-        let Some(value) = decode_hex_32(&pcr.sha256, "pcr_values.sha256", errors) else {
-            return;
-        };
-        concat.extend_from_slice(&value);
-    }
-    let actual: [u8; 32] = Sha256::digest(&concat).into();
-    if let Some(projected) = decode_hex_32(
-        &bundle.recomputation.quote_pcr_digest,
-        "recomputation.quote_pcr_digest",
-        errors,
-    ) {
-        record(
-            checks,
-            errors,
-            "quote-pcr-digest-projection",
-            actual == projected,
-            "recomputation.quote_pcr_digest does not match the quoted PCR projection",
-        );
-    }
 }
 
 fn verify_raw_certify(
@@ -1936,12 +1864,6 @@ mod tests {
             owner: SessionOwner {
                 fingerprint: format!("0x{}", "00".repeat(32)),
                 contract_authorization: None,
-            },
-            recomputation: SessionRecomputation {
-                tee_report_bytes_hash: format!("0x{}", "00".repeat(32)),
-                tpm_signature_hash: format!("0x{}", "00".repeat(32)),
-                session_id: format!("0x{}", "00".repeat(32)),
-                quote_pcr_digest: format!("0x{}", "00".repeat(32)),
             },
         }
     }

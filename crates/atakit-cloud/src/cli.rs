@@ -548,6 +548,10 @@ pub struct VerifySessionArgs {
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
+    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
+    #[arg(long, value_name = "HEX")]
+    pub azure_maa_key: Vec<String>,
+
     /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
     #[arg(long, value_name = "HEX")]
     pub gcp_ak_root_cert: Vec<String>,
@@ -582,4 +586,36 @@ pub struct SerialArgs {
     /// Target name (for disambiguation)
     #[arg(long)]
     pub target: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: CloudCommand,
+    }
+
+    #[test]
+    fn verify_session_accepts_repeatable_manual_azure_maa_keys() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "azure-vm",
+            "--azure-maa-key",
+            "aa",
+            "--azure-maa-key",
+            "bb",
+        ])
+        .expect("verify-session arguments");
+
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(args.azure_maa_key, ["aa", "bb"]);
+    }
 }

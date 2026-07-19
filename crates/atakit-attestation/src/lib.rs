@@ -156,6 +156,67 @@ pub fn amd_snp_ark_from_cert_table(table: &[u8]) -> std::result::Result<Vec<u8>,
         .ok_or_else(|| "SNP certificate table is missing the ARK certificate".to_string())
 }
 
+/// Select the manually trusted MAA key that signed an Azure binding and add
+/// the JWT metadata required by session verification.
+///
+/// Manual keys are explicit operator trust and do not carry registry expiry
+/// metadata. The returned key therefore remains valid until the operator
+/// removes it. Callers still perform complete TLS and session verification.
+pub fn select_azure_maa_manual_trust_key(
+    binding: &AkBinding,
+    trusted_keys: &[Vec<u8>],
+) -> std::result::Result<AzureMaaTrustKey, String> {
+    if trusted_keys.is_empty() {
+        return Err("no manually trusted Azure MAA signing keys configured".to_string());
+    }
+    let binding = verification_core::parse_azure_maa_binding(binding)?;
+    let (signing_input, header, claims, signature) =
+        verification_core::parse_azure_maa_jwt(&binding.jwt)?;
+    if header.alg != "RS256" {
+        return Err(format!("MAA JWT alg is {}, expected RS256", header.alg));
+    }
+    let kid = header
+        .kid
+        .filter(|kid| !kid.is_empty())
+        .ok_or_else(|| "MAA JWT kid is missing".to_string())?;
+    if claims.iss.is_empty() {
+        return Err("MAA JWT issuer is empty".to_string());
+    }
+    let signature = RsaSignature::try_from(signature.as_slice())
+        .map_err(|error| format!("MAA JWT signature is invalid: {error}"))?;
+    let mut key_errors = Vec::new();
+    for key_bytes in trusted_keys {
+        let key = match verification_core::parse_rsa_public_key(key_bytes) {
+            Ok(key) => key,
+            Err(detail) => {
+                key_errors.push(detail);
+                continue;
+            }
+        };
+        let verifier = RsaVerifyingKey::<rsa::sha2::Sha256>::new(key);
+        if verifier
+            .verify(signing_input.as_bytes(), &signature)
+            .is_ok()
+        {
+            return Ok(AzureMaaTrustKey {
+                kid,
+                issuer: claims.iss,
+                not_after: u64::MAX,
+                public_key: key_bytes.clone(),
+            });
+        }
+    }
+    let detail = if key_errors.is_empty() {
+        format!("MAA JWT signature did not verify under any manually trusted key; kid={kid}")
+    } else {
+        format!(
+            "MAA JWT signature did not verify under any manually trusted key; kid={kid}; key parse errors: {}",
+            key_errors.join("; ")
+        )
+    };
+    Err(detail)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsAttestationResponse {
@@ -2766,8 +2827,8 @@ mod tests {
             SessionAttestationMode, SessionBinding, SessionEventHashes, SessionEvidenceBundle,
             SessionKeyDelegation, SessionOwner, SessionPcrPolicy, SessionPcrValue,
             SessionPcrVerifyType, SessionPlatform, SessionPlatformTrust, SessionPolicy,
-            SessionPublicKey, SessionRecomputation, SessionRequestBinding, SessionTrust,
-            SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence, TrustedSessionPolicy,
+            SessionPublicKey, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
+            TpmCertifyEvidence, TpmQuoteEvidence, TrustedSessionPolicy,
         };
 
         let (snp_report, amd_ark, snp_cert_table) = fixture_gcp_snp_report_and_certs();
@@ -2826,10 +2887,6 @@ mod tests {
             .sign_prehash(&delegation_digest)
             .expect("delegation signature");
 
-        let mut quoted_pcrs = Vec::with_capacity(64);
-        quoted_pcrs.extend_from_slice(&pcr4);
-        quoted_pcrs.extend_from_slice(&pcr15);
-        let quote_pcr_digest: [u8; 32] = Sha256::digest(quoted_pcrs).into();
         let pcr4_policy = SessionPcrPolicy {
             pcr_index: 4,
             verify_type: SessionPcrVerifyType::Static,
@@ -2919,12 +2976,6 @@ mod tests {
             owner: SessionOwner {
                 fingerprint: hex0x(&owner_fingerprint),
                 contract_authorization: None,
-            },
-            recomputation: SessionRecomputation {
-                tee_report_bytes_hash: hex0x(&tee_report_hash),
-                tpm_signature_hash: hex0x(&quote_signature_hash),
-                session_id: hex0x(&session_id),
-                quote_pcr_digest: hex0x(&quote_pcr_digest),
             },
         };
 
@@ -3277,5 +3328,20 @@ mod tests {
         let parsed = verification_core::parse_amd_snp_cert_table(&table).unwrap();
         assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
         assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
+    }
+
+    #[test]
+    fn selects_manual_azure_maa_key_with_live_jwt_metadata() {
+        let quote = fake_tpm_quote(&[0u8; 32], &[(4, [0xaau8; 32])]);
+        let (binding, _, trusted_key) = fake_azure_ak_binding_and_signature(&quote);
+
+        let selected = select_azure_maa_manual_trust_key(&binding, &[vec![0], trusted_key.clone()])
+            .expect("matching manual MAA key");
+
+        assert_eq!(selected.kid, "test-maa-key");
+        assert_eq!(selected.issuer, "https://sharedeus.eus.attest.azure.net");
+        assert_eq!(selected.not_after, u64::MAX);
+        assert_eq!(selected.public_key, trusted_key);
+        assert!(select_azure_maa_manual_trust_key(&binding, &[vec![0]]).is_err());
     }
 }

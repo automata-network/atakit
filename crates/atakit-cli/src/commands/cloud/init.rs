@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use atakit_cloud::cli::InitArgs;
 use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
-use atakit_cloud::session::{self, TrustedWorkloadSessionPolicy};
 use atakit_cloud::state::{DeployState, DeployStatus, PortalPorts};
 use atakit_cloud::{PlatformKind, ProcessRunner};
 use atakit_config::{KeyMode, KeyType, TransactionSubmitter};
@@ -248,7 +247,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 target.provider
             )
         })?;
-    let verify_offchain_session =
+    let wait_for_local_session =
         registration_off && !matches!(provider_config.platform, atakit_cloud::PlatformKind::Qemu);
     let reconcile_gcp_firewall = matches!(provider_config.platform, PlatformKind::Gcp);
     if registration_off
@@ -256,7 +255,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         && !matches!(provider_config.platform, atakit_cloud::PlatformKind::Qemu)
     {
         bail!(
-            "registration-off initialization requires full TLS attestation so the current session can be verified off-chain; remove --unsafe-skip-tls-attestation"
+            "registration-off initialization requires full TLS attestation; remove --unsafe-skip-tls-attestation"
         );
     }
 
@@ -300,9 +299,9 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             "  {}. Wait for session registration by {owner}",
             if reconcile_gcp_firewall { 4 } else { 3 }
         );
-    } else if verify_offchain_session {
+    } else if wait_for_local_session {
         eprintln!(
-            "  {}. Verify the local-bound session evidence off-chain",
+            "  {}. Wait for the local-bound session and workload",
             if reconcile_gcp_firewall { 4 } else { 3 }
         );
     }
@@ -336,7 +335,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // 7. Wait for portal.
-    let mut step_count = if verify_offchain_session || !registration_off {
+    let mut step_count = if wait_for_local_session || !registration_off {
         4
     } else {
         3
@@ -470,7 +469,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .save(&env.data_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if verify_offchain_session {
+    if wait_for_local_session {
+        eprint!("  [{step}/{step_count}] Wait for workload... ");
         match init::wait_for_portal_terminal_with_client(
             &portal_client,
             &portal_host,
@@ -481,41 +481,11 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?
         {
-            PortalTerminalState::Running => {}
+            PortalTerminalState::Running => eprintln!("{}", "done".green()),
             PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
                 bail!("portal did not reach Running: {detail}")
             }
         }
-
-        eprint!("  [{step}/{step_count}] Verify current session... ");
-        let verified_tls = verified_tls.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "off-chain session verification requires full TLS attestation; remove --unsafe-skip-tls-attestation"
-            )
-        })?;
-        let workload_id =
-            crate::commands::workload::compute_workload_id(&workload_name, &workload_version);
-        let verified = session::verify_current_session(
-            verified_tls,
-            &portal_host,
-            status_port,
-            TrustedWorkloadSessionPolicy {
-                workload_id: workload_id.0,
-                attribute_requirements: Vec::new(),
-            },
-            Some(atakit_attestation::BindingMode::Local),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let report_path =
-            super::verify_session::session_report_path(&env.data_dir, &target_name, &instance_name);
-        if let Some(parent) = report_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&report_path, serde_json::to_vec_pretty(&verified)?)?;
-        eprintln!("{}", "done".green());
-        eprintln!("      session: 0x{}", hex::encode(verified.session_id));
-        eprintln!("      report:  {}", report_path.display());
     }
 
     // 10. atakit-cli submission is an explicit compatibility path.
