@@ -64,6 +64,9 @@ pub enum CloudError {
     #[error("portal session verification failed: {message}")]
     PortalSessionVerificationFailed { message: String },
 
+    #[error("portal session lifecycle failed: {message}")]
+    PortalSessionLifecycleFailed { message: String },
+
     #[error("deploy failed at step '{step}': {message}")]
     DeployFailed { step: String, message: String },
 

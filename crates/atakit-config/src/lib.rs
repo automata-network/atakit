@@ -275,19 +275,6 @@ pub struct ChainConfig {
     pub tee_backend: String,
     #[serde(default)]
     pub prover: Option<String>,
-    #[serde(default)]
-    pub proving_strategy: Option<String>,
-    /// Component that signs and submits chain transactions.
-    #[serde(default)]
-    pub transaction_submitter: TransactionSubmitter,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TransactionSubmitter {
-    #[default]
-    AtakitPortal,
-    AtakitCli,
 }
 
 fn default_tee_backend() -> String {
@@ -1419,8 +1406,6 @@ mod tests {
             session_registry = "0x0000000000000000000000000000000000000001"
             tee_backend = "zk"
             prover = "sp1-network"
-            transaction_submitter = "atakit-cli"
-
             [provers.sp1-network]
             backend = "sp1"
             execution = "network"
@@ -1450,10 +1435,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.chains["hoodi"].tee_backend, "zk");
-        assert_eq!(
-            config.chains["hoodi"].transaction_submitter,
-            TransactionSubmitter::AtakitCli
-        );
         assert_eq!(config.owner_operations.op_expiry_seconds, 900);
         assert_eq!(
             config.chains["hoodi"].prover.as_deref(),
@@ -1485,31 +1466,29 @@ mod tests {
     }
 
     #[test]
-    fn transaction_submitter_defaults_to_atakit_portal() {
-        let chain: ChainConfig = toml::from_str(
-            r#"
-            rpc_url = "https://rpc.example"
-            session_registry = "0x0000000000000000000000000000000000000001"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            chain.transaction_submitter,
-            TransactionSubmitter::AtakitPortal
-        );
-    }
-
-    #[test]
-    fn transaction_submitter_rejects_old_boolean_shape() {
+    fn transaction_submitter_is_rejected() {
         let error = toml::from_str::<ChainConfig>(
             r#"
             rpc_url = "https://rpc.example"
             session_registry = "0x0000000000000000000000000000000000000001"
-            transaction_submitter = true
+            transaction_submitter = "atakit-cli"
             "#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("string"));
+        assert!(error.to_string().contains("transaction_submitter"));
+    }
+
+    #[test]
+    fn proving_strategy_is_rejected() {
+        let error = toml::from_str::<ChainConfig>(
+            r#"
+            rpc_url = "https://rpc.example"
+            session_registry = "0x0000000000000000000000000000000000000001"
+            proving_strategy = "network"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("proving_strategy"));
     }
 
     #[test]

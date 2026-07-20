@@ -192,21 +192,20 @@ impl CloudConfig {
 /// Any field set here is inherited by targets that omit it.
 /// Target-level values always take precedence.
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CloudTargetDefaults {
     pub chain: Option<String>,
     pub registration: Option<String>,
     pub owner_key: Option<String>,
     pub gas_wallet: Option<String>,
     /// Default prover credential key name (references `[keys.<name>]`).
-    /// `sp1_payer` is accepted as a deprecated TOML alias.
-    #[serde(alias = "sp1_payer")]
     pub prover_credential: Option<String>,
     pub image: Option<String>,
 }
 
 /// A named cloud deployment target (e.g. `[cloud.targets.c3-standard-4]`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudTarget {
     /// Provider name (references a key in `[cloud.providers]`).
     pub provider: String,
@@ -273,9 +272,7 @@ pub struct CloudTarget {
     pub gas_wallet: Option<String>,
     /// Optional backend-neutral prover credential key name (references a key
     /// in `[keys]`). Falls back to `[cloud.defaults] prover_credential`.
-    /// `sp1_payer` is accepted as a deprecated TOML alias.
     #[serde(default)]
-    #[serde(alias = "sp1_payer")]
     pub prover_credential: Option<String>,
 }
 
@@ -1226,26 +1223,16 @@ mod tests {
     }
 
     #[test]
-    fn cloud_target_accepts_neutral_and_legacy_prover_credential_names() {
-        for field in ["prover_credential", "sp1_payer"] {
-            let toml = format!(
-                r#"
-                [targets.test]
-                provider = "gcp"
-                vmtype = "n2d-standard-2"
-                {field} = "prover-key"
-                "#
-            );
-            #[derive(Deserialize)]
-            struct W {
-                targets: BTreeMap<String, CloudTarget>,
-            }
-            let parsed: W = toml::from_str(&toml).unwrap();
-            assert_eq!(
-                parsed.targets["test"].prover_credential.as_deref(),
-                Some("prover-key")
-            );
-        }
+    fn cloud_target_rejects_sp1_payer() {
+        let error = toml::from_str::<CloudTarget>(
+            r#"
+            provider = "gcp"
+            vmtype = "n2d-standard-2"
+            sp1_payer = "prover-key"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("sp1_payer"));
     }
 
     #[test]

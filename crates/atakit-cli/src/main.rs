@@ -3,7 +3,7 @@ mod config;
 mod progress;
 
 use anyhow::Result;
-use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand};
+use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand, SessionCommand};
 use atakit_core::Env;
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
@@ -153,12 +153,26 @@ async fn main() -> Result<()> {
                 CloudProviderCommand::Ls => commands::cloud::provider::run(&config),
             },
             CloudCommand::Init(args) => commands::cloud::init::run(args, &env, &config).await,
-            CloudCommand::RelaySession(args) => {
-                commands::cloud::relay_session::run(args, &env, &config).await
-            }
             CloudCommand::VerifySession(args) => {
                 commands::cloud::verify_session::run(args, &env, &config).await
             }
+            CloudCommand::Session(command) => match command {
+                SessionCommand::New(args) => {
+                    commands::cloud::session::run_new(args, &env, &config).await
+                }
+                SessionCommand::RotateKey(args) => {
+                    commands::cloud::session::run_rotate_key(args, &env, &config).await
+                }
+                SessionCommand::Renew(args) => {
+                    commands::cloud::session::run_renew(args, &env, &config).await
+                }
+                SessionCommand::Recover(args) => {
+                    commands::cloud::session::run_recover(args, &env, &config).await
+                }
+                SessionCommand::Status(args) => {
+                    commands::cloud::session::run_status(args, &env, &config).await
+                }
+            },
         },
         Command::External(args) => {
             let subcmd = &args[0];
@@ -173,5 +187,44 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn workload_init_uses_the_shared_initialization_timeout_flag() {
+        let cli = Cli::try_parse_from(["atakit", "workload", "init", "127.0.0.1"])
+            .expect("workload init arguments");
+        let Command::Workload(WorkloadCommand::Init(args)) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = Cli::try_parse_from([
+            "atakit",
+            "workload",
+            "init",
+            "127.0.0.1",
+            "--init-timeout",
+            "1400",
+        ])
+        .expect("workload init arguments");
+        let Command::Workload(WorkloadCommand::Init(args)) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(Cli::try_parse_from([
+            "atakit",
+            "workload",
+            "init",
+            "127.0.0.1",
+            "--timeout",
+            "1400",
+        ])
+        .is_err());
     }
 }

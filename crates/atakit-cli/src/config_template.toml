@@ -23,7 +23,6 @@
 # base_image_registry = "0x..."
 # tee_backend = "auto"       # "auto" | "solidity" | "zk"
 # prover = "sp1-network"     # named [provers] profile used by ZK paths
-# transaction_submitter = "atakit-portal" # default; or "atakit-cli"
 
 # [owner_operations]
 # op_expiry_seconds = 300

@@ -4,14 +4,15 @@ pub mod image;
 pub mod init;
 pub mod list;
 pub mod provider;
-pub mod relay_session;
 pub mod serial;
+pub mod session;
+mod session_access;
 pub mod ssh;
 pub mod status;
 pub mod verify_session;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_ext::core::primitives::Address;
@@ -25,11 +26,12 @@ use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{InitChainConfig, InitKeyConfig, InitProverConfig};
+use atakit_cloud::init::{InitChainConfig, InitKeyConfig, InitProverConfig, PortalTerminalState};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
-    AzureResourceNames, CloudTarget, DeployState, PersistedInitEnv, PlatformKind, ProcessRunner,
+    AzureResourceNames, CloudTarget, DeployState, DeployStatus, PersistedInitEnv, PlatformKind,
+    ProcessRunner,
 };
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
@@ -42,6 +44,51 @@ use automata_tee_workload_measurement::types::AppRef;
 use owo_colors::OwoColorize;
 
 use crate::config::{ChainConfig, Config, KeyMode, KeySpec, ProverSpec};
+
+pub(crate) const WAIT_FOR_PORTAL_RUNNING_STEP: &str = "Wait for portal Running";
+
+pub(crate) fn terminal_initialization_error(
+    target_name: &str,
+    instance_name: &str,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{error}; this deployment cannot resume after portal initialization; run `atakit cloud destroy {instance_name} --target {target_name}`, then run `atakit cloud deploy` again"
+    )
+}
+
+pub(crate) fn persist_portal_terminal_failure(
+    state: &mut DeployState,
+    data_dir: &Path,
+    target_name: &str,
+    instance_name: &str,
+    terminal: PortalTerminalState,
+) -> Result<anyhow::Error> {
+    let detail = match terminal {
+        PortalTerminalState::Failed { detail } if detail.is_empty() => {
+            "portal reached terminal Failed state".to_string()
+        }
+        PortalTerminalState::Failed { detail } => {
+            format!("portal reached terminal Failed state: {detail}")
+        }
+        PortalTerminalState::CleanHalt { detail } if detail.is_empty() => {
+            "portal reached terminal CleanHalt state".to_string()
+        }
+        PortalTerminalState::CleanHalt { detail } => {
+            format!("portal reached terminal CleanHalt state: {detail}")
+        }
+        PortalTerminalState::Running => bail!("cannot persist Running as a terminal failure"),
+    };
+    let error = terminal_initialization_error(target_name, instance_name, detail);
+    state.set_status(
+        DeployStatus::Failed {
+            step: WAIT_FOR_PORTAL_RUNNING_STEP.to_string(),
+            message: error.to_string(),
+        },
+        data_dir,
+    )?;
+    Ok(error)
+}
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -80,32 +127,37 @@ impl<'a> InitEnvResolver<'a> {
                 .map(String::from)
                 .or_else(|| self.target.gas_wallet.clone())
                 .unwrap_or_default(),
-            // Persisted state retains the old field name for compatibility.
-            sp1_payer: self.prover_credential(),
+            prover_credential: self.prover_credential(),
         }
     }
 }
 
-/// Resolve the credential name used by a prover with one precedence rule for
-/// initial deploys and recovery: chain profile, persisted/target fallback, gas
-/// wallet. Registration-off never selects a prover credential.
+/// Resolve the separately named credential used by a prover. A chain profile
+/// takes precedence over the persisted or target value. The gas wallet is not
+/// a prover credential.
 pub(crate) fn effective_prover_credential(
     config: &Config,
     chain_name: Option<&str>,
     fallback: Option<String>,
-    gas_wallet: Option<String>,
     registration_off: bool,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if registration_off {
-        return None;
+        return Ok(None);
     }
-    chain_name
-        .and_then(|name| config.chains.get(name))
+    let chain = chain_name.and_then(|name| config.chains.get(name));
+    let prover = chain
         .and_then(|chain| chain.prover.as_deref())
-        .and_then(|name| config.provers.get(name))
+        .and_then(|name| config.provers.get(name));
+    let credential = prover
         .and_then(|prover| prover.credential.clone())
-        .or_else(|| fallback.filter(|value| !value.is_empty()))
-        .or_else(|| gas_wallet.filter(|value| !value.is_empty()))
+        .or_else(|| fallback.filter(|value| !value.is_empty()));
+    let explicit_network_prover = prover.is_some_and(|prover| prover.execution == "network");
+    if explicit_network_prover && credential.is_none() {
+        bail!(
+            "the selected network prover requires a separately named prover_credential; configure it on the prover profile, cloud target, or [cloud.defaults]"
+        );
+    }
+    Ok(credential)
 }
 
 #[cfg(test)]
@@ -141,17 +193,12 @@ mod prover_credential_tests {
     }
 
     #[test]
-    fn profile_precedes_persisted_target_and_gas() {
+    fn profile_precedes_persisted_target() {
         let config = config();
         assert_eq!(
-            effective_prover_credential(
-                &config,
-                Some("primary"),
-                Some("target".into()),
-                Some("gas".into()),
-                false,
-            )
-            .as_deref(),
+            effective_prover_credential(&config, Some("primary"), Some("target".into()), false,)
+                .unwrap()
+                .as_deref(),
             Some("profile")
         );
     }
@@ -160,26 +207,37 @@ mod prover_credential_tests {
     fn fallback_and_registration_off_are_deterministic() {
         let config = config();
         assert_eq!(
-            effective_prover_credential(
-                &config,
-                Some("unknown"),
-                Some("target".into()),
-                Some("gas".into()),
-                false,
-            )
-            .as_deref(),
+            effective_prover_credential(&config, Some("unknown"), Some("target".into()), false,)
+                .unwrap()
+                .as_deref(),
             Some("target")
         );
         assert_eq!(
-            effective_prover_credential(
-                &config,
-                Some("primary"),
-                Some("target".into()),
-                Some("gas".into()),
-                true,
-            ),
+            effective_prover_credential(&config, Some("primary"), Some("target".into()), true,)
+                .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn network_prover_requires_a_separate_credential() {
+        let config = Config::load_from_str(
+            r#"
+            [provers.sp1]
+            backend = "sp1"
+            execution = "network"
+
+            [chains.primary]
+            rpc_url = "https://rpc.example"
+            session_registry = "0x1"
+            prover = "sp1"
+            "#,
+        )
+        .unwrap();
+        let error = effective_prover_credential(&config, Some("primary"), None, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("separately named prover_credential"));
     }
 }
 
@@ -201,8 +259,6 @@ pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
         chain_id: None,
         tee_backend: "auto".to_string(),
         prover: None,
-        proving_strategy: None,
-        transaction_submitter: atakit_config::TransactionSubmitter::AtakitPortal,
     }
 }
 
@@ -556,6 +612,17 @@ fn build_init_chain_config(
         placeholder_ok,
     )?;
 
+    let prover = prover.map(|prover| InitProverConfig {
+        backend: prover.backend.clone(),
+        execution: prover.execution.clone(),
+        endpoint: prover.endpoint.clone(),
+        credential: prover.credential.clone(),
+        options: prover
+            .options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    });
     Ok(InitChainConfig {
         rpc_url: chain.rpc_url.clone(),
         session_registry: chain.session_registry.clone(),
@@ -564,19 +631,7 @@ fn build_init_chain_config(
         registration: registration.map(str::to_string),
         chain_id: chain.chain_id,
         tee_backend: chain.tee_backend.clone(),
-        prover: prover.map(|prover| InitProverConfig {
-            backend: prover.backend.clone(),
-            execution: prover.execution.clone(),
-            endpoint: prover.endpoint.clone(),
-            credential: prover.credential.clone(),
-            options: prover
-                .options
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        }),
-        proving_strategy: chain.proving_strategy.clone(),
-        transaction_submitter: chain.transaction_submitter,
+        prover,
     })
 }
 
@@ -1533,8 +1588,6 @@ fn test_chain_config() -> ChainConfig {
         chain_id: None,
         tee_backend: "auto".to_string(),
         prover: None,
-        proving_strategy: None,
-        transaction_submitter: atakit_config::TransactionSubmitter::AtakitPortal,
     }
 }
 

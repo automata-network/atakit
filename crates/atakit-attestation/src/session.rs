@@ -801,6 +801,22 @@ fn azure_ak_binding(
     })
 }
 
+/// Project the retained Azure MAA JWT and HCL data from a committed session
+/// evidence bundle. Callers use this before selecting the exact historical
+/// MAA signing key for session verification.
+pub fn azure_maa_binding_from_session_bundle(
+    bundle: &SessionEvidenceBundle,
+) -> Result<super::AkBinding, String> {
+    let mut errors = Vec::new();
+    azure_ak_binding(bundle, &mut errors).ok_or_else(|| {
+        if errors.is_empty() {
+            "committed session has no Azure MAA binding".to_string()
+        } else {
+            errors.join("; ")
+        }
+    })
+}
+
 fn import_core_checks(
     report: super::VerificationReport,
     checks: &mut Vec<SessionVerificationCheck>,
@@ -1100,22 +1116,12 @@ fn verify_raw_certify(
     );
     verify_tpmt_public_attributes(&tpmt_public, checks, errors);
 
-    if let Ok(certified_key) = super::verification_core::parse_tpmt_public_ecc_p256(&tpmt_public) {
-        let projected = certified_key.to_encoded_point(false);
-        if let Some(delegation_key) = decode_hex(
-            &bundle.session_key_delegation.tpm_signing_key.bytes,
-            "session_key_delegation.tpm_signing_key.bytes",
-            errors,
-        ) {
-            record(
-                checks,
-                errors,
-                "tpm-certify-public-key",
-                projected.as_bytes() == delegation_key,
-                "certified TPMT_PUBLIC differs from the delegation signing key",
-            );
-        }
-    }
+    verify_certified_delegation_key(
+        &tpmt_public,
+        &bundle.session_key_delegation.tpm_signing_key.bytes,
+        checks,
+        errors,
+    );
 
     if bundle.ak_evidence.kind == "azure_maa_jwt" {
         let Some(binding) = azure_ak_binding(bundle, errors) else {
@@ -1150,6 +1156,49 @@ fn verify_raw_certify(
             "TPM Certify signature did not verify under the AK",
         );
     }
+}
+
+fn verify_certified_delegation_key(
+    tpmt_public: &[u8],
+    delegation_key_hex: &str,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    let certified_key = match super::verification_core::parse_tpmt_public_ecc_p256(tpmt_public) {
+        Ok(key) => key,
+        Err(detail) => {
+            record(
+                checks,
+                errors,
+                "tpm-certify-public-key",
+                false,
+                &format!("certified TPMT_PUBLIC is not an ECC P-256 key: {detail}"),
+            );
+            return;
+        }
+    };
+    let Some(delegation_key) = decode_hex(
+        delegation_key_hex,
+        "session_key_delegation.tpm_signing_key.bytes",
+        errors,
+    ) else {
+        record(
+            checks,
+            errors,
+            "tpm-certify-public-key",
+            false,
+            "delegation signing key is malformed",
+        );
+        return;
+    };
+    let projected = certified_key.to_encoded_point(false);
+    record(
+        checks,
+        errors,
+        "tpm-certify-public-key",
+        projected.as_bytes() == delegation_key,
+        "certified TPMT_PUBLIC differs from the delegation signing key",
+    );
 }
 
 fn verify_tpmt_public_attributes(
@@ -2057,6 +2106,30 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.starts_with("tpm-certify-object-attributes:")));
+    }
+
+    #[test]
+    fn unsupported_or_malformed_certified_public_key_fails_closed() {
+        for tpmt_public in [vec![0x00, 0x01], vec![0x00, 0x23]] {
+            let mut checks = Vec::new();
+            let mut errors = Vec::new();
+
+            verify_certified_delegation_key(
+                &tpmt_public,
+                &format!("0x04{}", "11".repeat(64)),
+                &mut checks,
+                &mut errors,
+            );
+
+            let check = checks
+                .iter()
+                .find(|check| check.name == "tpm-certify-public-key")
+                .expect("the certified public-key check must never be skipped");
+            assert!(!check.valid);
+            assert!(errors
+                .iter()
+                .any(|error| error.starts_with("tpm-certify-public-key:")));
+        }
     }
 
     #[test]

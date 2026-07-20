@@ -293,9 +293,10 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Portal wait timeout in seconds
-    #[arg(long, default_value = "300")]
-    pub timeout: u64,
+    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
 
     /// Timeout in seconds for the POST /init multipart upload.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
@@ -371,4 +372,38 @@ pub struct InitArgs {
     /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
     #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
     pub unsafe_skip_tls_attestation: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::WorkloadCommand;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    }
+
+    #[test]
+    fn workload_init_uses_the_shared_initialization_timeout_flag() {
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1"])
+            .expect("workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--init-timeout", "1400"])
+            .expect("workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(
+            TestCli::try_parse_from(["test", "init", "127.0.0.1", "--timeout", "1400",]).is_err()
+        );
+    }
 }

@@ -411,22 +411,6 @@ impl Config {
                     bail!("chain '{name}' references unknown prover profile '{prover}'");
                 }
             }
-            if chain.prover.is_some() && chain.proving_strategy.is_some() {
-                bail!("chain '{name}' cannot set both `prover` and deprecated `proving_strategy`");
-            }
-            if let Some(strategy) = &chain.proving_strategy {
-                if !matches!(
-                    strategy.as_str(),
-                    "network"
-                        | "local"
-                        | "dev"
-                        | "risc_zero_boundless"
-                        | "risc_zero_local"
-                        | "risc_zero_dev"
-                ) {
-                    bail!("chain '{name}' has unsupported proving_strategy '{strategy}'");
-                }
-            }
         }
 
         // Cloud target chain/key references must point to defined entries.
@@ -2520,21 +2504,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_rejects_profile_and_legacy_strategy_together() {
+    fn chain_rejects_proving_strategy() {
         let error = Config::load_from_str(
             r#"
-            [provers.sp1]
-            backend = "sp1"
-
             [chains.hoodi]
             rpc_url = "https://rpc.test"
             session_registry = "0xABCD"
-            prover = "sp1"
             proving_strategy = "network"
             "#,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("cannot set both"));
+        assert!(format!("{error:#}").contains("proving_strategy"));
     }
 
     #[test]

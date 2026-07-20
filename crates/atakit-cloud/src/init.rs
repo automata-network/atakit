@@ -6,11 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atakit_attestation::{
     amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
-    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation,
+    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation, AkBinding,
     AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TlsAttestationResponse,
     TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
-use atakit_config::TransactionSubmitter;
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use atakit_image::encode_image_ref_path_segment;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -22,6 +21,22 @@ use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 
 use crate::error::CloudError;
+
+pub const INIT_SCHEMA_VERSION: u32 = 2;
+pub const PORTAL_READINESS_TIMEOUT_SECONDS: u64 = 300;
+pub const PORTAL_PROOF_TIMEOUT_SECONDS: u64 = 900;
+pub const INITIALIZATION_COMPLETION_BUFFER_SECONDS: u64 = 60;
+
+pub fn initialization_timeout_seconds(
+    explicit_timeout: Option<u64>,
+    owner_operation_expiry_seconds: u64,
+) -> u64 {
+    explicit_timeout.unwrap_or_else(|| {
+        PORTAL_PROOF_TIMEOUT_SECONDS
+            .saturating_add(owner_operation_expiry_seconds)
+            .saturating_add(INITIALIZATION_COMPLETION_BUFFER_SECONDS)
+    })
+}
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
@@ -61,7 +76,7 @@ pub struct InitConfig {
     pub gas_wallet: InitKeyConfig,
     /// Backend-neutral credential delegated to the selected prover daemon.
     /// The internal field name is retained during the compatibility cycle.
-    pub prover_credential: InitKeyConfig,
+    pub prover_credential: Option<InitKeyConfig>,
     /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
     /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
     /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
@@ -291,21 +306,14 @@ pub struct InitChainConfig {
     /// debugging chain-side prerequisites should set this to
     /// `"off"` in their `[chains.<name>]` config.
     pub registration: Option<String>,
-    /// EIP-155 chain id. Forwarded as `chain.chain_id` when set.
-    /// Only honored by the portal under air-gapped operation (no
-    /// `rpc_url`); ignored with a warning otherwise.
+    /// Optional configured EIP-155 chain id. Forwarded as `chain.chain_id`
+    /// when set. The portal reads the effective value from `rpc_url` and
+    /// warns that this configured value is ignored.
     pub chain_id: Option<u64>,
     /// On-chain TEE verification policy (`auto`, `solidity`, or `zk`).
     pub tee_backend: String,
     /// Resolved top-level prover profile.
     pub prover: Option<InitProverConfig>,
-    /// Portal-side SNP ZK prover selection (`"network"` | `"local"` |
-    /// `"dev"`). `None` ⇒ field omitted from the `/init` JSON; the
-    /// portal falls back to its `"network"` default. Only consulted for
-    /// AMD SEV-SNP CVMs (TDX ignores it). Sent as `chain.proving_strategy`.
-    pub proving_strategy: Option<String>,
-    /// Component that signs and submits chain transactions.
-    pub transaction_submitter: TransactionSubmitter,
 }
 
 #[derive(Debug, Clone)]
@@ -351,7 +359,6 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "base_image_registry": config.chain.base_image_registry,
         },
         "tee_backend": config.chain.tee_backend,
-        "transaction_submitter": config.chain.transaction_submitter,
     });
     // `registration` and `chain_id` are only included when set. The portal's
     // "section present, no registration field → required" default continues
@@ -362,22 +369,19 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     if let Some(id) = config.chain.chain_id {
         chain["chain_id"] = serde_json::Value::Number(id.into());
     }
-    if let Some(ref ps) = config.chain.proving_strategy {
-        chain["proving_strategy"] = serde_json::Value::String(ps.clone());
-    }
-
-    // Keep the legacy wire name until the init protocol has explicit version
-    // negotiation. New portals accept it as an alias; old portals require it.
-    let mut prover_credential = serde_json::json!({
-        "mode": config.prover_credential.mode,
-        "type": config.prover_credential.key_type,
+    let prover_credential = config.prover_credential.as_ref().map(|credential| {
+        let mut value = serde_json::json!({
+            "mode": credential.mode,
+            "type": credential.key_type,
+        });
+        if let Some(ref pk) = credential.private_key {
+            value["private_key"] = serde_json::Value::String(pk.clone());
+        }
+        value
     });
-    if let Some(ref pk) = config.prover_credential.private_key {
-        prover_credential["private_key"] = serde_json::Value::String(pk.clone());
-    }
 
     let mut portal_config = serde_json::json!({
-        "format": 1,
+        "format": INIT_SCHEMA_VERSION,
         "platform": {
             "declared": &config.platform,
         },
@@ -385,11 +389,8 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         "owner_operations": config.owner_operations,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
-        "sp1_payer": prover_credential,
+        "prover_credential": prover_credential,
     });
-    // A legacy proving_strategy must remain the only prover selector on the
-    // wire. New portals translate it; emitting both fields is intentionally
-    // rejected as ambiguous.
     if let Some(prover) = config.chain.prover.clone() {
         portal_config["prover"] = serde_json::json!({
             "backend": prover.backend,
@@ -399,10 +400,8 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         });
     }
 
-    // Only emit `disks` when there is at least one passphrase, so the
-    // common no-encryption / TPM-only deploy produces the exact JSON the
-    // portal saw before this field existed (the portal defaults `disks`
-    // to empty when the key is absent).
+    // Only emit `disks` when there is at least one passphrase. The portal
+    // treats an absent `disks` field as an empty map.
     if !config.disks.is_empty() {
         let disks: serde_json::Map<String, serde_json::Value> = config
             .disks
@@ -815,6 +814,10 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             message: format!("invalid response JSON: {e}"),
         }
     })?;
+    // Manual keys remain available until the committed session evidence is
+    // fetched. The key that verifies fresh TLS evidence may differ from the
+    // key that signed the retained session MAA JWT.
+    let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
 
     if let Err(detail) = resolve_tdx_dcap_collateral(&mut response, &tdx_dcap_collateral).await {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
@@ -833,26 +836,20 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
-    let azure_maa_signing_keys =
-        match resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await {
-            Ok(keys) => keys,
-            Err(detail) => {
-                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-                let live_hash = format!("0x{}", hex::encode(live_sha));
-                let report = tls_preverification_failure_report(
-                    &response,
-                    &live_hash,
-                    "azure-maa-trust",
-                    detail,
-                );
-                return handle_tls_attestation_failure(
-                    report,
-                    live_peer_cert_der,
-                    trust_tls_cert_sha256,
-                    report_path,
-                );
-            }
-        };
+    if let Err(detail) =
+        resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await
+    {
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report =
+            tls_preverification_failure_report(&response, &live_hash, "azure-maa-trust", detail);
+        return handle_tls_attestation_failure(
+            report,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+        );
+    }
 
     let azure_snp_cert_table = if response.platform.cloud.eq_ignore_ascii_case("azure")
         && response.platform.tee.eq_ignore_ascii_case("sev-snp")
@@ -909,7 +906,8 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             platform: response.platform.clone(),
             measurement_policy,
             trust_anchors: trust_anchors.clone(),
-            azure_maa_signing_keys: azure_maa_signing_keys.clone(),
+            azure_maa_trust: azure_maa_trust.clone(),
+            manual_azure_maa_keys: manual_azure_maa_keys.clone(),
             azure_snp_cert_table: azure_snp_cert_table.clone(),
             tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
         }
@@ -1098,6 +1096,113 @@ async fn resolve_azure_maa_trust(
         not_after: entry.not_after,
         public_key: entry.pkcs1_pubkey,
     }])
+}
+
+pub(crate) async fn resolve_committed_session_azure_maa_key(
+    binding: &AkBinding,
+    config: &AzureMaaTrustConfig,
+    manual_keys: &[Vec<u8>],
+) -> Result<AzureMaaTrustKey, CloudError> {
+    if !manual_keys.is_empty() {
+        return select_azure_maa_manual_trust_key(binding, manual_keys).map_err(|detail| {
+            committed_session_maa_error("committed_session_maa_signature_invalid", detail)
+        });
+    }
+    let AzureMaaTrustSource::OnchainRegistry {
+        rpc_url,
+        session_registry,
+    } = &config.source
+    else {
+        return Err(committed_session_maa_error(
+            "committed_session_maa_key_not_registered",
+            "no MaaKeyRegistry trust source is configured",
+        ));
+    };
+
+    let jwt = extract_azure_maa_jwt_info_from_binding(binding).map_err(|detail| {
+        committed_session_maa_error("committed_session_maa_signature_invalid", detail)
+    })?;
+    let kid_hash = keccak256(jwt.kid.as_bytes());
+    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry)
+        .await
+        .map_err(|detail| {
+            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
+        })?;
+    let maa_key_registry = resolve_maa_key_registry(rpc_url, &ak_collateral_verifier)
+        .await
+        .map_err(|detail| {
+            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
+        })?;
+    let entry = resolve_maa_signing_key(rpc_url, &maa_key_registry, kid_hash)
+        .await
+        .map_err(|detail| {
+            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
+        })?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            committed_session_maa_error(
+                "committed_session_maa_key_resolution_failed",
+                format!("system clock is before Unix epoch: {error}"),
+            )
+        })?
+        .as_secs();
+    validate_committed_session_maa_entry(&jwt, &entry, now)?;
+
+    let mut key =
+        select_azure_maa_manual_trust_key(binding, std::slice::from_ref(&entry.pkcs1_pubkey))
+            .map_err(|detail| {
+                committed_session_maa_error("committed_session_maa_signature_invalid", detail)
+            })?;
+    key.not_after = entry.not_after;
+    Ok(key)
+}
+
+fn validate_committed_session_maa_entry(
+    jwt: &AzureMaaJwtInfo,
+    entry: &MaaSigningKeyEntry,
+    now: u64,
+) -> Result<(), CloudError> {
+    if entry.pkcs1_pubkey.is_empty() {
+        return Err(committed_session_maa_error(
+            "committed_session_maa_key_not_registered",
+            format!("no signing key is registered for kid {}", jwt.kid),
+        ));
+    }
+    if entry.revoked {
+        return Err(committed_session_maa_error(
+            "committed_session_maa_key_revoked",
+            format!("signing key for kid {} is revoked", jwt.kid),
+        ));
+    }
+    let expected_issuer_hash = keccak256(jwt.issuer.as_bytes());
+    if entry.issuer_hash != expected_issuer_hash {
+        return Err(committed_session_maa_error(
+            "committed_session_maa_issuer_mismatch",
+            format!(
+                "JWT issuer {} hashes to 0x{}, registry has 0x{}",
+                jwt.issuer,
+                hex::encode(expected_issuer_hash),
+                hex::encode(entry.issuer_hash)
+            ),
+        ));
+    }
+    if now > entry.not_after {
+        return Err(committed_session_maa_error(
+            "committed_session_maa_key_expired",
+            format!(
+                "signing key for kid {} expired at Unix time {} (now {now})",
+                jwt.kid, entry.not_after
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn committed_session_maa_error(code: &str, detail: impl Into<String>) -> CloudError {
+    CloudError::PortalSessionVerificationFailed {
+        message: format!("{code}: {}", detail.into()),
+    }
 }
 
 async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
@@ -1445,6 +1550,10 @@ fn extract_azure_maa_jwt_info(
         .ak_binding
         .as_ref()
         .ok_or_else(|| "Azure response is missing akBinding".to_string())?;
+    extract_azure_maa_jwt_info_from_binding(binding)
+}
+
+fn extract_azure_maa_jwt_info_from_binding(binding: &AkBinding) -> Result<AzureMaaJwtInfo, String> {
     if !binding.kind.eq_ignore_ascii_case("azure-maa-jwt") {
         return Err(format!(
             "Azure response akBinding kind is {}, expected azure-maa-jwt",
@@ -2460,6 +2569,7 @@ pub async fn wait_for_portal_terminal_with_client(
 /// so we always accept invalid certs for the init request.
 pub async fn post_portal_init(
     host: &str,
+    status_port: u16,
     init_port: u16,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
@@ -2476,6 +2586,7 @@ pub async fn post_portal_init(
     post_portal_init_with_client(
         &client,
         host,
+        status_port,
         init_port,
         archive_path,
         unmeasured_tar,
@@ -2491,6 +2602,7 @@ pub async fn post_portal_init(
 pub async fn post_portal_init_with_client(
     client: &reqwest::Client,
     host: &str,
+    status_port: u16,
     init_port: u16,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
@@ -2498,6 +2610,7 @@ pub async fn post_portal_init_with_client(
     upload_timeout: Duration,
     progress: &dyn ProgressReporter,
 ) -> Result<(), CloudError> {
+    verify_portal_init_schema(client, host, status_port).await?;
     let url = format!("https://{host}:{init_port}/init");
     // Read archive file.
     let archive_bytes = tokio::fs::read(archive_path)
@@ -2590,11 +2703,101 @@ pub async fn post_portal_init_with_client(
     Ok(())
 }
 
+async fn verify_portal_init_schema(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+) -> Result<(), CloudError> {
+    let url = format!("https://{host}:{status_port}/status");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("read portal init schema from {url}: {error}"),
+        })?;
+    let status = response
+        .error_for_status()
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("read portal init schema from {url}: {error}"),
+        })?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("parse portal status from {url}: {error}"),
+        })?;
+    validate_portal_init_schema(&status)
+}
+
+fn validate_portal_init_schema(status: &serde_json::Value) -> Result<(), CloudError> {
+    let observed = status
+        .get("init_schema_version")
+        .and_then(|value| value.as_u64());
+    if observed == Some(u64::from(INIT_SCHEMA_VERSION)) {
+        return Ok(());
+    }
+    Err(CloudError::PortalInitFailed {
+        message: format!(
+            "portal does not support required init schema version {INIT_SCHEMA_VERSION}; observed {}",
+            observed
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "no init_schema_version".to_string())
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use k256::ecdsa::signature::Signer;
     use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+    use rsa::rand_core::OsRng;
+    use rsa::RsaPrivateKey;
+    use signature::SignatureEncoding;
+
+    fn signed_maa_binding(kid: &str, issuer: &str) -> (AkBinding, Vec<u8>) {
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let public = private
+            .to_public_key()
+            .to_pkcs1_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"alg": "RS256", "kid": kid})
+                .to_string()
+                .as_bytes(),
+        );
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "iss": issuer,
+                "x-ms-attestation-type": "tdxvm",
+                "x-ms-compliance-status": "azure-compliant-cvm"
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let signing_input = format!("{header}.{claims}");
+        let signature = RsaSigningKey::<Sha256>::new(private).sign(signing_input.as_bytes());
+        let jwt = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_vec())
+        );
+        let data = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"jwt": jwt, "hclVarData": ""})
+                .to_string()
+                .as_bytes(),
+        );
+        (
+            AkBinding {
+                kind: "azure-maa-jwt".into(),
+                data,
+            },
+            public,
+        )
+    }
 
     fn sample_config() -> InitConfig {
         InitConfig {
@@ -2614,8 +2817,6 @@ mod tests {
                     credential: Some("prover-key".to_string()),
                     options: BTreeMap::new(),
                 }),
-                proving_strategy: None,
-                transaction_submitter: TransactionSubmitter::AtakitPortal,
             },
             owner_operations: atakit_config::OwnerOperationsConfig::default(),
             owner_key: InitKeyConfig {
@@ -2628,11 +2829,11 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: None,
             },
-            prover_credential: InitKeyConfig {
+            prover_credential: Some(InitKeyConfig {
                 mode: "provisioned".to_string(),
                 key_type: "es256k".to_string(),
                 private_key: Some("0xSP1".to_string()),
-            },
+            }),
             disks: BTreeMap::new(),
         }
     }
@@ -2837,6 +3038,88 @@ mod tests {
         assert_eq!(info.issuer, "https://issuer.example");
     }
 
+    #[tokio::test]
+    async fn committed_session_selects_its_own_manual_maa_key() {
+        let (session_binding, session_key) =
+            signed_maa_binding("session-key-a", "https://issuer.example");
+        let (tls_binding, tls_key) = signed_maa_binding("tls-key-b", "https://issuer.example");
+        let manual_keys = vec![tls_key.clone(), session_key.clone()];
+
+        let fresh_tls = select_azure_maa_manual_trust_key(&tls_binding, &manual_keys).unwrap();
+        assert_eq!(fresh_tls.kid, "tls-key-b");
+        assert_eq!(fresh_tls.public_key, tls_key);
+
+        let committed = resolve_committed_session_azure_maa_key(
+            &session_binding,
+            &AzureMaaTrustConfig::default(),
+            &manual_keys,
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.kid, "session-key-a");
+        assert_eq!(committed.public_key, session_key);
+    }
+
+    #[test]
+    fn committed_session_registry_maa_failures_have_exact_codes() {
+        let jwt = AzureMaaJwtInfo {
+            kid: "session-key-a".into(),
+            issuer: "https://issuer.example".into(),
+        };
+        let issuer_hash = keccak256(jwt.issuer.as_bytes());
+        let valid = MaaSigningKeyEntry {
+            pkcs1_pubkey: vec![1],
+            issuer_hash,
+            not_after: 200,
+            revoked: false,
+        };
+
+        let mut entry = valid.clone();
+        entry.pkcs1_pubkey.clear();
+        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("committed_session_maa_key_not_registered"));
+
+        let mut entry = valid.clone();
+        entry.revoked = true;
+        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("committed_session_maa_key_revoked"));
+
+        let mut entry = valid.clone();
+        entry.not_after = 99;
+        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("committed_session_maa_key_expired"));
+
+        let mut entry = valid;
+        entry.issuer_hash = [0x55; 32];
+        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("committed_session_maa_issuer_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn committed_session_rejects_invalid_manual_maa_signature() {
+        let (session_binding, _) = signed_maa_binding("session-key-a", "https://issuer.example");
+        let (_, wrong_key) = signed_maa_binding("tls-key-b", "https://issuer.example");
+
+        let error = resolve_committed_session_azure_maa_key(
+            &session_binding,
+            &AzureMaaTrustConfig::default(),
+            &[wrong_key],
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("committed_session_maa_signature_invalid"));
+    }
+
     #[test]
     fn maa_signing_key_return_decodes_dynamic_struct() {
         let pkcs1 = vec![0x30, 0x82, 0x01, 0x0a];
@@ -2862,13 +3145,13 @@ mod tests {
     fn portal_config_json_shape() {
         let json = build_portal_config_json(&sample_config());
 
-        assert_eq!(json["format"], 1);
+        assert_eq!(json["format"], INIT_SCHEMA_VERSION);
         assert_eq!(json["platform"]["declared"], "gcp");
         assert_eq!(json["chain"]["rpc_url"], "https://rpc.example.com");
         assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
         assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
         assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
-        assert_eq!(json["chain"]["transaction_submitter"], "atakit-portal");
+        assert!(json["chain"].get("transaction_submitter").is_none());
         assert!(json["chain"].get("expire_offset").is_none());
         assert_eq!(json["owner_operations"]["op_expiry_seconds"], 300);
         assert_eq!(json["owner_operations"]["challenge_expiry_seconds"], 60);
@@ -2878,17 +3161,14 @@ mod tests {
         assert_eq!(json["gas_wallet"]["mode"], "self_generated");
         assert_eq!(json["gas_wallet"]["type"], "es256k");
         assert!(json["gas_wallet"].get("private_key").is_none());
-        assert_eq!(json["sp1_payer"]["mode"], "provisioned");
-        assert_eq!(json["sp1_payer"]["type"], "es256k");
-        assert_eq!(json["sp1_payer"]["private_key"], "0xSP1");
-        assert!(json.get("prover_credential").is_none());
+        assert_eq!(json["prover_credential"]["mode"], "provisioned");
+        assert_eq!(json["prover_credential"]["type"], "es256k");
+        assert_eq!(json["prover_credential"]["private_key"], "0xSP1");
+        assert!(json.get("sp1_payer").is_none());
         assert_eq!(json["prover"]["backend"], "sp1");
         assert_eq!(json["prover"]["execution"], "network");
 
-        // registration / chain_id / proving_strategy omitted when None —
-        // portal's "section present, no registration → required" and
-        // "proving_strategy → network" defaults apply, matching pre-patch
-        // behaviour.
+        // Optional chain fields remain absent when they are not configured.
         assert!(json["chain"].get("registration").is_none());
         assert!(json["chain"].get("chain_id").is_none());
         assert!(json["chain"].get("proving_strategy").is_none());
@@ -3287,18 +3567,31 @@ mod tests {
         }
     }
 
-    /// When the operator sets `proving_strategy`, each value appears
-    /// verbatim under `chain.proving_strategy` for the portal to parse.
     #[test]
-    fn portal_config_json_emits_each_proving_strategy_value() {
-        for value in ["network", "local", "dev"] {
-            let mut cfg = sample_config();
-            cfg.chain.prover = None;
-            cfg.chain.proving_strategy = Some(value.to_string());
-            let json = build_portal_config_json(&cfg);
-            assert_eq!(json["chain"]["proving_strategy"], value);
-            assert!(json.get("prover").is_none());
+    fn latest_portal_schema_capability_is_required() {
+        validate_portal_init_schema(&serde_json::json!({
+            "init_schema_version": INIT_SCHEMA_VERSION
+        }))
+        .unwrap();
+
+        for status in [
+            serde_json::json!({}),
+            serde_json::json!({"init_schema_version": 1}),
+            serde_json::json!({"init_schema_version": INIT_SCHEMA_VERSION + 1}),
+        ] {
+            let error = validate_portal_init_schema(&status).unwrap_err();
+            assert!(error.to_string().contains("required init schema version"));
         }
+    }
+
+    #[test]
+    fn initialization_timeout_covers_proof_owner_operation_and_buffer() {
+        assert_eq!(initialization_timeout_seconds(None, 300), 1_260);
+    }
+
+    #[test]
+    fn explicit_initialization_timeout_overrides_calculated_default() {
+        assert_eq!(initialization_timeout_seconds(Some(42), 300), 42);
     }
 
     #[test]

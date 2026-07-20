@@ -11,6 +11,7 @@ pub mod plan;
 pub mod provider;
 pub mod qemu;
 pub mod session;
+pub mod session_lifecycle;
 pub mod state;
 
 #[cfg(feature = "cli")]

@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use atakit_attestation::{
-    verify_session_bundle, AzureMaaTrustKey, BindingMode, CertificateTrust, SessionAttribute,
-    SessionAttributeRequirement, SessionEvidenceBundle, SessionPcrPolicy, SessionPcrVerifyType,
-    SessionPlatformTrust, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
-    TrustedSessionPolicy, VerifiedSession,
+    azure_maa_binding_from_session_bundle, verify_session_bundle, AzureMaaTrustKey, BindingMode,
+    CertificateTrust, SessionAttribute, SessionAttributeRequirement, SessionEvidenceBundle,
+    SessionPcrPolicy, SessionPcrVerifyType, SessionPlatformTrust, SessionRequestBinding,
+    SessionTrust, SessionVerificationInputs, TrustedSessionPolicy, VerifiedSession,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -14,14 +14,15 @@ use base64::Engine;
 use serde::Deserialize;
 
 use crate::error::CloudError;
-use crate::init::VerifiedPortalTls;
+use crate::init::{AzureMaaTrustConfig, VerifiedPortalTls};
 
 #[derive(Debug, Clone)]
 pub struct PortalSessionVerificationContext {
     pub platform: PlatformEvidence,
     pub measurement_policy: MeasurementPolicy,
     pub trust_anchors: TrustAnchors,
-    pub azure_maa_signing_keys: Vec<AzureMaaTrustKey>,
+    pub azure_maa_trust: AzureMaaTrustConfig,
+    pub manual_azure_maa_keys: Vec<Vec<u8>>,
     pub azure_snp_cert_table: Option<Vec<u8>>,
     pub tdx_dcap_collateral: Option<serde_json::Value>,
 }
@@ -29,6 +30,7 @@ pub struct PortalSessionVerificationContext {
 #[derive(Debug, Clone)]
 pub struct TrustedWorkloadSessionPolicy {
     pub workload_id: [u8; 32],
+    pub pcr_specs: Vec<SessionPcrPolicy>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
 }
 
@@ -46,7 +48,7 @@ pub async fn verify_current_session(
     host: &str,
     status_port: u16,
     workload: TrustedWorkloadSessionPolicy,
-    expected_binding: Option<BindingMode>,
+    required_binding: Option<BindingMode>,
 ) -> Result<VerifiedSession, CloudError> {
     if verified_tls.manual_override.is_some() {
         return Err(session_error(
@@ -80,7 +82,14 @@ pub async fn verify_current_session(
         .map_err(|error| session_error(format!("decode evidence bundle response: {error}")))?;
     let bundle: SessionEvidenceBundle = serde_json::from_value(response.evidence_bundle.clone())
         .map_err(|error| session_error(format!("decode session evidence bundle: {error}")))?;
-    let trust = build_session_trust(context, &verified_tls.identity, &bundle, workload)?;
+    let committed_maa_keys = committed_session_maa_keys(context, &bundle).await?;
+    let trust = build_session_trust(
+        context,
+        &verified_tls.identity,
+        &bundle,
+        workload,
+        committed_maa_keys,
+    )?;
     let verified = verify_session_bundle(SessionVerificationInputs {
         bundle: response.evidence_bundle,
         request_binding: response.request_binding,
@@ -92,15 +101,39 @@ pub async fn verify_current_session(
             serde_json::to_string_pretty(&failure).unwrap_or_else(|_| failure.errors.join("; ")),
         )
     })?;
-    if let Some(expected) = expected_binding {
-        if verified.binding_mode != expected {
+    enforce_required_binding(verified.binding_mode, required_binding)?;
+    Ok(verified)
+}
+
+async fn committed_session_maa_keys(
+    context: &PortalSessionVerificationContext,
+    bundle: &SessionEvidenceBundle,
+) -> Result<Vec<AzureMaaTrustKey>, CloudError> {
+    if bundle.platform.cloud != "azure" {
+        return Ok(Vec::new());
+    }
+    let binding = azure_maa_binding_from_session_bundle(bundle).map_err(session_error)?;
+    crate::init::resolve_committed_session_azure_maa_key(
+        &binding,
+        &context.azure_maa_trust,
+        &context.manual_azure_maa_keys,
+    )
+    .await
+    .map(|key| vec![key])
+}
+
+fn enforce_required_binding(
+    actual: BindingMode,
+    required: Option<BindingMode>,
+) -> Result<(), CloudError> {
+    if let Some(required) = required {
+        if actual != required {
             return Err(session_error(format!(
-                "expected {expected:?} binding, got {:?}",
-                verified.binding_mode
+                "expected {required:?} binding, got {actual:?}"
             )));
         }
     }
-    Ok(verified)
+    Ok(())
 }
 
 fn build_session_trust(
@@ -108,6 +141,7 @@ fn build_session_trust(
     identity: &atakit_attestation::VerifiedTlsIdentity,
     bundle: &SessionEvidenceBundle,
     workload: TrustedWorkloadSessionPolicy,
+    committed_maa_keys: Vec<AzureMaaTrustKey>,
 ) -> Result<SessionTrust, CloudError> {
     if context.platform.cloud != bundle.platform.cloud
         || context.platform.tee != bundle.platform.tee
@@ -145,13 +179,13 @@ fn build_session_trust(
             ),
         },
         ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
-            maa_signing_keys: context.azure_maa_signing_keys.clone(),
+            maa_signing_keys: committed_maa_keys,
             dcap_collateral: context.tdx_dcap_collateral.clone().ok_or_else(|| {
                 session_error("verified TLS context has no Azure TDX DCAP collateral")
             })?,
         },
         ("azure", "sev-snp") => SessionPlatformTrust::AzureSnp {
-            maa_signing_keys: context.azure_maa_signing_keys.clone(),
+            maa_signing_keys: committed_maa_keys,
             amd_ark_roots: certificate_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
@@ -190,15 +224,25 @@ fn trusted_policy(
         &bundle.platform.machine_type,
     )?;
 
+    let pcr_specs = combined_pcr_specs(effective_pcr_specs(profile, variant)?, workload.pcr_specs);
+
     Ok(TrustedSessionPolicy {
         workload_id: workload.workload_id,
         base_image_id,
         platform_profile_id,
         measurement_variant_id,
-        pcr_specs: effective_pcr_specs(profile, variant)?,
+        pcr_specs,
         effective_attributes: effective_attributes(profile, variant)?,
         attribute_requirements: workload.attribute_requirements,
     })
+}
+
+fn combined_pcr_specs(
+    mut base_image: Vec<SessionPcrPolicy>,
+    workload: Vec<SessionPcrPolicy>,
+) -> Vec<SessionPcrPolicy> {
+    base_image.extend(workload);
+    base_image
 }
 
 fn required_identity_id(value: Option<[u8; 32]>, label: &str) -> Result<[u8; 32], CloudError> {
@@ -432,5 +476,37 @@ mod tests {
             pcrs[0].verify_type,
             SessionPcrVerifyType::DynamicSubsequence
         );
+    }
+
+    #[test]
+    fn required_and_off_binding_policies_reject_the_opposite_binding() {
+        assert!(enforce_required_binding(BindingMode::Local, Some(BindingMode::Chain)).is_err());
+        assert!(enforce_required_binding(BindingMode::Chain, Some(BindingMode::Local)).is_err());
+        enforce_required_binding(BindingMode::Chain, Some(BindingMode::Chain)).unwrap();
+        enforce_required_binding(BindingMode::Local, Some(BindingMode::Local)).unwrap();
+    }
+
+    #[test]
+    fn optional_binding_policy_accepts_local_and_chain() {
+        enforce_required_binding(BindingMode::Local, None).unwrap();
+        enforce_required_binding(BindingMode::Chain, None).unwrap();
+    }
+
+    #[test]
+    fn workload_pcr_rule_does_not_replace_base_image_rule_for_same_pcr() {
+        let base_image_rule = SessionPcrPolicy {
+            pcr_index: 23,
+            verify_type: SessionPcrVerifyType::DynamicSubsequence,
+            match_data: vec![format!("0x{}", hex::encode([0x11; 32]))],
+        };
+        let workload_rule = SessionPcrPolicy {
+            pcr_index: 23,
+            verify_type: SessionPcrVerifyType::Static,
+            match_data: vec![format!("0x{}", hex::encode([0x22; 32]))],
+        };
+        let combined =
+            combined_pcr_specs(vec![base_image_rule.clone()], vec![workload_rule.clone()]);
+
+        assert_eq!(combined, [base_image_rule, workload_rule]);
     }
 }

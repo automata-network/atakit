@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
-use atakit_config::TransactionSubmitter;
 use atakit_core::Env;
 use atakit_workload::cli::InitArgs;
 use owo_colors::OwoColorize;
@@ -78,7 +77,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         }
     };
     let registration_off = registration_is_off(registration);
-    reject_unsafe_direct_cli_submission(registration_off, init_chain.transaction_submitter)?;
     let owner_init = match owner_key_name.as_deref() {
         Some(name) => match config.keys.get(name) {
             Some(spec) => init_key_from_config(name, spec, false)?,
@@ -96,27 +94,22 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         },
         None => synthesize_self_generated_key(),
     };
-    let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
-    // Prover credential: profile override, then `[cloud.defaults]`, then the
-    // gas-wallet key. Missing values synthesize an ephemeral
-    // self-generated key; configured provisioned keys are also valid.
-    let sp1_payer_name = effective_prover_credential(
+    // The prover credential must be separate from the gas wallet.
+    let prover_credential_name = effective_prover_credential(
         config,
         chain_name.as_deref(),
         defaults.prover_credential.clone(),
-        gas_wallet_name.clone(),
         registration_off,
-    );
-    let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
+    )?;
     let prover_init = if registration_off {
-        synthesize_self_generated_key()
+        None
     } else {
-        match sp1_payer_name.as_deref() {
+        match prover_credential_name.as_deref() {
             Some(name) => match config.keys.get(name) {
-                Some(spec) => init_key_from_config(name, spec, false)?,
-                None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
+                Some(spec) => Some(init_key_from_config(name, spec, false)?),
+                None => bail!("key '{name}' not found in [keys]"),
             },
-            None => synthesize_self_generated_key(),
+            None => None,
         }
     };
 
@@ -138,6 +131,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         prover_credential: prover_init,
         disks: disk_passphrases,
     };
+    let initialization_timeout_secs = init::initialization_timeout_seconds(
+        args.init_timeout,
+        init_config.owner_operations.op_expiry_seconds,
+    );
 
     // 5. Show plan and confirm.
     eprintln!("{}", "Plan:".dimmed());
@@ -145,6 +142,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!("  2. Initialize workload");
     if !registration_off {
         eprintln!("  3. Wait for session registration by atakit-portal");
+    } else {
+        eprintln!("  3. Wait for portal Running");
     }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
@@ -164,7 +163,11 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!("  {:<18}{}", "Archive:".dimmed(), archive_path.display());
     eprintln!("  {:<18}{}", "SHA-256:".dimmed(), &archive_hash[..16]);
-    eprintln!("  {:<18}{}s", "Timeout:".dimmed(), args.timeout);
+    eprintln!(
+        "  {:<18}{}s",
+        "Initialization timeout:".dimmed(),
+        initialization_timeout_secs
+    );
     eprintln!();
 
     if !args.yes {
@@ -178,9 +181,9 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // 6. Wait for portal.
-    let step_count = if registration_off { 3 } else { 4 };
+    let step_count = 4;
     eprint!("  [1/{step_count}] Wait for CVM portal... ");
-    init::wait_for_portal(&host, status_port, args.timeout)
+    init::wait_for_portal(&host, status_port, init::PORTAL_READINESS_TIMEOUT_SECONDS)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
@@ -189,8 +192,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let portal_client = if args.unsafe_skip_tls_attestation {
         eprintln!("{}", "unsafe bypass".yellow());
         crate::commands::cloud::warn_unsafe_skip_tls_attestation();
-        init::unsafe_portal_client(std::time::Duration::from_secs(300))
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+        init::unsafe_portal_client(std::time::Duration::from_secs(
+            init::PORTAL_READINESS_TIMEOUT_SECONDS,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
         let measurement_policy = resolve_tls_measurement_policy(
             args.measurements.as_deref(),
@@ -243,6 +248,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     init::post_portal_init_with_client(
         &portal_client,
         &host,
+        status_port,
         init_port,
         &archive_path.display().to_string(),
         unmeasured_tar.as_deref(),
@@ -254,22 +260,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("  {}", "done".green());
 
-    if !registration_off {
-        eprint!("  [4/{step_count}] Register session... ");
-        match init::wait_for_portal_terminal_with_client(
-            &portal_client,
-            &host,
-            status_port,
-            args.timeout,
-            |_| {},
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        {
-            PortalTerminalState::Running => eprintln!("{}", "done".green()),
-            PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
-                bail!("portal did not reach Running: {detail}")
-            }
+    eprint!("  [4/{step_count}] Wait for portal Running... ");
+    match init::wait_for_portal_terminal_with_client(
+        &portal_client,
+        &host,
+        status_port,
+        initialization_timeout_secs,
+        |_| {},
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?
+    {
+        PortalTerminalState::Running => eprintln!("{}", "done".green()),
+        PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
+            bail!("portal did not reach Running: {detail}")
         }
     }
 
@@ -286,19 +290,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!();
 
-    Ok(())
-}
-
-fn reject_unsafe_direct_cli_submission(
-    registration_off: bool,
-    submitter: TransactionSubmitter,
-) -> Result<()> {
-    if !registration_off && submitter == TransactionSubmitter::AtakitCli {
-        bail!(
-            "direct workload initialization does not support transaction_submitter = \"atakit-cli\": \
-             it cannot resume safely after /init; use \"atakit-portal\" or redeploy the portal"
-        );
-    }
     Ok(())
 }
 
@@ -349,18 +340,5 @@ mod tests {
     fn parse_address_rejects_bad_port() {
         assert!(parse_address("host:notaport").is_err());
         assert!(parse_address("host:99999").is_err());
-    }
-
-    #[test]
-    fn direct_init_rejects_cli_submission_before_posting_init() {
-        let error = reject_unsafe_direct_cli_submission(false, TransactionSubmitter::AtakitCli)
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("cannot resume safely after /init"));
-        assert!(
-            reject_unsafe_direct_cli_submission(false, TransactionSubmitter::AtakitPortal).is_ok()
-        );
-        assert!(reject_unsafe_direct_cli_submission(true, TransactionSubmitter::AtakitCli).is_ok());
     }
 }

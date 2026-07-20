@@ -111,7 +111,9 @@ impl CloudProvider for GcpProvider {
 
         if !opts.skip_init {
             // Wait for portal.
-            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal {
+                timeout_secs: crate::init::PORTAL_READINESS_TIMEOUT_SECONDS,
+            });
             // Initialize workload.
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),

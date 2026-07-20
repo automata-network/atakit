@@ -153,7 +153,9 @@ impl CloudProvider for AzureProvider {
         });
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal {
+                timeout_secs: crate::init::PORTAL_READINESS_TIMEOUT_SECONDS,
+            });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });

@@ -859,6 +859,71 @@ mod tests {
         assert_eq!(std::fs::read(&imported_cert).unwrap(), b"fake-pk-cert");
     }
 
+    #[test]
+    fn legacy_gzip_archive_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tag_dir = tmp.path().join("tag");
+        let disk_dir = tag_dir.join("disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"legacy-gzip-disk").unwrap();
+
+        let image_ref: ImageRef = "legacy-image:v1".parse().unwrap();
+        let out_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let archive_path = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &[Platform::Gcp],
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::Gz,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&archive_path).unwrap();
+        assert_eq!(manifest.meta.format, IMAGE_FORMAT_VERSION);
+        assert_eq!(manifest.meta.name, "legacy-image");
+
+        let store_dir = tmp.path().join("store");
+        assert_eq!(
+            import_image_archive(&archive_path, &store_dir).unwrap(),
+            image_ref
+        );
+        assert_eq!(
+            std::fs::read(store_dir.join("legacy-image/v1/disk_images/gcp_disk.tar.gz")).unwrap(),
+            b"legacy-gzip-disk"
+        );
+    }
+
+    #[test]
+    fn new_archive_uses_current_zstd_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tag_dir = tmp.path().join("tag");
+        let disk_dir = tag_dir.join("disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"current-disk").unwrap();
+
+        let image_ref: ImageRef = "current-image:v1".parse().unwrap();
+        let out_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let archive_path = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &[Platform::Gcp],
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::default(),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&archive_path).unwrap();
+        assert_eq!(&bytes[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(
+            read_manifest(&archive_path).unwrap().meta.format,
+            IMAGE_FORMAT_VERSION
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn create_rejects_preexisting_symlink_archive_path() {
