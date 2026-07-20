@@ -397,6 +397,9 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     state.workload_version = workload_version.clone();
     state.archive_path = archive_path.display().to_string();
     state.archive_hash = archive_hash;
+    if let Some(base_image_ref) = &args.base_image {
+        state.base_image_ref = Some(base_image_ref.clone());
+    }
     state.init_env = atakit_cloud::PersistedInitEnv {
         chain: chain_name.clone().unwrap_or_default(),
         owner_key: owner_key_name.unwrap_or_default(),
@@ -514,6 +517,7 @@ mod tests {
             provider_name: "gcp-provider".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v2".into(),
+            base_image_ref: Some("automata-linux:v2".into()),
             archive_path: "/tmp/updated-workload-v2.atawl".into(),
             archive_hash: "updated-hash".into(),
             init_env: PersistedInitEnv {

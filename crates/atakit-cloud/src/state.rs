@@ -54,7 +54,11 @@ pub struct DeployState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: DeployStatus,
+    /// Provider image selector used to create and manage cloud resources.
     pub image_ref: String,
+    /// Canonical base-image identity used only as an optional verifier subject
+    /// default. It is never a collateral or policy trust source.
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -237,6 +241,7 @@ pub struct NewDeployParams {
     pub provider_name: String,
     pub platform: PlatformKind,
     pub image_ref: String,
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -264,6 +269,7 @@ impl DeployState {
                 total: params.total_steps,
             },
             image_ref: params.image_ref,
+            base_image_ref: params.base_image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
             init_env: params.init_env,
@@ -523,6 +529,7 @@ fn decode_deploy_state(content: &str, path: &Path) -> Result<(DeployState, bool)
             if let Some(value) = init_env.remove("sp1_payer") {
                 init_env.insert("prover_credential".into(), value);
             }
+            value["base_image_ref"] = serde_json::Value::Null;
             value["format"] = serde_json::json!(FORMAT_VERSION);
             true
         }
@@ -663,6 +670,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v0.1.6".into(),
+            base_image_ref: Some("automata-linux:v0.1.6".into()),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             init_env: PersistedInitEnv::default(),
@@ -701,6 +709,8 @@ mod tests {
     fn state_round_trip() {
         let dir = TempDir::new().unwrap();
         let mut state = test_state();
+        state.image_ref = "automata-linux:v0.1.6-provider-alias".into();
+        state.base_image_ref = Some("automata-linux:v0.1.6".into());
         state.save(dir.path()).unwrap();
 
         let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
@@ -711,6 +721,11 @@ mod tests {
             loaded.status,
             DeployStatus::Deploying { step: 0, total: 7 }
         ));
+        assert_eq!(loaded.image_ref, "automata-linux:v0.1.6-provider-alias");
+        assert_eq!(
+            loaded.base_image_ref.as_deref(),
+            Some("automata-linux:v0.1.6")
+        );
     }
 
     #[test]
@@ -733,6 +748,7 @@ mod tests {
         let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
         assert_eq!(loaded.format, FORMAT_VERSION);
         assert_eq!(loaded.init_env.prover_credential, None);
+        assert_eq!(loaded.base_image_ref, None);
 
         let rewritten: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -812,6 +828,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
@@ -837,6 +854,7 @@ mod tests {
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -862,6 +880,7 @@ mod tests {
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -886,6 +905,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),

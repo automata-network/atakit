@@ -21,7 +21,60 @@ use super::{
     init_chain_from_config, portal_endpoints, registration_is_off, resolve_instance,
     resolve_tls_measurement_policy, synthesize_off_init_chain,
 };
-use crate::config::Config;
+use crate::config::{ChainConfig, Config};
+
+/// Resolve workload policy from sources selected by an independent verifier.
+/// Explicit PCR23 collateral wins; otherwise the verifier-selected chain must
+/// provide the exact WorkloadSpec.
+pub(crate) async fn resolve_verifier_workload_policy(
+    workload_ref: &str,
+    trusted_workload_pcr23: Option<&str>,
+    init_chain: &InitChainConfig,
+    selected_base_image_id: [u8; 32],
+) -> Result<TrustedWorkloadSessionPolicy> {
+    let parsed = crate::commands::workload::parse_workload_ref(workload_ref)?;
+    let crate::commands::workload::WorkloadRef::NameVersion { name, version } = parsed else {
+        bail!("--workload-ref requires a canonical name:version reference, not a workload ID");
+    };
+    let workload_id = crate::commands::workload::compute_workload_id(&name, &version).0;
+
+    if let Some(value) = trusted_workload_pcr23 {
+        return Ok(TrustedWorkloadSessionPolicy {
+            workload_id,
+            pcr_specs: vec![static_pcr23_policy(decode_hex_32(
+                value,
+                "--trusted-workload-pcr23",
+            )?)],
+            attribute_requirements: Vec::new(),
+        });
+    }
+
+    if init_chain.workload_registry == super::ZERO_ADDR || init_chain.rpc_url.trim().is_empty() {
+        bail!(
+            "no trusted workload collateral is available; select a verifier chain with --chain or provide --trusted-workload-pcr23"
+        );
+    }
+
+    load_registered_workload_policy(
+        &name,
+        &version,
+        init_chain,
+        workload_id,
+        selected_base_image_id,
+    )
+    .await
+}
+
+pub(crate) struct VerifiedPortalAccess {
+    pub target_name: String,
+    pub instance_name: String,
+    pub state: DeployState,
+    pub host: String,
+    pub status_port: u16,
+    pub chain_name: Option<String>,
+    pub verified_tls: VerifiedPortalTls,
+    registration: Option<String>,
+}
 
 pub(crate) struct VerifiedCloudSessionAccess {
     pub target_name: String,
@@ -49,13 +102,13 @@ impl VerifiedCloudSessionAccess {
     }
 }
 
-pub(crate) async fn resolve_verified_session_access(
+pub(crate) async fn resolve_verified_portal_access(
     instance: &str,
     target_filter: Option<&str>,
     verification: &SessionVerificationArgs,
     env: &Env,
     config: &Config,
-) -> Result<VerifiedCloudSessionAccess> {
+) -> Result<VerifiedPortalAccess> {
     let (target_name, instance_name) = resolve_instance(&env.data_dir, instance, target_filter)?;
     let state = DeployState::load(&env.data_dir, &target_name, &instance_name)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -78,14 +131,39 @@ pub(crate) async fn resolve_verified_session_access(
         .or((!state.init_env.chain.is_empty()).then_some(state.init_env.chain.as_str()))
         .or(target.chain.as_deref())
         .map(str::to_string);
+    let base_image = verification
+        .base_image
+        .as_deref()
+        .or(state.base_image_ref.as_deref())
+        .unwrap_or(&state.image_ref);
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
             Some(chain) => {
-                let prover = chain
-                    .prover
-                    .as_ref()
-                    .and_then(|prover| config.provers.get(prover));
-                init_chain_from_config(name, chain, target.registration.as_deref(), prover).await?
+                let local_pack_exists = if verification.measurements.is_none() {
+                    init::local_measurement_pack_exists(&env.data_dir, base_image)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?
+                } else {
+                    false
+                };
+                if tls_needs_registry_derivation(
+                    !base_image.is_empty(),
+                    verification.measurements.is_some(),
+                    local_pack_exists,
+                    chain.base_image_registry.is_some(),
+                    target.registration.as_deref(),
+                ) {
+                    let prover = chain
+                        .prover
+                        .as_ref()
+                        .and_then(|prover| config.provers.get(prover));
+                    init_chain_from_config(name, chain, target.registration.as_deref(), prover)
+                        .await?
+                } else {
+                    verification_chain_without_registry_derivation(
+                        chain,
+                        target.registration.as_deref(),
+                    )
+                }
             }
             None => bail!("chain '{name}' not found in [chains]"),
         },
@@ -93,10 +171,6 @@ pub(crate) async fn resolve_verified_session_access(
         None => bail!("no chain config is available for verifier trust lookup"),
     };
 
-    let base_image = verification
-        .base_image
-        .as_deref()
-        .unwrap_or(&state.image_ref);
     let measurement_policy = resolve_tls_measurement_policy(
         verification.measurements.as_deref(),
         Some(base_image),
@@ -136,32 +210,99 @@ pub(crate) async fn resolve_verified_session_access(
     .await
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let workload_id = crate::commands::workload::compute_workload_id(
-        &state.workload_name,
-        &state.workload_version,
-    );
-    let workload_policy = resolve_trusted_workload_policy(
-        &state,
-        target.registration.as_deref(),
-        verification,
-        &init_chain,
-        workload_id.0,
-        verified_tls.identity.base_image_id,
-    )
-    .await?;
-    let required_binding = required_binding_for_registration(target.registration.as_deref());
-
-    Ok(VerifiedCloudSessionAccess {
+    Ok(VerifiedPortalAccess {
         target_name,
         instance_name,
         state,
         host,
         status_port,
         chain_name,
-        required_binding,
         verified_tls,
+        registration: target.registration.clone(),
+    })
+}
+
+pub(crate) async fn resolve_verified_session_access(
+    portal: VerifiedPortalAccess,
+    verification: &SessionVerificationArgs,
+    config: &Config,
+) -> Result<VerifiedCloudSessionAccess> {
+    let init_chain = match portal.chain_name.as_deref() {
+        Some(name) => match config.chains.get(name) {
+            Some(chain) => {
+                let prover = chain
+                    .prover
+                    .as_ref()
+                    .and_then(|prover| config.provers.get(prover));
+                init_chain_from_config(name, chain, portal.registration.as_deref(), prover).await?
+            }
+            None => bail!("chain '{name}' not found in [chains]"),
+        },
+        None if registration_is_off(portal.registration.as_deref()) => synthesize_off_init_chain(),
+        None => bail!("no chain config is available for verifier trust lookup"),
+    };
+    let workload_id = crate::commands::workload::compute_workload_id(
+        &portal.state.workload_name,
+        &portal.state.workload_version,
+    );
+    let workload_policy = resolve_trusted_workload_policy(
+        &portal.state,
+        portal.registration.as_deref(),
+        verification,
+        &init_chain,
+        workload_id.0,
+        portal.verified_tls.identity.base_image_id,
+    )
+    .await?;
+    let required_binding = required_binding_for_registration(portal.registration.as_deref());
+
+    Ok(VerifiedCloudSessionAccess {
+        target_name: portal.target_name,
+        instance_name: portal.instance_name,
+        state: portal.state,
+        host: portal.host,
+        status_port: portal.status_port,
+        chain_name: portal.chain_name,
+        required_binding,
+        verified_tls: portal.verified_tls,
         workload_policy,
     })
+}
+
+fn verification_chain_without_registry_derivation(
+    chain: &ChainConfig,
+    registration: Option<&str>,
+) -> InitChainConfig {
+    InitChainConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        workload_registry: chain
+            .workload_registry
+            .clone()
+            .unwrap_or_else(|| super::ZERO_ADDR.to_string()),
+        base_image_registry: chain
+            .base_image_registry
+            .clone()
+            .unwrap_or_else(|| super::ZERO_ADDR.to_string()),
+        registration: registration.map(str::to_string),
+        chain_id: chain.chain_id,
+        tee_backend: chain.tee_backend.clone(),
+        prover: None,
+    }
+}
+
+fn tls_needs_registry_derivation(
+    has_base_image: bool,
+    has_explicit_measurements: bool,
+    local_pack_exists: bool,
+    has_configured_base_image_registry: bool,
+    registration: Option<&str>,
+) -> bool {
+    has_base_image
+        && !has_explicit_measurements
+        && !local_pack_exists
+        && !has_configured_base_image_registry
+        && !registration_is_off(registration)
 }
 
 async fn resolve_trusted_workload_policy(
@@ -177,7 +318,8 @@ async fn resolve_trusted_workload_policy(
     let manual_pcr23 = verification.trusted_workload_pcr23.as_deref();
     let mut policy = if !registration_is_off(registration) || registry_available {
         load_registered_workload_policy(
-            state,
+            &state.workload_name,
+            &state.workload_version,
             init_chain,
             workload_id,
             selected_base_image_id.ok_or_else(|| {
@@ -205,7 +347,8 @@ async fn resolve_trusted_workload_policy(
 }
 
 async fn load_registered_workload_policy(
-    state: &DeployState,
+    expected_name: &str,
+    expected_version: &str,
     init_chain: &InitChainConfig,
     workload_id: [u8; 32],
     selected_base_image_id: [u8; 32],
@@ -235,22 +378,29 @@ async fn load_registered_workload_policy(
             )
         })?;
 
-    trusted_policy_from_workload_spec(state, workload_id, selected_base_image_id, &spec)
+    trusted_policy_from_workload_spec(
+        expected_name,
+        expected_version,
+        workload_id,
+        selected_base_image_id,
+        &spec,
+    )
 }
 
 fn trusted_policy_from_workload_spec(
-    state: &DeployState,
+    expected_name: &str,
+    expected_version: &str,
     workload_id: [u8; 32],
     selected_base_image_id: [u8; 32],
     spec: &WorkloadSpec,
 ) -> Result<TrustedWorkloadSessionPolicy> {
-    if spec.name != state.workload_name || spec.version != state.workload_version {
+    if spec.name != expected_name || spec.version != expected_version {
         bail!(
-            "trusted WorkloadSpec identity {}/{} does not match saved workload {}/{}",
+            "trusted WorkloadSpec identity {}/{} does not match expected workload {}/{}",
             spec.name,
             spec.version,
-            state.workload_name,
-            state.workload_version
+            expected_name,
+            expected_version
         );
     }
     ensure_base_image_allowed(
@@ -378,7 +528,7 @@ fn ensure_base_image_allowed(mode: u8, configured: &[B256], selected: B256) -> R
     Ok(())
 }
 
-fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
+pub(crate) fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
     SessionPcrPolicy {
         pcr_index: 23,
         verify_type: SessionPcrVerifyType::Static,
@@ -386,7 +536,7 @@ fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
     }
 }
 
-fn decode_hex_32(value: &str, label: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_hex_32(value: &str, label: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
         .with_context(|| format!("decode {label} as hex"))?;
     bytes
@@ -424,6 +574,7 @@ mod tests {
             provider_name: "gcp".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v1".into(),
+            base_image_ref: Some("automata-linux:v1".into()),
             archive_path,
             archive_hash,
             init_env: PersistedInitEnv::default(),
@@ -509,6 +660,45 @@ mod tests {
     }
 
     #[test]
+    fn local_tls_measurements_defer_session_registry_derivation() {
+        assert!(!tls_needs_registry_derivation(
+            true,
+            true,
+            false,
+            false,
+            Some("required"),
+        ));
+        assert!(!tls_needs_registry_derivation(
+            true,
+            false,
+            true,
+            false,
+            Some("required"),
+        ));
+        assert!(!tls_needs_registry_derivation(
+            true,
+            false,
+            false,
+            true,
+            Some("required"),
+        ));
+        assert!(!tls_needs_registry_derivation(
+            true,
+            false,
+            false,
+            false,
+            Some("off"),
+        ));
+        assert!(tls_needs_registry_derivation(
+            true,
+            false,
+            false,
+            false,
+            Some("required"),
+        ));
+    }
+
+    #[test]
     fn workload_spec_converts_all_pcrs_requirements_and_base_image_policy() {
         let state = deployed_state(String::new(), String::new());
         let selected_base_image = B256::repeat_byte(0x44);
@@ -536,9 +726,14 @@ mod tests {
             ],
         };
 
-        let policy =
-            trusted_policy_from_workload_spec(&state, [0x11; 32], selected_base_image.0, &spec)
-                .unwrap();
+        let policy = trusted_policy_from_workload_spec(
+            &state.workload_name,
+            &state.workload_version,
+            [0x11; 32],
+            selected_base_image.0,
+            &spec,
+        )
+        .unwrap();
         assert_eq!(policy.workload_id, [0x11; 32]);
         assert_eq!(policy.pcr_specs.len(), 2);
         assert_eq!(policy.pcr_specs[0].pcr_index, 20);

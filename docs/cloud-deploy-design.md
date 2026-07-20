@@ -193,13 +193,22 @@ directory mode. `--image-only` provisions a VM without workload init. Repeating
 `--target` performs image pre-upload serially per unique provider/image pair,
 then deploys targets concurrently; `--name` is rejected in multi-target mode.
 
-Session verification derives its required binding from `registration`.
-`required` and an omitted policy require a chain-bound session. `off` requires
-a local-bound session. `optional` accepts either verified binding because a
-failed optional registration may validly install a local-bound session.
-Lifecycle completion uses the verified successor binding to decide whether to
-call `isSessionActive`. Rotate-key, renew, and recover still require a
-chain-bound predecessor; new may start from a local-bound predecessor.
+Deployment-management session commands derive their required binding from the
+deployment target's `registration` value. `required` and an omitted policy
+require a chain-bound session. `off` requires a local-bound session. `optional`
+accepts either verified binding because a failed optional registration may
+validly install a local-bound session. Lifecycle completion uses the verified
+successor binding to decide whether to call `isSessionActive`. Rotate-key,
+renew, and recover still require a chain-bound predecessor; new may start from
+a local-bound predecessor.
+
+`atakit cloud verify-session` is different. The verifier may be on another
+computer. The verifier supplies the canonical base-image reference, canonical
+workload reference, and portal address. A matching local deployment may fill
+only those subject fields. The verifier selects `--chain` or supplies explicit
+collateral. The command never takes a chain, registration policy, registry,
+measurement policy, workload policy, or platform trust root from the local
+deployment or deployment target.
 
 The default lifecycle `op_expires_at` window is the portal's 900-second proof
 timeout plus `owner_operations.op_expiry_seconds`. The configured owner-
@@ -208,14 +217,26 @@ submission after the longest supported proof. `--op-expiry-seconds` replaces
 the complete calculated window. The default command wait adds a further
 60-second completion buffer.
 
-Registry-backed session verification reads the exact `WorkloadSpec`, checks
+Verifier-selected registry-backed session verification reads the exact
+`WorkloadSpec`, checks
 that it allows the TLS-selected base image, and supplies all workload PCR and
 attribute requirements to the offline verifier. These workload PCR rules are
 appended to the effective base-image profile and variant rules, including when
-both policies constrain the same PCR. Registration-off verification without a
-`WorkloadRegistry` hashes and inspects the saved `.atawl` and uses its PCR23.
-`--trusted-workload-pcr23` provides an explicit alternative in that mode and
-an additional PCR23 constraint in registry-backed mode.
+both policies constrain the same PCR. Deployment-management verification with
+`registration = "off"` and no `WorkloadRegistry` hashes and inspects the saved
+`.atawl` and uses its PCR23. For `atakit cloud verify-session`,
+`--trusted-workload-pcr23` is an explicit verifier-owned alternative to
+`WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
+collateral.
+
+`atakit cloud session status` resolves only the deployment and verified portal
+TLS connection before reading portal request state. It displays `idle`,
+`waiting`, `running`, and `failed` without loading `WorkloadRegistry` policy.
+When the portal reports `completed`, the command then resolves the trusted
+workload policy, verifies the exact successor as the current session, and calls
+`isSessionActive` for a chain-bound successor. A failure in that second stage
+does not hide the portal's completed state. Session mutation commands retain
+full current-session verification before owner authorization.
 
 Azure TLS bootstrap and committed-session verification resolve MAA trust
 separately. TLS bootstrap verifies the fresh `/tls-attestation` JWT with its
@@ -280,17 +301,23 @@ Deployment state is stored below the atakit XDG data directory:
 ~/.local/share/atakit/cloud/deployments/<target>/<instance>.state.json
 ```
 
-Deployment-state format 2 records the provider alias, platform,
-workload/image identity, archive hash, selected config entry names, portal
-ports, lifecycle status, and provider resource identifiers. It stores
-references to named keys, not private key bytes. When the loader reads format
-1, it renames only `init_env.sp1_payer` to
+Deployment-state format 2 records the provider alias in `image_ref` and the
+canonical verification subject identity in `base_image_ref`. `image_ref`
+remains necessary for provider resource management. `base_image_ref` is only
+an optional subject-input shortcut for `atakit cloud verify-session`; it is not
+a policy or collateral source. Format 2 also records the platform, workload
+identity, archive hash, selected config entry names, portal ports, lifecycle
+status, and provider resource identifiers. It stores references to named keys,
+not private key bytes.
+
+When the loader reads format 1, it renames only `init_env.sp1_payer` to
 `init_env.prover_credential`, preserves string and `null` values, rejects a
-document containing both names, and atomically rewrites the state as format 2.
-Format 2 rejects `sp1_payer`. This compatibility is limited to local deployment
-state; operator configuration and portal `/init` remain strict current schemas.
-The loader also migrates the older top-level `deployments/` directory when
-possible.
+document containing both names, adds `base_image_ref = null`, and atomically
+rewrites the state as format 2. The migration does not assume that the old
+`image_ref` was a canonical base-image identity. Format 2 rejects `sp1_payer`.
+This compatibility is limited to local deployment state; operator configuration
+and portal `/init` remain strict current schemas. The loader also migrates the
+older top-level `deployments/` directory when possible.
 
 Lifecycle states are `deploying`, `deployed`, `failed`, `destroying`, and
 `destroyed`. Each provider uses check-before-create behavior so a failed

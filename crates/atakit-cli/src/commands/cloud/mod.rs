@@ -330,6 +330,37 @@ pub(crate) async fn resolve_tls_measurement_policy(
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Resolve base-image measurement collateral from sources selected by the
+/// verifier. An explicit measurement path wins; otherwise the verifier's
+/// selected chain is used. The automatic deployment-local cache is
+/// intentionally excluded from this path.
+pub(crate) async fn resolve_verifier_tls_measurement_policy(
+    measurements: Option<&std::path::Path>,
+    base_image: &str,
+    measurement_publisher_keys: &[String],
+    data_dir: &std::path::Path,
+    init_chain: &InitChainConfig,
+) -> Result<MeasurementPolicy> {
+    if measurements.is_some() {
+        return atakit_cloud::init::load_measurement_policy(
+            measurements,
+            Some(base_image),
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"));
+    }
+
+    if chain_measurement_policy_available(init_chain) {
+        return load_measurement_policy_from_chain(base_image, init_chain).await;
+    }
+
+    bail!(
+        "no trusted base-image measurement collateral is available; select a verifier chain with --chain or provide --measurements"
+    )
+}
+
 fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
     init_chain.base_image_registry != ZERO_ADDR && !init_chain.rpc_url.trim().is_empty()
 }
@@ -1730,6 +1761,7 @@ mod portal_endpoint_tests {
                 ip: "127.0.0.1".to_string(),
             },
             image_ref: "test-image:v1".to_string(),
+            base_image_ref: Some("test-image:v1".to_string()),
             archive_path: "/tmp/test.atawl".to_string(),
             archive_hash: "abc123".to_string(),
             init_env: PersistedInitEnv::default(),

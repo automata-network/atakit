@@ -28,7 +28,7 @@ pub enum CloudCommand {
     /// Initialize a deployed instance with a workload
     #[command(arg_required_else_help = true)]
     Init(InitArgs),
-    /// Verify the current session evidence locally without registry state
+    /// Verify current session evidence without deployment policy or a transaction
     #[command(arg_required_else_help = true)]
     VerifySession(VerifySessionArgs),
     /// Create, rotate, renew, recover, or inspect portal sessions
@@ -471,12 +471,29 @@ pub struct InitArgs {
 /// Arguments for `cloud verify-session`.
 #[derive(Args)]
 pub struct VerifySessionArgs {
-    /// Instance name (or target/instance)
-    pub instance: String,
+    /// Optional local deployment name (or target/instance) used only to fill
+    /// missing subject identity fields.
+    pub instance: Option<String>,
 
-    /// Target name (for disambiguation)
+    /// Target name for disambiguating a local deployment shortcut.
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Portal host or IP supplied by the verifier.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// Portal HTTPS status port. Defaults to 2024 with --host.
+    #[arg(long, value_name = "PORT")]
+    pub status_port: Option<u16>,
+
+    /// Expected canonical workload reference.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub workload_ref: Option<String>,
+
+    /// Verification report output path.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
 
     #[command(flatten)]
     pub verification: SessionVerificationArgs,
@@ -490,7 +507,7 @@ pub struct SessionVerificationArgs {
     pub chain: Option<String>,
 
     /// Manually trusted final PCR23 value for the workload manifest.
-    /// This is an alternative to reading the saved .atawl in registration-off mode.
+    /// For verify-session, this selects an explicit PCR23-only workload policy.
     #[arg(long, value_name = "0xBYTES32")]
     pub trusted_workload_pcr23: Option<String>,
 
@@ -641,6 +658,37 @@ mod tests {
             panic!("expected verify-session command");
         };
         assert_eq!(args.verification.azure_maa_key, ["aa", "bb"]);
+    }
+
+    #[test]
+    fn verify_session_accepts_explicit_remote_subject() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "--host",
+            "203.0.113.10",
+            "--status-port",
+            "2024",
+            "--base-image",
+            "automata-linux:v1",
+            "--workload-ref",
+            "example:v1",
+            "--chain",
+            "hoodi",
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(args.instance, None);
+        assert_eq!(args.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(args.status_port, Some(2024));
+        assert_eq!(args.workload_ref.as_deref(), Some("example:v1"));
+        assert_eq!(
+            args.verification.base_image.as_deref(),
+            Some("automata-linux:v1")
+        );
+        assert_eq!(args.verification.chain.as_deref(), Some("hoodi"));
     }
 
     #[test]

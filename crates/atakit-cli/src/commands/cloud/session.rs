@@ -17,7 +17,9 @@ use k256::ecdsa::SigningKey;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
-use super::session_access::{resolve_verified_session_access, VerifiedCloudSessionAccess};
+use super::session_access::{
+    resolve_verified_portal_access, resolve_verified_session_access, VerifiedCloudSessionAccess,
+};
 use crate::config::{Config, KeyMode, KeyType};
 
 const REPORT_SCHEMA: &str = "atakit.session-lifecycle-report.v1";
@@ -115,7 +117,7 @@ async fn run_mutation(
     config: &Config,
 ) -> Result<()> {
     eprint!("Verify portal TLS... ");
-    let access = resolve_verified_session_access(
+    let portal_access = resolve_verified_portal_access(
         &args.instance,
         args.target.as_deref(),
         &args.verification,
@@ -124,6 +126,8 @@ async fn run_mutation(
     )
     .await?;
     eprintln!("{}", "done".green());
+
+    let access = resolve_verified_session_access(portal_access, &args.verification, config).await?;
 
     eprint!("Verify current session... ");
     let predecessor = access.verify_current_session().await?;
@@ -273,7 +277,7 @@ async fn run_mutation(
 
 pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> Result<()> {
     eprint!("Verify portal TLS... ");
-    let access = resolve_verified_session_access(
+    let portal_access = resolve_verified_portal_access(
         &args.instance,
         args.target.as_deref(),
         &args.verification,
@@ -282,12 +286,17 @@ pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> 
     )
     .await?;
     eprintln!("{}", "done".green());
-    let client = LifecycleClient::new(&access.verified_tls, &access.host, access.status_port);
+    let client = LifecycleClient::new(
+        &portal_access.verified_tls,
+        &portal_access.host,
+        portal_access.status_port,
+    );
     let mut status = match args.request_hash.as_deref() {
         Some(request_hash) => client.request_status(request_hash).await,
         None => client.selected_status().await,
     }
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    print_status(&status);
 
     if args.wait && !status.is_terminal() {
         let request_hash = status
@@ -309,16 +318,17 @@ pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> 
             )
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        println!();
+        print_status(&status);
     }
 
-    print_status(&status);
     if status.state == "failed" {
         bail!(
             "portal lifecycle request failed: {}",
             status.error_code.as_deref().unwrap_or("unknown error")
         );
     }
-    if status.state == "completed" {
+    if status_requires_successor_verification(&status) {
         let operation = parse_operation(status.command.as_deref())?;
         let request_hash = status
             .request_hash
@@ -326,8 +336,8 @@ pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> 
             .ok_or_else(|| anyhow::anyhow!("completed status has no request hash"))?;
         let report_path = lifecycle_report_path(
             &env.data_dir,
-            &access.target_name,
-            &access.instance_name,
+            &portal_access.target_name,
+            &portal_access.instance_name,
             request_hash,
         );
         let mut report = read_report(&report_path).unwrap_or_else(|_| LifecycleReport {
@@ -348,6 +358,12 @@ pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> 
             updated_at: Utc::now().to_rfc3339(),
         });
         report.update_status(&status);
+        write_report(&report_path, &report)?;
+        let access = resolve_verified_session_access(portal_access, &args.verification, config)
+            .await
+            .context(
+                "portal reports completed, but successor verification trust could not be resolved",
+            )?;
         finalize_completed(
             operation,
             &access,
@@ -360,6 +376,10 @@ pub async fn run_status(args: SessionStatusArgs, env: &Env, config: &Config) -> 
         print_completed(operation, &report, &report_path);
     }
     Ok(())
+}
+
+fn status_requires_successor_verification(status: &LifecycleStatus) -> bool {
+    status.state == "completed"
 }
 
 async fn finalize_completed(
@@ -681,6 +701,34 @@ mod tests {
         );
         assert!(parse_operation(Some("rotate-key")).is_err());
         assert!(parse_operation(None).is_err());
+    }
+
+    #[test]
+    fn only_completed_status_requires_successor_verification() {
+        for state in ["idle", "waiting", "running", "failed"] {
+            let status = LifecycleStatus {
+                request_hash: None,
+                command: None,
+                state: state.into(),
+                session_id: None,
+                error_code: None,
+                created_at: None,
+                started_at: None,
+                completed_at: None,
+            };
+            assert!(!status_requires_successor_verification(&status), "{state}");
+        }
+        let completed = LifecycleStatus {
+            request_hash: Some(hex0x([0x11; 32])),
+            command: Some("renew".into()),
+            state: "completed".into(),
+            session_id: Some(hex0x([0x22; 32])),
+            error_code: None,
+            created_at: Some(1),
+            started_at: Some(2),
+            completed_at: Some(3),
+        };
+        assert!(status_requires_successor_verification(&completed));
     }
 
     #[test]

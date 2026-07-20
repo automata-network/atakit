@@ -447,10 +447,11 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
     let resolved_image = resolve_image(image_arg, &provider_config.platform, env)?;
     let image_ref = &resolved_image.display_name;
+    let base_image_ref = canonical_base_image_ref(image_ref, args.base_image.as_deref());
 
     // 8b. Validate image against workload's base-image policy.
     if !image_only {
-        validate_base_image(image_ref, &base_image_mode, &base_image_list)?;
+        validate_base_image(base_image_ref, &base_image_mode, &base_image_list)?;
     }
 
     // 8c. Resolve CC types for image registration.
@@ -769,6 +770,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         provider_name: target.provider.clone(),
         platform: provider_config.platform,
         image_ref: image_ref.to_string(),
+        base_image_ref: Some(base_image_ref.to_string()),
         archive_path,
         archive_hash,
         init_env: init_env.clone(),
@@ -1313,6 +1315,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     Ok(())
 }
 
+fn canonical_base_image_ref<'a>(
+    provider_image_ref: &'a str,
+    explicit_base_image_ref: Option<&'a str>,
+) -> &'a str {
+    explicit_base_image_ref.unwrap_or(provider_image_ref)
+}
+
 /// Parse a human-readable size string (e.g. "10GB", "500MB", "1TB") into whole gigabytes.
 /// Returns `None` for invalid formats. Fractional GB from MB conversion rounds up.
 fn parse_size_gb(s: &str) -> Option<u64> {
@@ -1734,5 +1743,20 @@ mod tests {
         assert!(error.contains("registration failed"));
         assert!(error.contains("atakit cloud destroy example --target azure"));
         assert!(error.contains("atakit cloud deploy"));
+    }
+
+    #[test]
+    fn explicit_base_image_ref_wins_over_provider_image_alias() {
+        assert_eq!(
+            canonical_base_image_ref(
+                "automata-linux:v0.2.7-debug-committed-20260720",
+                Some("automata-linux:v0.2.7-debug"),
+            ),
+            "automata-linux:v0.2.7-debug"
+        );
+        assert_eq!(
+            canonical_base_image_ref("automata-linux:v0.2.7-debug", None),
+            "automata-linux:v0.2.7-debug"
+        );
     }
 }
