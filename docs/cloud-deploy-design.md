@@ -210,6 +210,13 @@ collateral. The command never takes a chain, registration policy, registry,
 measurement policy, workload policy, or platform trust root from the local
 deployment or deployment target.
 
+For a chain-bound session, the authenticated chain ID and `SessionRegistry`
+address must match the chain ID returned by the verifier-selected RPC endpoint
+and the `SessionRegistry` address in the verifier-selected chain configuration.
+The portal evidence never selects those trusted values. Selecting `--chain`
+does not by itself require a chain-bound session; it may supply collateral for
+a local-bound session when the caller's binding policy permits that session.
+
 The default lifecycle `op_expires_at` window is the portal's 900-second proof
 timeout plus `owner_operations.op_expiry_seconds`. The configured owner-
 operation interval therefore remains available for portal transaction

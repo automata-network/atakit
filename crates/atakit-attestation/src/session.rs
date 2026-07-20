@@ -189,6 +189,15 @@ pub struct SessionVerificationInputs {
 pub struct SessionTrust {
     pub platform: SessionPlatformTrust,
     pub policy: TrustedSessionPolicy,
+    /// Chain coordinates selected by the verifier. Portal evidence never
+    /// selects these values. Local-bound sessions do not use them.
+    pub binding: Option<TrustedSessionBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedSessionBinding {
+    pub chain_id: u64,
+    pub registry: [u8; 20],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -268,6 +277,8 @@ pub struct VerifiedSession {
     pub session_id: [u8; 32],
     pub session_key_fingerprint: [u8; 32],
     pub binding_mode: BindingMode,
+    pub binding_chain_id: u64,
+    pub binding_registry: [u8; 20],
     pub attestation_mode: SessionAttestationMode,
     pub checks: Vec<SessionVerificationCheck>,
 }
@@ -371,7 +382,12 @@ pub fn verify_session_bundle(
     verify_raw_certify(bundle, &mut checks, &mut errors);
     verify_delegation(bundle, &mut checks, &mut errors);
 
-    verify_binding(bundle, &mut checks, &mut errors);
+    let binding_registry = verify_binding(
+        bundle,
+        inputs.trust.binding.as_ref(),
+        &mut checks,
+        &mut errors,
+    );
     verify_policies(bundle, &inputs.trust.policy, &mut checks, &mut errors);
     verify_request_binding(
         bundle,
@@ -387,6 +403,8 @@ pub fn verify_session_bundle(
             session_id: session_id.expect("validated session id"),
             session_key_fingerprint: session_key_fingerprint.expect("validated session key"),
             binding_mode: bundle.binding.mode,
+            binding_chain_id: bundle.binding.chain_id,
+            binding_registry: binding_registry.expect("validated binding registry"),
             attestation_mode: SessionAttestationMode::Hardware,
             checks,
         })
@@ -1390,9 +1408,10 @@ pub fn evaluate_session_pcr_policy(
 }
 fn verify_binding(
     bundle: &SessionEvidenceBundle,
+    trusted: Option<&TrustedSessionBinding>,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
-) {
+) -> Option<[u8; 20]> {
     let registry = decode_address(&bundle.binding.registry, "binding.registry", errors);
     let owner = decode_hex_32(&bundle.owner.fingerprint, "owner.fingerprint", errors);
     let nonce = decode_hex_32(&bundle.binding.owner_nonce, "binding.owner_nonce", errors);
@@ -1425,7 +1444,43 @@ fn verify_binding(
             shape,
             "binding mode does not match chain ID and registry",
         );
+        verify_trusted_binding(
+            bundle.binding.mode,
+            bundle.binding.chain_id,
+            registry,
+            trusted,
+            checks,
+            errors,
+        );
     }
+    registry
+}
+
+fn verify_trusted_binding(
+    mode: BindingMode,
+    chain_id: u64,
+    registry: [u8; 20],
+    trusted: Option<&TrustedSessionBinding>,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    let Some(trusted) = trusted.filter(|_| mode == BindingMode::Chain) else {
+        return;
+    };
+    record(
+        checks,
+        errors,
+        "trusted-binding-chain-id",
+        chain_id == trusted.chain_id,
+        "authenticated session chain ID differs from the verifier-selected chain",
+    );
+    record(
+        checks,
+        errors,
+        "trusted-binding-registry",
+        registry == trusted.registry,
+        "authenticated session registry differs from the verifier-selected SessionRegistry",
+    );
 }
 
 fn verify_policies(
@@ -1815,6 +1870,65 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_binding_must_match_verifier_selected_coordinates() {
+        let trusted = TrustedSessionBinding {
+            chain_id: 11_155_111,
+            registry: [0x11; 20],
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_trusted_binding(
+            BindingMode::Chain,
+            1,
+            [0x22; 20],
+            Some(&trusted),
+            &mut checks,
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-binding-chain-id" && !check.valid }));
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-binding-registry" && !check.valid }));
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_trusted_binding(
+            BindingMode::Chain,
+            trusted.chain_id,
+            trusted.registry,
+            Some(&trusted),
+            &mut checks,
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+        assert_eq!(checks.len(), 2);
+        assert!(checks.iter().all(|check| check.valid));
+    }
+
+    #[test]
+    fn verifier_selected_chain_does_not_require_chain_binding() {
+        let trusted = TrustedSessionBinding {
+            chain_id: 11_155_111,
+            registry: [0x11; 20],
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_trusted_binding(
+            BindingMode::Local,
+            0,
+            [0; 20],
+            Some(&trusted),
+            &mut checks,
+            &mut errors,
+        );
+        assert!(checks.is_empty());
+        assert!(errors.is_empty());
+    }
 
     fn word(value: usize) -> [u8; 32] {
         let mut out = [0u8; 32];

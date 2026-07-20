@@ -3019,6 +3019,7 @@ mod tests {
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
                 },
+                binding: None,
             },
         };
         let verified = crate::session::verify_session_bundle(inputs.clone())
@@ -3026,6 +3027,8 @@ mod tests {
 
         assert_eq!(verified.session_id, session_id);
         assert_eq!(verified.binding_mode, BindingMode::Local);
+        assert_eq!(verified.binding_chain_id, 0);
+        assert_eq!(verified.binding_registry, [0; 20]);
         assert_eq!(verified.attestation_mode, SessionAttestationMode::Hardware);
         assert!(bundle.owner.contract_authorization.take().is_none());
 

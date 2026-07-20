@@ -8,7 +8,7 @@ use atakit_cloud::DEFAULT_PORTAL_STATUS_PORT;
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 
-use super::session_access::resolve_verifier_workload_policy;
+use super::session_access::{resolve_trusted_session_binding, resolve_verifier_workload_policy};
 use super::{
     init_chain_from_config, resolve_instance, resolve_verifier_tls_measurement_policy,
     synthesize_off_init_chain,
@@ -25,7 +25,7 @@ struct VerificationSubject {
 
 pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<()> {
     let subject = resolve_subject(&args, env)?;
-    let init_chain = match args.verification.chain.as_deref() {
+    let (init_chain, trusted_binding) = match args.verification.chain.as_deref() {
         Some(chain_name) => {
             let chain = config
                 .chains
@@ -34,9 +34,12 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
             // Registration policy controls portal submission, not verifier
             // collateral lookup. Always derive the registries from the
             // verifier-selected SessionRegistry.
-            init_chain_from_config(chain_name, chain, Some("required"), None).await?
+            let init_chain =
+                init_chain_from_config(chain_name, chain, Some("required"), None).await?;
+            let trusted_binding = resolve_trusted_session_binding(chain_name, chain).await?;
+            (init_chain, Some(trusted_binding))
         }
-        None => synthesize_off_init_chain(),
+        None => (synthesize_off_init_chain(), None),
     };
 
     let measurement_policy = resolve_verifier_tls_measurement_policy(
@@ -97,6 +100,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         subject.status_port,
         workload_policy,
         None,
+        trusted_binding,
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error}"))?;

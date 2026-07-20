@@ -4,7 +4,8 @@ use atakit_attestation::{
     azure_maa_binding_from_session_bundle, verify_session_bundle, AzureMaaTrustKey, BindingMode,
     CertificateTrust, SessionAttribute, SessionAttributeRequirement, SessionEvidenceBundle,
     SessionPcrPolicy, SessionPcrVerifyType, SessionPlatformTrust, SessionRequestBinding,
-    SessionTrust, SessionVerificationInputs, TrustedSessionPolicy, VerifiedSession,
+    SessionTrust, SessionVerificationInputs, TrustedSessionBinding, TrustedSessionPolicy,
+    VerifiedSession,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -49,6 +50,7 @@ pub async fn verify_current_session(
     status_port: u16,
     workload: TrustedWorkloadSessionPolicy,
     required_binding: Option<BindingMode>,
+    trusted_binding: Option<TrustedSessionBinding>,
 ) -> Result<VerifiedSession, CloudError> {
     if verified_tls.manual_override.is_some() {
         return Err(session_error(
@@ -89,6 +91,7 @@ pub async fn verify_current_session(
         &bundle,
         workload,
         committed_maa_keys,
+        trusted_binding,
     )?;
     let verified = verify_session_bundle(SessionVerificationInputs {
         bundle: response.evidence_bundle,
@@ -142,6 +145,7 @@ fn build_session_trust(
     bundle: &SessionEvidenceBundle,
     workload: TrustedWorkloadSessionPolicy,
     committed_maa_keys: Vec<AzureMaaTrustKey>,
+    binding: Option<TrustedSessionBinding>,
 ) -> Result<SessionTrust, CloudError> {
     if context.platform.cloud != bundle.platform.cloud
         || context.platform.tee != bundle.platform.tee
@@ -204,6 +208,7 @@ fn build_session_trust(
     Ok(SessionTrust {
         platform,
         policy: trusted_policy(context, identity, bundle, workload)?,
+        binding,
     })
 }
 

@@ -2,11 +2,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use alloy_ext::core::primitives::{Address, B256};
-use alloy_ext::ext::NetworkProvider;
+use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
     BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrVerifyType,
-    VerifiedSession,
+    TrustedSessionBinding, VerifiedSession,
 };
 use atakit_cloud::cli::SessionVerificationArgs;
 use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
@@ -86,6 +86,7 @@ pub(crate) struct VerifiedCloudSessionAccess {
     pub required_binding: Option<BindingMode>,
     pub verified_tls: VerifiedPortalTls,
     workload_policy: TrustedWorkloadSessionPolicy,
+    trusted_binding: Option<TrustedSessionBinding>,
 }
 
 impl VerifiedCloudSessionAccess {
@@ -96,6 +97,7 @@ impl VerifiedCloudSessionAccess {
             self.status_port,
             self.workload_policy.clone(),
             self.required_binding,
+            self.trusted_binding,
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -227,18 +229,24 @@ pub(crate) async fn resolve_verified_session_access(
     verification: &SessionVerificationArgs,
     config: &Config,
 ) -> Result<VerifiedCloudSessionAccess> {
-    let init_chain = match portal.chain_name.as_deref() {
+    let (init_chain, trusted_binding) = match portal.chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
             Some(chain) => {
                 let prover = chain
                     .prover
                     .as_ref()
                     .and_then(|prover| config.provers.get(prover));
-                init_chain_from_config(name, chain, portal.registration.as_deref(), prover).await?
+                let init_chain =
+                    init_chain_from_config(name, chain, portal.registration.as_deref(), prover)
+                        .await?;
+                let trusted_binding = resolve_trusted_session_binding(name, chain).await?;
+                (init_chain, Some(trusted_binding))
             }
             None => bail!("chain '{name}' not found in [chains]"),
         },
-        None if registration_is_off(portal.registration.as_deref()) => synthesize_off_init_chain(),
+        None if registration_is_off(portal.registration.as_deref()) => {
+            (synthesize_off_init_chain(), None)
+        }
         None => bail!("no chain config is available for verifier trust lookup"),
     };
     let workload_id = crate::commands::workload::compute_workload_id(
@@ -266,6 +274,39 @@ pub(crate) async fn resolve_verified_session_access(
         required_binding,
         verified_tls: portal.verified_tls,
         workload_policy,
+        trusted_binding,
+    })
+}
+
+pub(crate) async fn resolve_trusted_session_binding(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<TrustedSessionBinding> {
+    let registry: Address = chain.session_registry.parse().with_context(|| {
+        format!(
+            "invalid session_registry address in chain '{chain_name}': {}",
+            chain.session_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| format!("connect to rpc_url for chain '{chain_name}'"))?;
+    let chain_id = provider.chain_id();
+    if let Some(configured) = chain.chain_id {
+        if configured != chain_id {
+            bail!(
+                "chain_id in chain '{chain_name}' is {configured}, but its rpc_url reports {chain_id}"
+            );
+        }
+    }
+    Ok(TrustedSessionBinding {
+        chain_id,
+        registry: registry.into_array(),
     })
 }
 
