@@ -1019,12 +1019,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "atakit-attestation-client"
+version = "0.5.5"
+dependencies = [
+ "alloy-ext",
+ "atakit-attestation",
+ "automata-tee-workload-measurement",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "atakit-cli"
 version = "0.5.5"
 dependencies = [
  "alloy-ext",
  "anyhow",
  "atakit-attestation",
+ "atakit-attestation-client",
  "atakit-cloud",
  "atakit-config",
  "atakit-core",
@@ -1061,6 +1081,7 @@ version = "0.5.5"
 dependencies = [
  "async-trait",
  "atakit-attestation",
+ "atakit-attestation-client",
  "atakit-config",
  "atakit-core",
  "atakit-image",
@@ -1072,12 +1093,10 @@ dependencies = [
  "hex",
  "k256",
  "reqwest 0.12.28",
- "rsa",
  "serde",
  "serde_json",
  "sha2",
  "sha3",
- "signature",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

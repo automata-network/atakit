@@ -7,6 +7,7 @@ members = [
     "crates/atakit-image",
     "crates/atakit-workload",
     "crates/atakit-attestation",
+    "crates/atakit-attestation-client",
     "crates/atakit-cloud",
     "crates/atakit-cli",
 ]
@@ -72,6 +73,7 @@ atakit-github = { path = "crates/atakit-github" }
 atakit-image = { path = "crates/atakit-image" }
 atakit-workload = { path = "crates/atakit-workload" }
 atakit-attestation = { path = "crates/atakit-attestation" }
+atakit-attestation-client = { path = "crates/atakit-attestation-client" }
 atakit-cloud = { path = "crates/atakit-cloud" }
 
 [patch.crates-io]

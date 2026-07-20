@@ -29,7 +29,7 @@ use crate::config::{ChainConfig, Config};
 pub(crate) async fn resolve_verifier_workload_policy(
     workload_ref: &str,
     trusted_workload_pcr23: Option<&str>,
-    init_chain: &InitChainConfig,
+    chain_client: Option<&atakit_attestation_client::AttestationClient>,
     selected_base_image_id: [u8; 32],
 ) -> Result<TrustedWorkloadSessionPolicy> {
     let parsed = crate::commands::workload::parse_workload_ref(workload_ref)?;
@@ -49,20 +49,15 @@ pub(crate) async fn resolve_verifier_workload_policy(
         });
     }
 
-    if init_chain.workload_registry == super::ZERO_ADDR || init_chain.rpc_url.trim().is_empty() {
+    let Some(chain_client) = chain_client else {
         bail!(
             "no trusted workload collateral is available; select a verifier chain with --chain or provide --trusted-workload-pcr23"
         );
-    }
-
-    load_registered_workload_policy(
-        &name,
-        &version,
-        init_chain,
-        workload_id,
-        selected_base_image_id,
-    )
-    .await
+    };
+    chain_client
+        .resolve_workload_policy(workload_ref, selected_base_image_id)
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 pub(crate) struct VerifiedPortalAccess {

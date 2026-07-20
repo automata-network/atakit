@@ -339,7 +339,7 @@ pub(crate) async fn resolve_verifier_tls_measurement_policy(
     base_image: &str,
     measurement_publisher_keys: &[String],
     data_dir: &std::path::Path,
-    init_chain: &InitChainConfig,
+    chain_client: Option<&atakit_attestation_client::AttestationClient>,
 ) -> Result<MeasurementPolicy> {
     if measurements.is_some() {
         return atakit_cloud::init::load_measurement_policy(
@@ -352,8 +352,11 @@ pub(crate) async fn resolve_verifier_tls_measurement_policy(
         .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"));
     }
 
-    if chain_measurement_policy_available(init_chain) {
-        return load_measurement_policy_from_chain(base_image, init_chain).await;
+    if let Some(chain_client) = chain_client {
+        return chain_client
+            .resolve_base_image_measurement_policy(base_image)
+            .await
+            .map_err(anyhow::Error::new);
     }
 
     bail!(

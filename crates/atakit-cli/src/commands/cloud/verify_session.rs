@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use atakit_attestation_client::{AttestationClient, AttestationClientConfig};
 use atakit_cloud::cli::VerifySessionArgs;
 use atakit_cloud::init;
 use atakit_cloud::state::{DeployState, DeployStatus};
@@ -8,11 +9,8 @@ use atakit_cloud::DEFAULT_PORTAL_STATUS_PORT;
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 
-use super::session_access::{resolve_trusted_session_binding, resolve_verifier_workload_policy};
-use super::{
-    init_chain_from_config, resolve_instance, resolve_verifier_tls_measurement_policy,
-    synthesize_off_init_chain,
-};
+use super::session_access::resolve_verifier_workload_policy;
+use super::{resolve_instance, resolve_verifier_tls_measurement_policy, synthesize_off_init_chain};
 use crate::config::Config;
 
 struct VerificationSubject {
@@ -25,19 +23,32 @@ struct VerificationSubject {
 
 pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<()> {
     let subject = resolve_subject(&args, env)?;
-    let (init_chain, trusted_binding) = match args.verification.chain.as_deref() {
+    let (init_chain, chain_client) = match args.verification.chain.as_deref() {
         Some(chain_name) => {
             let chain = config
                 .chains
                 .get(chain_name)
                 .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in config"))?;
-            // Registration policy controls portal submission, not verifier
-            // collateral lookup. Always derive the registries from the
-            // verifier-selected SessionRegistry.
-            let init_chain =
-                init_chain_from_config(chain_name, chain, Some("required"), None).await?;
-            let trusted_binding = resolve_trusted_session_binding(chain_name, chain).await?;
-            (init_chain, Some(trusted_binding))
+            let client = AttestationClient::connect(AttestationClientConfig {
+                rpc_url: chain.rpc_url.clone(),
+                session_registry: chain.session_registry.clone(),
+                expected_chain_id: chain.chain_id,
+                expected_base_image_registry: chain.base_image_registry.clone(),
+                expected_workload_registry: chain.workload_registry.clone(),
+            })
+            .await?;
+            let context = client.context();
+            let init_chain = init::InitChainConfig {
+                rpc_url: chain.rpc_url.clone(),
+                session_registry: context.session_registry.clone(),
+                workload_registry: context.workload_registry.clone(),
+                base_image_registry: context.base_image_registry.clone(),
+                registration: Some("required".to_string()),
+                chain_id: Some(context.chain_id),
+                tee_backend: chain.tee_backend.clone(),
+                prover: None,
+            };
+            (init_chain, Some(client))
         }
         None => (synthesize_off_init_chain(), None),
     };
@@ -47,7 +58,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &subject.base_image_ref,
         &args.verification.measurement_publisher_key,
         &env.data_dir,
-        &init_chain,
+        chain_client.as_ref(),
     )
     .await?;
     let trust_anchors = init::load_tls_trust_anchors(
@@ -85,25 +96,42 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         .identity
         .base_image_id
         .ok_or_else(|| anyhow::anyhow!("TLS verification did not select a base image ID"))?;
-    let workload_policy = resolve_verifier_workload_policy(
-        &subject.workload_ref,
-        args.verification.trusted_workload_pcr23.as_deref(),
-        &init_chain,
-        base_image_id,
-    )
-    .await?;
-
     eprint!("Verify current session... ");
-    let verified = atakit_cloud::session::verify_current_session(
-        &verified_tls,
-        &subject.host,
-        subject.status_port,
-        workload_policy,
-        None,
-        trusted_binding,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verified = if let Some(client) = chain_client
+        .as_ref()
+        .filter(|_| args.verification.trusted_workload_pcr23.is_none())
+    {
+        client
+            .verify_current_session(
+                &verified_tls,
+                &subject.host,
+                subject.status_port,
+                &subject.workload_ref,
+                None,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+    } else {
+        let workload_policy = resolve_verifier_workload_policy(
+            &subject.workload_ref,
+            args.verification.trusted_workload_pcr23.as_deref(),
+            chain_client.as_ref(),
+            base_image_id,
+        )
+        .await?;
+        atakit_cloud::session::verify_current_session(
+            &verified_tls,
+            &subject.host,
+            subject.status_port,
+            workload_policy,
+            None,
+            chain_client
+                .as_ref()
+                .map(AttestationClient::trusted_session_binding),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    };
     eprintln!("{}", "done".green());
 
     if let Some(parent) = subject.report_path.parent() {

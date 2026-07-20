@@ -474,7 +474,8 @@ crates/
   atakit-github/       # GitHub Releases client
   atakit-image/        # Base-image download, cache, and metadata
   atakit-workload/     # Workload build, registry, and on-chain operations
-  atakit-attestation/  # Attestation verification and measurement handling
+  atakit-attestation/  # Network-free attestation verification
+  atakit-attestation-client/ # Read-only RPC and portal verification client
   atakit-cloud/        # GCP, Azure, AWS, and QEMU deployment backends
   atakit-cli/          # CLI parsing, presentation, and external subcommands
 ```

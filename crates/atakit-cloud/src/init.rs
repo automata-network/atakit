@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use atakit_attestation::{
     amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
@@ -10,6 +10,10 @@ use atakit_attestation::{
     AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TlsAttestationResponse,
     TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
+use atakit_attestation_client::{
+    AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
+};
+pub use atakit_attestation_client::{TlsManualOverride, VerifiedPortalTls};
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use atakit_image::encode_image_ref_path_segment;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -417,23 +421,6 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     }
 
     portal_config
-}
-
-#[derive(Debug, Clone)]
-pub struct VerifiedPortalTls {
-    pub client: reqwest::Client,
-    pub identity: VerifiedTlsIdentity,
-    pub manual_override: Option<TlsManualOverride>,
-    /// Independently trusted inputs retained for current-session
-    /// verification. This is absent for a manual TLS certificate override.
-    pub session_verification: Option<crate::session::PortalSessionVerificationContext>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TlsManualOverride {
-    pub live_cert_sha256: String,
-    pub report: VerificationReport,
-    pub report_path: Option<PathBuf>,
 }
 
 pub fn cloud_tls_attestation_report_path(
@@ -901,17 +888,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
-    let session_verification = measurement_policy.clone().map(|measurement_policy| {
-        crate::session::PortalSessionVerificationContext {
-            platform: response.platform.clone(),
-            measurement_policy,
-            trust_anchors: trust_anchors.clone(),
-            azure_maa_trust: azure_maa_trust.clone(),
-            manual_azure_maa_keys: manual_azure_maa_keys.clone(),
-            azure_snp_cert_table: azure_snp_cert_table.clone(),
-            tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
-        }
-    });
+    let session_chain_client = session_attestation_client(&azure_maa_trust).await?;
+    let session_verification =
+        measurement_policy
+            .clone()
+            .map(|measurement_policy| PortalSessionVerificationContext {
+                platform: response.platform.clone(),
+                measurement_policy,
+                trust_anchors: trust_anchors.clone(),
+                chain_client: session_chain_client.clone(),
+                manual_azure_maa_keys: manual_azure_maa_keys.clone(),
+                azure_snp_cert_table: azure_snp_cert_table.clone(),
+                tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
+            });
     match verify_tls_attestation(VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
@@ -1049,160 +1038,13 @@ async fn resolve_azure_maa_trust(
     };
 
     let jwt = extract_azure_maa_jwt_info(response)?;
-    let kid_hash = keccak256(jwt.kid.as_bytes());
-    let expected_issuer_hash = keccak256(jwt.issuer.as_bytes());
-    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
-    let maa_key_registry = resolve_maa_key_registry(rpc_url, &ak_collateral_verifier).await?;
-    let entry = resolve_maa_signing_key(rpc_url, &maa_key_registry, kid_hash).await?;
-    if entry.pkcs1_pubkey.is_empty() {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} has no signing key for kid hash 0x{}",
-            hex::encode(kid_hash)
-        ));
-    }
-    if entry.revoked {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} is revoked",
-            hex::encode(kid_hash)
-        ));
-    }
-    if entry.issuer_hash != expected_issuer_hash {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} issuer hash mismatch for kid hash 0x{}: JWT issuer {} hashes to 0x{}, registry has 0x{}",
-            hex::encode(kid_hash),
-            jwt.issuer,
-            hex::encode(expected_issuer_hash),
-            hex::encode(entry.issuer_hash)
-        ));
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock is before Unix epoch: {e}"))?
-        .as_secs();
-    if entry.not_after < now {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} expired at Unix time {} (now {now})",
-            hex::encode(kid_hash),
-            entry.not_after
-        ));
-    }
-
-    trust_anchors
-        .azure_maa_keys
-        .push(entry.pkcs1_pubkey.clone());
-    Ok(vec![AzureMaaTrustKey {
-        kid: jwt.kid,
-        issuer: jwt.issuer,
-        not_after: entry.not_after,
-        public_key: entry.pkcs1_pubkey,
-    }])
-}
-
-pub(crate) async fn resolve_committed_session_azure_maa_key(
-    binding: &AkBinding,
-    config: &AzureMaaTrustConfig,
-    manual_keys: &[Vec<u8>],
-) -> Result<AzureMaaTrustKey, CloudError> {
-    if !manual_keys.is_empty() {
-        return select_azure_maa_manual_trust_key(binding, manual_keys).map_err(|detail| {
-            committed_session_maa_error("committed_session_maa_signature_invalid", detail)
-        });
-    }
-    let AzureMaaTrustSource::OnchainRegistry {
-        rpc_url,
-        session_registry,
-    } = &config.source
-    else {
-        return Err(committed_session_maa_error(
-            "committed_session_maa_key_not_registered",
-            "no MaaKeyRegistry trust source is configured",
-        ));
-    };
-
-    let jwt = extract_azure_maa_jwt_info_from_binding(binding).map_err(|detail| {
-        committed_session_maa_error("committed_session_maa_signature_invalid", detail)
-    })?;
-    let kid_hash = keccak256(jwt.kid.as_bytes());
-    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry)
+    let client = connect_attestation_client(rpc_url, session_registry).await?;
+    let key = client
+        .resolve_azure_maa_signing_key(&jwt.kid, &jwt.issuer)
         .await
-        .map_err(|detail| {
-            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
-        })?;
-    let maa_key_registry = resolve_maa_key_registry(rpc_url, &ak_collateral_verifier)
-        .await
-        .map_err(|detail| {
-            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
-        })?;
-    let entry = resolve_maa_signing_key(rpc_url, &maa_key_registry, kid_hash)
-        .await
-        .map_err(|detail| {
-            committed_session_maa_error("committed_session_maa_key_resolution_failed", detail)
-        })?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            committed_session_maa_error(
-                "committed_session_maa_key_resolution_failed",
-                format!("system clock is before Unix epoch: {error}"),
-            )
-        })?
-        .as_secs();
-    validate_committed_session_maa_entry(&jwt, &entry, now)?;
-
-    let mut key =
-        select_azure_maa_manual_trust_key(binding, std::slice::from_ref(&entry.pkcs1_pubkey))
-            .map_err(|detail| {
-                committed_session_maa_error("committed_session_maa_signature_invalid", detail)
-            })?;
-    key.not_after = entry.not_after;
-    Ok(key)
-}
-
-fn validate_committed_session_maa_entry(
-    jwt: &AzureMaaJwtInfo,
-    entry: &MaaSigningKeyEntry,
-    now: u64,
-) -> Result<(), CloudError> {
-    if entry.pkcs1_pubkey.is_empty() {
-        return Err(committed_session_maa_error(
-            "committed_session_maa_key_not_registered",
-            format!("no signing key is registered for kid {}", jwt.kid),
-        ));
-    }
-    if entry.revoked {
-        return Err(committed_session_maa_error(
-            "committed_session_maa_key_revoked",
-            format!("signing key for kid {} is revoked", jwt.kid),
-        ));
-    }
-    let expected_issuer_hash = keccak256(jwt.issuer.as_bytes());
-    if entry.issuer_hash != expected_issuer_hash {
-        return Err(committed_session_maa_error(
-            "committed_session_maa_issuer_mismatch",
-            format!(
-                "JWT issuer {} hashes to 0x{}, registry has 0x{}",
-                jwt.issuer,
-                hex::encode(expected_issuer_hash),
-                hex::encode(entry.issuer_hash)
-            ),
-        ));
-    }
-    if now > entry.not_after {
-        return Err(committed_session_maa_error(
-            "committed_session_maa_key_expired",
-            format!(
-                "signing key for kid {} expired at Unix time {} (now {now})",
-                jwt.kid, entry.not_after
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn committed_session_maa_error(code: &str, detail: impl Into<String>) -> CloudError {
-    CloudError::PortalSessionVerificationFailed {
-        message: format!("{code}: {}", detail.into()),
-    }
+        .map_err(|error| error.to_string())?;
+    trust_anchors.azure_maa_keys.push(key.public_key.clone());
+    Ok(vec![key])
 }
 
 async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
@@ -1307,21 +1149,17 @@ async fn resolve_chain_trust_anchors(
     else {
         return Ok(());
     };
-    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
+    let client = connect_attestation_client(rpc_url, session_registry).await?;
 
     if response.platform.cloud.eq_ignore_ascii_case("gcp")
         && trust_anchors.gcp_roots.is_empty()
         && trust_anchors.gcp_root_hashes.is_empty()
     {
         let root = extract_gcp_ak_root_cert(response)?;
-        let root_hash = keccak256(&root);
-        let tpm_attestation = resolve_tpm_attestation(rpc_url, &ak_collateral_verifier).await?;
-        if !resolve_verified_ca(rpc_url, &tpm_attestation, root_hash).await? {
-            return Err(format!(
-                "TpmAttestation {tpm_attestation} does not trust GCP AK root keccak256(root_der)=0x{}",
-                hex::encode(root_hash)
-            ));
-        }
+        let root_hash = client
+            .resolve_gcp_ak_root(&root)
+            .await
+            .map_err(|error| error.to_string())?;
         trust_anchors.gcp_root_hashes.push(root_hash);
     }
 
@@ -1338,167 +1176,51 @@ async fn resolve_chain_trust_anchors(
         } else {
             return Ok(());
         };
-        let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
-        let tee_verifier = resolve_tee_verifier(rpc_url, session_registry).await?;
-        let snp_attestation = resolve_snp_attestation(rpc_url, &tee_verifier).await?;
-        if !resolve_snp_root_hash(rpc_url, &snp_attestation, ark_hash).await? {
-            return Err(format!(
-                "SnpAttestation {snp_attestation} does not trust AMD ARK sha256(ark_der)=0x{}",
-                hex::encode(ark_hash)
-            ));
-        }
+        let ark_hash = client
+            .resolve_amd_ark_root(&ark)
+            .await
+            .map_err(|error| error.to_string())?;
         trust_anchors.amd_ark_root_hashes.push(ark_hash);
     }
 
     Ok(())
 }
 
+async fn connect_attestation_client(
+    rpc_url: &str,
+    session_registry: &str,
+) -> Result<AttestationClient, String> {
+    AttestationClient::connect(AttestationClientConfig {
+        rpc_url: rpc_url.to_string(),
+        session_registry: session_registry.to_string(),
+        expected_chain_id: None,
+        expected_base_image_registry: None,
+        expected_workload_registry: None,
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn session_attestation_client(
+    config: &AzureMaaTrustConfig,
+) -> Result<Option<AttestationClient>, CloudError> {
+    let AzureMaaTrustSource::OnchainRegistry {
+        rpc_url,
+        session_registry,
+    } = &config.source
+    else {
+        return Ok(None);
+    };
+    connect_attestation_client(rpc_url, session_registry)
+        .await
+        .map(Some)
+        .map_err(|message| CloudError::PortalTlsAttestationFailed { message })
+}
+
 #[derive(Debug, Clone)]
 struct AzureMaaJwtInfo {
     kid: String,
     issuer: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MaaSigningKeyEntry {
-    pkcs1_pubkey: Vec<u8>,
-    issuer_hash: [u8; 32],
-    not_after: u64,
-    revoked: bool,
-}
-
-async fn resolve_ak_collateral_verifier(
-    rpc_url: &str,
-    session_registry: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("akCollateralVerifier()");
-    let result = eth_call_bytes(
-        rpc_url,
-        session_registry,
-        &calldata,
-        "SessionRegistry.akCollateralVerifier",
-    )
-    .await?;
-    decode_address_return(&result, "SessionRegistry.akCollateralVerifier")
-}
-
-async fn resolve_maa_key_registry(
-    rpc_url: &str,
-    ak_collateral_verifier: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("maaKeyRegistry()");
-    let result = eth_call_bytes(
-        rpc_url,
-        ak_collateral_verifier,
-        &calldata,
-        "AkCollateralVerifier.maaKeyRegistry",
-    )
-    .await?;
-    decode_address_return(&result, "AkCollateralVerifier.maaKeyRegistry")
-}
-
-async fn resolve_maa_signing_key(
-    rpc_url: &str,
-    maa_key_registry: &str,
-    kid_hash: [u8; 32],
-) -> Result<MaaSigningKeyEntry, String> {
-    let calldata = encode_bytes32_arg_call("getMaaSigningKey(bytes32)", kid_hash);
-    let result = eth_call_bytes(
-        rpc_url,
-        maa_key_registry,
-        &calldata,
-        "MaaKeyRegistry.getMaaSigningKey",
-    )
-    .await?;
-    decode_maa_signing_key_return(&result)
-}
-
-async fn resolve_tpm_attestation(
-    rpc_url: &str,
-    ak_collateral_verifier: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("tpmAttestation()");
-    let result = eth_call_bytes(
-        rpc_url,
-        ak_collateral_verifier,
-        &calldata,
-        "AkCollateralVerifier.tpmAttestation",
-    )
-    .await?;
-    decode_address_return(&result, "AkCollateralVerifier.tpmAttestation")
-}
-
-async fn resolve_tee_verifier(rpc_url: &str, session_registry: &str) -> Result<String, String> {
-    let calldata = encode_no_arg_call("teeVerifier()");
-    let result = eth_call_bytes(
-        rpc_url,
-        session_registry,
-        &calldata,
-        "SessionRegistry.teeVerifier",
-    )
-    .await?;
-    decode_address_return(&result, "SessionRegistry.teeVerifier")
-}
-
-async fn resolve_snp_attestation(rpc_url: &str, tee_verifier: &str) -> Result<String, String> {
-    let calldata = encode_no_arg_call("snpAttestation()");
-    let result = eth_call_bytes(
-        rpc_url,
-        tee_verifier,
-        &calldata,
-        "TeeVerifier.snpAttestation",
-    )
-    .await?;
-    decode_address_return(&result, "TeeVerifier.snpAttestation")
-}
-
-async fn resolve_verified_ca(
-    rpc_url: &str,
-    tpm_attestation: &str,
-    root_hash: [u8; 32],
-) -> Result<bool, String> {
-    let calldata = encode_bytes32_arg_call("verifiedCA(bytes32)", root_hash);
-    let result = eth_call_bytes(
-        rpc_url,
-        tpm_attestation,
-        &calldata,
-        "TpmAttestation.verifiedCA",
-    )
-    .await?;
-    if result.len() != 32 {
-        return Err(format!(
-            "TpmAttestation.verifiedCA return has invalid length: got {}, need 32",
-            result.len()
-        ));
-    }
-    abi_word_bool(&result)
-}
-
-async fn resolve_snp_root_hash(
-    rpc_url: &str,
-    snp_attestation: &str,
-    ark_hash: [u8; 32],
-) -> Result<bool, String> {
-    for processor_model in 0..8u64 {
-        let calldata = encode_uint_arg_call("rootCerts(uint8)", processor_model);
-        let result = eth_call_bytes(
-            rpc_url,
-            snp_attestation,
-            &calldata,
-            "SnpAttestation.rootCerts",
-        )
-        .await?;
-        if result.len() != 32 {
-            return Err(format!(
-                "SnpAttestation.rootCerts return has invalid length: got {}, need 32",
-                result.len()
-            ));
-        }
-        if result.as_slice() == ark_hash {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn eth_call_bytes(
@@ -1847,13 +1569,6 @@ fn encode_no_arg_call(signature: &str) -> Vec<u8> {
     out
 }
 
-fn encode_bytes32_arg_call(signature: &str, arg: [u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(36);
-    out.extend_from_slice(&function_selector(signature));
-    out.extend_from_slice(&arg);
-    out
-}
-
 fn encode_uint_arg_call(signature: &str, arg: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(36);
     out.extend_from_slice(&function_selector(signature));
@@ -2078,67 +1793,6 @@ fn pem_cert_from_der(cert: &[u8]) -> String {
     out
 }
 
-fn decode_address_return(bytes: &[u8], label: &str) -> Result<String, String> {
-    if bytes.len() != 32 {
-        return Err(format!(
-            "{label} return has invalid ABI address length: got {}, need 32",
-            bytes.len()
-        ));
-    }
-    if bytes[..12].iter().any(|byte| *byte != 0) {
-        return Err(format!("{label} return has non-zero address padding"));
-    }
-    let address = &bytes[12..32];
-    if address.iter().all(|byte| *byte == 0) {
-        return Err(format!("{label} returned the zero address"));
-    }
-    Ok(format!("0x{}", hex::encode(address)))
-}
-
-fn decode_maa_signing_key_return(bytes: &[u8]) -> Result<MaaSigningKeyEntry, String> {
-    if bytes.len() < 32 {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey return is too short: got {}, need at least 32",
-            bytes.len()
-        ));
-    }
-    let tuple_offset = abi_word_usize(&bytes[0..32])?;
-    if tuple_offset + 128 > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey tuple offset {tuple_offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let tuple = &bytes[tuple_offset..];
-    let pkcs1_offset = abi_word_usize(&tuple[0..32])?;
-    let mut issuer_hash = [0u8; 32];
-    issuer_hash.copy_from_slice(&tuple[32..64]);
-    let not_after = abi_word_to_u64(&tuple[64..96])?;
-    let revoked = abi_word_bool(&tuple[96..128])?;
-    if tuple_offset + pkcs1_offset + 32 > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey offset {pkcs1_offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let pkcs1_start = tuple_offset + pkcs1_offset;
-    let pkcs1_len = abi_word_usize(&bytes[pkcs1_start..pkcs1_start + 32])?;
-    let data_start = pkcs1_start + 32;
-    let data_end = data_start + pkcs1_len;
-    if data_end > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey length {pkcs1_len} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    Ok(MaaSigningKeyEntry {
-        pkcs1_pubkey: bytes[data_start..data_end].to_vec(),
-        issuer_hash,
-        not_after,
-        revoked,
-    })
-}
-
 fn decode_hex_result(result: &str, label: &str) -> Result<Vec<u8>, String> {
     let raw_hex = result.strip_prefix("0x").unwrap_or(result);
     hex::decode(raw_hex).map_err(|e| format!("decode {label} hex: {e}"))
@@ -2151,41 +1805,10 @@ fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, Stri
     serde_json::from_slice(&raw).map_err(|e| format!("parse {label} JSON: {e}"))
 }
 
-fn keccak256(input: &[u8]) -> [u8; 32] {
-    let digest = Keccak256::digest(input);
-    digest.into()
-}
-
 fn abi_word_u64(value: u64) -> [u8; 32] {
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&value.to_be_bytes());
     word
-}
-
-fn abi_word_to_u64(word: &[u8]) -> Result<u64, String> {
-    if word.len() != 32 {
-        return Err("ABI uint word has invalid length".to_string());
-    }
-    if word[..24].iter().any(|byte| *byte != 0) {
-        return Err("ABI uint word is too large for u64".to_string());
-    }
-    let mut value = [0u8; 8];
-    value.copy_from_slice(&word[24..32]);
-    Ok(u64::from_be_bytes(value))
-}
-
-fn abi_word_bool(word: &[u8]) -> Result<bool, String> {
-    if word.len() != 32 {
-        return Err("ABI bool word has invalid length".to_string());
-    }
-    if word[..31].iter().any(|byte| *byte != 0) {
-        return Err("ABI bool word has non-zero high bytes".to_string());
-    }
-    match word[31] {
-        0 => Ok(false),
-        1 => Ok(true),
-        other => Err(format!("ABI bool word has invalid value {other}")),
-    }
 }
 
 fn abi_word_usize(word: &[u8]) -> Result<usize, String> {
@@ -2751,53 +2374,6 @@ mod tests {
     use super::*;
     use k256::ecdsa::signature::Signer;
     use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
-    use rsa::pkcs1::EncodeRsaPublicKey;
-    use rsa::pkcs1v15::SigningKey as RsaSigningKey;
-    use rsa::rand_core::OsRng;
-    use rsa::RsaPrivateKey;
-    use signature::SignatureEncoding;
-
-    fn signed_maa_binding(kid: &str, issuer: &str) -> (AkBinding, Vec<u8>) {
-        let private = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let public = private
-            .to_public_key()
-            .to_pkcs1_der()
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-        let header = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"alg": "RS256", "kid": kid})
-                .to_string()
-                .as_bytes(),
-        );
-        let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({
-                "iss": issuer,
-                "x-ms-attestation-type": "tdxvm",
-                "x-ms-compliance-status": "azure-compliant-cvm"
-            })
-            .to_string()
-            .as_bytes(),
-        );
-        let signing_input = format!("{header}.{claims}");
-        let signature = RsaSigningKey::<Sha256>::new(private).sign(signing_input.as_bytes());
-        let jwt = format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature.to_vec())
-        );
-        let data = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"jwt": jwt, "hclVarData": ""})
-                .to_string()
-                .as_bytes(),
-        );
-        (
-            AkBinding {
-                kind: "azure-maa-jwt".into(),
-                data,
-            },
-            public,
-        )
-    }
 
     fn sample_config() -> InitConfig {
         InitConfig {
@@ -3036,109 +2612,6 @@ mod tests {
         let info = extract_azure_maa_jwt_info(&response).unwrap();
         assert_eq!(info.kid, "kid-1");
         assert_eq!(info.issuer, "https://issuer.example");
-    }
-
-    #[tokio::test]
-    async fn committed_session_selects_its_own_manual_maa_key() {
-        let (session_binding, session_key) =
-            signed_maa_binding("session-key-a", "https://issuer.example");
-        let (tls_binding, tls_key) = signed_maa_binding("tls-key-b", "https://issuer.example");
-        let manual_keys = vec![tls_key.clone(), session_key.clone()];
-
-        let fresh_tls = select_azure_maa_manual_trust_key(&tls_binding, &manual_keys).unwrap();
-        assert_eq!(fresh_tls.kid, "tls-key-b");
-        assert_eq!(fresh_tls.public_key, tls_key);
-
-        let committed = resolve_committed_session_azure_maa_key(
-            &session_binding,
-            &AzureMaaTrustConfig::default(),
-            &manual_keys,
-        )
-        .await
-        .unwrap();
-        assert_eq!(committed.kid, "session-key-a");
-        assert_eq!(committed.public_key, session_key);
-    }
-
-    #[test]
-    fn committed_session_registry_maa_failures_have_exact_codes() {
-        let jwt = AzureMaaJwtInfo {
-            kid: "session-key-a".into(),
-            issuer: "https://issuer.example".into(),
-        };
-        let issuer_hash = keccak256(jwt.issuer.as_bytes());
-        let valid = MaaSigningKeyEntry {
-            pkcs1_pubkey: vec![1],
-            issuer_hash,
-            not_after: 200,
-            revoked: false,
-        };
-
-        let mut entry = valid.clone();
-        entry.pkcs1_pubkey.clear();
-        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
-            .unwrap_err()
-            .to_string()
-            .contains("committed_session_maa_key_not_registered"));
-
-        let mut entry = valid.clone();
-        entry.revoked = true;
-        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
-            .unwrap_err()
-            .to_string()
-            .contains("committed_session_maa_key_revoked"));
-
-        let mut entry = valid.clone();
-        entry.not_after = 99;
-        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
-            .unwrap_err()
-            .to_string()
-            .contains("committed_session_maa_key_expired"));
-
-        let mut entry = valid;
-        entry.issuer_hash = [0x55; 32];
-        assert!(validate_committed_session_maa_entry(&jwt, &entry, 100)
-            .unwrap_err()
-            .to_string()
-            .contains("committed_session_maa_issuer_mismatch"));
-    }
-
-    #[tokio::test]
-    async fn committed_session_rejects_invalid_manual_maa_signature() {
-        let (session_binding, _) = signed_maa_binding("session-key-a", "https://issuer.example");
-        let (_, wrong_key) = signed_maa_binding("tls-key-b", "https://issuer.example");
-
-        let error = resolve_committed_session_azure_maa_key(
-            &session_binding,
-            &AzureMaaTrustConfig::default(),
-            &[wrong_key],
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("committed_session_maa_signature_invalid"));
-    }
-
-    #[test]
-    fn maa_signing_key_return_decodes_dynamic_struct() {
-        let pkcs1 = vec![0x30, 0x82, 0x01, 0x0a];
-        let issuer_hash = [0x42u8; 32];
-        let mut returned = Vec::new();
-        returned.extend_from_slice(&abi_word_u64(32));
-        returned.extend_from_slice(&abi_word_u64(128));
-        returned.extend_from_slice(&issuer_hash);
-        returned.extend_from_slice(&abi_word_u64(1_811_611_165));
-        returned.extend_from_slice(&abi_word_u64(0));
-        returned.extend_from_slice(&abi_word_u64(pkcs1.len() as u64));
-        returned.extend_from_slice(&pkcs1);
-        returned.extend_from_slice(&[0; 28]);
-
-        let decoded = decode_maa_signing_key_return(&returned).unwrap();
-        assert_eq!(decoded.pkcs1_pubkey, pkcs1);
-        assert_eq!(decoded.issuer_hash, issuer_hash);
-        assert_eq!(decoded.not_after, 1_811_611_165);
-        assert!(!decoded.revoked);
     }
 
     #[test]

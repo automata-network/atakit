@@ -15,7 +15,8 @@ crates/
   atakit-github/        generic GitHub Releases client
   atakit-image/         base-image distribution and local image store
   atakit-workload/      workload schema, build, stores, and repositories
-  atakit-attestation/   verifier-side TLS and TEE attestation logic
+  atakit-attestation/   network-free TLS, TEE, and session verification
+  atakit-attestation-client/ read-only RPC and portal verification client
   atakit-cloud/         provider plans, execution, state, and portal client
   atakit-cli/           clap surface, top-level config composition, and presentation
 ```
@@ -67,9 +68,16 @@ included in the archive; the manifest commits only to its allowlisted paths.
 
 ### Attestation
 
-`atakit-attestation` verifies the portal's attested TLS bootstrap evidence and
-measurement policy. Cloud deployment resolves this policy before provisioning
-unless the operator explicitly selects the unsafe bypass.
+`atakit-attestation` verifies TLS, TEE, TPM, PCR, and current-session evidence
+from explicit typed inputs. It performs no network access.
+
+`atakit-attestation-client` owns read-only access to verifier-selected chain
+state. It derives `BaseImageRegistry` and `WorkloadRegistry` from the selected
+`SessionRegistry`, resolves registered measurement and workload policy, checks
+platform trust roots, resolves Azure MAA signing keys, fetches fresh
+challenge-bound current-session evidence, and calls `atakit-attestation`. The
+configured RPC endpoint remains a verifier-selected trusted data source; the
+client does not verify consensus or storage proofs.
 
 ### Cloud
 
@@ -108,8 +116,9 @@ atakit-cli
   ├── atakit-config
   ├── atakit-image ──────┐
   ├── atakit-workload ───┼── atakit-github ── atakit-core
-  ├── atakit-cloud ──────┤
-  └── atakit-attestation ┘
+  ├── atakit-cloud ──────┼── atakit-attestation-client
+  └── atakit-attestation ┘              │
+                                        └── atakit-attestation
 
 atakit-imgbuild (separate repository) ── atakit-config
 ```
