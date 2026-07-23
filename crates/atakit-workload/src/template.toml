@@ -6,7 +6,7 @@
 # containing manifest.json + images + measured-data.
 
 # Schema version. Current: 4.
-format = 4
+format = 5
 
 # ── package data ────────────────────────────────────────────────
 #

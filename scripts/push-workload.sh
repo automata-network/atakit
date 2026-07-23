@@ -15,13 +15,13 @@
 #   ATAKIT_RPC_URL              Ethereum RPC endpoint (required)
 #   ATAKIT_SESSION_REGISTRY     Session registry contract address (required)
 #   ATAKIT_OWNER_PRIVATE_KEY    Owner private key, 0x... (required)
-#   ATAKIT_RELAY_PRIVATE_KEY    Relay private key, 0x... (required)
+#   ATAKIT_GAS_WALLET_PRIVATE_KEY Gas-wallet private key, 0x... (required)
 #
 # Example:
 #   export ATAKIT_RPC_URL=https://sepolia.infura.io/v3/KEY
 #   export ATAKIT_SESSION_REGISTRY=0x1234...5678
 #   export ATAKIT_OWNER_PRIVATE_KEY=0xabc...
-#   export ATAKIT_RELAY_PRIVATE_KEY=0xdef...
+#   export ATAKIT_GAS_WALLET_PRIVATE_KEY=0xdef...
 #   ./push-workload.sh 192.0.2.10 my-workload-v0.0.1.atawl
 
 set -euo pipefail
@@ -36,7 +36,7 @@ UNMEASURED_DIR=""
 RPC_URL="${ATAKIT_RPC_URL:-}"
 SESSION_REGISTRY="${ATAKIT_SESSION_REGISTRY:-}"
 OWNER_KEY="${ATAKIT_OWNER_PRIVATE_KEY:-}"
-RELAY_KEY="${ATAKIT_RELAY_PRIVATE_KEY:-}"
+GAS_WALLET_KEY="${ATAKIT_GAS_WALLET_PRIVATE_KEY:-}"
 EXPIRE_OFFSET=3600
 PORT=1024
 WAIT_TIMEOUT=300
@@ -47,7 +47,7 @@ while [[ $# -gt 0 ]]; do
         --rpc-url)         RPC_URL="$2"; shift 2 ;;
         --session-registry) SESSION_REGISTRY="$2"; shift 2 ;;
         --owner-key)       OWNER_KEY="$2"; shift 2 ;;
-        --relay-key)       RELAY_KEY="$2"; shift 2 ;;
+        --gas-wallet-key)  GAS_WALLET_KEY="$2"; shift 2 ;;
         --expire-offset)   EXPIRE_OFFSET="$2"; shift 2 ;;
         --port)            PORT="$2"; shift 2 ;;
         --wait)            WAIT_TIMEOUT="$2"; shift 2 ;;
@@ -77,7 +77,7 @@ done
 [[ -n "$RPC_URL" ]]           || die "ATAKIT_RPC_URL / --rpc-url is required"
 [[ -n "$SESSION_REGISTRY" ]]  || die "ATAKIT_SESSION_REGISTRY / --session-registry is required"
 [[ -n "$OWNER_KEY" ]]         || die "ATAKIT_OWNER_PRIVATE_KEY / --owner-key is required"
-[[ -n "$RELAY_KEY" ]]         || die "ATAKIT_RELAY_PRIVATE_KEY / --relay-key is required"
+[[ -n "$GAS_WALLET_KEY" ]]     || die "ATAKIT_GAS_WALLET_PRIVATE_KEY / --gas-wallet-key is required"
 
 AGENT_URL="https://${HOST}:${PORT}"
 
@@ -112,12 +112,27 @@ done
 config_file=$(mktemp /tmp/config-XXXXXX.json)
 cat > "$config_file" <<EOF
 {
-  "agent_env": {
+  "format": 2,
+  "chain": {
+    "registration": "required",
     "rpc_url": "${RPC_URL}",
-    "session_registry": "${SESSION_REGISTRY}",
-    "owner_private_key": "${OWNER_KEY}",
-    "relay_private_key": "${RELAY_KEY}",
-    "expire_offset": ${EXPIRE_OFFSET}
+    "contracts": {
+      "session_registry": "${SESSION_REGISTRY}",
+      "workload_registry": "",
+      "base_image_registry": ""
+    },
+    "tee_backend": "auto"
+  },
+  "owner_operations": {"op_expiry_seconds": ${EXPIRE_OFFSET}},
+  "owner_key": {
+    "mode": "provisioned",
+    "type": "es256k",
+    "private_key": "${OWNER_KEY}"
+  },
+  "gas_wallet": {
+    "mode": "provisioned",
+    "type": "es256k",
+    "private_key": "${GAS_WALLET_KEY}"
   }
 }
 EOF

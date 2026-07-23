@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::PlatformKind;
 use crate::error::CloudError;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const LEGACY_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_PORTAL_INIT_PORT: u16 = 1024;
 pub const DEFAULT_PORTAL_STATUS_PORT: u16 = 2024;
 
@@ -53,7 +54,11 @@ pub struct DeployState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: DeployStatus,
+    /// Provider image selector used to create and manage cloud resources.
     pub image_ref: String,
+    /// Canonical base-image identity used only as an optional verifier subject
+    /// default. It is never a collateral or policy trust source.
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -76,14 +81,14 @@ pub enum DeployStatus {
 /// Init environment config persisted for re-deploys.
 /// Stores reference names into `[chains.*]` and `[keys.*]` config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedInitEnv {
     pub chain: String,
     pub owner_key: String,
     pub gas_wallet: String,
-    /// Optional SP1 prover-network key name. `#[serde(default)]` so deploy
-    /// states written before this field existed still load (as `None`).
+    /// Optional prover credential key name.
     #[serde(default)]
-    pub sp1_payer: Option<String>,
+    pub prover_credential: Option<String>,
 }
 
 /// Cloud provider resources tracked in state.
@@ -236,6 +241,7 @@ pub struct NewDeployParams {
     pub provider_name: String,
     pub platform: PlatformKind,
     pub image_ref: String,
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -263,6 +269,7 @@ impl DeployState {
                 total: params.total_steps,
             },
             image_ref: params.image_ref,
+            base_image_ref: params.base_image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
             init_env: params.init_env,
@@ -286,9 +293,10 @@ impl DeployState {
                 }
             }
         })?;
-        let state: DeployState = serde_json::from_str(&content).map_err(|e| CloudError::State {
-            message: format!("failed to parse {}: {e}", path.display()),
-        })?;
+        let (state, migrated) = decode_deploy_state(&content, &path)?;
+        if migrated {
+            write_state_file(&path, &state)?;
+        }
         Ok(state)
     }
 
@@ -302,17 +310,7 @@ impl DeployState {
                 source: e,
             })?;
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &json).map_err(|e| CloudError::IoPath {
-            path: tmp.clone(),
-            source: e,
-        })?;
-        fs::rename(&tmp, &path).map_err(|e| CloudError::IoPath {
-            path: path.clone(),
-            source: e,
-        })?;
-        Ok(())
+        write_state_file(&path, self)
     }
 
     /// Delete state file from disk.
@@ -488,6 +486,83 @@ impl DeployState {
     }
 }
 
+fn decode_deploy_state(content: &str, path: &Path) -> Result<(DeployState, bool), CloudError> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| CloudError::State {
+            message: format!("failed to parse {}: {e}", path.display()),
+        })?;
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CloudError::State {
+            message: format!(
+                "failed to parse {}: missing or invalid format",
+                path.display()
+            ),
+        })?;
+    let format = u32::try_from(format).map_err(|_| CloudError::State {
+        message: format!(
+            "failed to parse {}: unsupported format {format}",
+            path.display()
+        ),
+    })?;
+
+    let migrated = match format {
+        LEGACY_FORMAT_VERSION => {
+            let init_env = value
+                .get_mut("init_env")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| CloudError::State {
+                    message: format!(
+                        "failed to migrate {}: format 1 init_env is missing or is not an object",
+                        path.display()
+                    ),
+                })?;
+            if init_env.contains_key("sp1_payer") && init_env.contains_key("prover_credential") {
+                return Err(CloudError::State {
+                    message: format!(
+                        "failed to migrate {}: format 1 init_env contains both sp1_payer and prover_credential",
+                        path.display()
+                    ),
+                });
+            }
+            if let Some(value) = init_env.remove("sp1_payer") {
+                init_env.insert("prover_credential".into(), value);
+            }
+            value["base_image_ref"] = serde_json::Value::Null;
+            value["format"] = serde_json::json!(FORMAT_VERSION);
+            true
+        }
+        FORMAT_VERSION => false,
+        other => {
+            return Err(CloudError::State {
+                message: format!(
+                    "failed to parse {}: unsupported format {other}",
+                    path.display()
+                ),
+            });
+        }
+    };
+
+    let state: DeployState = serde_json::from_value(value).map_err(|e| CloudError::State {
+        message: format!("failed to parse {}: {e}", path.display()),
+    })?;
+    Ok((state, migrated))
+}
+
+fn write_state_file(path: &Path, state: &DeployState) -> Result<(), CloudError> {
+    let json = serde_json::to_string_pretty(state)?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &json).map_err(|e| CloudError::IoPath {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    fs::rename(&tmp, path).map_err(|e| CloudError::IoPath {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
 /// List all deployment states across all targets.
 pub fn list_deployments(data_dir: &Path) -> Result<Vec<DeployState>, CloudError> {
     let base = deployments_dir(data_dir);
@@ -586,9 +661,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn state_round_trip() {
-        let dir = TempDir::new().unwrap();
+    fn test_state() -> DeployState {
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "test-instance".into(),
             workload_name: "my-workload".into(),
@@ -597,6 +670,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v0.1.6".into(),
+            base_image_ref: Some("automata-linux:v0.1.6".into()),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             init_env: PersistedInitEnv::default(),
@@ -606,18 +680,134 @@ mod tests {
         state.resources.gcp = Some(GcpResources {
             project: "my-project".into(),
             zone: "us-central1-a".into(),
+            firewall_rule: Some("test-instance-ingress".into()),
+            disks: vec!["test-instance-data".into()],
+            instance: Some("test-instance".into()),
+            external_ip: Some("192.0.2.10".into()),
             ..Default::default()
         });
+        state
+    }
+
+    fn format_1_value(sp1_payer: serde_json::Value) -> serde_json::Value {
+        let mut value = serde_json::to_value(test_state()).unwrap();
+        value["format"] = serde_json::json!(LEGACY_FORMAT_VERSION);
+        let init_env = value["init_env"].as_object_mut().unwrap();
+        init_env.remove("prover_credential");
+        init_env.insert("sp1_payer".into(), sp1_payer);
+        value
+    }
+
+    fn write_state_value(dir: &Path, value: &serde_json::Value) -> PathBuf {
+        let path = state_path(dir, "prod-gcp", "test-instance");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut state = test_state();
+        state.image_ref = "automata-linux:v0.1.6-provider-alias".into();
+        state.base_image_ref = Some("automata-linux:v0.1.6".into());
         state.save(dir.path()).unwrap();
 
         let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
         assert_eq!(loaded.instance_name, "test-instance");
         assert_eq!(loaded.workload_name, "my-workload");
-        assert_eq!(loaded.format, 1);
+        assert_eq!(loaded.format, FORMAT_VERSION);
         assert!(matches!(
             loaded.status,
             DeployStatus::Deploying { step: 0, total: 7 }
         ));
+        assert_eq!(loaded.image_ref, "automata-linux:v0.1.6-provider-alias");
+        assert_eq!(
+            loaded.base_image_ref.as_deref(),
+            Some("automata-linux:v0.1.6")
+        );
+    }
+
+    #[test]
+    fn persisted_init_environment_rejects_sp1_payer() {
+        let error = serde_json::from_value::<PersistedInitEnv>(serde_json::json!({
+            "chain": "hoodi",
+            "owner_key": "owner",
+            "gas_wallet": "gas",
+            "sp1_payer": "prover"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("sp1_payer"));
+    }
+
+    #[test]
+    fn format_1_null_sp1_payer_loads_and_rewrites_as_format_2() {
+        let dir = TempDir::new().unwrap();
+        let path = write_state_value(dir.path(), &format_1_value(serde_json::Value::Null));
+
+        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
+        assert_eq!(loaded.format, FORMAT_VERSION);
+        assert_eq!(loaded.init_env.prover_credential, None);
+        assert_eq!(loaded.base_image_ref, None);
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(rewritten["format"], FORMAT_VERSION);
+        assert_eq!(
+            rewritten["init_env"]["prover_credential"],
+            serde_json::Value::Null
+        );
+        assert!(rewritten["init_env"].get("sp1_payer").is_none());
+    }
+
+    #[test]
+    fn format_1_sp1_payer_reference_becomes_prover_credential() {
+        let dir = TempDir::new().unwrap();
+        write_state_value(dir.path(), &format_1_value(serde_json::json!("prover-key")));
+
+        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
+        assert_eq!(
+            loaded.init_env.prover_credential.as_deref(),
+            Some("prover-key")
+        );
+    }
+
+    #[test]
+    fn format_1_rejects_conflicting_prover_fields() {
+        let dir = TempDir::new().unwrap();
+        let mut value = format_1_value(serde_json::Value::Null);
+        value["init_env"]["prover_credential"] = serde_json::json!("new-key");
+        write_state_value(dir.path(), &value);
+
+        let error = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("both sp1_payer and prover_credential"));
+    }
+
+    #[test]
+    fn format_2_rejects_sp1_payer() {
+        let dir = TempDir::new().unwrap();
+        let mut value = serde_json::to_value(test_state()).unwrap();
+        value["init_env"]["sp1_payer"] = serde_json::Value::Null;
+        write_state_value(dir.path(), &value);
+
+        let error = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap_err();
+        assert!(error.to_string().contains("sp1_payer"));
+    }
+
+    #[test]
+    fn format_1_migration_preserves_status_and_destroy_resource_identifiers() {
+        let dir = TempDir::new().unwrap();
+        write_state_value(dir.path(), &format_1_value(serde_json::Value::Null));
+
+        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
+        let gcp = loaded.resources.gcp.unwrap();
+        assert_eq!(gcp.project, "my-project");
+        assert_eq!(gcp.zone, "us-central1-a");
+        assert_eq!(gcp.instance.as_deref(), Some("test-instance"));
+        assert_eq!(gcp.firewall_rule.as_deref(), Some("test-instance-ingress"));
+        assert_eq!(gcp.disks, ["test-instance-data"]);
+        assert_eq!(gcp.external_ip.as_deref(), Some("192.0.2.10"));
     }
 
     #[test]
@@ -638,6 +828,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
@@ -663,6 +854,7 @@ mod tests {
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -688,6 +880,7 @@ mod tests {
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -712,6 +905,7 @@ mod tests {
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),

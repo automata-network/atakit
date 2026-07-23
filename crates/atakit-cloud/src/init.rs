@@ -2,14 +2,20 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use atakit_attestation::{
-    verify_measurement_pack, verify_tls_attestation, CheckResult, EvidenceSummary,
-    MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
-    VerificationReport, VerifiedTlsIdentity,
+    amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
+    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation, AkBinding,
+    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TlsAttestationResponse,
+    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
+use atakit_attestation_client::{
+    AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
+};
+pub use atakit_attestation_client::{TlsManualOverride, VerifiedPortalTls};
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
+use atakit_image::encode_image_ref_path_segment;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use dcap_qvl::config::PckCa;
@@ -19,6 +25,22 @@ use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 
 use crate::error::CloudError;
+
+pub const INIT_SCHEMA_VERSION: u32 = 2;
+pub const PORTAL_READINESS_TIMEOUT_SECONDS: u64 = 300;
+pub const PORTAL_PROOF_TIMEOUT_SECONDS: u64 = 900;
+pub const INITIALIZATION_COMPLETION_BUFFER_SECONDS: u64 = 60;
+
+pub fn initialization_timeout_seconds(
+    explicit_timeout: Option<u64>,
+    owner_operation_expiry_seconds: u64,
+) -> u64 {
+    explicit_timeout.unwrap_or_else(|| {
+        PORTAL_PROOF_TIMEOUT_SECONDS
+            .saturating_add(owner_operation_expiry_seconds)
+            .saturating_add(INITIALIZATION_COMPLETION_BUFFER_SECONDS)
+    })
+}
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
@@ -53,11 +75,12 @@ pub struct InitConfig {
     /// Sent verbatim as `platform.declared` in the init JSON (e.g. "gcp", "azure", "qemu").
     pub platform: String,
     pub chain: InitChainConfig,
+    pub owner_operations: atakit_config::OwnerOperationsConfig,
     pub owner_key: InitKeyConfig,
     pub gas_wallet: InitKeyConfig,
     /// Backend-neutral credential delegated to the selected prover daemon.
     /// The internal field name is retained during the compatibility cycle.
-    pub prover_credential: InitKeyConfig,
+    pub prover_credential: Option<InitKeyConfig>,
     /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
     /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
     /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
@@ -280,12 +303,6 @@ pub struct InitChainConfig {
     pub session_registry: String,
     pub workload_registry: String,
     pub base_image_registry: String,
-    /// Seconds. Validity window for owner-key-signed messages submitted to
-    /// the on-chain registries. Inside the CVM the portal applies it to
-    /// `registerCvm`; on the operator side the same chain default backs
-    /// the publish/deactivate/imgbuild publish signature offsets. Sent to
-    /// the portal as `chain.expire_offset`.
-    pub expire_offset: u64,
     /// Portal-side chain-registration policy (`"required"` |
     /// `"optional"` | `"off"`). `None` ⇒ field omitted from the
     /// `/init` JSON; the portal falls back to its `"required"`
@@ -293,19 +310,14 @@ pub struct InitChainConfig {
     /// debugging chain-side prerequisites should set this to
     /// `"off"` in their `[chains.<name>]` config.
     pub registration: Option<String>,
-    /// EIP-155 chain id. Forwarded as `chain.chain_id` when set.
-    /// Only honored by the portal under air-gapped operation (no
-    /// `rpc_url`); ignored with a warning otherwise.
+    /// Optional configured EIP-155 chain id. Forwarded as `chain.chain_id`
+    /// when set. The portal reads the effective value from `rpc_url` and
+    /// warns that this configured value is ignored.
     pub chain_id: Option<u64>,
     /// On-chain TEE verification policy (`auto`, `solidity`, or `zk`).
     pub tee_backend: String,
     /// Resolved top-level prover profile.
     pub prover: Option<InitProverConfig>,
-    /// Portal-side SNP ZK prover selection (`"network"` | `"local"` |
-    /// `"dev"`). `None` ⇒ field omitted from the `/init` JSON; the
-    /// portal falls back to its `"network"` default. Only consulted for
-    /// AMD SEV-SNP CVMs (TDX ignores it). Sent as `chain.proving_strategy`.
-    pub proving_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,47 +362,39 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "workload_registry": config.chain.workload_registry,
             "base_image_registry": config.chain.base_image_registry,
         },
-        "expire_offset": config.chain.expire_offset,
         "tee_backend": config.chain.tee_backend,
     });
-    // `registration` and `chain_id` are only included when set so
-    // pre-existing configs that don't carry them keep producing the
-    // exact same JSON the portal saw before (and the portal's
-    // "section present, no registration field → required" default
-    // continues to apply).
+    // `registration` and `chain_id` are only included when set. The portal's
+    // "section present, no registration field → required" default continues
+    // to apply.
     if let Some(ref reg) = config.chain.registration {
         chain["registration"] = serde_json::Value::String(reg.clone());
     }
     if let Some(id) = config.chain.chain_id {
         chain["chain_id"] = serde_json::Value::Number(id.into());
     }
-    if let Some(ref ps) = config.chain.proving_strategy {
-        chain["proving_strategy"] = serde_json::Value::String(ps.clone());
-    }
-
-    // Keep the legacy wire name until the init protocol has explicit version
-    // negotiation. New portals accept it as an alias; old portals require it.
-    let mut prover_credential = serde_json::json!({
-        "mode": config.prover_credential.mode,
-        "type": config.prover_credential.key_type,
+    let prover_credential = config.prover_credential.as_ref().map(|credential| {
+        let mut value = serde_json::json!({
+            "mode": credential.mode,
+            "type": credential.key_type,
+        });
+        if let Some(ref pk) = credential.private_key {
+            value["private_key"] = serde_json::Value::String(pk.clone());
+        }
+        value
     });
-    if let Some(ref pk) = config.prover_credential.private_key {
-        prover_credential["private_key"] = serde_json::Value::String(pk.clone());
-    }
 
     let mut portal_config = serde_json::json!({
-        "format": 1,
+        "format": INIT_SCHEMA_VERSION,
         "platform": {
             "declared": &config.platform,
         },
         "chain": chain,
+        "owner_operations": config.owner_operations,
         "owner_key": owner_key,
         "gas_wallet": gas_wallet,
-        "sp1_payer": prover_credential,
+        "prover_credential": prover_credential,
     });
-    // A legacy proving_strategy must remain the only prover selector on the
-    // wire. New portals translate it; emitting both fields is intentionally
-    // rejected as ambiguous.
     if let Some(prover) = config.chain.prover.clone() {
         portal_config["prover"] = serde_json::json!({
             "backend": prover.backend,
@@ -400,10 +404,8 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
         });
     }
 
-    // Only emit `disks` when there is at least one passphrase, so the
-    // common no-encryption / TPM-only deploy produces the exact JSON the
-    // portal saw before this field existed (the portal defaults `disks`
-    // to empty when the key is absent).
+    // Only emit `disks` when there is at least one passphrase. The portal
+    // treats an absent `disks` field as an empty map.
     if !config.disks.is_empty() {
         let disks: serde_json::Map<String, serde_json::Value> = config
             .disks
@@ -419,20 +421,6 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     }
 
     portal_config
-}
-
-#[derive(Debug, Clone)]
-pub struct VerifiedPortalTls {
-    pub client: reqwest::Client,
-    pub identity: VerifiedTlsIdentity,
-    pub manual_override: Option<TlsManualOverride>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TlsManualOverride {
-    pub live_cert_sha256: String,
-    pub report: VerificationReport,
-    pub report_path: Option<PathBuf>,
 }
 
 pub fn cloud_tls_attestation_report_path(
@@ -515,7 +503,7 @@ pub fn load_measurement_policy(
                     .to_string(),
             });
         };
-        let path = local_measurement_pack_dir(data_dir, name, version);
+        let path = select_local_measurement_pack_dir(data_dir, name, version)?.path;
         let (json_path, sig_path) = measurement_pack_dir_paths(&path);
         (json_path, sig_path, format!("local:{}", path.display()))
     } else {
@@ -556,6 +544,19 @@ pub fn load_measurement_policy(
     }
 
     Ok(Some(MeasurementPolicy { source, pack }))
+}
+
+/// Return whether either file for the automatic local pack lookup exists.
+///
+/// Callers use this only to choose local-versus-chain precedence. Once a local
+/// pack artifact exists, loading or signature errors must fail closed instead
+/// of falling back to a different policy source.
+pub fn local_measurement_pack_exists(
+    data_dir: &Path,
+    base_image: &str,
+) -> Result<bool, CloudError> {
+    let (name, version) = parse_base_image_ref(base_image)?;
+    Ok(select_local_measurement_pack_dir(data_dir, name, version)?.detected)
 }
 
 fn parse_base_image_ref(value: &str) -> Result<(&str, &str), CloudError> {
@@ -624,11 +625,19 @@ fn local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> Pat
     data_dir
         .join("baseimage")
         .join("measurements")
-        .join(sanitize_measurement_path_segment(name))
-        .join(sanitize_measurement_path_segment(version))
+        .join(encode_image_ref_path_segment(name))
+        .join(encode_image_ref_path_segment(version))
 }
 
-fn sanitize_measurement_path_segment(value: &str) -> String {
+fn legacy_local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> PathBuf {
+    data_dir
+        .join("baseimage")
+        .join("measurements")
+        .join(legacy_measurement_path_segment(name))
+        .join(legacy_measurement_path_segment(version))
+}
+
+fn legacy_measurement_path_segment(value: &str) -> String {
     value
         .chars()
         .map(|ch| match ch {
@@ -636,6 +645,54 @@ fn sanitize_measurement_path_segment(value: &str) -> String {
             _ => '_',
         })
         .collect()
+}
+
+struct LocalMeasurementPackSelection {
+    path: PathBuf,
+    detected: bool,
+}
+
+fn select_local_measurement_pack_dir(
+    data_dir: &Path,
+    name: &str,
+    version: &str,
+) -> Result<LocalMeasurementPackSelection, CloudError> {
+    let new_path = local_measurement_pack_dir(data_dir, name, version);
+    if measurement_pack_artifact_exists(&new_path)? {
+        return Ok(LocalMeasurementPackSelection {
+            path: new_path,
+            detected: true,
+        });
+    }
+
+    let legacy_path = legacy_local_measurement_pack_dir(data_dir, name, version);
+    if measurement_pack_artifact_exists(&legacy_path)? {
+        return Ok(LocalMeasurementPackSelection {
+            path: legacy_path,
+            detected: true,
+        });
+    }
+
+    Ok(LocalMeasurementPackSelection {
+        path: new_path,
+        detected: false,
+    })
+}
+
+fn measurement_pack_artifact_exists(dir: &Path) -> Result<bool, CloudError> {
+    let (json, signature) = measurement_pack_dir_paths(dir);
+    Ok(path_exists(&json)? || path_exists(&signature)?)
+}
+
+fn path_exists(path: &Path) -> Result<bool, CloudError> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CloudError::IoPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Fetch and verify the portal's TLS attestation, then return a client pinned
@@ -725,6 +782,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                     report,
                     report_path: written_report_path,
                 }),
+                session_verification: None,
             });
         }
         let report_location = written_report_path
@@ -743,6 +801,10 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             message: format!("invalid response JSON: {e}"),
         }
     })?;
+    // Manual keys remain available until the committed session evidence is
+    // fetched. The key that verifies fresh TLS evidence may differ from the
+    // key that signed the retained session MAA JWT.
+    let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
 
     if let Err(detail) = resolve_tdx_dcap_collateral(&mut response, &tdx_dcap_collateral).await {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
@@ -766,12 +828,8 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report = tls_preverification_failure_report(
-            &response,
-            &live_hash,
-            "azure-maa-onchain-trust",
-            detail,
-        );
+        let report =
+            tls_preverification_failure_report(&response, &live_hash, "azure-maa-trust", detail);
         return handle_tls_attestation_failure(
             report,
             live_peer_cert_der,
@@ -780,8 +838,39 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
-    if let Err(detail) =
-        resolve_chain_trust_anchors(&response, &azure_maa_trust, &mut trust_anchors).await
+    let azure_snp_cert_table = if response.platform.cloud.eq_ignore_ascii_case("azure")
+        && response.platform.tee.eq_ignore_ascii_case("sev-snp")
+    {
+        match fetch_azure_snp_cert_table(&response).await {
+            Ok(table) => Some(table),
+            Err(detail) => {
+                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+                let live_hash = format!("0x{}", hex::encode(live_sha));
+                let report = tls_preverification_failure_report(
+                    &response,
+                    &live_hash,
+                    "azure-snp-amd-collateral",
+                    detail,
+                );
+                return handle_tls_attestation_failure(
+                    report,
+                    live_peer_cert_der,
+                    trust_tls_cert_sha256,
+                    report_path,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(detail) = resolve_chain_trust_anchors(
+        &response,
+        &azure_maa_trust,
+        &mut trust_anchors,
+        azure_snp_cert_table.as_deref(),
+    )
+    .await
     {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
@@ -799,6 +888,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
+    let session_chain_client = session_attestation_client(&azure_maa_trust).await?;
+    let session_verification =
+        measurement_policy
+            .clone()
+            .map(|measurement_policy| PortalSessionVerificationContext {
+                platform: response.platform.clone(),
+                measurement_policy,
+                trust_anchors: trust_anchors.clone(),
+                chain_client: session_chain_client.clone(),
+                manual_azure_maa_keys: manual_azure_maa_keys.clone(),
+                azure_snp_cert_table: azure_snp_cert_table.clone(),
+                tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
+            });
     match verify_tls_attestation(VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
@@ -812,6 +914,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 client,
                 identity,
                 manual_override: None,
+                session_verification,
             })
         }
         Err(failure) => handle_tls_attestation_failure(
@@ -827,7 +930,7 @@ async fn resolve_tdx_dcap_collateral(
     response: &mut TlsAttestationResponse,
     config: &TdxDcapCollateralConfig,
 ) -> Result<(), String> {
-    if !is_gcp_tdx(response) || has_gcp_tdx_collateral(&response.collateral) {
+    if !is_tdx(response) || has_gcp_tdx_collateral(&response.collateral) {
         return Ok(());
     }
     let collateral = match &config.source {
@@ -914,65 +1017,130 @@ async fn resolve_azure_maa_trust(
     response: &TlsAttestationResponse,
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
-) -> Result<(), String> {
-    if !is_azure_maa_response(response) || !trust_anchors.azure_maa_keys.is_empty() {
-        return Ok(());
+) -> Result<Vec<AzureMaaTrustKey>, String> {
+    if !is_azure_maa_response(response) {
+        return Ok(Vec::new());
+    }
+    if !trust_anchors.azure_maa_keys.is_empty() {
+        let binding = response
+            .ak_binding
+            .as_ref()
+            .ok_or_else(|| "Azure response is missing akBinding".to_string())?;
+        return select_azure_maa_manual_trust_key(binding, &trust_anchors.azure_maa_keys)
+            .map(|key| vec![key]);
     }
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
         session_registry,
     } = &config.source
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let jwt = extract_azure_maa_jwt_info(response)?;
-    let kid_hash = keccak256(jwt.kid.as_bytes());
-    let expected_issuer_hash = keccak256(jwt.issuer.as_bytes());
-    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
-    let maa_key_registry = resolve_maa_key_registry(rpc_url, &ak_collateral_verifier).await?;
-    let entry = resolve_maa_signing_key(rpc_url, &maa_key_registry, kid_hash).await?;
-    if entry.pkcs1_pubkey.is_empty() {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} has no signing key for kid hash 0x{}",
-            hex::encode(kid_hash)
-        ));
-    }
-    if entry.revoked {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} is revoked",
-            hex::encode(kid_hash)
-        ));
-    }
-    if entry.issuer_hash != expected_issuer_hash {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} issuer hash mismatch for kid hash 0x{}: JWT issuer {} hashes to 0x{}, registry has 0x{}",
-            hex::encode(kid_hash),
-            jwt.issuer,
-            hex::encode(expected_issuer_hash),
-            hex::encode(entry.issuer_hash)
-        ));
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock is before Unix epoch: {e}"))?
-        .as_secs();
-    if entry.not_after < now {
-        return Err(format!(
-            "MaaKeyRegistry {maa_key_registry} signing key for kid hash 0x{} expired at Unix time {} (now {now})",
-            hex::encode(kid_hash),
-            entry.not_after
-        ));
-    }
+    let client = connect_attestation_client(rpc_url, session_registry).await?;
+    let key = client
+        .resolve_azure_maa_signing_key(&jwt.kid, &jwt.issuer)
+        .await
+        .map_err(|error| error.to_string())?;
+    trust_anchors.azure_maa_keys.push(key.public_key.clone());
+    Ok(vec![key])
+}
 
-    trust_anchors.azure_maa_keys.push(entry.pkcs1_pubkey);
-    Ok(())
+async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "Azure SNP response is missing teeEvidence".to_string())?;
+    let report = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|error| format!("decode Azure SNP report: {error}"))?;
+    let request = amd_snp_vcek_request(&report)?;
+    let product = amd_kds_product(request.cpuid_family, request.cpuid_model)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build AMD KDS client: {error}"))?;
+    let chip_id = hex::encode(request.chip_id);
+    let vcek_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/{chip_id}");
+    let vcek = client
+        .get(&vcek_url)
+        .query(&[
+            ("blSPL", request.bootloader),
+            ("teeSPL", request.tee),
+            ("snpSPL", request.snp),
+            ("ucodeSPL", request.microcode),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("read AMD {product} VCEK: {error}"))?
+        .to_vec();
+    let chain_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/cert_chain");
+    let chain = client
+        .get(&chain_url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("read AMD {product} certificate chain: {error}"))?;
+    let certs = parse_pem_certificates(&chain)?;
+    let [ask, ark] = certs.as_slice() else {
+        return Err(format!(
+            "AMD {product} certificate chain contains {} certificates, expected ASK then ARK",
+            certs.len()
+        ));
+    };
+    amd_snp_vcek_cert_table(ark, ask, &vcek)
+}
+
+fn amd_kds_product(family: u8, model: u8) -> Result<&'static str, String> {
+    match (family, model) {
+        (0x19, 0x00..=0x0f) => Ok("Milan"),
+        (0x19, 0x10..=0x1f) => Ok("Genoa"),
+        _ => Err(format!(
+            "unsupported AMD SNP CPUID family 0x{family:02x}, model 0x{model:02x} for KDS lookup"
+        )),
+    }
+}
+
+fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = std::str::from_utf8(input)
+        .map_err(|error| format!("AMD certificate chain is not UTF-8 PEM: {error}"))?;
+    let mut remaining = text;
+    let mut certs = Vec::new();
+    while let Some(begin) = remaining.find(BEGIN) {
+        let body = &remaining[begin + BEGIN.len()..];
+        let end = body
+            .find(END)
+            .ok_or_else(|| "AMD certificate chain has an unterminated PEM block".to_string())?;
+        let encoded = body[..end].lines().map(str::trim).collect::<String>();
+        let der = STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("decode AMD certificate PEM: {error}"))?;
+        certs.push(der);
+        remaining = &body[end + END.len()..];
+    }
+    if certs.is_empty() {
+        return Err("AMD certificate chain has no PEM certificates".to_string());
+    }
+    Ok(certs)
 }
 
 async fn resolve_chain_trust_anchors(
     response: &TlsAttestationResponse,
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
+    azure_snp_cert_table: Option<&[u8]>,
 ) -> Result<(), String> {
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
@@ -981,22 +1149,17 @@ async fn resolve_chain_trust_anchors(
     else {
         return Ok(());
     };
-    if !response.platform.cloud.eq_ignore_ascii_case("gcp") {
-        return Ok(());
-    }
+    let client = connect_attestation_client(rpc_url, session_registry).await?;
 
-    let ak_collateral_verifier = resolve_ak_collateral_verifier(rpc_url, session_registry).await?;
-
-    if trust_anchors.gcp_roots.is_empty() && trust_anchors.gcp_root_hashes.is_empty() {
+    if response.platform.cloud.eq_ignore_ascii_case("gcp")
+        && trust_anchors.gcp_roots.is_empty()
+        && trust_anchors.gcp_root_hashes.is_empty()
+    {
         let root = extract_gcp_ak_root_cert(response)?;
-        let root_hash = keccak256(&root);
-        let tpm_attestation = resolve_tpm_attestation(rpc_url, &ak_collateral_verifier).await?;
-        if !resolve_verified_ca(rpc_url, &tpm_attestation, root_hash).await? {
-            return Err(format!(
-                "TpmAttestation {tpm_attestation} does not trust GCP AK root keccak256(root_der)=0x{}",
-                hex::encode(root_hash)
-            ));
-        }
+        let root_hash = client
+            .resolve_gcp_ak_root(&root)
+            .await
+            .map_err(|error| error.to_string())?;
         trust_anchors.gcp_root_hashes.push(root_hash);
     }
 
@@ -1004,168 +1167,60 @@ async fn resolve_chain_trust_anchors(
         && trust_anchors.amd_ark_roots.is_empty()
         && trust_anchors.amd_ark_root_hashes.is_empty()
     {
-        let ark = extract_snp_ark_cert(response)?;
-        let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
-        let tee_verifier = resolve_tee_verifier(rpc_url, session_registry).await?;
-        let snp_attestation = resolve_snp_attestation(rpc_url, &tee_verifier).await?;
-        if !resolve_snp_root_hash(rpc_url, &snp_attestation, ark_hash).await? {
-            return Err(format!(
-                "SnpAttestation {snp_attestation} does not trust AMD ARK sha256(ark_der)=0x{}",
-                hex::encode(ark_hash)
-            ));
-        }
+        let ark = if response.platform.cloud.eq_ignore_ascii_case("gcp") {
+            extract_snp_ark_cert(response)?
+        } else if response.platform.cloud.eq_ignore_ascii_case("azure") {
+            amd_snp_ark_from_cert_table(azure_snp_cert_table.ok_or_else(|| {
+                "Azure SNP response is missing resolved AMD certificate table".to_string()
+            })?)?
+        } else {
+            return Ok(());
+        };
+        let ark_hash = client
+            .resolve_amd_ark_root(&ark)
+            .await
+            .map_err(|error| error.to_string())?;
         trust_anchors.amd_ark_root_hashes.push(ark_hash);
     }
 
     Ok(())
 }
 
+async fn connect_attestation_client(
+    rpc_url: &str,
+    session_registry: &str,
+) -> Result<AttestationClient, String> {
+    AttestationClient::connect(AttestationClientConfig {
+        rpc_url: rpc_url.to_string(),
+        session_registry: session_registry.to_string(),
+        expected_chain_id: None,
+        expected_base_image_registry: None,
+        expected_workload_registry: None,
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn session_attestation_client(
+    config: &AzureMaaTrustConfig,
+) -> Result<Option<AttestationClient>, CloudError> {
+    let AzureMaaTrustSource::OnchainRegistry {
+        rpc_url,
+        session_registry,
+    } = &config.source
+    else {
+        return Ok(None);
+    };
+    connect_attestation_client(rpc_url, session_registry)
+        .await
+        .map(Some)
+        .map_err(|message| CloudError::PortalTlsAttestationFailed { message })
+}
+
 #[derive(Debug, Clone)]
 struct AzureMaaJwtInfo {
     kid: String,
     issuer: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MaaSigningKeyEntry {
-    pkcs1_pubkey: Vec<u8>,
-    issuer_hash: [u8; 32],
-    not_after: u64,
-    revoked: bool,
-}
-
-async fn resolve_ak_collateral_verifier(
-    rpc_url: &str,
-    session_registry: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("akCollateralVerifier()");
-    let result = eth_call_bytes(
-        rpc_url,
-        session_registry,
-        &calldata,
-        "SessionRegistry.akCollateralVerifier",
-    )
-    .await?;
-    decode_address_return(&result, "SessionRegistry.akCollateralVerifier")
-}
-
-async fn resolve_maa_key_registry(
-    rpc_url: &str,
-    ak_collateral_verifier: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("maaKeyRegistry()");
-    let result = eth_call_bytes(
-        rpc_url,
-        ak_collateral_verifier,
-        &calldata,
-        "AkCollateralVerifier.maaKeyRegistry",
-    )
-    .await?;
-    decode_address_return(&result, "AkCollateralVerifier.maaKeyRegistry")
-}
-
-async fn resolve_maa_signing_key(
-    rpc_url: &str,
-    maa_key_registry: &str,
-    kid_hash: [u8; 32],
-) -> Result<MaaSigningKeyEntry, String> {
-    let calldata = encode_bytes32_arg_call("getMaaSigningKey(bytes32)", kid_hash);
-    let result = eth_call_bytes(
-        rpc_url,
-        maa_key_registry,
-        &calldata,
-        "MaaKeyRegistry.getMaaSigningKey",
-    )
-    .await?;
-    decode_maa_signing_key_return(&result)
-}
-
-async fn resolve_tpm_attestation(
-    rpc_url: &str,
-    ak_collateral_verifier: &str,
-) -> Result<String, String> {
-    let calldata = encode_no_arg_call("tpmAttestation()");
-    let result = eth_call_bytes(
-        rpc_url,
-        ak_collateral_verifier,
-        &calldata,
-        "AkCollateralVerifier.tpmAttestation",
-    )
-    .await?;
-    decode_address_return(&result, "AkCollateralVerifier.tpmAttestation")
-}
-
-async fn resolve_tee_verifier(rpc_url: &str, session_registry: &str) -> Result<String, String> {
-    let calldata = encode_no_arg_call("teeVerifier()");
-    let result = eth_call_bytes(
-        rpc_url,
-        session_registry,
-        &calldata,
-        "SessionRegistry.teeVerifier",
-    )
-    .await?;
-    decode_address_return(&result, "SessionRegistry.teeVerifier")
-}
-
-async fn resolve_snp_attestation(rpc_url: &str, tee_verifier: &str) -> Result<String, String> {
-    let calldata = encode_no_arg_call("snpAttestation()");
-    let result = eth_call_bytes(
-        rpc_url,
-        tee_verifier,
-        &calldata,
-        "TeeVerifier.snpAttestation",
-    )
-    .await?;
-    decode_address_return(&result, "TeeVerifier.snpAttestation")
-}
-
-async fn resolve_verified_ca(
-    rpc_url: &str,
-    tpm_attestation: &str,
-    root_hash: [u8; 32],
-) -> Result<bool, String> {
-    let calldata = encode_bytes32_arg_call("verifiedCA(bytes32)", root_hash);
-    let result = eth_call_bytes(
-        rpc_url,
-        tpm_attestation,
-        &calldata,
-        "TpmAttestation.verifiedCA",
-    )
-    .await?;
-    if result.len() != 32 {
-        return Err(format!(
-            "TpmAttestation.verifiedCA return has invalid length: got {}, need 32",
-            result.len()
-        ));
-    }
-    abi_word_bool(&result)
-}
-
-async fn resolve_snp_root_hash(
-    rpc_url: &str,
-    snp_attestation: &str,
-    ark_hash: [u8; 32],
-) -> Result<bool, String> {
-    for processor_model in 0..8u64 {
-        let calldata = encode_uint_arg_call("rootCerts(uint8)", processor_model);
-        let result = eth_call_bytes(
-            rpc_url,
-            snp_attestation,
-            &calldata,
-            "SnpAttestation.rootCerts",
-        )
-        .await?;
-        if result.len() != 32 {
-            return Err(format!(
-                "SnpAttestation.rootCerts return has invalid length: got {}, need 32",
-                result.len()
-            ));
-        }
-        if result.as_slice() == ark_hash {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn eth_call_bytes(
@@ -1217,6 +1272,10 @@ fn extract_azure_maa_jwt_info(
         .ak_binding
         .as_ref()
         .ok_or_else(|| "Azure response is missing akBinding".to_string())?;
+    extract_azure_maa_jwt_info_from_binding(binding)
+}
+
+fn extract_azure_maa_jwt_info_from_binding(binding: &AkBinding) -> Result<AzureMaaJwtInfo, String> {
     if !binding.kind.eq_ignore_ascii_case("azure-maa-jwt") {
         return Err(format!(
             "Azure response akBinding kind is {}, expected azure-maa-jwt",
@@ -1510,13 +1569,6 @@ fn encode_no_arg_call(signature: &str) -> Vec<u8> {
     out
 }
 
-fn encode_bytes32_arg_call(signature: &str, arg: [u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(36);
-    out.extend_from_slice(&function_selector(signature));
-    out.extend_from_slice(&arg);
-    out
-}
-
 fn encode_uint_arg_call(signature: &str, arg: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(36);
     out.extend_from_slice(&function_selector(signature));
@@ -1741,67 +1793,6 @@ fn pem_cert_from_der(cert: &[u8]) -> String {
     out
 }
 
-fn decode_address_return(bytes: &[u8], label: &str) -> Result<String, String> {
-    if bytes.len() != 32 {
-        return Err(format!(
-            "{label} return has invalid ABI address length: got {}, need 32",
-            bytes.len()
-        ));
-    }
-    if bytes[..12].iter().any(|byte| *byte != 0) {
-        return Err(format!("{label} return has non-zero address padding"));
-    }
-    let address = &bytes[12..32];
-    if address.iter().all(|byte| *byte == 0) {
-        return Err(format!("{label} returned the zero address"));
-    }
-    Ok(format!("0x{}", hex::encode(address)))
-}
-
-fn decode_maa_signing_key_return(bytes: &[u8]) -> Result<MaaSigningKeyEntry, String> {
-    if bytes.len() < 32 {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey return is too short: got {}, need at least 32",
-            bytes.len()
-        ));
-    }
-    let tuple_offset = abi_word_usize(&bytes[0..32])?;
-    if tuple_offset + 128 > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey tuple offset {tuple_offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let tuple = &bytes[tuple_offset..];
-    let pkcs1_offset = abi_word_usize(&tuple[0..32])?;
-    let mut issuer_hash = [0u8; 32];
-    issuer_hash.copy_from_slice(&tuple[32..64]);
-    let not_after = abi_word_to_u64(&tuple[64..96])?;
-    let revoked = abi_word_bool(&tuple[96..128])?;
-    if tuple_offset + pkcs1_offset + 32 > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey offset {pkcs1_offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let pkcs1_start = tuple_offset + pkcs1_offset;
-    let pkcs1_len = abi_word_usize(&bytes[pkcs1_start..pkcs1_start + 32])?;
-    let data_start = pkcs1_start + 32;
-    let data_end = data_start + pkcs1_len;
-    if data_end > bytes.len() {
-        return Err(format!(
-            "MaaKeyRegistry.getMaaSigningKey pkcs1Pubkey length {pkcs1_len} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    Ok(MaaSigningKeyEntry {
-        pkcs1_pubkey: bytes[data_start..data_end].to_vec(),
-        issuer_hash,
-        not_after,
-        revoked,
-    })
-}
-
 fn decode_hex_result(result: &str, label: &str) -> Result<Vec<u8>, String> {
     let raw_hex = result.strip_prefix("0x").unwrap_or(result);
     hex::decode(raw_hex).map_err(|e| format!("decode {label} hex: {e}"))
@@ -1814,41 +1805,10 @@ fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, Stri
     serde_json::from_slice(&raw).map_err(|e| format!("parse {label} JSON: {e}"))
 }
 
-fn keccak256(input: &[u8]) -> [u8; 32] {
-    let digest = Keccak256::digest(input);
-    digest.into()
-}
-
 fn abi_word_u64(value: u64) -> [u8; 32] {
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&value.to_be_bytes());
     word
-}
-
-fn abi_word_to_u64(word: &[u8]) -> Result<u64, String> {
-    if word.len() != 32 {
-        return Err("ABI uint word has invalid length".to_string());
-    }
-    if word[..24].iter().any(|byte| *byte != 0) {
-        return Err("ABI uint word is too large for u64".to_string());
-    }
-    let mut value = [0u8; 8];
-    value.copy_from_slice(&word[24..32]);
-    Ok(u64::from_be_bytes(value))
-}
-
-fn abi_word_bool(word: &[u8]) -> Result<bool, String> {
-    if word.len() != 32 {
-        return Err("ABI bool word has invalid length".to_string());
-    }
-    if word[..31].iter().any(|byte| *byte != 0) {
-        return Err("ABI bool word has non-zero high bytes".to_string());
-    }
-    match word[31] {
-        0 => Ok(false),
-        1 => Ok(true),
-        other => Err(format!("ABI bool word has invalid value {other}")),
-    }
 }
 
 fn abi_word_usize(word: &[u8]) -> Result<usize, String> {
@@ -1864,9 +1824,8 @@ fn abi_word_usize(word: &[u8]) -> Result<usize, String> {
         .map_err(|_| "ABI uint word does not fit in usize".to_string())
 }
 
-fn is_gcp_tdx(response: &TlsAttestationResponse) -> bool {
-    response.platform.cloud.eq_ignore_ascii_case("gcp")
-        && response.platform.tee.eq_ignore_ascii_case("tdx")
+fn is_tdx(response: &TlsAttestationResponse) -> bool {
+    response.platform.tee.eq_ignore_ascii_case("tdx")
 }
 
 fn is_azure_maa_response(response: &TlsAttestationResponse) -> bool {
@@ -1970,6 +1929,7 @@ fn handle_tls_attestation_failure(
                 report,
                 report_path: written_report_path,
             }),
+            session_verification: None,
         });
     }
     let report_json = serde_json::to_string_pretty(&report)
@@ -2060,7 +2020,7 @@ pub fn unsafe_portal_client(timeout: Duration) -> Result<reqwest::Client, CloudE
         })
 }
 
-fn random_nonce() -> Result<[u8; 32], CloudError> {
+pub(crate) fn random_nonce() -> Result<[u8; 32], CloudError> {
     let mut nonce = [0u8; 32];
     let mut file = std::fs::File::open("/dev/urandom").map_err(|e| CloudError::IoPath {
         path: "/dev/urandom".into(),
@@ -2232,6 +2192,7 @@ pub async fn wait_for_portal_terminal_with_client(
 /// so we always accept invalid certs for the init request.
 pub async fn post_portal_init(
     host: &str,
+    status_port: u16,
     init_port: u16,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
@@ -2248,6 +2209,7 @@ pub async fn post_portal_init(
     post_portal_init_with_client(
         &client,
         host,
+        status_port,
         init_port,
         archive_path,
         unmeasured_tar,
@@ -2263,6 +2225,7 @@ pub async fn post_portal_init(
 pub async fn post_portal_init_with_client(
     client: &reqwest::Client,
     host: &str,
+    status_port: u16,
     init_port: u16,
     archive_path: &str,
     unmeasured_tar: Option<&[u8]>,
@@ -2270,6 +2233,7 @@ pub async fn post_portal_init_with_client(
     upload_timeout: Duration,
     progress: &dyn ProgressReporter,
 ) -> Result<(), CloudError> {
+    verify_portal_init_schema(client, host, status_port).await?;
     let url = format!("https://{host}:{init_port}/init");
     // Read archive file.
     let archive_bytes = tokio::fs::read(archive_path)
@@ -2362,6 +2326,49 @@ pub async fn post_portal_init_with_client(
     Ok(())
 }
 
+async fn verify_portal_init_schema(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+) -> Result<(), CloudError> {
+    let url = format!("https://{host}:{status_port}/status");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("read portal init schema from {url}: {error}"),
+        })?;
+    let status = response
+        .error_for_status()
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("read portal init schema from {url}: {error}"),
+        })?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| CloudError::PortalInitFailed {
+            message: format!("parse portal status from {url}: {error}"),
+        })?;
+    validate_portal_init_schema(&status)
+}
+
+fn validate_portal_init_schema(status: &serde_json::Value) -> Result<(), CloudError> {
+    let observed = status
+        .get("init_schema_version")
+        .and_then(|value| value.as_u64());
+    if observed == Some(u64::from(INIT_SCHEMA_VERSION)) {
+        return Ok(());
+    }
+    Err(CloudError::PortalInitFailed {
+        message: format!(
+            "portal does not support required init schema version {INIT_SCHEMA_VERSION}; observed {}",
+            observed
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "no init_schema_version".to_string())
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2376,7 +2383,6 @@ mod tests {
                 session_registry: "0xSESS".to_string(),
                 workload_registry: "0xWORK".to_string(),
                 base_image_registry: "0xBASE".to_string(),
-                expire_offset: 300,
                 registration: None,
                 chain_id: None,
                 tee_backend: "auto".to_string(),
@@ -2387,8 +2393,8 @@ mod tests {
                     credential: Some("prover-key".to_string()),
                     options: BTreeMap::new(),
                 }),
-                proving_strategy: None,
             },
+            owner_operations: atakit_config::OwnerOperationsConfig::default(),
             owner_key: InitKeyConfig {
                 mode: "provisioned".to_string(),
                 key_type: "es256k".to_string(),
@@ -2399,11 +2405,11 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: None,
             },
-            prover_credential: InitKeyConfig {
+            prover_credential: Some(InitKeyConfig {
                 mode: "provisioned".to_string(),
                 key_type: "es256k".to_string(),
                 private_key: Some("0xSP1".to_string()),
-            },
+            }),
             disks: BTreeMap::new(),
         }
     }
@@ -2609,54 +2615,33 @@ mod tests {
     }
 
     #[test]
-    fn maa_signing_key_return_decodes_dynamic_struct() {
-        let pkcs1 = vec![0x30, 0x82, 0x01, 0x0a];
-        let issuer_hash = [0x42u8; 32];
-        let mut returned = Vec::new();
-        returned.extend_from_slice(&abi_word_u64(32));
-        returned.extend_from_slice(&abi_word_u64(128));
-        returned.extend_from_slice(&issuer_hash);
-        returned.extend_from_slice(&abi_word_u64(1_811_611_165));
-        returned.extend_from_slice(&abi_word_u64(0));
-        returned.extend_from_slice(&abi_word_u64(pkcs1.len() as u64));
-        returned.extend_from_slice(&pkcs1);
-        returned.extend_from_slice(&[0; 28]);
-
-        let decoded = decode_maa_signing_key_return(&returned).unwrap();
-        assert_eq!(decoded.pkcs1_pubkey, pkcs1);
-        assert_eq!(decoded.issuer_hash, issuer_hash);
-        assert_eq!(decoded.not_after, 1_811_611_165);
-        assert!(!decoded.revoked);
-    }
-
-    #[test]
     fn portal_config_json_shape() {
         let json = build_portal_config_json(&sample_config());
 
-        assert_eq!(json["format"], 1);
+        assert_eq!(json["format"], INIT_SCHEMA_VERSION);
         assert_eq!(json["platform"]["declared"], "gcp");
         assert_eq!(json["chain"]["rpc_url"], "https://rpc.example.com");
         assert_eq!(json["chain"]["contracts"]["session_registry"], "0xSESS");
         assert_eq!(json["chain"]["contracts"]["workload_registry"], "0xWORK");
         assert_eq!(json["chain"]["contracts"]["base_image_registry"], "0xBASE");
-        assert_eq!(json["chain"]["expire_offset"], 300);
+        assert!(json["chain"].get("transaction_submitter").is_none());
+        assert!(json["chain"].get("expire_offset").is_none());
+        assert_eq!(json["owner_operations"]["op_expiry_seconds"], 300);
+        assert_eq!(json["owner_operations"]["challenge_expiry_seconds"], 60);
         assert_eq!(json["owner_key"]["mode"], "provisioned");
         assert_eq!(json["owner_key"]["type"], "es256k");
         assert_eq!(json["owner_key"]["private_key"], "0xOWNER");
         assert_eq!(json["gas_wallet"]["mode"], "self_generated");
         assert_eq!(json["gas_wallet"]["type"], "es256k");
         assert!(json["gas_wallet"].get("private_key").is_none());
-        assert_eq!(json["sp1_payer"]["mode"], "provisioned");
-        assert_eq!(json["sp1_payer"]["type"], "es256k");
-        assert_eq!(json["sp1_payer"]["private_key"], "0xSP1");
-        assert!(json.get("prover_credential").is_none());
+        assert_eq!(json["prover_credential"]["mode"], "provisioned");
+        assert_eq!(json["prover_credential"]["type"], "es256k");
+        assert_eq!(json["prover_credential"]["private_key"], "0xSP1");
+        assert!(json.get("sp1_payer").is_none());
         assert_eq!(json["prover"]["backend"], "sp1");
         assert_eq!(json["prover"]["execution"], "network");
 
-        // registration / chain_id / proving_strategy omitted when None —
-        // portal's "section present, no registration → required" and
-        // "proving_strategy → network" defaults apply, matching pre-patch
-        // behaviour.
+        // Optional chain fields remain absent when they are not configured.
         assert!(json["chain"].get("registration").is_none());
         assert!(json["chain"].get("chain_id").is_none());
         assert!(json["chain"].get("proving_strategy").is_none());
@@ -2786,6 +2771,15 @@ mod tests {
         (signature.to_bytes().to_vec(), vec![publisher_key])
     }
 
+    fn write_signed_measurement_pack(pack_dir: &Path, name: &str, version: &str) -> Vec<String> {
+        let json = measurement_pack_json(name, version);
+        let (signature, publisher_keys) = signed_measurement_pack(&json);
+        std::fs::create_dir_all(pack_dir).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.sig"), signature).unwrap();
+        publisher_keys
+    }
+
     #[test]
     fn load_measurement_policy_accepts_json_and_signature() {
         let dir = tempfile::tempdir().unwrap();
@@ -2831,8 +2825,8 @@ mod tests {
             .path()
             .join("baseimage")
             .join("measurements")
-            .join("base_image")
-            .join("v1");
+            .join(encode_image_ref_path_segment("base/image"))
+            .join(encode_image_ref_path_segment("v1"));
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.sig"), sig).unwrap();
@@ -2857,9 +2851,148 @@ mod tests {
             load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
         assert!(
             err.to_string()
-                .contains("baseimage/measurements/base/v1/measurement-pack.json"),
+                .contains("baseimage/measurements/ref~base/ref~v1/measurement-pack.json"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn local_measurement_pack_exists_when_either_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir
+            .path()
+            .join("baseimage")
+            .join("measurements")
+            .join(encode_image_ref_path_segment("base"))
+            .join(encode_image_ref_path_segment("v1"));
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::remove_file(pack_dir.join("measurement-pack.json")).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.sig"), b"signature").unwrap();
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+    }
+
+    #[test]
+    fn local_measurement_pack_paths_do_not_collapse_distinct_refs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_ne!(
+            local_measurement_pack_dir(dir.path(), "foo@bar", "v1"),
+            local_measurement_pack_dir(dir.path(), "foo_bar", "v1")
+        );
+    }
+
+    #[test]
+    fn load_measurement_policy_reads_legacy_safe_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "automata-linux", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "automata-linux", "v1");
+
+        let policy =
+            load_measurement_policy(None, Some("automata-linux:v1"), &keys, Some(dir.path()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(policy.source, format!("local:{}", legacy.display()));
+    }
+
+    #[test]
+    fn load_measurement_policy_reads_legacy_sanitized_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "foo@bar", "v1");
+
+        let policy = load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.pack.base_image.name, "foo@bar");
+    }
+
+    #[test]
+    fn load_measurement_policy_rejects_legacy_collision_identity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
+        let keys = write_signed_measurement_pack(&legacy, "foo_bar", "v1");
+
+        let error =
+            load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("measurement pack is for foo_bar:v1, not foo@bar:v1"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn incomplete_legacy_pack_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("measurement-pack.json"),
+            measurement_pack_json("base", "v1"),
+        )
+        .unwrap();
+
+        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        let error =
+            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("baseimage/measurements/base/v1/measurement-pack.sig"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn new_pack_path_takes_priority_over_legacy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        let keys = write_signed_measurement_pack(&new_path, "base", "v1");
+        write_signed_measurement_pack(&legacy, "wrong", "v1");
+
+        let policy = load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.source, format!("local:{}", new_path.display()));
+    }
+
+    #[test]
+    fn incomplete_new_pack_does_not_fall_back_to_legacy_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
+        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
+        std::fs::create_dir_all(&new_path).unwrap();
+        std::fs::write(
+            new_path.join("measurement-pack.json"),
+            measurement_pack_json("base", "v1"),
+        )
+        .unwrap();
+        let keys = write_signed_measurement_pack(&legacy, "base", "v1");
+
+        let error =
+            load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ref~base/ref~v1/measurement-pack.sig"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn no_local_pack_artifacts_remain_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
     }
 
     #[test]
@@ -2907,17 +3040,48 @@ mod tests {
         }
     }
 
-    /// When the operator sets `proving_strategy`, each value appears
-    /// verbatim under `chain.proving_strategy` for the portal to parse.
     #[test]
-    fn portal_config_json_emits_each_proving_strategy_value() {
-        for value in ["network", "local", "dev"] {
-            let mut cfg = sample_config();
-            cfg.chain.prover = None;
-            cfg.chain.proving_strategy = Some(value.to_string());
-            let json = build_portal_config_json(&cfg);
-            assert_eq!(json["chain"]["proving_strategy"], value);
-            assert!(json.get("prover").is_none());
+    fn latest_portal_schema_capability_is_required() {
+        validate_portal_init_schema(&serde_json::json!({
+            "init_schema_version": INIT_SCHEMA_VERSION
+        }))
+        .unwrap();
+
+        for status in [
+            serde_json::json!({}),
+            serde_json::json!({"init_schema_version": 1}),
+            serde_json::json!({"init_schema_version": INIT_SCHEMA_VERSION + 1}),
+        ] {
+            let error = validate_portal_init_schema(&status).unwrap_err();
+            assert!(error.to_string().contains("required init schema version"));
         }
+    }
+
+    #[test]
+    fn initialization_timeout_covers_proof_owner_operation_and_buffer() {
+        assert_eq!(initialization_timeout_seconds(None, 300), 1_260);
+    }
+
+    #[test]
+    fn explicit_initialization_timeout_overrides_calculated_default() {
+        assert_eq!(initialization_timeout_seconds(Some(42), 300), 42);
+    }
+
+    #[test]
+    fn selects_amd_kds_product_for_supported_cpuid() {
+        assert_eq!(amd_kds_product(0x19, 0x01).unwrap(), "Milan");
+        assert_eq!(amd_kds_product(0x19, 0x11).unwrap(), "Genoa");
+        assert!(amd_kds_product(0x1a, 0x01).is_err());
+    }
+
+    #[test]
+    fn parses_amd_kds_pem_chain() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nYXNr\n-----END CERTIFICATE-----\n\
+                    -----BEGIN CERTIFICATE-----\nYXJr\n-----END CERTIFICATE-----\n";
+
+        assert_eq!(
+            parse_pem_certificates(pem).unwrap(),
+            vec![b"ask".to_vec(), b"ark".to_vec()]
+        );
     }
 }

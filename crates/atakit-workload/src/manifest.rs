@@ -21,7 +21,7 @@ pub struct Manifest {
     /// the `measured-data/` keys in `hashes`. Unlike `hashes`, there is no
     /// content hash: the files are never bundled into the archive -- only the
     /// declared path *set* is committed to the manifest (and thus PCR23). The
-    /// portal verifies the operator-supplied tar matches this set exactly at
+    /// portal verifies the operator-supplied tar is a subset of this set at
     /// `/init`; contents stay unverified. A `BTreeSet` because this is a path
     /// *set* with no associated value (unlike `hashes`): it serialises to a
     /// JSON array, sorted + deduped, so canonical JSON is byte-deterministic.
@@ -29,6 +29,12 @@ pub struct Manifest {
     /// declares no operator-provided files).
     #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: BTreeSet<String>,
+    /// Measured variable-name allowlist for each unmeasured env file.
+    ///
+    /// Keys are normalized `unmeasured-data/...` paths. Values are sorted,
+    /// unique variable names. Runtime values are intentionally absent.
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: BTreeMap<String, Vec<String>>,
     /// Per-service image metadata: archive path + immutable image config
     /// digest ("image ID"). Keyed by service name (workload + each
     /// dependency). Always serialised; defaults to empty when reading
@@ -123,8 +129,8 @@ pub struct ManifestLogging {
 
 /// Service data mount declaration in `manifest.json`.
 ///
-/// Old manifest formats used a boolean. Format 4 emits the selective path-list
-/// form, but the enum keeps older manifests parseable by tooling.
+/// Old manifest formats used a boolean. Format 5 emits the exact path-list
+/// form, but the enum keeps older manifests parseable by local tooling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ManifestDataMount {
@@ -344,6 +350,94 @@ pub fn parse_env_file(path: &Path, content: &str) -> Result<Vec<(String, String)
     Ok(pairs)
 }
 
+/// Return whether `name` is a portable shell-style environment name.
+pub fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    matches!(chars.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && chars.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// Parse the measured variable-name allowlist from a developer-side
+/// unmeasured env-file template. Values are deliberately ignored.
+pub fn parse_unmeasured_env_file_names(
+    path: &Path,
+    content: &str,
+) -> Result<Vec<String>, WorkloadError> {
+    let mut names = BTreeSet::new();
+    for (i, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, _value)) = line.split_once('=') else {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: "expected KEY=VALUE".into(),
+            });
+        };
+        let key = key.trim();
+        if !is_valid_env_name(key) {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("invalid environment variable name {key:?}"),
+            });
+        }
+        if key.starts_with("ATAKIT_") {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("reserved environment variable name {key:?}"),
+            });
+        }
+        if !names.insert(key.to_string()) {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("duplicate environment variable name {key:?}"),
+            });
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Read every referenced developer-side unmeasured env-file template and
+/// build the top-level measured name allowlists.
+pub fn resolve_unmeasured_env_allowlists(
+    config: &WorkloadConfig,
+    unmeasured_data_root: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, WorkloadError> {
+    let mut allowlists = BTreeMap::new();
+    let service_files = std::iter::once(&config.workload.unmeasured_env_file).chain(
+        config
+            .dependencies
+            .values()
+            .map(|dependency| &dependency.unmeasured_env_file),
+    );
+
+    for files in service_files.flatten() {
+        for logical_path in files.as_vec() {
+            let normalized = namespaced_data_path("unmeasured-data", &logical_path);
+            if allowlists.contains_key(&normalized) {
+                continue;
+            }
+            let path = unmeasured_data_root.join(logical_data_path_rel(&logical_path));
+            let content =
+                std::fs::read_to_string(&path).map_err(|source| WorkloadError::ReadFile {
+                    path: path.clone(),
+                    source,
+                })?;
+            allowlists.insert(
+                normalized,
+                parse_unmeasured_env_file_names(&path, &content)?,
+            );
+        }
+    }
+
+    Ok(allowlists)
+}
+
 /// Resolve environment: merge env_file values first, then explicit environment overrides.
 pub fn resolve_environment(
     env_file: &Option<StringOrArray>,
@@ -534,6 +628,9 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 /// `images` contains per-service image metadata (archive path + image ID).
 /// `environment` is the already-resolved (env_file merged) environment.
 /// `dep_environments` contains resolved environments for each dependency.
+// Keep each measured manifest section explicit at this deterministic build
+// boundary. Grouping them would hide which inputs affect the canonical bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_manifest(
     config: &WorkloadConfig,
     resolved_image: &str,
@@ -541,6 +638,7 @@ pub fn build_manifest(
     dep_environments: BTreeMap<String, BTreeMap<String, String>>,
     hashes: BTreeMap<String, String>,
     unmeasured_data: BTreeSet<String>,
+    unmeasured_env_files: BTreeMap<String, Vec<String>>,
     images: BTreeMap<String, ManifestImage>,
 ) -> Manifest {
     let w = &config.workload;
@@ -796,6 +894,7 @@ pub fn build_manifest(
         disks,
         hashes,
         unmeasured_data,
+        unmeasured_env_files,
         images,
     }
 }
@@ -916,6 +1015,28 @@ mod tests {
     }
 
     #[test]
+    fn unmeasured_env_file_names_are_sorted_and_values_are_ignored() {
+        let path = Path::new("runtime.env");
+        let first = parse_unmeasured_env_file_names(path, "ZED=one\nALPHA=two\n").unwrap();
+        let second =
+            parse_unmeasured_env_file_names(path, "ZED=changed\nALPHA=also-changed\n").unwrap();
+        assert_eq!(first, vec!["ALPHA", "ZED"]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unmeasured_env_file_names_reject_duplicates_invalid_and_reserved_names() {
+        let path = Path::new("runtime.env");
+        for content in [
+            "TOKEN=one\nTOKEN=two\n",
+            "BAD-NAME=value\n",
+            "ATAKIT_PUBLIC_IP=value\n",
+        ] {
+            assert!(parse_unmeasured_env_file_names(path, content).is_err());
+        }
+    }
+
+    #[test]
     fn resolve_image_ref_registry() {
         assert_eq!(
             resolve_image_ref(&ImageSource::Registry("alpine:3.18".into()), "x", "v1"),
@@ -979,12 +1100,13 @@ image = "my-app:latest"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":4"));
+        assert!(output.contains("\"format\":5"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
@@ -1040,6 +1162,7 @@ encryption = { unlock_method = [], bind = [] }
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
 
         let workload_storage = &manifest.config.storage["data"];
@@ -1078,11 +1201,22 @@ unmeasured-env-file = ["/secrets/runtime.env"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::from(["unmeasured-data/secrets/runtime.env".to_string()]),
+            BTreeMap::from([(
+                "unmeasured-data/secrets/runtime.env".to_string(),
+                vec!["API_TOKEN".to_string()],
+            )]),
             BTreeMap::new(),
         );
         assert_eq!(
             manifest.config.unmeasured_env_files,
             vec!["unmeasured-data/secrets/runtime.env"]
+        );
+        assert_eq!(
+            manifest.unmeasured_env_files,
+            BTreeMap::from([(
+                "unmeasured-data/secrets/runtime.env".to_string(),
+                vec!["API_TOKEN".to_string()],
+            )])
         );
     }
 
@@ -1124,6 +1258,7 @@ unmeasured-data = false
             BTreeMap::new(),
             hashes,
             unmeasured_data,
+            BTreeMap::new(),
             BTreeMap::new(),
         );
 
@@ -1177,6 +1312,7 @@ image = "test:latest"
             BTreeMap::new(),
             hashes.clone(),
             BTreeSet::new(),
+            BTreeMap::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -1186,6 +1322,7 @@ image = "test:latest"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
@@ -1237,6 +1374,7 @@ image = "redis:7"
             BTreeMap::new(),
             hashes.clone(),
             BTreeSet::new(),
+            BTreeMap::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -1246,6 +1384,7 @@ image = "redis:7"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
@@ -1285,6 +1424,7 @@ image = "redis:7"
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
         );
         let json = serialize_canonical_json(&manifest).unwrap();
@@ -1333,6 +1473,7 @@ cap-drop = ["KILL"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
         );
 
@@ -1386,6 +1527,7 @@ encryption = { unlock_method = [], bind = [] }
             BTreeMap::new(), // dep_environments
             BTreeMap::new(), // hashes
             BTreeSet::new(), // unmeasured_data
+            BTreeMap::new(), // unmeasured_env_files
             BTreeMap::new(), // images
         );
         let json = serialize_canonical_json(&manifest).unwrap();
@@ -1456,6 +1598,7 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         let m_b = build_manifest(
             &cfg_b,
@@ -1464,6 +1607,7 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
         );
 

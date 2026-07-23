@@ -104,7 +104,7 @@ Do not put credentials in this table; provider CLIs supply authentication.
 | `registration` | `required`, `optional`, or `off`. |
 | `owner_key` | Named owner key. |
 | `gas_wallet` | Named transaction payer. |
-| `prover_credential` | Optional fallback prover key; `sp1_payer` is a deprecated alias. |
+| `prover_credential` | Optional fallback prover key. |
 | `uefi` | Per-target QEMU firmware override. |
 
 `[cloud.defaults]` can provide `chain`, `registration`, `owner_key`,
@@ -112,6 +112,15 @@ Do not put credentials in this table; provider CLIs supply authentication.
 default. Supported CLI overrides are documented by `atakit cloud <command>
 --help`; notably `--chain`, `--owner-key`, and `--gas-wallet` refer to config
 entry names, not file paths.
+
+The effective configuration of `[cloud.targets.<name>]` is immutable while a
+saved deployment references that target name. The effective configuration
+includes inherited `[cloud.defaults]` values and every referenced provider,
+chain, key, and prover entry. Later verification, session lifecycle, status,
+and destruction commands resolve the same named configuration. An operator who
+needs different configuration must create `[cloud.targets.<new-name>]` and a
+new instance. Editing or reusing the old target name while its deployment
+remains is unsupported.
 
 `[cloud.images]` optionally declares the CC types used when registering a cloud
 image:
@@ -138,18 +147,18 @@ credential = "prover"
 
 The CLI validates backend/profile references, execution-mode spelling,
 credential type, and `tee_backend` before provider operations. It resolves the
-profile into the portal's top-level `prover` object. Format-1 requests emit the
-credential under the compatibility key `sp1_payer`; the portal accepts that as
-an alias for `prover_credential`.
+profile into the portal's top-level `prover` object. Format-2 requests emit the
+credential as `prover_credential`.
 
 `tee_backend = "auto"` selects ZK for AMD SEV-SNP and Solidity/DCAP for Intel
 TDX. `zk` forces a prover program for either TEE. `solidity` is invalid for SNP.
-The deprecated `chain.proving_strategy` is accepted only when `prover` is
-absent and is emitted alone for portal-side normalization.
+The strict operator schema rejects the removed `chain.proving_strategy` field.
 
-Effective prover credential precedence is profile credential, persisted/target
-fallback, then gas wallet. With `registration = "off"`, no prover is launched
-and no configured prover credential is resolved.
+Effective prover credential precedence is profile credential, then
+persisted/target fallback. The gas wallet is never a prover credential. A
+selected network prover requires a separately named credential. With
+`registration = "off"`, no prover is launched and no configured prover
+credential is resolved.
 
 The portal currently requires `owner_key.private_key` on every `/init`, so the
 effective owner key must be a provisioned key even though the CLI schema and
@@ -164,6 +173,9 @@ The current command families are:
 ```text
 atakit cloud deploy [SOURCE] --target <name> [--target <name> ...]
 atakit cloud init <instance> [SOURCE] [--target <name>]
+atakit cloud session new|rotate-key|renew <instance> [--target <name>]
+atakit cloud session recover <instance> --old-session-id <bytes32> [--target <name>]
+atakit cloud session status <instance> [--request-hash <bytes32>] [--wait]
 atakit cloud destroy <instance>... [--target <name>]
 atakit cloud status <instance> [--target <name>] [--live]
 atakit cloud ls [--target <name>]
@@ -180,6 +192,67 @@ atakit cloud provider ls
 directory mode. `--image-only` provisions a VM without workload init. Repeating
 `--target` performs image pre-upload serially per unique provider/image pair,
 then deploys targets concurrently; `--name` is rejected in multi-target mode.
+
+Deployment-management session commands derive their required binding from the
+deployment target's `registration` value. `required` and an omitted policy
+require a chain-bound session. `off` requires a local-bound session. `optional`
+accepts either verified binding because a failed optional registration may
+validly install a local-bound session. Lifecycle completion uses the verified
+successor binding to decide whether to call `isSessionActive`. Rotate-key,
+renew, and recover still require a chain-bound predecessor; new may start from
+a local-bound predecessor.
+
+`atakit cloud verify-session` is different. The verifier may be on another
+computer. The verifier supplies the canonical base-image reference, canonical
+workload reference, and portal address. A matching local deployment may fill
+only those subject fields. The verifier selects `--chain` or supplies explicit
+collateral. The command never takes a chain, registration policy, registry,
+measurement policy, workload policy, or platform trust root from the local
+deployment or deployment target.
+
+For a chain-bound session, the authenticated chain ID and `SessionRegistry`
+address must match the chain ID returned by the verifier-selected RPC endpoint
+and the `SessionRegistry` address in the verifier-selected chain configuration.
+The portal evidence never selects those trusted values. Selecting `--chain`
+does not by itself require a chain-bound session; it may supply collateral for
+a local-bound session when the caller's binding policy permits that session.
+
+The default lifecycle `op_expires_at` window is the portal's 900-second proof
+timeout plus `owner_operations.op_expiry_seconds`. The configured owner-
+operation interval therefore remains available for portal transaction
+submission after the longest supported proof. `--op-expiry-seconds` replaces
+the complete calculated window. The default command wait adds a further
+60-second completion buffer.
+
+Verifier-selected registry-backed session verification reads the exact
+`WorkloadSpec`, checks
+that it allows the TLS-selected base image, and supplies all workload PCR and
+attribute requirements to the offline verifier. These workload PCR rules are
+appended to the effective base-image profile and variant rules, including when
+both policies constrain the same PCR. Deployment-management verification with
+`registration = "off"` and no `WorkloadRegistry` hashes and inspects the saved
+`.atawl` and uses its PCR23. For `atakit cloud verify-session`,
+`--trusted-workload-pcr23` is an explicit verifier-owned alternative to
+`WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
+collateral.
+
+`atakit cloud session status` resolves only the deployment and verified portal
+TLS connection before reading portal request state. It displays `idle`,
+`waiting`, `running`, and `failed` without loading `WorkloadRegistry` policy.
+When the portal reports `completed`, the command then resolves the trusted
+workload policy, verifies the exact successor as the current session, and calls
+`isSessionActive` for a chain-bound successor. A failure in that second stage
+does not hide the portal's completed state. Session mutation commands retain
+full current-session verification before owner authorization.
+
+Azure TLS bootstrap and committed-session verification resolve MAA trust
+separately. TLS bootstrap verifies the fresh `/tls-attestation` JWT with its
+exact `kid` and `iss`. After the committed session evidence bundle is fetched,
+session verification resolves that bundle's exact MAA key and verifies its JWT
+with that key. A fresh TLS MAA key is not a fallback for the committed session
+MAA key. Every manual `--azure-maa-key` value remains available until both JWTs
+have been checked, so valid key rotation between session creation and a later
+command does not make the committed session unverifiable.
 
 Portal status and init ports default to `2024` and `1024` and can be overridden
 per invocation with `--status-port` and `--init-port`. The selected ports are
@@ -200,18 +273,25 @@ A single-target deploy performs these logical stages:
 6. Wait for `GET /status` on the configured status port.
 7. Verify the portal TLS certificate against fresh attestation and the selected
    measurement policy.
-8. Unless `--skip-init` or `--image-only` is set, send the one-shot multipart
-   `POST /init` request and poll portal state.
+8. Unless `--skip-init` or `--image-only` is set, require `GET /status` to
+   report `init_schema_version = 2`, send the one-shot multipart `POST /init`
+   request, and poll portal state.
 
-The init upload timeout is controlled by `--init-upload-timeout`; `cloud init`
-also has `--timeout` for waiting for the portal. The unsafe TLS bypass accepts a
-self-signed certificate without attestation and always prints a warning.
+The init upload timeout is controlled by `--init-upload-timeout`. Portal
+readiness keeps a separate 300-second timeout. After `POST /init`,
+`atakit workload init <host> --init-timeout`,
+`atakit cloud init <instance> --init-timeout`, and
+`atakit cloud deploy <workload> --init-timeout` use the same completion-timeout
+calculation. The calculated default is the 900-second portal proof timeout plus
+`owner_operations.op_expiry_seconds` plus a 60-second completion buffer. The
+unsafe TLS bypass accepts a self-signed certificate without attestation and
+always prints a warning.
 
 The init JSON schema is defined in the suite's
 [init-config specification](../../docs/specs/init-config-spec.md). It contains
 `chain`, unified `owner_key` and
-`gas_wallet` objects, optional resolved `prover`, the format-1 `sp1_payer`
-compatibility key, platform declaration, network values, and disk passphrases.
+`gas_wallet` objects, optional resolved `prover`, `prover_credential`, platform
+declaration, network values, and disk passphrases.
 Legacy `agent_env`, `owner_private_key`, and `relay_private_key` objects are not
 part of the current producer.
 
@@ -228,21 +308,42 @@ Deployment state is stored below the atakit XDG data directory:
 ~/.local/share/atakit/cloud/deployments/<target>/<instance>.state.json
 ```
 
-The state format records the provider alias, platform, workload/image identity,
-archive hash, selected config entry names, portal ports, lifecycle status, and
-provider resource identifiers. It stores references to named keys, not private
-key bytes. The loader migrates the older top-level `deployments/` directory
-when possible.
+Deployment-state format 2 records the provider alias in `image_ref` and the
+canonical verification subject identity in `base_image_ref`. `image_ref`
+remains necessary for provider resource management. `base_image_ref` is only
+an optional subject-input shortcut for `atakit cloud verify-session`; it is not
+a policy or collateral source. Format 2 also records the platform, workload
+identity, archive hash, selected config entry names, portal ports, lifecycle
+status, and provider resource identifiers. It stores references to named keys,
+not private key bytes.
+
+When the loader reads format 1, it renames only `init_env.sp1_payer` to
+`init_env.prover_credential`, preserves string and `null` values, rejects a
+document containing both names, adds `base_image_ref = null`, and atomically
+rewrites the state as format 2. The migration does not assume that the old
+`image_ref` was a canonical base-image identity. Format 2 rejects `sp1_payer`.
+This compatibility is limited to local deployment state; operator configuration
+and portal `/init` remain strict current schemas. The loader also migrates the
+older top-level `deployments/` directory when possible.
 
 Lifecycle states are `deploying`, `deployed`, `failed`, `destroying`, and
-`destroyed`. Each provider uses check-before-create behavior so a failed deploy
-can resume from persisted state. `cloud status --live` queries the provider in
-addition to local state.
+`destroyed`. Each provider uses check-before-create behavior so a failed
+provider step can resume before `POST /init`. `POST /init` is one-shot. If a
+new deployment fails after `POST /init`, remove it with `atakit cloud destroy`
+and create a new deployment with `atakit cloud deploy`. `cloud status --live`
+queries the provider in addition to local state.
 
 `cloud init` resolves config with CLI overrides first, persisted state second,
 and the target/default config last. The selected chain profile still wins for
 its prover credential, so a recovery init cannot silently use a different
 proving identity.
+
+If `cloud init` observes portal `Failed` or `CleanHalt` after the one-shot
+`POST /init`, it saves deployment status `failed` with step `Wait for portal
+Running` before returning an error. It keeps the updated workload identity,
+configuration references, and provider resource identifiers so `cloud
+destroy` can remove the deployment. A later `cloud init` rejects that failed
+deployment.
 
 ## Resource ownership and destroy
 

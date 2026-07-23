@@ -140,16 +140,14 @@ pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(St
 pub struct ResolvedChain {
     pub rpc_url: String,
     pub session_registry: String,
-    /// Default validity window (seconds) for owner-key-signed messages
-    /// when the CLI does not pass `--expire-offset`.
-    pub expire_offset: u64,
+    /// Default validity window for owner-key-signed operations.
+    pub op_expiry_seconds: u64,
 }
 
 /// Resolve chain config for on-chain workload commands.
 ///
 /// Precedence: `cli_chain` > `config.publish.chain`. Looks up the name
-/// in `config.chains` and returns the rpc_url, session_registry, and
-/// the chain's `expire_offset` default.
+/// in `config.chains`; the operation window comes from `[owner_operations]`.
 pub fn resolve_chain(
     cli_chain: Option<&str>,
     config: &crate::config::Config,
@@ -166,7 +164,7 @@ pub fn resolve_chain(
     Ok(ResolvedChain {
         rpc_url: chain.rpc_url.clone(),
         session_registry: chain.session_registry.clone(),
-        expire_offset: chain.expire_offset,
+        op_expiry_seconds: config.owner_operations.op_expiry_seconds,
     })
 }
 

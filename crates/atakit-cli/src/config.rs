@@ -8,7 +8,8 @@ use atakit_cloud::CloudConfig;
 use atakit_config::CredentialSpec;
 pub use atakit_config::{
     repo_local_name, BuildConfig, ChainConfig, ContainerEngine, GithubConfig, ImageConfig,
-    ImageRepositorySpec, KeyMode, KeySpec, KeyType, ProverSpec, PublishConfig,
+    ImageRepositorySpec, KeyMode, KeySpec, KeyType, OwnerOperationsConfig, ProverSpec,
+    PublishConfig,
 };
 use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
 use indexmap::IndexMap;
@@ -22,6 +23,7 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub chains: IndexMap<String, ChainConfig>,
+    pub owner_operations: OwnerOperationsConfig,
     pub provers: IndexMap<String, ProverSpec>,
     pub keys: IndexMap<String, KeySpec>,
     pub image: ImageConfig,
@@ -409,22 +411,6 @@ impl Config {
                     bail!("chain '{name}' references unknown prover profile '{prover}'");
                 }
             }
-            if chain.prover.is_some() && chain.proving_strategy.is_some() {
-                bail!("chain '{name}' cannot set both `prover` and deprecated `proving_strategy`");
-            }
-            if let Some(strategy) = &chain.proving_strategy {
-                if !matches!(
-                    strategy.as_str(),
-                    "network"
-                        | "local"
-                        | "dev"
-                        | "risc_zero_boundless"
-                        | "risc_zero_local"
-                        | "risc_zero_dev"
-                ) {
-                    bail!("chain '{name}' has unsupported proving_strategy '{strategy}'");
-                }
-            }
         }
 
         // Cloud target chain/key references must point to defined entries.
@@ -771,7 +757,7 @@ fn check_legacy_fields(content: &str) -> Result<()> {
         if cloud.contains_key("expire_offset") {
             bail!(
                 "`[cloud] expire_offset` is no longer supported. Use \
-                 `expire_offset` in `[chains.<name>]` instead."
+                 `[owner_operations] op_expiry_seconds` instead."
             );
         }
         for field in ["owner_key_file", "relay_key_file"] {
@@ -819,18 +805,20 @@ fn check_legacy_fields(content: &str) -> Result<()> {
             if let Some(t) = cval.as_table() {
                 if t.contains_key("session_ttl_seconds") {
                     bail!(
-                        "`[chains.{cname}] session_ttl_seconds` was renamed to \
-                         `expire_offset`."
+                        "`[chains.{cname}] session_ttl_seconds` is no longer supported. Use \
+                         `[owner_operations] op_expiry_seconds`."
                     );
                 }
                 if t.contains_key("register_cvm_expire_offset") {
                     bail!(
-                        "`[chains.{cname}] register_cvm_expire_offset` was renamed \
-                         to `expire_offset` (now used as the default validity \
-                         window for the portal's registerCvm message AND for the \
-                         operator's `workload publish` / `workload deactivate` / \
-                         `imgbuild publish` signature offsets; CLI \
-                         `--expire-offset` overrides per call)."
+                        "`[chains.{cname}] register_cvm_expire_offset` is no longer supported. \
+                         Use `[owner_operations] op_expiry_seconds`."
+                    );
+                }
+                if t.contains_key("expire_offset") {
+                    bail!(
+                        "`[chains.{cname}] expire_offset` was replaced by \
+                         `[owner_operations] op_expiry_seconds`; move the value there."
                     );
                 }
                 if t.contains_key("registration") {
@@ -2160,7 +2148,9 @@ mod tests {
             [chains.testnet]
             rpc_url = "https://rpc.test"
             session_registry = "0xABCD"
-            expire_offset = 7200
+
+            [owner_operations]
+            op_expiry_seconds = 7200
 
             [keys.owner]
             type = "es256k"
@@ -2178,7 +2168,7 @@ mod tests {
         let chain = config.chains.get("testnet").unwrap();
         assert_eq!(chain.rpc_url, "https://rpc.test");
         assert_eq!(chain.session_registry, "0xABCD");
-        assert_eq!(chain.expire_offset, 7200);
+        assert_eq!(config.owner_operations.op_expiry_seconds, 7200);
         assert!(chain.workload_registry.is_none());
 
         assert_eq!(config.keys.len(), 2);
@@ -2514,21 +2504,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_rejects_profile_and_legacy_strategy_together() {
+    fn chain_rejects_proving_strategy() {
         let error = Config::load_from_str(
             r#"
-            [provers.sp1]
-            backend = "sp1"
-
             [chains.hoodi]
             rpc_url = "https://rpc.test"
             session_registry = "0xABCD"
-            prover = "sp1"
             proving_strategy = "network"
             "#,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("cannot set both"));
+        assert!(format!("{error:#}").contains("proving_strategy"));
     }
 
     #[test]
@@ -2684,7 +2670,7 @@ mod tests {
             "expected field name in error: {msg}"
         );
         assert!(
-            msg.contains("expire_offset"),
+            msg.contains("op_expiry_seconds"),
             "expected new name in error: {msg}"
         );
     }
@@ -2706,8 +2692,30 @@ mod tests {
             "expected old field name in error: {msg}"
         );
         assert!(
-            msg.contains("expire_offset"),
+            msg.contains("op_expiry_seconds"),
             "expected new name in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_chains_expire_offset_rejected() {
+        let err = Config::load_from_str(
+            r#"
+            [chains.testnet]
+            rpc_url = "https://rpc.test"
+            session_registry = "0xABCD"
+            expire_offset = 7200
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expire_offset"),
+            "expected old field name: {msg}"
+        );
+        assert!(
+            msg.contains("owner_operations"),
+            "expected migration target: {msg}"
         );
     }
 }

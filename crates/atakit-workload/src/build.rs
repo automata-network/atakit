@@ -230,6 +230,8 @@ pub async fn build_workload(
     // their member files; files / absent entries are recorded as leaves.
     let unmeasured_data =
         manifest::normalize_unmeasured_data(config.unmeasured_data_paths(), &data_roots.unmeasured);
+    let unmeasured_env_files =
+        manifest::resolve_unmeasured_env_allowlists(&config, &data_roots.unmeasured)?;
     let m = manifest::build_manifest(
         &config,
         &resolved_image,
@@ -237,6 +239,7 @@ pub async fn build_workload(
         dep_environments,
         hashes,
         unmeasured_data,
+        unmeasured_env_files,
         images,
     );
     let manifest_json = manifest::serialize_canonical_json(&m)?;

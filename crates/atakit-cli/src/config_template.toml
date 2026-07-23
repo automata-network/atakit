@@ -21,13 +21,16 @@
 # session_registry = "0x..."
 # workload_registry = "0x..."
 # base_image_registry = "0x..."
-# expire_offset = 300
 # tee_backend = "auto"       # "auto" | "solidity" | "zk"
 # prover = "sp1-network"     # named [provers] profile used by ZK paths
-# # ^ default validity window (seconds) for owner-key-signed on-chain
-# # messages: registerCvm in the CVM, plus the operator-side
-# # registerWorkload / deactivateWorkload / registerBaseImage flows.
-# # `--expire-offset` on each CLI command overrides per call.
+
+# [owner_operations]
+# op_expiry_seconds = 300
+# challenge_expiry_seconds = 60
+# max_request_body_bytes = 1048576
+# max_waiting_requests = 64
+# max_completed_request_statuses = 256
+# request_status_retention_seconds = 3600
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #

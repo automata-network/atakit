@@ -4,7 +4,9 @@ use std::path::{Component, Path};
 use crate::config::{
     self, DataMount, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig,
 };
-use crate::data::{namespaced_data_path, validate_logical_data_path, DataRoots};
+use crate::data::{
+    logical_data_path_rel, namespaced_data_path, validate_logical_data_path, DataRoots,
+};
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
@@ -113,7 +115,7 @@ pub fn validate_config_with_roots(
     // ── format version ───────────────────────────────────
     if config.format < 2 {
         return Err(WorkloadError::Validation(format!(
-            "atakit-workload.toml format version {} is no longer supported; update to format = 2",
+            "atakit-workload.toml format version {} is no longer supported; update to format = 2 or newer",
             config.format
         )));
     }
@@ -349,6 +351,7 @@ pub fn validate_config_with_roots(
     validate_unmeasured_env_files(
         &w.unmeasured_env_file,
         &declared_unmeasured_data,
+        &data_roots.unmeasured,
         "unmeasured-env-file",
     )?;
 
@@ -540,6 +543,7 @@ pub fn validate_config_with_roots(
         validate_unmeasured_env_files(
             &dep.unmeasured_env_file,
             &declared_unmeasured_data,
+            &data_roots.unmeasured,
             &format!("dependencies.{dep_name}.unmeasured-env-file"),
         )?;
         validate_data_mount(
@@ -622,6 +626,7 @@ fn validate_env_files(
 fn validate_unmeasured_env_files(
     env_files: &Option<config::StringOrArray>,
     declared_unmeasured_data: &BTreeSet<String>,
+    unmeasured_data_root: &Path,
     context: &str,
 ) -> Result<(), WorkloadError> {
     if let Some(env_files) = env_files {
@@ -639,6 +644,17 @@ fn validate_unmeasured_env_files(
                     "{context}: {normalized:?} must be declared in [package] unmeasured-data"
                 )));
             }
+            let path = unmeasured_data_root.join(logical_data_path_rel(&ef));
+            if !path.is_file() {
+                return Err(WorkloadError::EnvFileMissing(path));
+            }
+            ensure_within(&path, unmeasured_data_root, context)?;
+            let content =
+                std::fs::read_to_string(&path).map_err(|source| WorkloadError::ReadFile {
+                    path: path.clone(),
+                    source,
+                })?;
+            crate::manifest::parse_unmeasured_env_file_names(&path, &content)?;
         }
     }
     Ok(())
@@ -2232,6 +2248,9 @@ unmeasured-env-file = "/secrets/runtime.env"
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("unmeasured-data/secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::write(secrets_dir.join("runtime.env"), "API_TOKEN=template\n").unwrap();
         assert!(validate_config(&cfg, tmp.path()).is_ok());
     }
 

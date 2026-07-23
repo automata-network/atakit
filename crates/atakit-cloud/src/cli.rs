@@ -28,6 +28,27 @@ pub enum CloudCommand {
     /// Initialize a deployed instance with a workload
     #[command(arg_required_else_help = true)]
     Init(InitArgs),
+    /// Verify current session evidence without deployment policy or a transaction
+    #[command(arg_required_else_help = true)]
+    VerifySession(VerifySessionArgs),
+    /// Create, rotate, renew, recover, or inspect portal sessions
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+/// Portal session lifecycle subcommands.
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Create a new session
+    New(SessionMutationArgs),
+    /// Rotate the current session key
+    RotateKey(SessionMutationArgs),
+    /// Renew the current session
+    Renew(SessionMutationArgs),
+    /// Recover an older session into a new current session
+    Recover(SessionRecoverArgs),
+    /// Show one lifecycle request or the portal's selected request
+    Status(SessionStatusArgs),
 }
 
 /// Cloud image subcommands.
@@ -117,6 +138,11 @@ pub struct DeployArgs {
     /// Timeout in seconds for the POST /init multipart upload.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
+
+    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
 
     /// Deploy only the base image VM without a workload (for measurements)
     #[arg(long)]
@@ -361,9 +387,10 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Agent wait timeout in seconds
-    #[arg(long, default_value = "300")]
-    pub timeout: u64,
+    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
 
     /// Timeout in seconds for the POST /init multipart upload.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
@@ -441,6 +468,156 @@ pub struct InitArgs {
     pub unsafe_skip_tls_attestation: bool,
 }
 
+/// Arguments for `cloud verify-session`.
+#[derive(Args)]
+pub struct VerifySessionArgs {
+    /// Optional local deployment name (or target/instance) used only to fill
+    /// missing subject identity fields.
+    pub instance: Option<String>,
+
+    /// Target name for disambiguating a local deployment shortcut.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Portal host or IP supplied by the verifier.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// Portal HTTPS status port. Defaults to 2024 with --host.
+    #[arg(long, value_name = "PORT")]
+    pub status_port: Option<u16>,
+
+    /// Expected canonical workload reference.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub workload_ref: Option<String>,
+
+    /// Verification report output path.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Trust inputs shared by session verification and lifecycle commands.
+#[derive(Args, Clone, Default)]
+pub struct SessionVerificationArgs {
+    /// Chain config used only for read-only trust, collateral, and session-state checks.
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Manually trusted final PCR23 value for the workload manifest.
+    /// For verify-session, this selects an explicit PCR23-only workload policy.
+    #[arg(long, value_name = "0xBYTES32")]
+    pub trusted_workload_pcr23: Option<String>,
+
+    /// Expected base image for the signed measurement policy.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Signed measurement pack JSON file or directory.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
+    #[arg(long, value_name = "HEX")]
+    pub azure_maa_key: Vec<String>,
+
+    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub gcp_ak_root_cert: Vec<String>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_ark_root_cert: Vec<String>,
+
+    /// TDX DCAP QuoteCollateralV3 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for GCP TDX collateral.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for read-only GCP TDX lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for read-only GCP TDX lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+}
+
+/// Common arguments for a session-changing operation.
+#[derive(Args, Clone)]
+pub struct SessionMutationArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
+    #[arg(long)]
+    pub owner_key: Option<String>,
+
+    /// Complete owner-authorization window in seconds.
+    /// Defaults to 900 seconds plus [owner_operations] op_expiry_seconds.
+    /// An explicit value replaces that calculated default.
+    #[arg(long, value_name = "SECONDS")]
+    pub op_expiry_seconds: Option<u64>,
+
+    /// Maximum time to wait for completion. Defaults to the complete owner-
+    /// authorization window plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Arguments for `cloud session recover`.
+#[derive(Args, Clone)]
+pub struct SessionRecoverArgs {
+    #[command(flatten)]
+    pub mutation: SessionMutationArgs,
+
+    /// Older chain session to recover.
+    #[arg(long, value_name = "0xBYTES32")]
+    pub old_session_id: String,
+}
+
+/// Arguments for `cloud session status`.
+#[derive(Args, Clone)]
+pub struct SessionStatusArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Exact lifecycle request hash. Omit to read `/session/status`.
+    #[arg(long, value_name = "0xBYTES32")]
+    pub request_hash: Option<String>,
+
+    /// Wait until the selected request completes or fails.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Maximum wait time in seconds.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub timeout: u64,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
 /// Arguments for `cloud serial`.
 #[derive(Args)]
 pub struct SerialArgs {
@@ -450,4 +627,301 @@ pub struct SerialArgs {
     /// Target name (for disambiguation)
     #[arg(long)]
     pub target: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: CloudCommand,
+    }
+
+    #[test]
+    fn verify_session_accepts_repeatable_manual_azure_maa_keys() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "azure-vm",
+            "--azure-maa-key",
+            "aa",
+            "--azure-maa-key",
+            "bb",
+        ])
+        .expect("verify-session arguments");
+
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(args.verification.azure_maa_key, ["aa", "bb"]);
+    }
+
+    #[test]
+    fn verify_session_accepts_explicit_remote_subject() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "--host",
+            "203.0.113.10",
+            "--status-port",
+            "2024",
+            "--base-image",
+            "automata-linux:v1",
+            "--workload-ref",
+            "example:v1",
+            "--chain",
+            "hoodi",
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(args.instance, None);
+        assert_eq!(args.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(args.status_port, Some(2024));
+        assert_eq!(args.workload_ref.as_deref(), Some("example:v1"));
+        assert_eq!(
+            args.verification.base_image.as_deref(),
+            Some("automata-linux:v1")
+        );
+        assert_eq!(args.verification.chain.as_deref(), Some("hoodi"));
+    }
+
+    #[test]
+    fn trusted_workload_pcr23_is_shared_by_verification_and_lifecycle_commands() {
+        let value = format!("0x{}", "55".repeat(32));
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "gcp-vm",
+            "--trusted-workload-pcr23",
+            &value,
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(
+            args.verification.trusted_workload_pcr23.as_deref(),
+            Some(value.as_str())
+        );
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "renew",
+            "gcp-vm",
+            "--trusted-workload-pcr23",
+            &value,
+        ])
+        .expect("session renew arguments");
+        let CloudCommand::Session(SessionCommand::Renew(args)) = cli.command else {
+            panic!("expected session renew command");
+        };
+        assert_eq!(
+            args.verification.trusted_workload_pcr23.as_deref(),
+            Some(value.as_str())
+        );
+
+        let help = TestCli::try_parse_from(["test", "verify-session", "--help"])
+            .err()
+            .expect("verify-session help response")
+            .to_string();
+        assert!(help.contains("--trusted-workload-pcr23 <0xBYTES32>"));
+        assert!(help.contains("final PCR23 value for the workload manifest"));
+    }
+
+    #[test]
+    fn session_lifecycle_commands_parse_exact_arguments() {
+        let cli =
+            TestCli::try_parse_from(["test", "session", "new", "gcp-vm"]).expect("new arguments");
+        assert!(matches!(
+            cli.command,
+            CloudCommand::Session(SessionCommand::New(_))
+        ));
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "rotate-key",
+            "gcp-vm",
+            "--owner-key",
+            "owner",
+            "--chain",
+            "hoodi-fork",
+        ])
+        .expect("rotate-key arguments");
+        let CloudCommand::Session(SessionCommand::RotateKey(args)) = cli.command else {
+            panic!("expected session rotate-key command");
+        };
+        assert_eq!(args.instance, "gcp-vm");
+        assert_eq!(args.owner_key.as_deref(), Some("owner"));
+        assert_eq!(args.verification.chain.as_deref(), Some("hoodi-fork"));
+
+        let cli = TestCli::try_parse_from(["test", "session", "renew", "gcp-vm"])
+            .expect("renew arguments");
+        assert!(matches!(
+            cli.command,
+            CloudCommand::Session(SessionCommand::Renew(_))
+        ));
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "recover",
+            "gcp-vm",
+            "--old-session-id",
+            "0x11",
+        ])
+        .expect("recover arguments");
+        let CloudCommand::Session(SessionCommand::Recover(args)) = cli.command else {
+            panic!("expected session recover command");
+        };
+        assert_eq!(args.old_session_id, "0x11");
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "status",
+            "gcp-vm",
+            "--request-hash",
+            "0x22",
+            "--wait",
+        ])
+        .expect("status arguments");
+        let CloudCommand::Session(SessionCommand::Status(args)) = cli.command else {
+            panic!("expected session status command");
+        };
+        assert!(args.wait);
+        assert_eq!(args.request_hash.as_deref(), Some("0x22"));
+    }
+
+    #[test]
+    fn lifecycle_help_explains_proof_aware_deadline_and_wait() {
+        let help = TestCli::try_parse_from(["test", "session", "new", "--help"])
+            .err()
+            .expect("session new help response")
+            .to_string();
+        assert!(help.contains("--op-expiry-seconds <SECONDS>"));
+        assert!(help.contains("900 seconds plus [owner_operations] op_expiry_seconds"));
+        assert!(help.contains("explicit value replaces that calculated default"));
+        assert!(help.contains("authorization window plus 60 seconds"));
+    }
+
+    #[test]
+    fn session_relay_commands_are_not_available() {
+        assert!(TestCli::try_parse_from(["test", "relay-session", "example-vm"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "register", "example-vm"]).is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "session",
+            "new",
+            "example-vm",
+            "--gas-wallet",
+            "gas"
+        ])
+        .is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "session",
+            "new",
+            "example-vm",
+            "--unsafe-skip-tls-attestation"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn deploy_initialization_timeout_is_separate_and_reaches_every_target() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx,azure-sev-snp",
+            "--init-timeout",
+            "1500",
+        ])
+        .expect("deploy arguments");
+        let CloudCommand::Deploy(args) = cli.command else {
+            panic!("expected deploy command");
+        };
+
+        assert_eq!(args.init_timeout, Some(1500));
+        assert_eq!(args.target, ["gcp-tdx", "azure-sev-snp"]);
+        for target in args.target.iter().cloned() {
+            let mut single_target_args = args.clone();
+            single_target_args.target = vec![target];
+            assert_eq!(single_target_args.init_timeout, Some(1500));
+        }
+    }
+
+    #[test]
+    fn initialization_timeouts_use_calculated_defaults_until_overridden() {
+        let cli = TestCli::try_parse_from(["test", "deploy", "workload:v1", "--target", "gcp-tdx"])
+            .expect("deploy arguments");
+        let CloudCommand::Deploy(args) = cli.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from(["test", "init", "gcp-vm", "workload:v1"])
+            .expect("init arguments");
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--init-timeout",
+            "1400",
+        ])
+        .expect("init arguments");
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--timeout",
+            "1400",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn portal_readiness_timeout_remains_300_seconds() {
+        assert_eq!(crate::init::PORTAL_READINESS_TIMEOUT_SECONDS, 300);
+    }
+
+    #[test]
+    fn command_help_distinguishes_initialization_and_upload_timeouts() {
+        let deploy_help = TestCli::try_parse_from(["test", "deploy", "--help"])
+            .err()
+            .expect("deploy help response")
+            .to_string();
+        assert!(deploy_help.contains("--init-timeout <SECONDS>"));
+        assert!(deploy_help.contains("proving, registration, and portal Running"));
+        assert!(deploy_help.contains("--init-upload-timeout <SECONDS>"));
+
+        let init_help = TestCli::try_parse_from(["test", "init", "--help"])
+            .err()
+            .expect("init help response")
+            .to_string();
+        assert!(init_help.contains("--init-timeout <SECONDS>"));
+        assert!(init_help.contains("proving, registration, and portal Running"));
+        assert!(init_help.contains("--init-upload-timeout <SECONDS>"));
+    }
 }
