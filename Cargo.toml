@@ -11,7 +11,9 @@ members = [
     "crates/atakit-cloud",
     "crates/atakit-cli",
 ]
-exclude = ["vendor/lazy_static"]
+exclude = [
+    "vendor/lazy_static",
+]
 
 [workspace.package]
 version = "0.5.5"
@@ -21,7 +23,8 @@ edition = "2021"
 # Shared
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+serde_bytes = "0.11"
 base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
@@ -30,7 +33,7 @@ libc = "0.2"
 # Network
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = "0.3"
-dcap-qvl = { version = "0.5.2", default-features = false, features = ["std", "report", "ring", "rustcrypto", "default-x509"] }
+urlencoding = "2"
 
 # Build / archive
 tempfile = "3"
@@ -45,15 +48,23 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 
 # Blockchain
 alloy-ext = "1.7.4"
+alloy = { version = "1.7.3", default-features = false }
 automata-tee-workload-measurement = "0.1.2"
+aws-lc-rs = "1"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
-rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 signature = "2"
 x509-parser = { version = "0.16", features = ["verify"] }
+x509-cert = "0.2.5"
+pem = "3"
 rcgen = "0.13"
+
+# Pin all Automata DCAP crates to the same reviewed upstream commit.
+dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
+automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
+pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
 
 # Async
 async-trait = "0.1"

@@ -65,15 +65,24 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &args.verification.gcp_ak_root_cert,
         &args.verification.azure_maa_key,
         &args.verification.amd_ark_root_cert,
+        &args.verification.amd_snp_crl,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let tdx_dcap = init::tdx_dcap_collateral_config(
+    let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+        &args.verification.tdx_dcap_automata_read_strategy,
+        args.verification
+            .tdx_dcap_automata_multicall3_address
+            .clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tdx_dcap = init::tdx_dcap_collateral_config_with_read_strategy(
         args.verification.tdx_dcap_collateral.clone(),
         args.verification.tdx_dcap_pccs_url.clone(),
         args.verification
             .tdx_dcap_automata_collateral_rpc_url
             .clone(),
         args.verification.tdx_dcap_automata_pcs_dao.clone(),
+        automata_read_strategy,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 

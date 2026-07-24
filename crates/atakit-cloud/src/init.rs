@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atakit_attestation::{
-    amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
-    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation, AkBinding,
-    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TlsAttestationResponse,
-    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_vcek_cert_table,
+    amd_snp_vcek_request, select_azure_maa_manual_trust_key, verify_measurement_pack,
+    verify_tls_attestation, AkBinding, AzureMaaTrustKey, CheckResult, EvidenceSummary,
+    MeasurementPolicy, TdxDcapCollateral, TlsAttestationResponse, TrustAnchors, VerificationCheck,
+    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -18,13 +19,11 @@ use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use atakit_image::encode_image_ref_path_segment;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use dcap_qvl::config::PckCa;
-use dcap_qvl::quote::Quote;
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
-use sha3::Keccak256;
 
 use crate::error::CloudError;
+use crate::tdx_dcap::{fetch_automata_collateral, fetch_http_collateral, AutomataPccsOverrides};
 
 pub const INIT_SCHEMA_VERSION: u32 = 2;
 pub const PORTAL_READINESS_TIMEOUT_SECONDS: u64 = 300;
@@ -44,30 +43,10 @@ pub fn initialization_timeout_seconds(
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
-const DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO: &str = "0xb6d715f2f630314cDC1EdE1a550F14822c38b245";
-const DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO: &str = "0x399c1927C72A3913B10f399D383ae4Ff1083aC24";
-const DEFAULT_TDX_DCAP_AUTOMATA_TCB_EVAL_DAO: &str = "0x7a675f882ba46a4F2ae95DFc9f07cBD16AF1fd9B";
-const DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL: &[(u64, &str)] = &[
-    (17, "0x3A1fDF33420026d145C59bC6b3129bA81E9bF68e"),
-    (18, "0xc6f31a3c102d7c2C43a9972BA8B1409278D41fF5"),
-    (19, "0x74A0b849030BC8afaAfFf8F46126E3c13E365C7b"),
-    (20, "0x34cE5cfD6472c5759cC9451ed2Cb13A0b2c8d1f3"),
-    (21, "0xf5536eB1Aa53CF9e1cfA11498749f151278D04bf"),
-];
-const DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL: &[(u64, &str)] = &[
-    (17, "0xE6fE85B78cb82e3b9C8AE57d754C86fe6774aF64"),
-    (18, "0x07ea7bD47684A331e012CFb9a797dF48C8Cb7DA7"),
-    (19, "0x299c1ae8101aF3d3483793dAfFe8ea9E098D7E17"),
-    (20, "0x63191CE92eA7d42998B2EDC5573a948b3c441Ae7"),
-    (21, "0x1649dd096557f5d2c317127F81F31Df98c43D6D4"),
-];
-const DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION: u64 = 3;
-const DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION: u64 = 4;
-const AUTOMATA_PCS_CA_ROOT: u64 = 0;
-const AUTOMATA_PCS_CA_PROCESSOR: u64 = 1;
-const AUTOMATA_PCS_CA_PLATFORM: u64 = 2;
-const AUTOMATA_TCB_ID_TDX: u64 = 1;
-const AUTOMATA_ENCLAVE_ID_TD_QE: u64 = 2;
+const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_PORTAL_STATUS_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_AMD_COLLATERAL_BYTES: usize = 1024 * 1024;
 
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
@@ -106,9 +85,9 @@ pub enum TdxDcapCollateralSource {
     /// on-chain PCCS for GCP TDX.
     #[default]
     None,
-    /// Load a `dcap_qvl::QuoteCollateralV3` JSON document from disk.
+    /// Load a `TdxDcapCollateral` JSON document from disk.
     File(PathBuf),
-    /// Fetch `QuoteCollateralV3` from a direct HTTP PCCS/PCS endpoint.
+    /// Fetch `TdxDcapCollateral` from a direct HTTP PCCS/PCS endpoint.
     HttpPccs { url: String },
     /// Read collateral through Automata's on-chain PCCS contracts.
     ///
@@ -121,7 +100,21 @@ pub enum TdxDcapCollateralSource {
         pck_dao: Option<String>,
         fmspc_tcb_dao: Option<String>,
         enclave_identity_dao: Option<String>,
+        read_strategy: TdxDcapAutomataReadStrategy,
     },
+}
+
+/// Selects how Automata on-chain PCCS contract reads are grouped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TdxDcapAutomataReadStrategy {
+    /// Send independent `eth_call` requests concurrently.
+    #[default]
+    DirectConcurrent,
+    /// Send the group through Multicall3.
+    ///
+    /// `None` uses Alloy's standard Multicall3 address. A failed batch falls
+    /// back to direct concurrent calls in `pccs-reader-rs`.
+    Multicall3 { address: Option<String> },
 }
 
 /// Verifier-side source for Azure MAA signing keys.
@@ -155,9 +148,33 @@ pub fn tdx_dcap_collateral_config(
     automata_collateral_rpc_url: Option<String>,
     automata_pcs_dao: Option<String>,
 ) -> Result<TdxDcapCollateralConfig, CloudError> {
+    tdx_dcap_collateral_config_with_read_strategy(
+        collateral_file,
+        pccs_url,
+        automata_collateral_rpc_url,
+        automata_pcs_dao,
+        TdxDcapAutomataReadStrategy::DirectConcurrent,
+    )
+}
+
+/// Build a verifier-side TDX DCAP collateral config with an explicit Automata
+/// on-chain read strategy.
+pub fn tdx_dcap_collateral_config_with_read_strategy(
+    collateral_file: Option<PathBuf>,
+    pccs_url: Option<String>,
+    automata_collateral_rpc_url: Option<String>,
+    automata_pcs_dao: Option<String>,
+    automata_read_strategy: TdxDcapAutomataReadStrategy,
+) -> Result<TdxDcapCollateralConfig, CloudError> {
+    let non_default_automata_strategy =
+        automata_read_strategy != TdxDcapAutomataReadStrategy::DirectConcurrent;
     let selected = usize::from(collateral_file.is_some())
         + usize::from(pccs_url.is_some())
-        + usize::from(automata_collateral_rpc_url.is_some() || automata_pcs_dao.is_some());
+        + usize::from(
+            automata_collateral_rpc_url.is_some()
+                || automata_pcs_dao.is_some()
+                || non_default_automata_strategy,
+        );
     if selected > 1 {
         return Err(CloudError::Config {
             message: "choose only one TDX DCAP collateral source: --tdx-dcap-collateral, --tdx-dcap-pccs-url, or --tdx-dcap-automata-*".to_string(),
@@ -175,18 +192,45 @@ pub fn tdx_dcap_collateral_config(
             pck_dao: None,
             fmspc_tcb_dao: None,
             enclave_identity_dao: None,
+            read_strategy: automata_read_strategy,
         }
     } else {
         TdxDcapCollateralSource::AutomataOnchainPccs {
             chain: Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN.to_string()),
             rpc_url: Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL.to_string()),
-            pcs_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO.to_string()),
-            pck_dao: Some(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO.to_string()),
+            pcs_dao: None,
+            pck_dao: None,
             fmspc_tcb_dao: None,
             enclave_identity_dao: None,
+            read_strategy: automata_read_strategy,
         }
     };
     Ok(TdxDcapCollateralConfig { source })
+}
+
+/// Parse the CLI values for the Automata on-chain read strategy.
+pub fn tdx_dcap_automata_read_strategy(
+    strategy: &str,
+    multicall3_address: Option<String>,
+) -> Result<TdxDcapAutomataReadStrategy, CloudError> {
+    match strategy {
+        "direct-concurrent" if multicall3_address.is_none() => {
+            Ok(TdxDcapAutomataReadStrategy::DirectConcurrent)
+        }
+        "direct-concurrent" => Err(CloudError::Config {
+            message:
+                "--tdx-dcap-automata-multicall3-address requires --tdx-dcap-automata-read-strategy multicall3"
+                    .to_string(),
+        }),
+        "multicall3" => Ok(TdxDcapAutomataReadStrategy::Multicall3 {
+            address: multicall3_address,
+        }),
+        value => Err(CloudError::Config {
+            message: format!(
+                "invalid --tdx-dcap-automata-read-strategy {value}; expected direct-concurrent or multicall3"
+            ),
+        }),
+    }
 }
 
 /// Build verifier-side Automata on-chain trust config from the available chain
@@ -581,11 +625,13 @@ pub fn load_tls_trust_anchors(
     gcp_ak_root_certs: &[String],
     azure_maa_keys: &[String],
     amd_ark_root_certs: &[String],
+    amd_snp_crls: &[String],
 ) -> Result<TrustAnchors, CloudError> {
     Ok(TrustAnchors {
         gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
         azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
         amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+        amd_snp_crls: parse_hex_blobs(amd_snp_crls, "--amd-snp-crl")?,
         ..TrustAnchors::default()
     })
 }
@@ -600,6 +646,40 @@ fn parse_hex_blobs(values: &[String], flag: &str) -> Result<Vec<Vec<u8>>, CloudE
             })
         })
         .collect()
+}
+
+async fn read_response_bytes_limited(
+    response: reqwest::Response,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| format!("read {label}: {error}"))?
+    {
+        append_response_chunk_limited(&mut body, &chunk, maximum_bytes, label)?;
+    }
+    Ok(body)
+}
+
+fn append_response_chunk_limited(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<(), String> {
+    let new_length = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| format!("{label} length overflow"))?;
+    if new_length > maximum_bytes {
+        return Err(format!("{label} exceeds the {maximum_bytes}-byte limit"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn measurement_pack_paths(path: &Path) -> (PathBuf, PathBuf) {
@@ -756,7 +836,14 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     let live_peer_cert_der = peer_cert_der(&resp)?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal TLS attestation error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
         let report = endpoint_failure_report(status.as_u16(), &body, &live_hash);
@@ -796,11 +883,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         });
     }
 
-    let mut response = resp.json::<TlsAttestationResponse>().await.map_err(|e| {
-        CloudError::PortalTlsAttestationFailed {
-            message: format!("invalid response JSON: {e}"),
-        }
-    })?;
+    let response_body = read_response_bytes_limited(
+        resp,
+        MAX_TLS_ATTESTATION_RESPONSE_BYTES,
+        "portal TLS attestation response",
+    )
+    .await
+    .map_err(|message| CloudError::PortalTlsAttestationFailed { message })?;
+    let mut response =
+        serde_json::from_slice::<TlsAttestationResponse>(&response_body).map_err(|e| {
+            CloudError::PortalTlsAttestationFailed {
+                message: format!("invalid response JSON: {e}"),
+            }
+        })?;
     // Manual keys remain available until the committed session evidence is
     // fetched. The key that verifies fresh TLS evidence may differ from the
     // key that signed the retained session MAA JWT.
@@ -863,6 +958,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     } else {
         None
     };
+
+    if let Err(detail) = resolve_amd_snp_crl(&response, &mut trust_anchors).await {
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report =
+            tls_preverification_failure_report(&response, &live_hash, "amd-snp-crl", detail);
+        return handle_tls_attestation_failure(
+            report,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+        );
+    }
 
     if let Err(detail) = resolve_chain_trust_anchors(
         &response,
@@ -945,13 +1053,13 @@ async fn resolve_tdx_dcap_collateral(
                 )
             })?;
             let collateral_value = value.get("gcpTdxDcap").unwrap_or(&value).clone();
-            let _: dcap_qvl::QuoteCollateralV3 = serde_json::from_value(collateral_value.clone())
-                .map_err(|e| {
-                format!(
-                    "parse TDX DCAP collateral file {} as QuoteCollateralV3: {e}",
-                    path.display()
-                )
-            })?;
+            let _: TdxDcapCollateral =
+                serde_json::from_value(collateral_value.clone()).map_err(|e| {
+                    format!(
+                        "parse TDX DCAP collateral file {} as TdxDcapCollateral: {e}",
+                        path.display()
+                    )
+                })?;
             collateral_value
         }
         TdxDcapCollateralSource::HttpPccs { url } => {
@@ -962,13 +1070,10 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for DCAP collateral fetch: {e}"))?;
-            let client = dcap_qvl::collateral::CollateralClient::with_default_http(url.clone())
-                .map_err(|e| format!("build DCAP collateral client for {url}: {e:#}"))?;
             serde_json::to_value(
-                client
-                    .fetch(&quote)
+                fetch_http_collateral(url, &quote)
                     .await
-                    .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e:#}"))?,
+                    .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?,
             )
             .map_err(|e| format!("serialize TDX DCAP collateral from {url}: {e}"))?
         }
@@ -979,6 +1084,7 @@ async fn resolve_tdx_dcap_collateral(
             pck_dao,
             fmspc_tcb_dao,
             enclave_identity_dao,
+            read_strategy,
         } => {
             let chain = chain.as_deref().unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN);
             let rpc_url = rpc_url
@@ -991,18 +1097,28 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
-            let daos = resolve_automata_pccs_daos(
-                rpc_url,
-                pcs_dao.as_deref(),
-                pck_dao.as_deref(),
-                fmspc_tcb_dao.as_deref(),
-                enclave_identity_dao.as_deref(),
+            let collateral = tokio::time::timeout(
+                Duration::from_secs(180),
+                fetch_automata_collateral(
+                    rpc_url,
+                    chain,
+                    AutomataPccsOverrides {
+                        pcs_dao: pcs_dao.as_deref(),
+                        pck_dao: pck_dao.as_deref(),
+                        fmspc_tcb_dao: fmspc_tcb_dao.as_deref(),
+                        enclave_identity_dao: enclave_identity_dao.as_deref(),
+                    },
+                    read_strategy,
+                    &quote,
+                ),
             )
             .await
-            .map_err(|e| format!("resolve Automata {chain} PCCS DAO set: {e}"))?;
-            let collateral = automata_dcap_quote_collateral(rpc_url, daos, &quote)
-                .await
-                .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
+            .map_err(|_| {
+                format!(
+                    "fetch GCP TDX DCAP collateral from Automata {chain}: timed out after 180 seconds"
+                )
+            })?
+            .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
             serde_json::to_value(collateral)
                 .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
         }
@@ -1056,14 +1172,14 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
         .decode(&evidence.report)
         .map_err(|error| format!("decode Azure SNP report: {error}"))?;
     let request = amd_snp_vcek_request(&report)?;
-    let product = amd_kds_product(request.cpuid_family, request.cpuid_model)?;
+    let product = amd_snp_kds_product(&report)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("build AMD KDS client: {error}"))?;
     let chip_id = hex::encode(request.chip_id);
     let vcek_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/{chip_id}");
-    let vcek = client
+    let vcek_response = client
         .get(&vcek_url)
         .query(&[
             ("blSPL", request.bootloader),
@@ -1075,22 +1191,27 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
         .await
         .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
-        .bytes()
-        .await
-        .map_err(|error| format!("read AMD {product} VCEK: {error}"))?
-        .to_vec();
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?;
+    let vcek = read_response_bytes_limited(
+        vcek_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} VCEK"),
+    )
+    .await?;
     let chain_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/cert_chain");
-    let chain = client
+    let chain_response = client
         .get(&chain_url)
         .send()
         .await
         .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
-        .bytes()
-        .await
-        .map_err(|error| format!("read AMD {product} certificate chain: {error}"))?;
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?;
+    let chain = read_response_bytes_limited(
+        chain_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} certificate chain"),
+    )
+    .await?;
     let certs = parse_pem_certificates(&chain)?;
     let [ask, ark] = certs.as_slice() else {
         return Err(format!(
@@ -1101,14 +1222,43 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
     amd_snp_vcek_cert_table(ark, ask, &vcek)
 }
 
-fn amd_kds_product(family: u8, model: u8) -> Result<&'static str, String> {
-    match (family, model) {
-        (0x19, 0x00..=0x0f) => Ok("Milan"),
-        (0x19, 0x10..=0x1f) => Ok("Genoa"),
-        _ => Err(format!(
-            "unsupported AMD SNP CPUID family 0x{family:02x}, model 0x{model:02x} for KDS lookup"
-        )),
+async fn resolve_amd_snp_crl(
+    response: &TlsAttestationResponse,
+    trust_anchors: &mut TrustAnchors,
+) -> Result<(), String> {
+    if !response.platform.tee.eq_ignore_ascii_case("sev-snp")
+        || !trust_anchors.amd_snp_crls.is_empty()
+    {
+        return Ok(());
     }
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
+    let report = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|error| format!("decode SNP report for AMD CRL lookup: {error}"))?;
+    let product = amd_snp_kds_product(&report)?;
+    let url = format!("https://kdsintf.amd.com/vcek/v1/{product}/crl");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build AMD KDS client: {error}"))?;
+    let crl_response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?;
+    let crl = read_response_bytes_limited(
+        crl_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} certificate revocation list"),
+    )
+    .await?;
+    trust_anchors.amd_snp_crls.push(crl);
+    Ok(())
 }
 
 fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -1221,48 +1371,6 @@ async fn session_attestation_client(
 struct AzureMaaJwtInfo {
     kid: String,
     issuer: String,
-}
-
-async fn eth_call_bytes(
-    rpc_url: &str,
-    contract: &str,
-    calldata: &[u8],
-    label: &str,
-) -> Result<Vec<u8>, String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [
-            {
-                "to": contract,
-                "data": format!("0x{}", hex::encode(calldata)),
-                "value": "0x0"
-            },
-            "latest"
-        ]
-    });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("build {label} RPC client: {e}"))?;
-    let response: serde_json::Value = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("call {label} at {rpc_url}: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("decode {label} RPC response from {rpc_url}: {e}"))?;
-    if let Some(error) = response.get("error") {
-        return Err(format!("{label} RPC error from {rpc_url}: {error}"));
-    }
-    let result = response
-        .get("result")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| format!("{label} RPC response missing result: {response}"))?;
-    decode_hex_result(result, label)
 }
 
 fn extract_azure_maa_jwt_info(
@@ -1405,423 +1513,11 @@ fn extract_snp_ark_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, St
     Err("GCP SNP auxiliary cert table is missing ARK certificate".to_string())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AutomataPccsDaos {
-    pcs_dao: String,
-    pck_dao: String,
-    fmspc_tcb_dao: String,
-    enclave_identity_dao: String,
-}
-
-async fn resolve_automata_pccs_daos(
-    rpc_url: &str,
-    pcs_dao: Option<&str>,
-    pck_dao: Option<&str>,
-    fmspc_tcb_dao: Option<&str>,
-    enclave_identity_dao: Option<&str>,
-) -> Result<AutomataPccsDaos, String> {
-    let standard_tcb_eval = if fmspc_tcb_dao.is_none() || enclave_identity_dao.is_none() {
-        Some(
-            automata_get_standard_tcb_eval(
-                rpc_url,
-                DEFAULT_TDX_DCAP_AUTOMATA_TCB_EVAL_DAO,
-                AUTOMATA_TCB_ID_TDX,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    let fmspc_tcb_dao = match fmspc_tcb_dao {
-        Some(value) => value.to_string(),
-        None => {
-            let tcb_eval = standard_tcb_eval.expect("standard TCB eval resolved above");
-            automata_default_dao_for_eval(
-                DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL,
-                tcb_eval,
-                "FMSPC TCB",
-            )?
-            .to_string()
-        }
-    };
-    let enclave_identity_dao = match enclave_identity_dao {
-        Some(value) => value.to_string(),
-        None => {
-            let tcb_eval = standard_tcb_eval.expect("standard TCB eval resolved above");
-            automata_default_dao_for_eval(
-                DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL,
-                tcb_eval,
-                "enclave identity",
-            )?
-            .to_string()
-        }
-    };
-
-    Ok(AutomataPccsDaos {
-        pcs_dao: pcs_dao
-            .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO)
-            .to_string(),
-        pck_dao: pck_dao
-            .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO)
-            .to_string(),
-        fmspc_tcb_dao,
-        enclave_identity_dao,
-    })
-}
-
-fn automata_default_dao_for_eval<'a>(
-    daos: &'a [(u64, &'a str)],
-    tcb_eval: u64,
-    label: &str,
-) -> Result<&'a str, String> {
-    daos.iter()
-        .find_map(|(eval, addr)| (*eval == tcb_eval).then_some(*addr))
-        .ok_or_else(|| {
-            format!(
-                "no default Automata {label} DAO for standard TDX TCB evaluation number {tcb_eval}"
-            )
-        })
-}
-
-async fn automata_dcap_quote_collateral(
-    rpc_url: &str,
-    daos: AutomataPccsDaos,
-    quote: &[u8],
-) -> Result<dcap_qvl::QuoteCollateralV3, String> {
-    let parsed = Quote::parse(quote).map_err(|e| format!("parse TDX quote: {e:#}"))?;
-    let quote_pck_chain = dcap_qvl::intel::extract_cert_chain(&parsed)
-        .map_err(|e| format!("extract PCK certificate chain from quote: {e:#}"))?;
-    let pck_ca = dcap_qvl::intel::quote_ca(&parsed)
-        .map_err(|e| format!("determine quote PCK CA type: {e:#}"))?;
-    let pck_ca_id = match pck_ca {
-        PckCa::Processor => AUTOMATA_PCS_CA_PROCESSOR,
-        PckCa::Platform => AUTOMATA_PCS_CA_PLATFORM,
-    };
-    let fmspc =
-        dcap_qvl::intel::quote_fmspc(&parsed).map_err(|e| format!("extract quote FMSPC: {e:#}"))?;
-    let fmspc = hex::encode_upper(fmspc);
-
-    let (root_ca_cert, root_ca_crl) =
-        automata_get_certificate_by_id(rpc_url, &daos.pcs_dao, AUTOMATA_PCS_CA_ROOT).await?;
-    let (pck_ca_cert, pck_crl) =
-        automata_get_certificate_by_id(rpc_url, &daos.pcs_dao, pck_ca_id).await?;
-    let pck_certificate_chain = if quote_pck_chain.len() > 1 {
-        pem_chain_from_der(&quote_pck_chain)?
-    } else {
-        let (intermediate, root) =
-            automata_get_pck_cert_chain(rpc_url, &daos.pck_dao, pck_ca_id).await?;
-        let mut full_chain = quote_pck_chain;
-        full_chain.push(intermediate);
-        full_chain.push(root);
-        pem_chain_from_der(&full_chain)?
-    };
-
-    let (tcb_info, tcb_info_signature) = automata_get_tcb_info(
-        rpc_url,
-        &daos.fmspc_tcb_dao,
-        AUTOMATA_TCB_ID_TDX,
-        &fmspc,
-        DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION,
-    )
-    .await?;
-    if tcb_info.is_empty() || tcb_info_signature.is_empty() {
-        return Err(format!(
-            "Automata FMSPC TCB DAO {} returned empty TDX TCB info for FMSPC {fmspc} version {}",
-            daos.fmspc_tcb_dao, DEFAULT_TDX_DCAP_AUTOMATA_TCB_INFO_VERSION
-        ));
-    }
-    let (tcb_signing_cert, tcb_root_cert) =
-        automata_get_tcb_issuer_chain(rpc_url, &daos.fmspc_tcb_dao).await?;
-    let (qe_identity, qe_identity_signature) = automata_get_enclave_identity(
-        rpc_url,
-        &daos.enclave_identity_dao,
-        AUTOMATA_ENCLAVE_ID_TD_QE,
-        DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION,
-    )
-    .await?;
-    if qe_identity.is_empty() || qe_identity_signature.is_empty() {
-        return Err(format!(
-            "Automata enclave identity DAO {} returned empty TD_QE identity version {}",
-            daos.enclave_identity_dao, DEFAULT_TDX_DCAP_AUTOMATA_TD_QE_IDENTITY_VERSION
-        ));
-    }
-    let (qe_signing_cert, qe_root_cert) =
-        automata_get_enclave_identity_issuer_chain(rpc_url, &daos.enclave_identity_dao).await?;
-
-    Ok(dcap_qvl::QuoteCollateralV3 {
-        pck_crl_issuer_chain: pem_chain_from_der(&[pck_ca_cert, root_ca_cert.clone()])?,
-        root_ca_crl,
-        pck_crl,
-        tcb_info_issuer_chain: pem_chain_from_der(&[tcb_signing_cert, tcb_root_cert])?,
-        tcb_info,
-        tcb_info_signature,
-        qe_identity_issuer_chain: pem_chain_from_der(&[qe_signing_cert, qe_root_cert])?,
-        qe_identity,
-        qe_identity_signature,
-        pck_certificate_chain: Some(pck_certificate_chain),
-    })
-}
-
-fn encode_no_arg_call(signature: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4);
-    out.extend_from_slice(&function_selector(signature));
-    out
-}
-
-fn encode_uint_arg_call(signature: &str, arg: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(36);
-    out.extend_from_slice(&function_selector(signature));
-    out.extend_from_slice(&abi_word_u64(arg));
-    out
-}
-
-fn encode_two_uint_args_call(signature: &str, first: u64, second: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(68);
-    out.extend_from_slice(&function_selector(signature));
-    out.extend_from_slice(&abi_word_u64(first));
-    out.extend_from_slice(&abi_word_u64(second));
-    out
-}
-
-fn encode_get_tcb_info_call(tcb_type: u64, fmspc: &str, version: u64) -> Vec<u8> {
-    let fmspc = fmspc.as_bytes();
-    let mut out = Vec::with_capacity(4 + 96 + 32 + fmspc.len().div_ceil(32) * 32);
-    out.extend_from_slice(&function_selector("getTcbInfo(uint256,string,uint256)"));
-    out.extend_from_slice(&abi_word_u64(tcb_type));
-    out.extend_from_slice(&abi_word_u64(96));
-    out.extend_from_slice(&abi_word_u64(version));
-    out.extend_from_slice(&abi_word_u64(fmspc.len() as u64));
-    out.extend_from_slice(fmspc);
-    let padding = (32 - (fmspc.len() % 32)) % 32;
-    out.resize(out.len() + padding, 0);
-    out
-}
-
-fn function_selector(signature: &str) -> [u8; 4] {
-    let hash = Keccak256::digest(signature.as_bytes());
-    [hash[0], hash[1], hash[2], hash[3]]
-}
-
-async fn automata_get_certificate_by_id(
-    rpc_url: &str,
-    pcs_dao: &str,
-    ca: u64,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let calldata = encode_uint_arg_call("getCertificateById(uint8)", ca);
-    let result = eth_call_bytes(rpc_url, pcs_dao, &calldata, "PcsDao.getCertificateById").await?;
-    decode_two_bytes_return(&result, "PcsDao.getCertificateById")
-}
-
-async fn automata_get_pck_cert_chain(
-    rpc_url: &str,
-    pck_dao: &str,
-    ca: u64,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let calldata = encode_uint_arg_call("getPckCertChain(uint8)", ca);
-    let result = eth_call_bytes(rpc_url, pck_dao, &calldata, "PckDao.getPckCertChain").await?;
-    decode_two_bytes_return(&result, "PckDao.getPckCertChain")
-}
-
-async fn automata_get_standard_tcb_eval(
-    rpc_url: &str,
-    tcb_eval_dao: &str,
-    tcb_id: u64,
-) -> Result<u64, String> {
-    let calldata = encode_uint_arg_call("standard(uint8)", tcb_id);
-    let result = eth_call_bytes(rpc_url, tcb_eval_dao, &calldata, "TcbEvalDao.standard").await?;
-    decode_uint_return(&result, "TcbEvalDao.standard")
-}
-
-async fn automata_get_tcb_info(
-    rpc_url: &str,
-    fmspc_tcb_dao: &str,
-    tcb_type: u64,
-    fmspc: &str,
-    version: u64,
-) -> Result<(String, Vec<u8>), String> {
-    let calldata = encode_get_tcb_info_call(tcb_type, fmspc, version);
-    let result =
-        eth_call_bytes(rpc_url, fmspc_tcb_dao, &calldata, "FmspcTcbDao.getTcbInfo").await?;
-    decode_string_bytes_struct_return(&result, "FmspcTcbDao.getTcbInfo")
-}
-
-async fn automata_get_tcb_issuer_chain(
-    rpc_url: &str,
-    fmspc_tcb_dao: &str,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let calldata = encode_no_arg_call("getTcbIssuerChain()");
-    let result = eth_call_bytes(
-        rpc_url,
-        fmspc_tcb_dao,
-        &calldata,
-        "FmspcTcbDao.getTcbIssuerChain",
-    )
-    .await?;
-    decode_two_bytes_return(&result, "FmspcTcbDao.getTcbIssuerChain")
-}
-
-async fn automata_get_enclave_identity(
-    rpc_url: &str,
-    enclave_identity_dao: &str,
-    id: u64,
-    version: u64,
-) -> Result<(String, Vec<u8>), String> {
-    let calldata = encode_two_uint_args_call("getEnclaveIdentity(uint256,uint256)", id, version);
-    let result = eth_call_bytes(
-        rpc_url,
-        enclave_identity_dao,
-        &calldata,
-        "EnclaveIdentityDao.getEnclaveIdentity",
-    )
-    .await?;
-    decode_string_bytes_struct_return(&result, "EnclaveIdentityDao.getEnclaveIdentity")
-}
-
-async fn automata_get_enclave_identity_issuer_chain(
-    rpc_url: &str,
-    enclave_identity_dao: &str,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let calldata = encode_no_arg_call("getEnclaveIdentityIssuerChain()");
-    let result = eth_call_bytes(
-        rpc_url,
-        enclave_identity_dao,
-        &calldata,
-        "EnclaveIdentityDao.getEnclaveIdentityIssuerChain",
-    )
-    .await?;
-    decode_two_bytes_return(&result, "EnclaveIdentityDao.getEnclaveIdentityIssuerChain")
-}
-
-fn decode_two_bytes_return(bytes: &[u8], label: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
-    if bytes.len() < 64 {
-        return Err(format!(
-            "{label} return is too short: got {}, need at least 64",
-            bytes.len()
-        ));
-    }
-    let first_offset = abi_word_usize(&bytes[0..32])?;
-    let second_offset = abi_word_usize(&bytes[32..64])?;
-    Ok((
-        abi_dynamic_bytes(bytes, first_offset, label)?.to_vec(),
-        abi_dynamic_bytes(bytes, second_offset, label)?.to_vec(),
-    ))
-}
-
-fn decode_uint_return(bytes: &[u8], label: &str) -> Result<u64, String> {
-    if bytes.len() < 32 {
-        return Err(format!(
-            "{label} return is too short: got {}, need at least 32",
-            bytes.len()
-        ));
-    }
-    let value = abi_word_usize(&bytes[0..32])?;
-    u64::try_from(value).map_err(|_| format!("{label} return does not fit u64: {value}"))
-}
-
-fn decode_string_bytes_struct_return(
-    bytes: &[u8],
-    label: &str,
-) -> Result<(String, Vec<u8>), String> {
-    if bytes.len() < 32 {
-        return Err(format!(
-            "{label} return is too short: got {}, need at least 32",
-            bytes.len()
-        ));
-    }
-    let tuple_offset = abi_word_usize(&bytes[0..32])?;
-    if tuple_offset + 64 > bytes.len() {
-        return Err(format!(
-            "{label} tuple offset {tuple_offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let tuple = &bytes[tuple_offset..];
-    let string_offset = abi_word_usize(&tuple[0..32])?;
-    let bytes_offset = abi_word_usize(&tuple[32..64])?;
-    let string_start = tuple_offset + string_offset;
-    let bytes_start = tuple_offset + bytes_offset;
-    let raw_string = abi_dynamic_bytes(bytes, string_start, label)?;
-    let string = String::from_utf8(raw_string.to_vec())
-        .map_err(|e| format!("{label} string field is not valid UTF-8: {e}"))?;
-    Ok((
-        string,
-        abi_dynamic_bytes(bytes, bytes_start, label)?.to_vec(),
-    ))
-}
-
-fn abi_dynamic_bytes<'a>(bytes: &'a [u8], offset: usize, label: &str) -> Result<&'a [u8], String> {
-    if offset + 32 > bytes.len() {
-        return Err(format!(
-            "{label} dynamic bytes offset {offset} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    let len = abi_word_usize(&bytes[offset..offset + 32])?;
-    let start = offset + 32;
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| format!("{label} dynamic bytes length overflows usize"))?;
-    if end > bytes.len() {
-        return Err(format!(
-            "{label} dynamic bytes length {len} is out of bounds for {} bytes",
-            bytes.len()
-        ));
-    }
-    Ok(&bytes[start..end])
-}
-
-fn pem_chain_from_der(certs: &[Vec<u8>]) -> Result<String, String> {
-    if certs.is_empty() {
-        return Err("cannot build PEM chain from empty certificate list".to_string());
-    }
-    let mut out = String::new();
-    for cert in certs {
-        out.push_str(&pem_cert_from_der(cert));
-    }
-    Ok(out)
-}
-
-fn pem_cert_from_der(cert: &[u8]) -> String {
-    let b64 = STANDARD.encode(cert);
-    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
-        out.push('\n');
-    }
-    out.push_str("-----END CERTIFICATE-----\n");
-    out
-}
-
-fn decode_hex_result(result: &str, label: &str) -> Result<Vec<u8>, String> {
-    let raw_hex = result.strip_prefix("0x").unwrap_or(result);
-    hex::decode(raw_hex).map_err(|e| format!("decode {label} hex: {e}"))
-}
-
 fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, String> {
     let raw = URL_SAFE_NO_PAD
         .decode(segment)
         .map_err(|e| format!("decode {label}: {e}"))?;
     serde_json::from_slice(&raw).map_err(|e| format!("parse {label} JSON: {e}"))
-}
-
-fn abi_word_u64(value: u64) -> [u8; 32] {
-    let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&value.to_be_bytes());
-    word
-}
-
-fn abi_word_usize(word: &[u8]) -> Result<usize, String> {
-    if word.len() != 32 {
-        return Err("ABI uint word has invalid length".to_string());
-    }
-    if word[..24].iter().any(|byte| *byte != 0) {
-        return Err("ABI uint word is too large for this verifier".to_string());
-    }
-    let mut value = [0u8; 8];
-    value.copy_from_slice(&word[24..32]);
-    usize::try_from(u64::from_be_bytes(value))
-        .map_err(|_| "ABI uint word does not fit in usize".to_string())
 }
 
 fn is_tdx(response: &TlsAttestationResponse) -> bool {
@@ -2140,7 +1836,16 @@ pub async fn wait_for_portal_terminal_with_client(
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
+                match read_response_bytes_limited(
+                    resp,
+                    MAX_PORTAL_STATUS_RESPONSE_BYTES,
+                    "portal status response",
+                )
+                .await
+                .and_then(|body| {
+                    serde_json::from_slice::<serde_json::Value>(&body)
+                        .map_err(|error| format!("parse portal status response: {error}"))
+                }) {
                     Ok(body) => {
                         let state = body
                             .get("state")
@@ -2316,7 +2021,14 @@ pub async fn post_portal_init_with_client(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal init error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         return Err(CloudError::PortalInitFailed {
             message: format!("portal returned {status}: {body}"),
         });
@@ -2339,16 +2051,25 @@ async fn verify_portal_init_schema(
         .map_err(|error| CloudError::PortalInitFailed {
             message: format!("read portal init schema from {url}: {error}"),
         })?;
-    let status = response
+    let response = response
         .error_for_status()
         .map_err(|error| CloudError::PortalInitFailed {
             message: format!("read portal init schema from {url}: {error}"),
-        })?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| CloudError::PortalInitFailed {
-            message: format!("parse portal status from {url}: {error}"),
         })?;
+    let body = read_response_bytes_limited(
+        response,
+        MAX_PORTAL_STATUS_RESPONSE_BYTES,
+        "portal init schema response",
+    )
+    .await
+    .map_err(|message| CloudError::PortalInitFailed {
+        message: format!("read portal init schema from {url}: {message}"),
+    })?;
+    let status = serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
+        CloudError::PortalInitFailed {
+            message: format!("parse portal status from {url}: {error}"),
+        }
+    })?;
     validate_portal_init_schema(&status)
 }
 
@@ -2429,48 +2150,6 @@ mod tests {
     }
 
     #[test]
-    fn automata_pccs_abi_encoding_and_return_decoding() {
-        let calldata = encode_uint_arg_call("getCertificateById(uint8)", 1);
-        assert_eq!(
-            &calldata[0..4],
-            &function_selector("getCertificateById(uint8)")
-        );
-        assert_eq!(&calldata[4..36], &abi_word_u64(1));
-
-        let mut returned = Vec::new();
-        returned.extend_from_slice(&abi_word_u64(64));
-        returned.extend_from_slice(&abi_word_u64(128));
-        returned.extend_from_slice(&abi_word_u64(3));
-        returned.extend_from_slice(&[0x11, 0x22, 0x33]);
-        returned.extend_from_slice(&[0u8; 29]);
-        returned.extend_from_slice(&abi_word_u64(2));
-        returned.extend_from_slice(&[0x44, 0x55]);
-        returned.extend_from_slice(&[0u8; 30]);
-
-        let decoded = decode_two_bytes_return(&returned, "test").expect("decode tuple");
-        assert_eq!(decoded.0, vec![0x11, 0x22, 0x33]);
-        assert_eq!(decoded.1, vec![0x44, 0x55]);
-    }
-
-    #[test]
-    fn automata_pccs_decodes_dynamic_string_bytes_struct() {
-        let mut returned = Vec::new();
-        returned.extend_from_slice(&abi_word_u64(32));
-        returned.extend_from_slice(&abi_word_u64(64));
-        returned.extend_from_slice(&abi_word_u64(128));
-        returned.extend_from_slice(&abi_word_u64(5));
-        returned.extend_from_slice(b"{json");
-        returned.extend_from_slice(&[0u8; 27]);
-        returned.extend_from_slice(&abi_word_u64(3));
-        returned.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
-        returned.extend_from_slice(&[0u8; 29]);
-
-        let decoded = decode_string_bytes_struct_return(&returned, "test").expect("decode struct");
-        assert_eq!(decoded.0, "{json");
-        assert_eq!(decoded.1, vec![0xaa, 0xbb, 0xcc]);
-    }
-
-    #[test]
     fn automata_pccs_default_config_defers_versioned_daos_to_tcb_eval() {
         let cfg = tdx_dcap_collateral_config(None, None, None, None).expect("collateral config");
         match cfg.source {
@@ -2481,47 +2160,43 @@ mod tests {
                 pck_dao,
                 fmspc_tcb_dao,
                 enclave_identity_dao,
+                read_strategy,
             } => {
                 assert_eq!(chain.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN));
                 assert_eq!(rpc_url.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL));
-                assert_eq!(pcs_dao.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_PCS_DAO));
-                assert_eq!(pck_dao.as_deref(), Some(DEFAULT_TDX_DCAP_AUTOMATA_PCK_DAO));
+                assert!(pcs_dao.is_none());
+                assert!(pck_dao.is_none());
                 assert!(fmspc_tcb_dao.is_none());
                 assert!(enclave_identity_dao.is_none());
+                assert_eq!(read_strategy, TdxDcapAutomataReadStrategy::DirectConcurrent);
             }
             other => panic!("expected Automata on-chain PCCS, got {other:?}"),
         }
     }
 
     #[test]
-    fn automata_pccs_eval_19_defaults_to_current_hoodi_versioned_daos() {
+    fn automata_pccs_multicall3_strategy_preserves_an_address_override() {
+        let strategy = tdx_dcap_automata_read_strategy(
+            "multicall3",
+            Some("0x1111111111111111111111111111111111111111".to_string()),
+        )
+        .expect("read strategy");
         assert_eq!(
-            automata_default_dao_for_eval(
-                DEFAULT_TDX_DCAP_AUTOMATA_FMSPC_TCB_DAOS_BY_EVAL,
-                19,
-                "FMSPC TCB",
-            )
-            .expect("fmspc dao"),
-            "0x74A0b849030BC8afaAfFf8F46126E3c13E365C7b",
-        );
-        assert_eq!(
-            automata_default_dao_for_eval(
-                DEFAULT_TDX_DCAP_AUTOMATA_ENCLAVE_IDENTITY_DAOS_BY_EVAL,
-                19,
-                "enclave identity",
-            )
-            .expect("enclave identity dao"),
-            "0x299c1ae8101aF3d3483793dAfFe8ea9E098D7E17",
+            strategy,
+            TdxDcapAutomataReadStrategy::Multicall3 {
+                address: Some("0x1111111111111111111111111111111111111111".to_string())
+            }
         );
     }
 
     #[test]
-    fn automata_pccs_decode_uint_return() {
-        let returned = abi_word_u64(19);
-        assert_eq!(decode_uint_return(&returned, "standard").unwrap(), 19);
-        assert!(decode_uint_return(&returned[..31], "standard")
-            .unwrap_err()
-            .contains("too short"));
+    fn automata_pccs_rejects_multicall3_address_with_direct_reads() {
+        let error = tdx_dcap_automata_read_strategy(
+            "direct-concurrent",
+            Some("0x1111111111111111111111111111111111111111".to_string()),
+        )
+        .expect_err("address requires multicall3");
+        assert!(error.to_string().contains("requires"));
     }
 
     #[test]
@@ -3069,9 +2744,23 @@ mod tests {
 
     #[test]
     fn selects_amd_kds_product_for_supported_cpuid() {
-        assert_eq!(amd_kds_product(0x19, 0x01).unwrap(), "Milan");
-        assert_eq!(amd_kds_product(0x19, 0x11).unwrap(), "Genoa");
-        assert!(amd_kds_product(0x1a, 0x01).is_err());
+        let mut report = vec![0u8; 0x4a0];
+        report[0x188] = 0x19;
+        report[0x189] = 0x01;
+        assert_eq!(amd_snp_kds_product(&report).unwrap(), "Milan");
+        report[0x189] = 0x11;
+        assert_eq!(amd_snp_kds_product(&report).unwrap(), "Genoa");
+        report[0x188] = 0x1a;
+        assert!(amd_snp_kds_product(&report).is_err());
+    }
+
+    #[test]
+    fn response_body_limit_rejects_the_first_excess_byte() {
+        let mut body = Vec::new();
+        append_response_chunk_limited(&mut body, b"1234", 4, "test response").unwrap();
+        let error = append_response_chunk_limited(&mut body, b"5", 4, "test response").unwrap_err();
+        assert_eq!(body, b"1234");
+        assert!(error.contains("4-byte limit"), "{error}");
     }
 
     #[test]

@@ -219,6 +219,7 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
+            amd_snp_crls: context.trust_anchors.amd_snp_crls.clone(),
         },
         ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
             maa_signing_keys: committed_maa_keys,
@@ -232,6 +233,7 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
+            amd_snp_crls: context.trust_anchors.amd_snp_crls.clone(),
             snp_cert_table: context.azure_snp_cert_table.clone().ok_or_else(|| {
                 session_error("verified TLS context has no Azure SNP certificate table")
             })?,

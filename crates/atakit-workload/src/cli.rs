@@ -349,7 +349,11 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_ark_root_cert: Vec<String>,
 
-    /// TDX DCAP QuoteCollateralV3 JSON file for offline GCP TDX TLS verification.
+    /// AMD SEV-SNP certificate revocation list, as hex DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_snp_crl: Vec<String>,
+
+    /// TDX DCAP collateral JSON file for offline GCP TDX TLS verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
 
@@ -364,6 +368,18 @@ pub struct InitArgs {
     /// Automata PCS DAO address override for verifier-side GCP TDX DCAP collateral lookup.
     #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
     pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// Automata PCCS read strategy. Direct concurrent calls are the default.
+    #[arg(
+        long = "tdx-dcap-automata-read-strategy",
+        value_parser = ["direct-concurrent", "multicall3"],
+        default_value = "direct-concurrent"
+    )]
+    pub tdx_dcap_automata_read_strategy: String,
+
+    /// Multicall3 address override for Automata PCCS reads.
+    #[arg(long = "tdx-dcap-automata-multicall3-address", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_multicall3_address: Option<String>,
 
     /// One-shot override: trust only this live TLS certificate SHA-256.
     #[arg(long, value_name = "0xSHA256")]

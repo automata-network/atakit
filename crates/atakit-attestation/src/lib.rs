@@ -1,26 +1,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::signature::{
+    ParsedPublicKey as ParsedRsaPublicKey, RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256,
+    RSA_PSS_2048_8192_SHA384,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256VerifyingKey};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::EncodedPoint;
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
-use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
-use rsa::pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey};
-use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256, Sha384};
 use sha3::Keccak256;
 use signature::Verifier;
 use thiserror::Error;
-use x509_parser::prelude::{FromDer, X509Certificate};
+use x509_parser::parse_x509_crl;
+use x509_parser::prelude::{FromDer, X509Certificate, X509Version};
+use x509_parser::time::ASN1Time;
 
 mod session;
+mod tdx_dcap;
 mod verification_core;
 pub use session::*;
+pub use tdx_dcap::*;
 
 #[derive(Debug, Error)]
 pub enum AttestationError {
@@ -56,10 +60,15 @@ const SNP_REPORT_REPORT_ID_LEN: usize = 32;
 const SNP_REPORT_SIGNATURE_OFFSET: usize = 0x2a0;
 const SNP_REPORT_SIGNED_LEN: usize = 0x2a0;
 const SNP_REPORT_MIN_LEN: usize = 0x4a0;
+const SNP_REPORT_VERSION_OFFSET: usize = 0x00;
+const SNP_REPORT_POLICY_OFFSET: usize = 0x08;
+const SNP_REPORT_VMPL_OFFSET: usize = 0x30;
 const SNP_REPORT_SIG_ALGO_OFFSET: usize = 0x34;
 const SNP_REPORT_KEY_SETTINGS_OFFSET: usize = 0x48;
 const SNP_REPORT_REPORTED_TCB_OFFSET: usize = 0x180;
 const SNP_REPORT_CHIP_ID_OFFSET: usize = 0x1a0;
+const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
+const SNP_POLICY_DEBUG: u64 = 1 << 19;
 const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
 const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
     0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0, 0xae,
@@ -112,6 +121,25 @@ pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequ
         cpuid_family: report[SNP_REPORT_REPORTED_TCB_OFFSET + 8],
         cpuid_model: report[SNP_REPORT_REPORTED_TCB_OFFSET + 9],
     })
+}
+
+/// Return the AMD Key Distribution Service product name for an SNP report.
+pub fn amd_snp_kds_product(report: &[u8]) -> std::result::Result<&'static str, String> {
+    if report.len() < SNP_REPORT_MIN_LEN {
+        return Err(format!(
+            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            report.len()
+        ));
+    }
+    let family = report[SNP_REPORT_REPORTED_TCB_OFFSET + 8];
+    let model = report[SNP_REPORT_REPORTED_TCB_OFFSET + 9];
+    match (family, model) {
+        (0x19, 0x00..=0x0f) => Ok("Milan"),
+        (0x19, 0x10..=0x1f) => Ok("Genoa"),
+        _ => Err(format!(
+            "unsupported AMD SNP CPUID family 0x{family:02x}, model 0x{model:02x} for KDS lookup"
+        )),
+    }
 }
 
 /// Build the standard SNP certificate-table byte layout from DER certificates.
@@ -182,8 +210,6 @@ pub fn select_azure_maa_manual_trust_key(
     if claims.iss.is_empty() {
         return Err("MAA JWT issuer is empty".to_string());
     }
-    let signature = RsaSignature::try_from(signature.as_slice())
-        .map_err(|error| format!("MAA JWT signature is invalid: {error}"))?;
     let mut key_errors = Vec::new();
     for key_bytes in trusted_keys {
         let key = match verification_core::parse_rsa_public_key(key_bytes) {
@@ -193,11 +219,7 @@ pub fn select_azure_maa_manual_trust_key(
                 continue;
             }
         };
-        let verifier = RsaVerifyingKey::<rsa::sha2::Sha256>::new(key);
-        if verifier
-            .verify(signing_input.as_bytes(), &signature)
-            .is_ok()
-        {
+        if key.verify_sig(signing_input.as_bytes(), &signature).is_ok() {
             return Ok(AzureMaaTrustKey {
                 kid,
                 issuer: claims.iss,
@@ -371,6 +393,8 @@ pub struct TrustAnchors {
     pub azure_maa_keys: Vec<Vec<u8>>,
     pub amd_ark_roots: Vec<Vec<u8>>,
     pub amd_ark_root_hashes: Vec<[u8; 32]>,
+    /// AMD-signed DER certificate revocation lists for the trusted ARK roots.
+    pub amd_snp_crls: Vec<Vec<u8>>,
     pub aws_nitro_roots: Vec<Vec<u8>>,
 }
 
@@ -572,6 +596,13 @@ fn parse_es256k_signature(sig: &[u8]) -> Result<K256Signature> {
 
 pub fn verify_tls_attestation(
     inputs: VerificationInputs,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_at(inputs, SystemTime::now())
+}
+
+fn verify_tls_attestation_at(
+    inputs: VerificationInputs,
+    current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
     let mut verified_base_image_id = None;
     let mut verified_platform_profile_id = None;
@@ -939,8 +970,12 @@ pub fn verify_tls_attestation(
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
             &inputs.response.collateral,
-            &inputs.trust_anchors.amd_ark_roots,
-            &inputs.trust_anchors.amd_ark_root_hashes,
+            verification_core::AmdSnpTrust {
+                ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                crls: &inputs.trust_anchors.amd_snp_crls,
+            },
+            current_time,
         );
     }
 
@@ -1510,16 +1545,17 @@ fn pad_left(bytes: &[u8], len: usize) -> Vec<u8> {
 mod tests {
     use super::verification_core::*;
     use super::*;
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::rsa::KeySize;
+    use aws_lc_rs::signature::{
+        KeyPair as AwsLcKeyPair, RsaKeyPair, RsaPublicKeyComponents, RSA_PKCS1_SHA256,
+    };
     use k256::ecdsa::SigningKey as K256SigningKey;
     use p256::ecdsa::SigningKey as P256SigningKey;
+    use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::DecodePrivateKey;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
-    use rsa::pkcs1v15::SigningKey as RsaSigningKey;
-    use rsa::rand_core::OsRng;
-    use rsa::signature::SignatureEncoding;
-    use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
-    use signature::{hazmat::PrehashSigner, Keypair, Signer};
+    use signature::{hazmat::PrehashSigner, Signer};
 
     fn response_for(nonce: [u8; 32], cert: &[u8], cloud: &str) -> TlsAttestationResponse {
         let cert_sha: [u8; 32] = Sha256::digest(cert).into();
@@ -1751,6 +1787,19 @@ mod tests {
         (report, ark, auxblob)
     }
 
+    fn fixture_amd_milan_crl() -> Vec<u8> {
+        let encoded = include_str!("../testdata/fedora-oci-gcp-n2d-standard-4/milan.crl.der.b64")
+            .lines()
+            .collect::<String>();
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("embedded AMD Milan CRL fixture must be valid base64")
+    }
+
+    fn snp_fixture_time() -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(1_784_851_200)
+    }
+
     fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
         let entries = [
             (SNP_CERT_TABLE_ARK_GUID, ark),
@@ -1842,6 +1891,68 @@ mod tests {
             ],
             vec![ca_cert.der().as_ref().to_vec()],
         )
+    }
+
+    #[test]
+    fn rejects_non_ca_certificate_used_as_gcp_ak_issuer() {
+        let mut root_params =
+            CertificateParams::new(Vec::new()).expect("root certificate parameters");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let root_key = KeyPair::generate().expect("root key");
+        let root = root_params
+            .self_signed(&root_key)
+            .expect("root certificate");
+
+        let mut non_ca_params =
+            CertificateParams::new(vec!["not-a-ca.test".into()]).expect("non-CA parameters");
+        non_ca_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let non_ca_key = KeyPair::generate().expect("non-CA key");
+        let non_ca = non_ca_params
+            .signed_by(&non_ca_key, &root, &root_key)
+            .expect("non-CA certificate");
+
+        let mut ak_params =
+            CertificateParams::new(vec!["forged-ak.test".into()]).expect("AK parameters");
+        ak_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let ak_key = KeyPair::generate().expect("AK key");
+        let ak = ak_params
+            .signed_by(&ak_key, &non_ca, &non_ca_key)
+            .expect("certificate signed by non-CA key");
+        let signing_key =
+            P256SigningKey::from_pkcs8_der(&ak_key.serialize_der()).expect("AK PKCS#8");
+        let ak_public = fake_tpmt_public_ecc(signing_key.verifying_key());
+        let chain = vec![
+            ak.der().as_ref().to_vec(),
+            non_ca.der().as_ref().to_vec(),
+            root.der().as_ref().to_vec(),
+        ];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        verify_gcp_ak_cert_chain_der(
+            &mut report,
+            &mut errors,
+            &chain,
+            &ak_public,
+            &[root.der().as_ref().to_vec()],
+            &[],
+        );
+
+        assert!(
+            errors.iter().any(|error| {
+                error.detail.contains("Basic Constraints")
+                    || error.detail.contains("not a certificate authority")
+            }),
+            "{errors:?}"
+        );
     }
 
     fn fake_ak_and_signature(tpm2b_attest: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -1939,19 +2050,18 @@ mod tests {
     }
 
     fn fake_azure_ak_binding_and_signature(tpm2b_attest: &[u8]) -> (AkBinding, Vec<u8>, Vec<u8>) {
-        let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("test RSA key");
-        let signing_key = RsaSigningKey::<rsa::sha2::Sha256>::new(private_key);
-        let public_key = signing_key.verifying_key();
-        let public_key = public_key.as_ref();
-        let signature: RsaSignature =
-            signing_key.sign(tpm2b_attest_body(tpm2b_attest).expect("TPM attest body"));
+        let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test RSA key");
+        let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
+        let signature = sign_rsa_sha256(
+            &signing_key,
+            tpm2b_attest_body(tpm2b_attest).expect("TPM attest body"),
+        );
         let hcl_var_data = serde_json::json!({
             "keys": [{
                 "kid": "HCLAkPub",
                 "kty": "RSA",
-                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
-                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+                "n": URL_SAFE_NO_PAD.encode(public_key.n),
+                "e": URL_SAFE_NO_PAD.encode(public_key.e)
             }]
         });
         let hcl_var_data = serde_json::to_vec(&hcl_var_data).expect("hcl var data JSON");
@@ -1966,21 +2076,18 @@ mod tests {
                 kind: "azure-maa-jwt".to_string(),
                 data: URL_SAFE_NO_PAD.encode(binding),
             },
-            fake_tpmt_signature_rsassa(&signature.to_bytes()),
+            fake_tpmt_signature_rsassa(&signature),
             trusted_maa_key,
         )
     }
 
     fn fake_azure_maa_jwt(hcl_var_data: &[u8], tee: &str) -> (String, Vec<u8>) {
-        let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("test MAA RSA key");
-        let signing_key = RsaSigningKey::<rsa::sha2::Sha256>::new(private_key);
-        let public_key = signing_key.verifying_key();
-        let public_key = public_key.as_ref();
+        let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test MAA RSA key");
+        let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let trusted_key = serde_json::to_vec(&serde_json::json!({
             "kty": "RSA",
-            "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
-            "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+            "n": URL_SAFE_NO_PAD.encode(public_key.n),
+            "e": URL_SAFE_NO_PAD.encode(public_key.e)
         }))
         .expect("trusted MAA key JSON");
 
@@ -2009,14 +2116,24 @@ mod tests {
             .expect("jwt claims"),
         );
         let signing_input = format!("{header}.{claims}");
-        let signature: RsaSignature = signing_key.sign(signing_input.as_bytes());
+        let signature = sign_rsa_sha256(&signing_key, signing_input.as_bytes());
         (
-            format!(
-                "{signing_input}.{}",
-                URL_SAFE_NO_PAD.encode(signature.to_bytes())
-            ),
+            format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature)),
             trusted_key,
         )
+    }
+
+    fn sign_rsa_sha256(signing_key: &RsaKeyPair, message: &[u8]) -> Vec<u8> {
+        let mut signature = vec![0u8; signing_key.public_modulus_len()];
+        signing_key
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                message,
+                &mut signature,
+            )
+            .expect("test RSA signature");
+        signature
     }
 
     fn fake_tpmt_signature_rsassa(signature: &[u8]) -> Vec<u8> {
@@ -2026,6 +2143,18 @@ mod tests {
         out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
         out.extend_from_slice(signature);
         out
+    }
+
+    #[test]
+    fn rsa_verifier_accepts_pkcs1_der_public_key() {
+        let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test RSA key");
+        let message = b"PKCS#1 DER compatibility";
+        let signature = sign_rsa_sha256(&signing_key, message);
+        let public_key =
+            parse_rsa_public_key(signing_key.public_key().as_ref()).expect("PKCS#1 public key");
+        public_key
+            .verify_sig(message, &signature)
+            .expect("PKCS#1 RSA signature");
     }
 
     fn fake_tpm_quote(qualifying_data: &[u8; 32], pcrs: &[(u8, [u8; 32])]) -> Vec<u8> {
@@ -2191,18 +2320,197 @@ mod tests {
     #[test]
     fn verifies_gcp_snp_vendor_report_fixture() {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let crl = fixture_amd_milan_crl();
 
-        verify_snp_report_with_aux_certs(&report, &auxblob, &[ark.to_vec()], &[])
-            .expect("GCP SEV-SNP fixture report should verify under fixture ARK");
+        verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark.to_vec()],
+            &[],
+            &[crl],
+        )
+        .expect("GCP SEV-SNP fixture report should verify under fixture ARK");
     }
 
     #[test]
     fn verifies_gcp_snp_vendor_report_fixture_with_ark_hash() {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
         let ark_hash: [u8; 32] = Sha256::digest(&ark).into();
+        let crl = fixture_amd_milan_crl();
 
-        verify_snp_report_with_aux_certs(&report, &auxblob, &[], &[ark_hash])
-            .expect("GCP SEV-SNP fixture report should verify under fixture ARK hash");
+        verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[],
+            &[ark_hash],
+            &[crl],
+        )
+        .expect("GCP SEV-SNP fixture report should verify under fixture ARK hash");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_that_permits_debugging() {
+        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let mut policy = u64::from_le_bytes(
+            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        policy |= SNP_POLICY_DEBUG;
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(error.contains("debugging"), "{error}");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_that_permits_migration_agent() {
+        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let mut policy = u64::from_le_bytes(
+            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        policy |= SNP_POLICY_MIGRATE_MA;
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(error.contains("migration agent"), "{error}");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_from_nonzero_vmpl() {
+        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        report[SNP_REPORT_VMPL_OFFSET..SNP_REPORT_VMPL_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(error.contains("VMPL"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unsupported_gcp_snp_report_version() {
+        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&6u32.to_le_bytes());
+
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("unsupported SNP report version 6"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_without_amd_crl() {
+        let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("revocation list"), "{error}");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_with_stale_amd_crl() {
+        let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let after_crl_expiry = UNIX_EPOCH + std::time::Duration::from_secs(1_786_233_600);
+        let error = verify_snp_report_with_aux_certs(
+            after_crl_expiry,
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(error.contains("CRL is stale"), "{error}");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_with_tampered_amd_crl() {
+        let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let mut crl = fixture_amd_milan_crl();
+        *crl.last_mut().unwrap() ^= 1;
+        let error = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[crl],
+        )
+        .unwrap_err();
+        assert!(error.contains("CRL signature"), "{error}");
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_with_expired_vek_certificate() {
+        let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
+        let after_vek_expiry = UNIX_EPOCH + std::time::Duration::from_secs(2_050_000_000);
+        let error = verify_snp_report_with_aux_certs(
+            after_vek_expiry,
+            &report,
+            &auxblob,
+            &[ark],
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("SNP VEK certificate is not valid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn required_snp_vek_extension_cannot_be_absent() {
+        let (_, _, auxblob) = fixture_gcp_snp_report_and_certs();
+        let certs = parse_amd_snp_cert_table(&auxblob).unwrap();
+        let (_, vcek) = X509Certificate::from_der(certs.vcek.as_deref().unwrap()).unwrap();
+        let error = check_snp_tcb_extension(&vcek, "1.2.3.4.5", 0, "test").unwrap_err();
+        assert!(error.contains("missing required test extension"), "{error}");
     }
 
     #[test]
@@ -2212,22 +2520,26 @@ mod tests {
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots, amd_ark) = gcp_snp_response_roots_and_ark(nonce, cert);
 
-        let identity = verify_tls_attestation(VerificationInputs {
-            nonce,
-            live_peer_cert_der: cert.to_vec(),
-            response,
-            measurement_policy: Some(measurement_policy_for_platform(
-                &pcr,
-                "gcp",
-                "sev-snp",
-                "n2d-standard-4",
-            )),
-            trust_anchors: TrustAnchors {
-                gcp_roots,
-                amd_ark_roots: vec![amd_ark],
-                ..TrustAnchors::default()
+        let identity = verify_tls_attestation_at(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response,
+                measurement_policy: Some(measurement_policy_for_platform(
+                    &pcr,
+                    "gcp",
+                    "sev-snp",
+                    "n2d-standard-4",
+                )),
+                trust_anchors: TrustAnchors {
+                    gcp_roots,
+                    amd_ark_roots: vec![amd_ark],
+                    amd_snp_crls: vec![fixture_amd_milan_crl()],
+                    ..TrustAnchors::default()
+                },
             },
-        })
+            snp_fixture_time(),
+        )
         .expect("GCP SEV-SNP TLS attestation should verify with trusted roots");
 
         assert_eq!(identity.cert_der, cert);
@@ -2239,8 +2551,9 @@ mod tests {
     #[test]
     fn rejects_gcp_snp_vendor_report_without_trusted_ark() {
         let (report, _, auxblob) = fixture_gcp_snp_report_and_certs();
-        let err = verify_snp_report_with_aux_certs(&report, &auxblob, &[], &[])
-            .expect_err("missing trusted ARK root must fail closed");
+        let err =
+            verify_snp_report_with_aux_certs(snp_fixture_time(), &report, &auxblob, &[], &[], &[])
+                .expect_err("missing trusted ARK root must fail closed");
 
         assert!(err.contains("trusted AMD ARK roots"), "{err}");
     }
@@ -2250,9 +2563,17 @@ mod tests {
         let (report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
         let mut tampered = report.to_vec();
         tampered[16] ^= 0x01;
+        let crl = fixture_amd_milan_crl();
 
-        let err = verify_snp_report_with_aux_certs(&tampered, &auxblob, &[ark.to_vec()], &[])
-            .expect_err("tampered SNP report must fail signature verification");
+        let err = verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &tampered,
+            &auxblob,
+            &[ark.to_vec()],
+            &[],
+            &[crl],
+        )
+        .expect_err("tampered SNP report must fail signature verification");
 
         assert!(err.contains("signature"), "{err}");
     }
@@ -3009,6 +3330,7 @@ mod tests {
                         certificates: vec![amd_ark],
                         keccak256_hashes: Vec::new(),
                     },
+                    amd_snp_crls: vec![fixture_amd_milan_crl()],
                 },
                 policy: TrustedSessionPolicy {
                     workload_id,
@@ -3022,7 +3344,7 @@ mod tests {
                 binding: None,
             },
         };
-        let verified = crate::session::verify_session_bundle(inputs.clone())
+        let verified = crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
             .expect("complete local-bound GCP SNP evidence must verify");
 
         assert_eq!(verified.session_id, session_id);
@@ -3034,7 +3356,7 @@ mod tests {
 
         let mut replayed = inputs.clone();
         replayed.expected_challenge = [0x56; 32];
-        let failure = crate::session::verify_session_bundle(replayed)
+        let failure = crate::session::verify_session_bundle_at(replayed, snp_fixture_time())
             .expect_err("a binding for an old challenge must not verify");
         assert!(failure
             .errors
@@ -3043,7 +3365,7 @@ mod tests {
 
         let mut mislabeled = inputs.clone();
         mislabeled.bundle["platform"]["attestation_mode"] = serde_json::json!("emulation");
-        let failure = crate::session::verify_session_bundle(mislabeled)
+        let failure = crate::session::verify_session_bundle_at(mislabeled, snp_fixture_time())
             .expect_err("emulation classification must not enter the production verifier");
         assert!(failure
             .errors
@@ -3054,13 +3376,14 @@ mod tests {
         let SessionPlatformTrust::GcpSnp {
             gcp_ak_roots,
             amd_ark_roots,
+            ..
         } = &mut untrusted.trust.platform
         else {
             unreachable!("test selected GCP SNP trust")
         };
         gcp_ak_roots.certificates.clear();
         amd_ark_roots.certificates.clear();
-        let failure = crate::session::verify_session_bundle(untrusted)
+        let failure = crate::session::verify_session_bundle_at(untrusted, snp_fixture_time())
             .expect_err("evidence without caller-supplied trusted roots must fail");
         assert!(failure
             .errors
