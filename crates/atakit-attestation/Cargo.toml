@@ -5,13 +5,15 @@ edition.workspace = true
 
 [dependencies]
 base64.workspace = true
-dcap-qvl.workspace = true
+dcap-rs.workspace = true
 hex.workspace = true
 k256.workspace = true
+pem.workspace = true
 p256.workspace = true
 p384.workspace = true
 rsa.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true

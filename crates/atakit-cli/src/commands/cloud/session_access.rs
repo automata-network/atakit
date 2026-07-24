@@ -182,11 +182,17 @@ pub(crate) async fn resolve_verified_portal_access(
         &verification.amd_ark_root_cert,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let tdx_dcap = init::tdx_dcap_collateral_config(
+    let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+        &verification.tdx_dcap_automata_read_strategy,
+        verification.tdx_dcap_automata_multicall3_address.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tdx_dcap = init::tdx_dcap_collateral_config_with_read_strategy(
         verification.tdx_dcap_collateral.clone(),
         verification.tdx_dcap_pccs_url.clone(),
         verification.tdx_dcap_automata_collateral_rpc_url.clone(),
         verification.tdx_dcap_automata_pcs_dao.clone(),
+        automata_read_strategy,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 

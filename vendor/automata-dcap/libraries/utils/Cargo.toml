@@ -1,0 +1,27 @@
+[package]
+name = "automata-dcap-utils"
+build = false
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+
+[lib]
+name = "automata_dcap_utils"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+dcap-rs = { workspace = true }
+alloy = { workspace = true, default-features = false, features = ["sol-types"] }
+
+# WASM dependencies (optional)
+wasm-bindgen = { version = "0.2.99", optional = true }
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "serde-wasm-bindgen", "getrandom"]

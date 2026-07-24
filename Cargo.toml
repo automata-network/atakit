@@ -11,7 +11,14 @@ members = [
     "crates/atakit-cloud",
     "crates/atakit-cli",
 ]
-exclude = ["vendor/lazy_static"]
+exclude = [
+    "vendor/lazy_static",
+    "vendor/automata-dcap/libraries/bindings",
+    "vendor/automata-dcap/libraries/dcap-rs",
+    "vendor/automata-dcap/libraries/network-registry",
+    "vendor/automata-dcap/libraries/pccs-reader",
+    "vendor/automata-dcap/libraries/utils",
+]
 
 [workspace.package]
 version = "0.5.5"
@@ -22,6 +29,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
@@ -30,7 +38,7 @@ libc = "0.2"
 # Network
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = "0.3"
-dcap-qvl = { version = "0.5.2", default-features = false, features = ["std", "report", "ring", "rustcrypto", "default-x509"] }
+urlencoding = "2"
 
 # Build / archive
 tempfile = "3"
@@ -45,6 +53,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 
 # Blockchain
 alloy-ext = "1.7.4"
+alloy = { version = "1.7.3", default-features = false }
 automata-tee-workload-measurement = "0.1.2"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
@@ -53,7 +62,15 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 signature = "2"
 x509-parser = { version = "0.16", features = ["verify"] }
+x509-cert = "0.2.5"
+pem = "3"
 rcgen = "0.13"
+
+# Vendored from automata-network/automata-dcap-attestation commit
+# bd3b13408640aa3d645f726a9f5f2f3697ce7f20.
+dcap-rs = { path = "vendor/automata-dcap/libraries/dcap-rs" }
+automata-dcap-network-registry = { path = "vendor/automata-dcap/libraries/network-registry" }
+pccs-reader-rs = { path = "vendor/automata-dcap/libraries/pccs-reader" }
 
 # Async
 async-trait = "0.1"

@@ -19,8 +19,10 @@ use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod session;
+mod tdx_dcap;
 mod verification_core;
 pub use session::*;
+pub use tdx_dcap::*;
 
 #[derive(Debug, Error)]
 pub enum AttestationError {

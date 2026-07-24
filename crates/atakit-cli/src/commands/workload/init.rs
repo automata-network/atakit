@@ -211,11 +211,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &args.amd_ark_root_cert,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let tdx_dcap_collateral = init::tdx_dcap_collateral_config(
+        let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+            &args.tdx_dcap_automata_read_strategy,
+            args.tdx_dcap_automata_multicall3_address.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tdx_dcap_collateral = init::tdx_dcap_collateral_config_with_read_strategy(
             args.tdx_dcap_collateral.clone(),
             args.tdx_dcap_pccs_url.clone(),
             args.tdx_dcap_automata_collateral_rpc_url.clone(),
             args.tdx_dcap_automata_pcs_dao.clone(),
+            automata_read_strategy,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let verified_tls = init::bootstrap_portal_tls_with_trust_config(

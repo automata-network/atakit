@@ -535,19 +535,32 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             return;
         }
     };
-    let now_secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(e) => {
+    let mut quote_bytes = raw_quote.as_slice();
+    let quote = match dcap_rs::types::quote::Quote::read(&mut quote_bytes) {
+        Ok(quote) => quote,
+        Err(error) => {
             fail(
                 report,
                 errors,
                 "gcp-tee-vendor-report",
-                format!("system clock is before Unix epoch: {e}"),
+                format!("GCP TDX DCAP quote did not parse: {error:#}"),
             );
             return;
         }
     };
-    match dcap_qvl::verify::QuoteVerifier::new_prod().verify(&raw_quote, &collateral, now_secs) {
+    let collateral = match collateral.to_automata_collateral() {
+        Ok(collateral) => collateral,
+        Err(error) => {
+            fail(report, errors, "gcp-tee-vendor-report", error);
+            return;
+        }
+    };
+    match dcap_rs::verify_dcap_quote_with_policy(
+        SystemTime::now(),
+        collateral,
+        quote,
+        &dcap_rs::DcapVerificationPolicy::production(),
+    ) {
         Ok(_) => pass(report, "gcp-tee-vendor-report"),
         Err(e) => fail(
             report,
@@ -560,7 +573,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
 
 pub(super) fn parse_gcp_tdx_dcap_collateral(
     collateral: &serde_json::Value,
-) -> std::result::Result<dcap_qvl::QuoteCollateralV3, String> {
+) -> std::result::Result<TdxDcapCollateral, String> {
     let value = collateral.get("gcpTdxDcap").unwrap_or(collateral);
     if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
         return Err(
