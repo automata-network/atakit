@@ -981,6 +981,53 @@ fn verify_tls_attestation_at(
             },
             current_time,
         );
+    } else if inputs.response.platform.cloud == "azure" {
+        match (
+            inputs.response.tee_evidence.as_ref(),
+            inputs.response.ak_binding.as_ref(),
+        ) {
+            (Some(evidence), Some(binding)) => {
+                verification_core::verify_azure_tee_ak_binding(
+                    &mut report,
+                    &mut errors,
+                    evidence,
+                    binding,
+                    &inputs.response.platform.tee,
+                );
+                match inputs.response.platform.tee.as_str() {
+                    "tdx" => verification_core::verify_azure_tdx_vendor_report(
+                        &mut report,
+                        &mut errors,
+                        Some(evidence),
+                        &inputs.response.collateral,
+                    ),
+                    "sev-snp" => verification_core::verify_azure_snp_vendor_report(
+                        &mut report,
+                        &mut errors,
+                        Some(evidence),
+                        &inputs.response.collateral,
+                        verification_core::AmdSnpTrust {
+                            ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                            ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                            crls: &inputs.trust_anchors.amd_snp_crls,
+                        },
+                        current_time,
+                    ),
+                    other => fail(
+                        &mut report,
+                        &mut errors,
+                        "azure-tee-vendor-report",
+                        format!("Azure raw TEE vendor verification is unsupported for tee={other}"),
+                    ),
+                }
+            }
+            _ => fail(
+                &mut report,
+                &mut errors,
+                "azure-tee-ak-binding",
+                "Azure TEE evidence or AK binding is missing".to_string(),
+            ),
+        }
     }
 
     match &inputs.response.ak_binding {
@@ -2198,6 +2245,13 @@ mod tests {
     }
 
     fn fake_azure_ak_binding_and_signature(tpm2b_attest: &[u8]) -> (AkBinding, Vec<u8>, Vec<u8>) {
+        fake_azure_ak_binding_and_signature_for_tee(tpm2b_attest, "tdx")
+    }
+
+    fn fake_azure_ak_binding_and_signature_for_tee(
+        tpm2b_attest: &[u8],
+        tee: &str,
+    ) -> (AkBinding, Vec<u8>, Vec<u8>) {
         let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test RSA key");
         let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let signature = sign_rsa_sha256(
@@ -2213,7 +2267,7 @@ mod tests {
             }]
         });
         let hcl_var_data = serde_json::to_vec(&hcl_var_data).expect("hcl var data JSON");
-        let (jwt, trusted_maa_key) = fake_azure_maa_jwt(&hcl_var_data, "tdx");
+        let (jwt, trusted_maa_key) = fake_azure_maa_jwt(&hcl_var_data, tee);
         let binding = serde_json::json!({
             "jwt": jwt,
             "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data)
@@ -2227,6 +2281,43 @@ mod tests {
             fake_tpmt_signature_rsassa(&signature),
             trusted_maa_key,
         )
+    }
+
+    fn bind_azure_tdx_evidence_to_ak_binding(response: &mut TlsAttestationResponse) {
+        let binding = response.ak_binding.as_ref().expect("Azure AK binding");
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        let hcl_var_data = URL_SAFE_NO_PAD
+            .decode(binding_json["hclVarData"].as_str().unwrap())
+            .unwrap();
+        let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
+        let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = gcp_tdx_report_start(&quote).expect("TDX quote body");
+        let report_data_start = report_start + TDX_REPORT_REPORT_DATA_OFFSET;
+        let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
+        quote[report_data_start..report_data_start + 32].copy_from_slice(&hcl_hash);
+        quote[report_data_start + 32..report_data_start + 64].fill(0);
+        evidence.report = URL_SAFE_NO_PAD.encode(quote);
+        evidence.auxiliary = Some(URL_SAFE_NO_PAD.encode(hcl_var_data));
+    }
+
+    fn bind_azure_snp_evidence_to_ak_binding(response: &mut TlsAttestationResponse) {
+        let binding = response.ak_binding.as_ref().expect("Azure AK binding");
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        let hcl_var_data = URL_SAFE_NO_PAD
+            .decode(binding_json["hclVarData"].as_str().unwrap())
+            .unwrap();
+        let mut snp_report = vec![0u8; SNP_REPORT_SIZE];
+        snp_report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&(1u64 << 17).to_le_bytes());
+        let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
+        snp_report[0x50..0x70].copy_from_slice(&hcl_hash);
+        let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
+        evidence.report = URL_SAFE_NO_PAD.encode(snp_report);
+        evidence.auxiliary = Some(URL_SAFE_NO_PAD.encode(hcl_var_data));
     }
 
     fn fake_azure_maa_jwt(hcl_var_data: &[u8], tee: &str) -> (String, Vec<u8>) {
@@ -2496,6 +2587,50 @@ mod tests {
             &[crl],
         )
         .expect("GCP SEV-SNP fixture report should verify under fixture ARK hash");
+    }
+
+    #[test]
+    fn azure_snp_vendor_wrapper_verifies_signature_before_rejecting_report_id_ma() {
+        let (snp_report, ark, cert_table) = fixture_gcp_snp_report_and_certs();
+        verify_snp_report_with_aux_certs(
+            snp_fixture_time(),
+            &snp_report,
+            &cert_table,
+            std::slice::from_ref(&ark),
+            &[],
+            &[fixture_amd_milan_crl()],
+        )
+        .expect("fixture report signature and certificate chain should verify");
+        let evidence = TeeEvidence {
+            kind: "azure-hcl-report".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: Some(URL_SAFE_NO_PAD.encode(b"HCL var_data")),
+        };
+        let collateral = serde_json::json!({
+            "azureSnpCertTable": URL_SAFE_NO_PAD.encode(cert_table)
+        });
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        verify_azure_snp_vendor_report(
+            &mut report,
+            &mut errors,
+            Some(&evidence),
+            &collateral,
+            AmdSnpTrust {
+                ark_roots: &[ark],
+                ark_root_hashes: &[],
+                crls: &[fixture_amd_milan_crl()],
+            },
+            snp_fixture_time(),
+        );
+
+        assert!(errors.iter().any(|error| {
+            error.check == "azure-tee-vendor-report" && error.detail.contains("REPORT_ID_MA")
+        }));
     }
 
     #[test]
@@ -3248,7 +3383,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_azure_hclak_rsa_quote_signature() {
+    fn verifier_authenticates_azure_hclak_before_rejecting_unverified_tdx_report() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let mut response = response_for(nonce, cert, "azure");
@@ -3257,8 +3392,9 @@ mod tests {
         response.tpm.ak_public = String::new();
         response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
         response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
 
-        let result = verify_tls_attestation(VerificationInputs {
+        let failure = verify_tls_attestation(VerificationInputs {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
@@ -3270,9 +3406,274 @@ mod tests {
                 azure_maa_keys: vec![trusted_maa_key],
                 ..TrustAnchors::default()
             },
-        });
+        })
+        .expect_err("Azure TDX report without DCAP collateral must fail");
 
-        assert!(result.is_ok());
+        for check in [
+            "azure-maa-jwt",
+            "tpm-quote-signature",
+            "azure-tee-ak-binding",
+            "azure-tee-var-data-binding",
+        ] {
+            assert_check_passed(&failure, check);
+        }
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-vendor-report"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_tdx_report_not_bound_to_hcl_data() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.tee_evidence.as_mut().unwrap().auxiliary =
+            Some(binding_json["hclVarData"].as_str().unwrap().to_string());
+        response.ak_binding = Some(binding);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure TDX report_data that does not bind HCL var_data must fail");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-var-data-binding"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_tee_auxiliary_different_from_ak_binding() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
+        response.tee_evidence.as_mut().unwrap().auxiliary =
+            Some(URL_SAFE_NO_PAD.encode(b"different HCL var_data"));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure TEE auxiliary data that differs from the MAA binding must fail");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-ak-binding"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_snp_report_without_vendor_certificates() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        response.platform.tee = "sev-snp".to_string();
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) =
+            fake_azure_ak_binding_and_signature_for_tee(&quote, "sev-snp");
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_snp_evidence_to_ak_binding(&mut response);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure SNP report without a certificate table must fail");
+
+        for check in [
+            "azure-maa-jwt",
+            "tpm-quote-signature",
+            "azure-tee-ak-binding",
+            "azure-tee-var-data-binding",
+        ] {
+            assert_check_passed(&failure, check);
+        }
+        assert!(failure.errors.iter().any(|error| {
+            error.check == "azure-tee-vendor-report"
+                && error.detail.contains("certificate table is missing")
+        }));
+    }
+
+    #[test]
+    fn verifier_enforces_azure_tdx_debug_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
+        let evidence = response.tee_evidence.as_mut().expect("Azure TDX evidence");
+        let mut tee_quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = gcp_tdx_report_start(&tee_quote).expect("TDX quote body");
+        tee_quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] |= 1;
+        evidence.report = URL_SAFE_NO_PAD.encode(tee_quote);
+        let check_name = format!(
+            "tee-attribute-base-image-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            measurement_policy: Some(measurement_policy_for_cloud(&pcr, "azure")),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key.clone()],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Azure Intel TDX debug declaration must fail");
+        assert!(failure.errors.iter().any(|error| error.check == check_name));
+
+        let mut policy = measurement_policy_for_cloud(&pcr, "azure");
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": false,
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": true,
+        })];
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic Azure Intel TDX evidence lacks DCAP collateral");
+        assert!(!failure.errors.iter().any(|error| error.check == check_name));
+        assert_check_passed(&failure, &check_name);
+    }
+
+    #[test]
+    fn verifier_enforces_azure_snp_states_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let mut response = response_for(nonce, cert, "azure");
+        response.platform.tee = "sev-snp".to_string();
+        response.platform.machine_type = "n2d-standard-4".to_string();
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) =
+            fake_azure_ak_binding_and_signature_for_tee(&quote, "sev-snp");
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_snp_evidence_to_ak_binding(&mut response);
+        let evidence = response.tee_evidence.as_mut().expect("Azure SNP evidence");
+        let mut snp_report = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8].copy_from_slice(
+            &((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA).to_le_bytes(),
+        );
+        evidence.report = URL_SAFE_NO_PAD.encode(snp_report);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            measurement_policy: Some(measurement_policy_for_platform(
+                &pcr,
+                "azure",
+                "sev-snp",
+                "n2d-standard-4",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key.clone()],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Azure AMD SEV-SNP declarations must fail");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let mut policy =
+            measurement_policy_for_platform(&pcr, "azure", "sev-snp", "n2d-standard-4");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            policy.pack.profiles[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": false}));
+            policy.pack.profiles[0].variants[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": true}));
+        }
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic Azure AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
     }
 
     #[test]

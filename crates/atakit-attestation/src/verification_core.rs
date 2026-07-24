@@ -579,12 +579,46 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     evidence: Option<&TeeEvidence>,
     collateral: &serde_json::Value,
 ) {
+    verify_tdx_vendor_report(
+        report,
+        errors,
+        evidence,
+        collateral,
+        "gcp-tee-vendor-report",
+        "GCP",
+    );
+}
+
+pub(super) fn verify_azure_tdx_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: &serde_json::Value,
+) {
+    verify_tdx_vendor_report(
+        report,
+        errors,
+        evidence,
+        collateral,
+        "azure-tee-vendor-report",
+        "Azure",
+    );
+}
+
+fn verify_tdx_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: &serde_json::Value,
+    check_name: &str,
+    provider_name: &str,
+) {
     let Some(evidence) = evidence else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP TDX TEE evidence is missing".to_string(),
+            check_name,
+            format!("{provider_name} TDX TEE evidence is missing"),
         );
         return;
     };
@@ -594,13 +628,13 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             fail(
                 report,
                 errors,
-                "gcp-tee-vendor-report",
-                "GCP TDX quote is empty".to_string(),
+                check_name,
+                format!("{provider_name} TDX quote is empty"),
             );
             return;
         }
         Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
+            fail(report, errors, check_name, e.to_string());
             return;
         }
     };
@@ -609,15 +643,15 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            format!("GCP TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
+            check_name,
+            format!("{provider_name} TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
         );
         return;
     }
-    let collateral = match parse_gcp_tdx_dcap_collateral(collateral) {
+    let collateral = match parse_tdx_dcap_collateral(collateral) {
         Ok(collateral) => collateral,
         Err(detail) => {
-            fail(report, errors, "gcp-tee-vendor-report", detail);
+            fail(report, errors, check_name, detail);
             return;
         }
     };
@@ -628,8 +662,8 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             fail(
                 report,
                 errors,
-                "gcp-tee-vendor-report",
-                format!("GCP TDX DCAP quote did not parse: {error:#}"),
+                check_name,
+                format!("{provider_name} TDX DCAP quote did not parse: {error:#}"),
             );
             return;
         }
@@ -638,9 +672,9 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             format!(
-                "GCP TDX evidence must contain a TDX quote with version 4 or 5; got tee_type 0x{:x} and version {}",
+                "{provider_name} TDX evidence must contain a TDX quote with version 4 or 5; got tee_type 0x{:x} and version {}",
                 quote.header.tee_type,
                 quote.header.version.get()
             ),
@@ -651,9 +685,9 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             format!(
-                "GCP TDX DCAP quote has {} non-zero trailing bytes",
+                "{provider_name} TDX DCAP quote has {} non-zero trailing bytes",
                 quote_bytes.len()
             ),
         );
@@ -662,7 +696,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     let collateral = match collateral.to_automata_collateral() {
         Ok(collateral) => collateral,
         Err(error) => {
-            fail(report, errors, "gcp-tee-vendor-report", error);
+            fail(report, errors, check_name, error);
             return;
         }
     };
@@ -670,30 +704,28 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         SystemTime::now(),
         collateral,
         quote,
-        &gcp_tdx_dcap_verification_policy(),
+        &tdx_dcap_verification_policy(),
     ) {
-        Ok(output) if output.tcb_status == 0 || output.tcb_status == 1 => {
-            pass(report, "gcp-tee-vendor-report")
-        }
+        Ok(output) if output.tcb_status == 0 || output.tcb_status == 1 => pass(report, check_name),
         Ok(output) => fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             format!(
-                "GCP TDX trusted computing base status {} is not accepted",
+                "{provider_name} TDX trusted computing base status {} is not accepted",
                 output.tcb_status
             ),
         ),
         Err(e) => fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            format!("GCP TDX DCAP quote verification failed: {e:#}"),
+            check_name,
+            format!("{provider_name} TDX DCAP quote verification failed: {e:#}"),
         ),
     }
 }
 
-fn gcp_tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
+fn tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
     let mut policy = dcap_rs::DcapVerificationPolicy::production();
     policy.allow_debug = true;
     policy.with_tdx_tcb_revocation_policy(
@@ -701,17 +733,15 @@ fn gcp_tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
     )
 }
 
-pub(super) fn parse_gcp_tdx_dcap_collateral(
+pub(super) fn parse_tdx_dcap_collateral(
     collateral: &serde_json::Value,
 ) -> std::result::Result<TdxDcapCollateral, String> {
     let value = collateral.get("gcpTdxDcap").unwrap_or(collateral);
     if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
-        return Err(
-            "GCP TDX DCAP collateral is missing; expected collateral.gcpTdxDcap".to_string(),
-        );
+        return Err("TDX DCAP collateral is missing; expected collateral.gcpTdxDcap".to_string());
     }
     serde_json::from_value(value.clone())
-        .map_err(|e| format!("GCP TDX DCAP collateral did not parse: {e}"))
+        .map_err(|e| format!("TDX DCAP collateral did not parse: {e}"))
 }
 
 pub(super) fn verify_gcp_snp_vendor_report(
@@ -723,35 +753,88 @@ pub(super) fn verify_gcp_snp_vendor_report(
     trusted_amd_snp_crls: &[Vec<u8>],
     current_time: SystemTime,
 ) {
+    let auxiliary = evidence.and_then(|evidence| evidence.auxiliary.as_deref());
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        auxiliary,
+        trusted_amd_ark_roots,
+        trusted_amd_ark_root_hashes,
+        trusted_amd_snp_crls,
+        current_time,
+        "gcp-tee-vendor-report",
+        "GCP",
+    );
+}
+
+pub(super) fn verify_azure_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: &serde_json::Value,
+    amd_snp_trust: AmdSnpTrust<'_>,
+    current_time: SystemTime,
+) {
+    let cert_table = collateral
+        .get("azureSnpCertTable")
+        .and_then(serde_json::Value::as_str);
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        cert_table,
+        amd_snp_trust.ark_roots,
+        amd_snp_trust.ark_root_hashes,
+        amd_snp_trust.crls,
+        current_time,
+        "azure-tee-vendor-report",
+        "Azure",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    encoded_cert_table: Option<&str>,
+    trusted_amd_ark_roots: &[Vec<u8>],
+    trusted_amd_ark_root_hashes: &[[u8; 32]],
+    trusted_amd_snp_crls: &[Vec<u8>],
+    current_time: SystemTime,
+    check_name: &str,
+    provider_name: &str,
+) {
     let Some(evidence) = evidence else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP SNP TEE evidence is missing".to_string(),
+            check_name,
+            format!("{provider_name} SNP TEE evidence is missing"),
         );
         return;
     };
     let snp_report = match decode_b64("teeEvidence.report", &evidence.report) {
         Ok(bytes) => bytes,
         Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
+            fail(report, errors, check_name, e.to_string());
             return;
         }
     };
-    let Some(auxiliary) = &evidence.auxiliary else {
+    let Some(encoded_cert_table) = encoded_cert_table else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP SNP auxiliary cert table is missing".to_string(),
+            check_name,
+            format!("{provider_name} SNP certificate table is missing"),
         );
         return;
     };
-    let auxblob = match decode_b64("teeEvidence.auxiliary", auxiliary) {
+    let auxblob = match decode_b64("SNP certificate table", encoded_cert_table) {
         Ok(bytes) => bytes,
         Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
+            fail(report, errors, check_name, e.to_string());
             return;
         }
     };
@@ -759,7 +842,7 @@ pub(super) fn verify_gcp_snp_vendor_report(
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             "no trusted AMD SEV-SNP ARK root certificates or root hashes configured".to_string(),
         );
         return;
@@ -773,10 +856,10 @@ pub(super) fn verify_gcp_snp_vendor_report(
         trusted_amd_snp_crls,
     ) {
         Ok(()) => match verified_snp_attribute_states(&snp_report) {
-            Ok(_) => pass(report, "gcp-tee-vendor-report"),
-            Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
+            Ok(_) => pass(report, check_name),
+            Err(detail) => fail(report, errors, check_name, detail),
         },
-        Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
+        Err(detail) => fail(report, errors, check_name, detail),
     }
 }
 
@@ -1834,6 +1917,57 @@ pub(super) fn verify_azure_tee_var_data_binding(
     );
 }
 
+pub(super) fn verify_azure_tee_ak_binding(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: &TeeEvidence,
+    binding: &AkBinding,
+    tee: &str,
+) {
+    let parsed_binding = match parse_azure_maa_binding(binding) {
+        Ok(binding) => binding,
+        Err(detail) => {
+            fail(report, errors, "azure-tee-ak-binding", detail);
+            return;
+        }
+    };
+    let Some(auxiliary) = evidence.auxiliary.as_deref() else {
+        fail(
+            report,
+            errors,
+            "azure-tee-ak-binding",
+            "Azure TEE evidence is missing HCL var_data".to_string(),
+        );
+        return;
+    };
+    let auxiliary = match decode_b64("teeEvidence.auxiliary", auxiliary) {
+        Ok(auxiliary) => auxiliary,
+        Err(error) => {
+            fail(report, errors, "azure-tee-ak-binding", error.to_string());
+            return;
+        }
+    };
+    let binding_hcl_var_data =
+        match decode_b64("akBinding.hclVarData", &parsed_binding.hcl_var_data) {
+            Ok(hcl_var_data) => hcl_var_data,
+            Err(error) => {
+                fail(report, errors, "azure-tee-ak-binding", error.to_string());
+                return;
+            }
+        };
+    if auxiliary != binding_hcl_var_data {
+        fail(
+            report,
+            errors,
+            "azure-tee-ak-binding",
+            "teeEvidence.auxiliary differs from akBinding HCL var_data".to_string(),
+        );
+        return;
+    }
+    pass(report, "azure-tee-ak-binding");
+    verify_azure_tee_var_data_binding(report, errors, evidence, tee);
+}
+
 pub(super) fn parse_azure_maa_binding(
     binding: &AkBinding,
 ) -> std::result::Result<AzureMaaAkBinding, String> {
@@ -2593,7 +2727,7 @@ mod tests {
     #[test]
     fn gcp_tdx_verification_rejects_revoked_sgx_pce_partial_matches() {
         assert_eq!(
-            gcp_tdx_dcap_verification_policy().tdx_tcb_revocation_policy,
+            tdx_dcap_verification_policy().tdx_tcb_revocation_policy,
             dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch
         );
     }

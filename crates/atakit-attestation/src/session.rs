@@ -775,21 +775,23 @@ fn verify_azure_platform(
     );
     match (snp_trust, dcap_collateral) {
         (Some(snp_trust), None) => {
-            let vendor_evidence = super::TeeEvidence {
-                auxiliary: Some(URL_SAFE_NO_PAD.encode(snp_trust.snp_cert_table)),
-                ..tee_evidence
-            };
-            super::verification_core::verify_gcp_snp_vendor_report(
+            let collateral = serde_json::json!({
+                "azureSnpCertTable": URL_SAFE_NO_PAD.encode(snp_trust.snp_cert_table)
+            });
+            super::verification_core::verify_azure_snp_vendor_report(
                 &mut report,
                 &mut core_errors,
-                Some(&vendor_evidence),
-                &snp_trust.amd_ark_roots.certificates,
-                &snp_trust.amd_ark_roots.keccak256_hashes,
-                snp_trust.amd_snp_crls,
+                Some(&tee_evidence),
+                &collateral,
+                super::verification_core::AmdSnpTrust {
+                    ark_roots: &snp_trust.amd_ark_roots.certificates,
+                    ark_root_hashes: &snp_trust.amd_ark_roots.keccak256_hashes,
+                    crls: snp_trust.amd_snp_crls,
+                },
                 current_time,
             );
         }
-        (None, Some(dcap)) => super::verification_core::verify_gcp_tdx_vendor_report(
+        (None, Some(dcap)) => super::verification_core::verify_azure_tdx_vendor_report(
             &mut report,
             &mut core_errors,
             Some(&tee_evidence),

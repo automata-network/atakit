@@ -907,7 +907,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         let report = tls_preverification_failure_report(
             &response,
             &live_hash,
-            "gcp-tdx-dcap-collateral",
+            "tdx-dcap-collateral",
             detail,
         );
         return handle_tls_attestation_failure(
@@ -958,6 +958,9 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     } else {
         None
     };
+    if let Some(cert_table) = azure_snp_cert_table.as_deref() {
+        attach_azure_snp_cert_table(&mut response, cert_table);
+    }
 
     if let Err(detail) = resolve_amd_snp_crl(&response, &mut trust_anchors).await {
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
@@ -1038,7 +1041,7 @@ async fn resolve_tdx_dcap_collateral(
     response: &mut TlsAttestationResponse,
     config: &TdxDcapCollateralConfig,
 ) -> Result<(), String> {
-    if !is_tdx(response) || has_gcp_tdx_collateral(&response.collateral) {
+    if !is_tdx(response) || has_tdx_dcap_collateral(&response.collateral) {
         return Ok(());
     }
     let collateral = match &config.source {
@@ -1066,7 +1069,7 @@ async fn resolve_tdx_dcap_collateral(
             let evidence = response
                 .tee_evidence
                 .as_ref()
-                .ok_or_else(|| "GCP TDX response is missing teeEvidence".to_string())?;
+                .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for DCAP collateral fetch: {e}"))?;
@@ -1093,7 +1096,7 @@ async fn resolve_tdx_dcap_collateral(
             let evidence = response
                 .tee_evidence
                 .as_ref()
-                .ok_or_else(|| "GCP TDX response is missing teeEvidence".to_string())?;
+                .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
@@ -1115,10 +1118,10 @@ async fn resolve_tdx_dcap_collateral(
             .await
             .map_err(|_| {
                 format!(
-                    "fetch GCP TDX DCAP collateral from Automata {chain}: timed out after 180 seconds"
+                    "fetch TDX DCAP collateral from Automata {chain}: timed out after 180 seconds"
                 )
             })?
-            .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
+            .map_err(|e| format!("fetch TDX DCAP collateral from Automata {chain}: {e}"))?;
             serde_json::to_value(collateral)
                 .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
         }
@@ -1220,6 +1223,15 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
         ));
     };
     amd_snp_vcek_cert_table(ark, ask, &vcek)
+}
+
+fn attach_azure_snp_cert_table(response: &mut TlsAttestationResponse, cert_table: &[u8]) {
+    let mut collateral = response.collateral.as_object().cloned().unwrap_or_default();
+    collateral.insert(
+        "azureSnpCertTable".to_string(),
+        serde_json::Value::String(URL_SAFE_NO_PAD.encode(cert_table)),
+    );
+    response.collateral = serde_json::Value::Object(collateral);
 }
 
 async fn resolve_amd_snp_crl(
@@ -1537,7 +1549,7 @@ fn is_zero_eth_address(value: &str) -> bool {
     raw.len() == 40 && raw.bytes().all(|byte| byte == b'0')
 }
 
-fn has_gcp_tdx_collateral(collateral: &serde_json::Value) -> bool {
+fn has_tdx_dcap_collateral(collateral: &serde_json::Value) -> bool {
     collateral
         .get("gcpTdxDcap")
         .is_some_and(|value| !value.is_null() && !value.as_object().is_some_and(|o| o.is_empty()))
@@ -2287,6 +2299,42 @@ mod tests {
         let info = extract_azure_maa_jwt_info(&response).unwrap();
         assert_eq!(info.kid, "kid-1");
         assert_eq!(info.issuer, "https://issuer.example");
+    }
+
+    #[test]
+    fn azure_snp_cert_table_is_added_to_client_collateral() {
+        let mut response = TlsAttestationResponse {
+            format: 1,
+            nonce: String::new(),
+            tls_cert_der: String::new(),
+            tls_cert_sha256: String::new(),
+            qualifying_data: String::new(),
+            platform: atakit_attestation::PlatformEvidence {
+                cloud: "azure".to_string(),
+                tee: "sev-snp".to_string(),
+                machine_type: String::new(),
+            },
+            tpm: atakit_attestation::TpmEvidence {
+                ak_public: String::new(),
+                quote: String::new(),
+                signature: String::new(),
+                pcrs: vec![],
+                event_log_hashes: vec![],
+            },
+            tee_evidence: None,
+            ak_binding: None,
+            collateral: serde_json::json!({
+                "existing": true
+            }),
+        };
+
+        attach_azure_snp_cert_table(&mut response, b"certificate table");
+
+        assert_eq!(response.collateral["existing"], true);
+        assert_eq!(
+            response.collateral["azureSnpCertTable"],
+            URL_SAFE_NO_PAD.encode(b"certificate table")
+        );
     }
 
     #[test]
