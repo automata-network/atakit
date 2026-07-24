@@ -201,6 +201,7 @@ pub(crate) async fn resolve_verified_portal_access(
         &host,
         status_port,
         measurement_policy,
+        None,
         trust_anchors,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,

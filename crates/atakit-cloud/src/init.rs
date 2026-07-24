@@ -7,9 +7,10 @@ use std::time::Duration;
 use atakit_attestation::{
     amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_vcek_cert_table,
     amd_snp_vcek_request, select_azure_maa_manual_trust_key, verify_measurement_pack,
-    verify_tls_attestation, AkBinding, AzureMaaTrustKey, CheckResult, EvidenceSummary,
-    MeasurementPolicy, TdxDcapCollateral, TlsAttestationResponse, TrustAnchors, VerificationCheck,
-    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    verify_tls_attestation, verify_tls_attestation_with_workload_tee_attributes, AkBinding,
+    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TdxDcapCollateral,
+    TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
+    VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -790,6 +791,7 @@ pub async fn bootstrap_portal_tls(
         host,
         status_port,
         measurement_policy,
+        None,
         trust_anchors,
         AzureMaaTrustConfig::default(),
         tdx_dcap_collateral,
@@ -807,6 +809,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     host: &str,
     status_port: u16,
     measurement_policy: Option<MeasurementPolicy>,
+    workload_tee_attributes: Option<BTreeMap<String, Vec<bool>>>,
     mut trust_anchors: TrustAnchors,
     azure_maa_trust: AzureMaaTrustConfig,
     tdx_dcap_collateral: TdxDcapCollateralConfig,
@@ -1012,13 +1015,20 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 azure_snp_cert_table: azure_snp_cert_table.clone(),
                 tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
             });
-    match verify_tls_attestation(VerificationInputs {
+    let verification_inputs = VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
         response,
         measurement_policy,
         trust_anchors,
-    }) {
+    };
+    let verification = match workload_tee_attributes.as_ref() {
+        Some(attributes) => {
+            verify_tls_attestation_with_workload_tee_attributes(verification_inputs, attributes)
+        }
+        None => verify_tls_attestation(verification_inputs),
+    };
+    match verification {
         Ok(identity) => {
             let client = pinned_client(&identity.cert_der, Duration::from_secs(300))?;
             Ok(VerifiedPortalTls {

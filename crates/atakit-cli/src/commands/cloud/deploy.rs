@@ -214,6 +214,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // 1. Resolve workload source (unless --image-only).
     // `workload_boot_min` carries the raw workload manifest boot-disk-size string
     // (if any); the effective size is resolved later once the target is known.
+    let workload_tee_attributes: BTreeMap<String, Vec<bool>>;
     let (
         archive_path,
         workload_name,
@@ -251,6 +252,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_boot_min = None;
         base_image_mode = String::new();
         base_image_list = Vec::new();
+        workload_tee_attributes = BTreeMap::new();
         unmeasured_tar = None;
         unmeasured_data_paths = Vec::<String>::new();
         // No workload in image-only mode; reject any stray --disk-passphrase.
@@ -281,6 +283,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_boot_min = resolved.boot_disk_size.clone();
         base_image_mode = resolved.base_image_mode;
         base_image_list = resolved.base_image;
+        workload_tee_attributes = resolved.tee_attributes;
         // Collect unmeasured-data files. Explicit root flags take precedence over
         // the default <workload-dir>/unmeasured-data root.
         let unmeasured_root = effective_unmeasured_data_root(
@@ -966,6 +969,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         &ip,
                         status_port,
                         measurement_policy,
+                        Some(workload_tee_attributes.clone()),
                         tls_trust_anchors,
                         init::azure_maa_trust_config_from_init_chain(&init_config.chain),
                         tdx_dcap_collateral,

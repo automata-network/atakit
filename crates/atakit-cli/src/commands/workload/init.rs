@@ -27,6 +27,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let archive_path = resolved.archive_path;
     let workload_name = resolved.name;
     let workload_version = resolved.version;
+    let workload_tee_attributes = resolved.tee_attributes;
 
     // Collect unmeasured-data files. Explicit root flags take precedence over
     // the default <workload-dir>/unmeasured-data root.
@@ -229,6 +230,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &host,
             status_port,
             measurement_policy,
+            Some(workload_tee_attributes),
             tls_trust_anchors,
             init::azure_maa_trust_config_from_init_chain(&init_config.chain),
             tdx_dcap_collateral,

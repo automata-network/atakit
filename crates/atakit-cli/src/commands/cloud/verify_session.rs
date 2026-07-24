@@ -91,6 +91,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &subject.host,
         subject.status_port,
         Some(measurement_policy),
+        None,
         trust_anchors,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,

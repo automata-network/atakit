@@ -604,8 +604,37 @@ pub fn verify_tls_attestation(
     verify_tls_attestation_at(inputs, SystemTime::now())
 }
 
+/// Verifies TLS evidence and applies the selected workload manifest's verified
+/// TEE attribute requirements before returning the trusted TLS identity.
+pub fn verify_tls_attestation_with_workload_tee_attributes(
+    inputs: VerificationInputs,
+    workload_tee_attributes: &BTreeMap<String, Vec<bool>>,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_with_workload_tee_attributes_at(
+        inputs,
+        workload_tee_attributes,
+        SystemTime::now(),
+    )
+}
+
 fn verify_tls_attestation_at(
     inputs: VerificationInputs,
+    current_time: SystemTime,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_internal(inputs, None, current_time)
+}
+
+fn verify_tls_attestation_with_workload_tee_attributes_at(
+    inputs: VerificationInputs,
+    workload_tee_attributes: &BTreeMap<String, Vec<bool>>,
+    current_time: SystemTime,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_internal(inputs, Some(workload_tee_attributes), current_time)
+}
+
+fn verify_tls_attestation_internal(
+    inputs: VerificationInputs,
+    workload_tee_attributes: Option<&BTreeMap<String, Vec<bool>>>,
     current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
     let mut verified_base_image_id = None;
@@ -1237,6 +1266,7 @@ fn verify_tls_attestation_at(
             variant,
             &inputs.response.platform.tee,
             inputs.response.tee_evidence.as_ref(),
+            workload_tee_attributes,
         );
 
         match effective_pcr_specs(profile, variant) {
@@ -1319,6 +1349,7 @@ fn verify_measurement_tee_attributes(
     variant: &MeasurementVariant,
     tee: &str,
     evidence: Option<&TeeEvidence>,
+    workload_tee_attributes: Option<&BTreeMap<String, Vec<bool>>>,
 ) {
     let Some(evidence) = evidence else {
         fail(
@@ -1356,6 +1387,27 @@ fn verify_measurement_tee_attributes(
             return;
         }
     };
+    if let Some(requirements) = workload_tee_attributes {
+        for (name, allowed_values) in requirements {
+            if atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).is_none() {
+                fail(
+                    report,
+                    errors,
+                    "workload-tee-attributes",
+                    format!("unknown workload TEE attribute name {name}"),
+                );
+            } else if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
+                fail(
+                    report,
+                    errors,
+                    "workload-tee-attributes",
+                    format!(
+                        "workload TEE attribute {name} must allow exactly [false] or [false, true]"
+                    ),
+                );
+            }
+        }
+    }
 
     for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL
         .into_iter()
@@ -1378,6 +1430,22 @@ fn verify_measurement_tee_attributes(
                 hex::encode(verified_value)
             ),
         );
+        if let Some(requirements) = workload_tee_attributes {
+            let allowed = requirements
+                .get(attribute.name())
+                .map_or(!enabled, |values| values.contains(&enabled));
+            check(
+                report,
+                errors,
+                &format!("tee-attribute-workload-{}", attribute.name()),
+                allowed,
+                format!(
+                    "workload requirement for {} does not permit verified value {}",
+                    attribute.name(),
+                    enabled
+                ),
+            );
+        }
     }
 }
 
@@ -2934,16 +3002,86 @@ mod tests {
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
             live_peer_cert_der: cert.to_vec(),
-            response,
-            measurement_policy: Some(policy),
+            response: response.clone(),
+            measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
-                gcp_roots,
+                gcp_roots: gcp_roots.clone(),
                 ..TrustAnchors::default()
             },
         })
         .expect_err("fixture still lacks TDX DCAP collateral");
         assert!(!failure.errors.iter().any(|error| error.check == check_name));
         assert_check_passed(&failure, &check_name);
+
+        let workload_check_name = format!(
+            "tee-attribute-workload-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+        let failure = verify_tls_attestation_with_workload_tee_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect_err("missing workload requirement must reject Intel TDX debug");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == workload_check_name));
+
+        let allowed = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
+            vec![false, true],
+        )]);
+        let failure = verify_tls_attestation_with_workload_tee_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &allowed,
+        )
+        .expect_err("fixture still lacks TDX DCAP collateral");
+        assert!(!failure
+            .errors
+            .iter()
+            .any(|error| error.check == workload_check_name));
+        assert_check_passed(&failure, &workload_check_name);
+
+        let malformed = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
+            vec![true],
+        )]);
+        let failure = verify_tls_attestation_with_workload_tee_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response,
+                measurement_policy: Some(policy),
+                trust_anchors: TrustAnchors {
+                    gcp_roots,
+                    ..TrustAnchors::default()
+                },
+            },
+            &malformed,
+        )
+        .expect_err("malformed workload requirement must fail");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "workload-tee-attributes"));
     }
 
     #[test]
@@ -3005,10 +3143,10 @@ mod tests {
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
             live_peer_cert_der: cert.to_vec(),
-            response,
-            measurement_policy: Some(policy),
+            response: response.clone(),
+            measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
-                gcp_roots,
+                gcp_roots: gcp_roots.clone(),
                 ..TrustAnchors::default()
             },
         })
@@ -3018,6 +3156,61 @@ mod tests {
             atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
         ] {
             let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
+
+        let failure = verify_tls_attestation_with_workload_tee_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect_err("missing workload requirements must reject enabled AMD SEV-SNP states");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-workload-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let allowed = BTreeMap::from([
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME.to_string(),
+                vec![false, true],
+            ),
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME.to_string(),
+                vec![false, true],
+            ),
+        ]);
+        let failure = verify_tls_attestation_with_workload_tee_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response,
+                measurement_policy: Some(policy),
+                trust_anchors: TrustAnchors {
+                    gcp_roots,
+                    ..TrustAnchors::default()
+                },
+            },
+            &allowed,
+        )
+        .expect_err("synthetic AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-workload-{name}");
             assert!(!failure.errors.iter().any(|error| error.check == check_name));
             assert_check_passed(&failure, &check_name);
         }
