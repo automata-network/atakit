@@ -1249,6 +1249,7 @@ dependencies = [
 name = "atakit-attestation"
 version = "0.5.5"
 dependencies = [
+ "atakit-core",
  "aws-lc-rs",
  "base64",
  "dcap-rs",
@@ -1275,6 +1276,7 @@ version = "0.5.5"
 dependencies = [
  "alloy-ext",
  "atakit-attestation",
+ "atakit-core",
  "automata-tee-workload-measurement",
  "base64",
  "chrono",

@@ -165,6 +165,8 @@ pub struct WorkloadSection {
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
+    #[serde(default, rename = "tee-attributes")]
+    pub tee_attributes: BTreeMap<String, Vec<bool>>,
     pub image: ImageSource,
     #[serde(default)]
     pub ports: Vec<String>,
@@ -844,6 +846,27 @@ image = "my-app:latest"
         assert_eq!(cfg.workload.name, "my-app");
         assert_eq!(cfg.workload.version, "v0.0.1");
         assert!(matches!(cfg.workload.image, ImageSource::Registry(ref s) if s == "my-app:latest"));
+    }
+
+    #[test]
+    fn parses_tee_attributes() {
+        let toml = r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.tee-attributes]
+"atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false, true]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workload.tee_attributes["atakit.attestation.v1.tee.amd-sev-snp.debug.enabled"],
+            vec![false, true]
+        );
     }
 
     #[test]

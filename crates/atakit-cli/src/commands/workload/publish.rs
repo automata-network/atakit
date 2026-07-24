@@ -126,7 +126,33 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     };
 
     // Build WorkloadSpec using the contract's generated types
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
+    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
+        AttributeRequirement, PcrSpec, WorkloadSpec,
+    };
+
+    let requirements = manifest
+        .config
+        .tee_attributes
+        .iter()
+        .map(|(name, allowed_values)| {
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown config.tee-attributes name `{name}`"))?;
+            if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
+                anyhow::bail!("config.tee-attributes `{name}` must be [false] or [false, true]");
+            }
+            Ok(AttributeRequirement {
+                key: alloy_ext::core::primitives::B256::from(attribute.key()),
+                allowedValues: allowed_values
+                    .iter()
+                    .map(|value| {
+                        alloy_ext::core::primitives::B256::from(
+                            atakit_core::tee_attributes::bool_value(*value),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let spec = WorkloadSpec {
         name: manifest.meta.name.clone(),
@@ -134,7 +160,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         ttl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
         baseImageMode: base_image_mode,
         baseImageIds: base_image_ids,
-        requirements: vec![],
+        requirements,
         pcrs: vec![PcrSpec {
             pcrIndex: 23,
             verifyType: 0, // STATIC
@@ -224,6 +250,34 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
         }
     );
+    if spec.requirements.is_empty() {
+        println!("  {:<20}{}", "TEE Attributes:".dimmed(), "none".dimmed());
+    } else {
+        for (index, requirement) in spec.requirements.iter().enumerate() {
+            let key: [u8; 32] = requirement.key.into();
+            let name = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key)
+                .map(|attribute| attribute.name())
+                .unwrap_or("unknown");
+            let values = requirement
+                .allowedValues
+                .iter()
+                .map(|value| {
+                    if *value == alloy_ext::core::primitives::B256::ZERO {
+                        "false"
+                    } else {
+                        "true"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  {:<20}{} = [{}]",
+                if index == 0 { "TEE Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {

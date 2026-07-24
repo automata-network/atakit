@@ -144,6 +144,23 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if !m.config.base_image.is_empty() {
         print_multi("Base Images:", &m.config.base_image);
     }
+    if m.config.tee_attributes.is_empty() {
+        println!("  {:<18}none", "TEE Attributes:");
+    } else {
+        for (index, (name, values)) in m.config.tee_attributes.iter().enumerate() {
+            let values = values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  {:<18}{} = [{}]",
+                if index == 0 { "TEE Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     // --- Runtime ---

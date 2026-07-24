@@ -1564,6 +1564,7 @@ fn verify_policies(
         bundle.policy.pcr_specs.is_empty() || bundle.policy.pcr_specs == trusted.pcr_specs,
         "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
     );
+    verify_attribute_policy(bundle, trusted, checks, errors);
     if trusted.pcr_specs.is_empty() {
         record(
             checks,
@@ -1612,10 +1613,10 @@ fn verify_policies(
             Err(detail) => record(checks, errors, &name, false, &detail),
         }
     }
-    verify_attribute_policy(trusted, checks, errors);
 }
 
 fn verify_attribute_policy(
+    bundle: &SessionEvidenceBundle,
     trusted: &TrustedSessionPolicy,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
@@ -1653,7 +1654,89 @@ fn verify_attribute_policy(
         requirements_unique,
         "caller-supplied attribute requirements contain duplicate keys",
     );
+
+    let verified_states = verified_tee_attribute_states(bundle);
+    record(
+        checks,
+        errors,
+        "verified-tee-attribute-report-fields",
+        verified_states.is_ok(),
+        &verified_states.as_ref().err().cloned().unwrap_or_default(),
+    );
+    if let Ok(verified_states) = verified_states {
+        for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL
+            .into_iter()
+            .zip(verified_states)
+        {
+            let key = attribute.key();
+            let verified_value = atakit_core::tee_attributes::bool_value(enabled);
+            let declared_value = trusted
+                .effective_attributes
+                .iter()
+                .find(|item| item.key == key)
+                .map(|item| item.value)
+                .unwrap_or(atakit_core::tee_attributes::ATTRIBUTE_FALSE);
+            let declared_is_boolean = declared_value
+                == atakit_core::tee_attributes::ATTRIBUTE_FALSE
+                || declared_value == atakit_core::tee_attributes::ATTRIBUTE_TRUE;
+            let declaration_matches = declared_is_boolean && declared_value == verified_value;
+            let declaration_detail = format!(
+                "base-image declaration for {} is 0x{}, verified value is 0x{}",
+                attribute.name(),
+                hex::encode(declared_value),
+                hex::encode(verified_value)
+            );
+            record(
+                checks,
+                errors,
+                &format!("tee-attribute-base-image-{}", attribute.name()),
+                declaration_matches,
+                if declaration_matches {
+                    ""
+                } else {
+                    &declaration_detail
+                },
+            );
+
+            let requirement = trusted
+                .attribute_requirements
+                .iter()
+                .find(|item| item.key == key);
+            let allowed_values = requirement
+                .map(|item| item.allowed_values.as_slice())
+                .unwrap_or(std::slice::from_ref(
+                    &atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                ));
+            let canonical = allowed_values == [atakit_core::tee_attributes::ATTRIBUTE_FALSE]
+                || allowed_values
+                    == [
+                        atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                        atakit_core::tee_attributes::ATTRIBUTE_TRUE,
+                    ];
+            let requirement_matches = canonical && allowed_values.contains(&verified_value);
+            let requirement_detail = format!(
+                "workload requirement for {} does not permit verified value 0x{}",
+                attribute.name(),
+                hex::encode(verified_value)
+            );
+            record(
+                checks,
+                errors,
+                &format!("tee-attribute-workload-{}", attribute.name()),
+                requirement_matches,
+                if requirement_matches {
+                    ""
+                } else {
+                    &requirement_detail
+                },
+            );
+        }
+    }
+
     for (index, requirement) in trusted.attribute_requirements.iter().enumerate() {
+        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&requirement.key).is_some() {
+            continue;
+        }
         let name = format!("attribute-requirement-{index}");
         let Some(attribute) = trusted
             .effective_attributes
@@ -1686,6 +1769,18 @@ fn verify_attribute_policy(
             ),
         );
     }
+}
+
+fn verified_tee_attribute_states(
+    bundle: &SessionEvidenceBundle,
+) -> std::result::Result<[bool; 3], String> {
+    if bundle.tee_evidence.report.contains('=') {
+        return Err("tee_evidence.report base64url padding is not allowed".into());
+    }
+    let report = URL_SAFE_NO_PAD
+        .decode(&bundle.tee_evidence.report)
+        .map_err(|error| format!("tee_evidence.report did not decode: {error}"))?;
+    super::verification_core::verified_tee_attribute_states(&bundle.platform.tee, &report)
 }
 
 fn verify_policy_id(
@@ -2071,6 +2166,31 @@ mod tests {
         }
     }
 
+    fn tdx_bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {
+        let mut bundle = bundle_for_policy(policy);
+        let mut report = vec![0u8; 584];
+        report[crate::TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
+        bundle.platform.attestation_mode = SessionAttestationMode::Hardware;
+        bundle.platform.tee = "tdx".into();
+        bundle.tee_evidence.kind = "tdx".into();
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+        bundle
+    }
+
+    fn snp_bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {
+        let mut bundle = bundle_for_policy(policy);
+        let mut report = vec![0u8; crate::SNP_REPORT_SIZE];
+        report[crate::SNP_REPORT_VERSION_OFFSET..crate::SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        report[crate::SNP_REPORT_POLICY_OFFSET..crate::SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&(1u64 << 17).to_le_bytes());
+        bundle.platform.attestation_mode = SessionAttestationMode::Hardware;
+        bundle.platform.tee = "sev-snp".into();
+        bundle.tee_evidence.kind = "sev-snp".into();
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+        bundle
+    }
+
     fn replay(events: &[[u8; 32]]) -> [u8; 32] {
         let mut value = [0u8; 32];
         for event in events {
@@ -2244,6 +2364,198 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.starts_with("trusted-effective-attribute-keys:")));
+    }
+
+    #[test]
+    fn verified_tdx_debug_drives_base_image_and_workload_policy() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+        let mut bundle = tdx_bundle_for_policy(policy);
+        let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
+        report[crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+
+        let base_policy = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_specs: Vec::new(),
+            effective_attributes: vec![SessionAttribute {
+                key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
+                value: atakit_core::tee_attributes::ATTRIBUTE_TRUE,
+            }],
+            attribute_requirements: vec![SessionAttributeRequirement {
+                key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
+                allowed_values: vec![
+                    atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                    atakit_core::tee_attributes::ATTRIBUTE_TRUE,
+                ],
+            }],
+        };
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &base_policy, &mut checks, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let missing_base_declaration = TrustedSessionPolicy {
+            effective_attributes: Vec::new(),
+            ..base_policy.clone()
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &missing_base_declaration, &mut checks, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.starts_with("tee-attribute-base-image-atakit.attestation.v1.tee.intel-tdx")
+        }));
+
+        let missing_workload_requirement = TrustedSessionPolicy {
+            attribute_requirements: Vec::new(),
+            ..base_policy
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(
+            &bundle,
+            &missing_workload_requirement,
+            &mut checks,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.starts_with("tee-attribute-workload-atakit.attestation.v1.tee.intel-tdx")
+        }));
+    }
+
+    #[test]
+    fn verified_tee_attribute_policy_matrices_match_session_registry() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+
+        for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL {
+            for actual in [false, true] {
+                for base_mode in 0..3 {
+                    for workload_mode in 0..3 {
+                        let bundle = match attribute {
+                            atakit_core::tee_attributes::VerifiedTeeAttribute::IntelTdxDebug => {
+                                let mut bundle = tdx_bundle_for_policy(policy.clone());
+                                if actual {
+                                    let mut report =
+                                        URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
+                                    report[crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+                                    bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+                                }
+                                bundle
+                            }
+                            atakit_core::tee_attributes::VerifiedTeeAttribute::AmdSevSnpDebug
+                            | atakit_core::tee_attributes::VerifiedTeeAttribute::AmdSevSnpMigrateMa => {
+                                let mut bundle = snp_bundle_for_policy(policy.clone());
+                                if actual {
+                                    let mut report =
+                                        URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
+                                    let bit = match attribute {
+                                        atakit_core::tee_attributes::VerifiedTeeAttribute::AmdSevSnpDebug => 19,
+                                        atakit_core::tee_attributes::VerifiedTeeAttribute::AmdSevSnpMigrateMa => 18,
+                                        _ => unreachable!(),
+                                    };
+                                    let policy = (1u64 << 17) | (1u64 << bit);
+                                    report[crate::SNP_REPORT_POLICY_OFFSET
+                                        ..crate::SNP_REPORT_POLICY_OFFSET + 8]
+                                        .copy_from_slice(&policy.to_le_bytes());
+                                    bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+                                }
+                                bundle
+                            }
+                        };
+
+                        let effective_attributes = if base_mode == 0 {
+                            Vec::new()
+                        } else {
+                            vec![SessionAttribute {
+                                key: attribute.key(),
+                                value: atakit_core::tee_attributes::bool_value(base_mode == 2),
+                            }]
+                        };
+                        let attribute_requirements = match workload_mode {
+                            0 => Vec::new(),
+                            1 => vec![SessionAttributeRequirement {
+                                key: attribute.key(),
+                                allowed_values: vec![atakit_core::tee_attributes::ATTRIBUTE_FALSE],
+                            }],
+                            2 => vec![SessionAttributeRequirement {
+                                key: attribute.key(),
+                                allowed_values: vec![
+                                    atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                                    atakit_core::tee_attributes::ATTRIBUTE_TRUE,
+                                ],
+                            }],
+                            _ => unreachable!(),
+                        };
+                        let trusted = TrustedSessionPolicy {
+                            workload_id: [1; 32],
+                            base_image_id: [2; 32],
+                            platform_profile_id: [3; 32],
+                            measurement_variant_id: [4; 32],
+                            pcr_specs: Vec::new(),
+                            effective_attributes,
+                            attribute_requirements,
+                        };
+
+                        let mut checks = Vec::new();
+                        let mut errors = Vec::new();
+                        verify_attribute_policy(&bundle, &trusted, &mut checks, &mut errors);
+
+                        let base_matches = if actual {
+                            base_mode == 2
+                        } else {
+                            base_mode != 2
+                        };
+                        let workload_permits = !actual || workload_mode == 2;
+                        assert_eq!(
+                            errors.is_empty(),
+                            base_matches && workload_permits,
+                            "{} actual={actual} base_mode={base_mode} workload_mode={workload_mode}: {errors:?}",
+                            attribute.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verified_tee_report_fields_reject_unsupported_migration() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+        let mut bundle = tdx_bundle_for_policy(policy);
+        let mut quote = vec![0u8; crate::TDX_QUOTE_HEADER_LEN + 6 + 648];
+        quote[0..2].copy_from_slice(&5u16.to_le_bytes());
+        quote[4..8].copy_from_slice(&crate::TDX_TEE_TYPE.to_le_bytes());
+        quote[crate::TDX_QUOTE_HEADER_LEN..crate::TDX_QUOTE_HEADER_LEN + 2]
+            .copy_from_slice(&crate::TDX_BODY_TD_REPORT15_TYPE.to_le_bytes());
+        let start = crate::TDX_QUOTE_HEADER_LEN + 6;
+        quote[start + crate::TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
+        quote[start + crate::TDX_REPORT15_MR_SERVICETD_OFFSET] = 1;
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(quote);
+
+        assert!(verified_tee_attribute_states(&bundle)
+            .unwrap_err()
+            .contains("MR_SERVICETD"));
     }
 
     #[test]

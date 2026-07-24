@@ -672,7 +672,18 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         quote,
         &gcp_tdx_dcap_verification_policy(),
     ) {
-        Ok(_) => pass(report, "gcp-tee-vendor-report"),
+        Ok(output) if output.tcb_status == 0 || output.tcb_status == 1 => {
+            pass(report, "gcp-tee-vendor-report")
+        }
+        Ok(output) => fail(
+            report,
+            errors,
+            "gcp-tee-vendor-report",
+            format!(
+                "GCP TDX trusted computing base status {} is not accepted",
+                output.tcb_status
+            ),
+        ),
         Err(e) => fail(
             report,
             errors,
@@ -683,7 +694,9 @@ pub(super) fn verify_gcp_tdx_vendor_report(
 }
 
 fn gcp_tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
-    dcap_rs::DcapVerificationPolicy::production().with_tdx_tcb_revocation_policy(
+    let mut policy = dcap_rs::DcapVerificationPolicy::production();
+    policy.allow_debug = true;
+    policy.with_tdx_tcb_revocation_policy(
         dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,
     )
 }
@@ -759,7 +772,10 @@ pub(super) fn verify_gcp_snp_vendor_report(
         trusted_amd_ark_root_hashes,
         trusted_amd_snp_crls,
     ) {
-        Ok(()) => pass(report, "gcp-tee-vendor-report"),
+        Ok(()) => match verified_snp_attribute_states(&snp_report) {
+            Ok(_) => pass(report, "gcp-tee-vendor-report"),
+            Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
+        },
         Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
     }
 }
@@ -772,9 +788,9 @@ pub(super) fn verify_snp_report_with_aux_certs(
     trusted_amd_ark_root_hashes: &[[u8; 32]],
     trusted_amd_snp_crls: &[Vec<u8>],
 ) -> std::result::Result<(), String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "GCP SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "GCP SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -849,17 +865,11 @@ pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(),
             "unsupported SNP report version {version}; expected a version from 2 through 5"
         ));
     }
-    let policy_bytes = read_exact_at(report, SNP_REPORT_POLICY_OFFSET, 8, "SNP policy")?;
-    let policy = u64::from_le_bytes(
-        policy_bytes
-            .try_into()
-            .expect("SNP policy slice has the checked length"),
-    );
-    if policy & SNP_POLICY_DEBUG != 0 {
-        return Err("SNP report policy permits host debugging".to_string());
-    }
-    if policy & SNP_POLICY_MIGRATE_MA != 0 {
-        return Err("SNP report policy permits association with a migration agent".to_string());
+    let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
+    if policy & (1 << 17) == 0 || policy >> 26 != 0 {
+        return Err(format!(
+            "SNP policy reserved bits are invalid: 0x{policy:016x}"
+        ));
     }
     let vmpl = read_le_u32(report, SNP_REPORT_VMPL_OFFSET, "SNP VMPL")?;
     if vmpl != 0 {
@@ -1390,6 +1400,112 @@ pub(super) fn read_le_u32(
 ) -> std::result::Result<u32, String> {
     let bytes = read_exact_at(data, offset, 4, field)?;
     Ok(u32::from_le_bytes(bytes.try_into().expect("slice length")))
+}
+
+pub(super) fn read_le_u64(
+    data: &[u8],
+    offset: usize,
+    field: &str,
+) -> std::result::Result<u64, String> {
+    let bytes = read_exact_at(data, offset, 8, field)?;
+    Ok(u64::from_le_bytes(bytes.try_into().expect("slice length")))
+}
+
+pub(super) fn verified_snp_attribute_states(
+    report: &[u8],
+) -> std::result::Result<(bool, bool), String> {
+    if report.len() != SNP_REPORT_SIZE {
+        return Err(format!(
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
+            report.len()
+        ));
+    }
+    let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP version")?;
+    if !(2..=5).contains(&version) {
+        return Err(format!("SNP report version {version} is unsupported"));
+    }
+    let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
+    if policy & (1 << 17) == 0 || policy >> 26 != 0 {
+        return Err(format!(
+            "SNP policy reserved bits are invalid: 0x{policy:016x}"
+        ));
+    }
+    let vmpl = read_le_u32(report, SNP_REPORT_VMPL_OFFSET, "SNP VMPL")?;
+    if vmpl != 0 {
+        return Err(format!("SNP VMPL {vmpl} is unsupported; expected 0"));
+    }
+    let report_id_ma = read_exact_at(
+        report,
+        SNP_REPORT_ID_MA_OFFSET,
+        SNP_REPORT_ID_MA_LEN,
+        "SNP report_id_ma",
+    )?;
+    if report_id_ma.iter().any(|byte| *byte != 0) {
+        return Err(
+            "SNP REPORT_ID_MA is nonzero; migration-agent association is unsupported".into(),
+        );
+    }
+    Ok((
+        policy & SNP_POLICY_DEBUG != 0,
+        policy & SNP_POLICY_MIGRATE_MA != 0,
+    ))
+}
+
+pub(super) fn verified_tee_attribute_states(
+    tee: &str,
+    report: &[u8],
+) -> std::result::Result<[bool; 3], String> {
+    match tee {
+        "tdx" => {
+            let report_start = gcp_tdx_report_start(report)?;
+            let attributes = read_exact_at(
+                report,
+                report_start + TDX_REPORT_ATTRIBUTES_OFFSET,
+                8,
+                "TDX TD_ATTRIBUTES",
+            )?;
+            if attributes[0] & !0x01 != 0
+                || attributes[1] != 0
+                || attributes[2] != 0
+                || attributes[3] & 0x2f != 0
+                || attributes[4] != 0
+                || attributes[5] != 0
+                || attributes[6] != 0
+                || attributes[7] & 0x7f != 0
+            {
+                return Err("TDX TD_ATTRIBUTES has reserved bits set".into());
+            }
+            if attributes[3] & 0x10 == 0 {
+                return Err("TDX TD_ATTRIBUTES.SEPT_VE_DISABLE is not set".into());
+            }
+            let version = read_le_u16_opt(report, 0);
+            let body_type = read_le_u16_opt(report, TDX_QUOTE_HEADER_LEN);
+            let td15 = matches!(
+                (version, body_type),
+                (Some(5), Some(TDX_BODY_TD_REPORT15_TYPE))
+            ) || (!matches!(version, Some(4 | 5)) && report.len() >= 648);
+            if td15 {
+                let mr_service_td = read_exact_at(
+                    report,
+                    report_start + TDX_REPORT15_MR_SERVICETD_OFFSET,
+                    48,
+                    "TDX MR_SERVICETD",
+                )?;
+                if mr_service_td.iter().any(|byte| *byte != 0) {
+                    return Err("TDX MR_SERVICETD is nonzero; migration is unsupported".into());
+                }
+            }
+            Ok([attributes[0] & 0x01 != 0, false, false])
+        }
+        "sev-snp" => {
+            let (debug, migrate_ma) = verified_snp_attribute_states(report)?;
+            Ok([false, debug, migrate_ma])
+        }
+        "emulation" | "none" => Ok([false; 3]),
+        other => Err(format!(
+            "verified TEE attribute extraction is unsupported for tee={other}"
+        )),
+    }
 }
 
 pub(super) fn read_exact_at<'a>(

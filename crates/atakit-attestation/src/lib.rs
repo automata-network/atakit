@@ -52,17 +52,21 @@ const TDX_QUOTE_V5_BODY_HEADER_LEN: usize = 6;
 const TDX_TEE_TYPE: u32 = 0x0000_0081;
 const TDX_BODY_TD_REPORT10_TYPE: u16 = 2;
 const TDX_BODY_TD_REPORT15_TYPE: u16 = 3;
+const TDX_REPORT_ATTRIBUTES_OFFSET: usize = 120;
 const TDX_REPORT_RTMR3_OFFSET: usize = 472;
 const TDX_REPORT_REPORT_DATA_OFFSET: usize = 520;
+const TDX_REPORT15_MR_SERVICETD_OFFSET: usize = 600;
 const GCP_TDX_UUID_LEN: usize = 16;
 const SNP_REPORT_REPORT_ID_OFFSET: usize = 0x140;
 const SNP_REPORT_REPORT_ID_LEN: usize = 32;
 const SNP_REPORT_SIGNATURE_OFFSET: usize = 0x2a0;
 const SNP_REPORT_SIGNED_LEN: usize = 0x2a0;
-const SNP_REPORT_MIN_LEN: usize = 0x4a0;
-const SNP_REPORT_VERSION_OFFSET: usize = 0x00;
-const SNP_REPORT_POLICY_OFFSET: usize = 0x08;
+const SNP_REPORT_SIZE: usize = 0x4a0;
+const SNP_REPORT_VERSION_OFFSET: usize = 0;
+const SNP_REPORT_POLICY_OFFSET: usize = 8;
 const SNP_REPORT_VMPL_OFFSET: usize = 0x30;
+const SNP_REPORT_ID_MA_OFFSET: usize = 0x160;
+const SNP_REPORT_ID_MA_LEN: usize = 32;
 const SNP_REPORT_SIG_ALGO_OFFSET: usize = 0x34;
 const SNP_REPORT_KEY_SETTINGS_OFFSET: usize = 0x48;
 const SNP_REPORT_REPORTED_TCB_OFFSET: usize = 0x180;
@@ -97,9 +101,9 @@ pub struct AmdSnpVcekRequest {
 
 /// Parse the VCEK lookup fields from a raw SEV-SNP attestation report.
 pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequest, String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -125,9 +129,9 @@ pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequ
 
 /// Return the AMD Key Distribution Service product name for an SNP report.
 pub fn amd_snp_kds_product(report: &[u8]) -> std::result::Result<&'static str, String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -1179,6 +1183,15 @@ fn verify_tls_attestation_at(
             Err(e) => fail(&mut report, &mut errors, "variant-id", e.to_string()),
         }
 
+        verify_measurement_tee_attributes(
+            &mut report,
+            &mut errors,
+            profile,
+            variant,
+            &inputs.response.platform.tee,
+            inputs.response.tee_evidence.as_ref(),
+        );
+
         match effective_pcr_specs(profile, variant) {
             Ok(pcr_specs) if pcr_specs.is_empty() => fail(
                 &mut report,
@@ -1250,6 +1263,140 @@ fn effective_pcr_specs<'a>(
     }
 
     Ok(specs.into_values().collect())
+}
+
+fn verify_measurement_tee_attributes(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    profile: &MeasurementProfile,
+    variant: &MeasurementVariant,
+    tee: &str,
+    evidence: Option<&TeeEvidence>,
+) {
+    let Some(evidence) = evidence else {
+        fail(
+            report,
+            errors,
+            "measurement-tee-attributes",
+            "TEE evidence is missing".to_string(),
+        );
+        return;
+    };
+    let report_bytes = match decode_b64("teeEvidence.report", &evidence.report) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            fail(
+                report,
+                errors,
+                "measurement-tee-attributes",
+                error.to_string(),
+            );
+            return;
+        }
+    };
+    let verified_states = match verification_core::verified_tee_attribute_states(tee, &report_bytes)
+    {
+        Ok(states) => states,
+        Err(detail) => {
+            fail(report, errors, "measurement-tee-attributes", detail);
+            return;
+        }
+    };
+    let effective_attributes = match effective_measurement_attributes(profile, variant) {
+        Ok(attributes) => attributes,
+        Err(detail) => {
+            fail(report, errors, "measurement-tee-attributes", detail);
+            return;
+        }
+    };
+
+    for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL
+        .into_iter()
+        .zip(verified_states)
+    {
+        let verified_value = atakit_core::tee_attributes::bool_value(enabled);
+        let declared_value = effective_attributes
+            .get(&attribute.key())
+            .copied()
+            .unwrap_or(atakit_core::tee_attributes::ATTRIBUTE_FALSE);
+        check(
+            report,
+            errors,
+            &format!("tee-attribute-base-image-{}", attribute.name()),
+            declared_value == verified_value,
+            format!(
+                "base-image declaration for {} is 0x{}, verified value is 0x{}",
+                attribute.name(),
+                hex::encode(declared_value),
+                hex::encode(verified_value)
+            ),
+        );
+    }
+}
+
+fn effective_measurement_attributes(
+    profile: &MeasurementProfile,
+    variant: &MeasurementVariant,
+) -> std::result::Result<BTreeMap<[u8; 32], [u8; 32]>, String> {
+    let mut attributes = parse_measurement_attributes(&profile.attributes, "profile")?;
+    for (key, value) in parse_measurement_attributes(&variant.attributes, "variant")? {
+        attributes.insert(key, value);
+    }
+    Ok(attributes)
+}
+
+fn parse_measurement_attributes(
+    values: &[serde_json::Value],
+    owner: &str,
+) -> std::result::Result<BTreeMap<[u8; 32], [u8; 32]>, String> {
+    let mut attributes = BTreeMap::new();
+    for value in values {
+        let (key, value) = if let Some(name) = value.get("name").and_then(serde_json::Value::as_str)
+        {
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
+                .ok_or_else(|| format!("{owner} attribute has unknown reserved name {name}"))?;
+            let enabled = value
+                .get("value")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    format!("{owner} readable reserved attribute {name} is missing Boolean value")
+                })?;
+            (
+                attribute.key(),
+                atakit_core::tee_attributes::bool_value(enabled),
+            )
+        } else {
+            let key = value
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{owner} attribute is missing string key"))?;
+            let value = value
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{owner} attribute is missing string value"))?;
+            (
+                decode_hex_32("attribute.key", key).map_err(|error| error.to_string())?,
+                decode_hex_32("attribute.value", value).map_err(|error| error.to_string())?,
+            )
+        };
+        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key).is_some()
+            && value != atakit_core::tee_attributes::ATTRIBUTE_FALSE
+            && value != atakit_core::tee_attributes::ATTRIBUTE_TRUE
+        {
+            return Err(format!(
+                "{owner} reserved attribute 0x{} has invalid Boolean value 0x{}",
+                hex::encode(key),
+                hex::encode(value)
+            ));
+        }
+        if attributes.insert(key, value).is_some() {
+            return Err(format!(
+                "{owner} attributes contain a duplicate key 0x{}",
+                hex::encode(key)
+            ));
+        }
+    }
+    Ok(attributes)
 }
 
 pub fn compute_tls_bootstrap_qualifying_data(
@@ -1745,6 +1892,7 @@ mod tests {
 
     fn fake_gcp_tdx_quote_body(uuid: &[u8; 16]) -> Vec<u8> {
         let mut quote = vec![0u8; TDX_REPORT_REPORT_DATA_OFFSET + 64];
+        quote[TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
         let mut rtmr3_input = Vec::with_capacity(96);
         rtmr3_input.extend_from_slice(&[0u8; 48]);
         rtmr3_input.extend_from_slice(&[0u8; 32]);
@@ -2351,51 +2499,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gcp_snp_report_that_permits_debugging() {
-        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
-        let mut policy = u64::from_le_bytes(
-            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-        policy |= SNP_POLICY_DEBUG;
+    fn vendor_policy_permits_gcp_snp_debug_for_measurement_policy_evaluation() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        let policy = (1u64 << 17) | SNP_POLICY_DEBUG;
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
             .copy_from_slice(&policy.to_le_bytes());
 
-        let error = verify_snp_report_with_aux_certs(
-            snp_fixture_time(),
-            &report,
-            &auxblob,
-            &[ark],
-            &[],
-            &[fixture_amd_milan_crl()],
-        )
-        .unwrap_err();
-        assert!(error.contains("debugging"), "{error}");
+        verify_snp_report_policy(&report)
+            .expect("SNP DEBUG must reach verified TEE attribute policy evaluation");
     }
 
     #[test]
-    fn rejects_gcp_snp_report_that_permits_migration_agent() {
-        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
-        let mut policy = u64::from_le_bytes(
-            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-        policy |= SNP_POLICY_MIGRATE_MA;
+    fn vendor_policy_permits_gcp_snp_migrate_ma_for_measurement_policy_evaluation() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        let policy = (1u64 << 17) | SNP_POLICY_MIGRATE_MA;
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
             .copy_from_slice(&policy.to_le_bytes());
 
-        let error = verify_snp_report_with_aux_certs(
-            snp_fixture_time(),
-            &report,
-            &auxblob,
-            &[ark],
-            &[],
-            &[fixture_amd_milan_crl()],
-        )
-        .unwrap_err();
-        assert!(error.contains("migration agent"), "{error}");
+        verify_snp_report_policy(&report)
+            .expect("SNP MIGRATE_MA must reach verified TEE attribute policy evaluation");
     }
 
     #[test]
@@ -2514,13 +2640,13 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_gcp_snp_tls_attestation_fixture() {
+    fn verifier_rejects_gcp_snp_fixture_with_nonzero_report_id_ma() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots, amd_ark) = gcp_snp_response_roots_and_ark(nonce, cert);
 
-        let identity = verify_tls_attestation_at(
+        let failure = verify_tls_attestation_at(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -2540,12 +2666,11 @@ mod tests {
             },
             snp_fixture_time(),
         )
-        .expect("GCP SEV-SNP TLS attestation should verify with trusted roots");
+        .expect_err("nonzero SNP REPORT_ID_MA must fail");
 
-        assert_eq!(identity.cert_der, cert);
-        assert!(identity.base_image_id.is_some());
-        assert!(identity.platform_profile_id.is_some());
-        assert!(identity.variant_id.is_some());
+        assert!(failure.errors.iter().any(|error| {
+            error.check == "gcp-tee-vendor-report" && error.detail.contains("REPORT_ID_MA")
+        }));
     }
 
     #[test]
@@ -2631,6 +2756,136 @@ mod tests {
         assert_check_passed(&failure, "platform-profile-id");
         assert_check_passed(&failure, "variant-id");
         assert_check_passed(&failure, "pcr-4-static");
+    }
+
+    #[test]
+    fn verifier_enforces_tdx_debug_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        let evidence = response.tee_evidence.as_mut().expect("TEE evidence");
+        let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = gcp_tdx_report_start(&quote).unwrap();
+        quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+        evidence.report = URL_SAFE_NO_PAD.encode(quote);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            measurement_policy: Some(measurement_policy(&pcr)),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Intel TDX debug declaration must fail");
+        let check_name = format!(
+            "tee-attribute-base-image-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+        assert!(failure.errors.iter().any(|error| error.check == check_name));
+
+        let mut policy = measurement_policy(&pcr);
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": false,
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": true,
+        })];
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                gcp_roots,
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("fixture still lacks TDX DCAP collateral");
+        assert!(!failure.errors.iter().any(|error| error.check == check_name));
+        assert_check_passed(&failure, &check_name);
+    }
+
+    #[test]
+    fn verifier_enforces_snp_states_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        response.platform.tee = "sev-snp".to_string();
+        response.platform.machine_type = "n2d-standard-4".to_string();
+        let mut snp_report = vec![0u8; SNP_REPORT_SIZE];
+        snp_report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8].copy_from_slice(
+            &((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA).to_le_bytes(),
+        );
+        response.tee_evidence = Some(TeeEvidence {
+            kind: "configfs-tsm".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: None,
+        });
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            measurement_policy: Some(measurement_policy_for_platform(
+                &pcr,
+                "gcp",
+                "sev-snp",
+                "n2d-standard-4",
+            )),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing AMD SEV-SNP declarations must fail");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let mut policy = measurement_policy_for_platform(&pcr, "gcp", "sev-snp", "n2d-standard-4");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            policy.pack.profiles[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": false}));
+            policy.pack.profiles[0].variants[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": true}));
+        }
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                gcp_roots,
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
     }
 
     #[test]
@@ -3141,7 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn public_session_verifier_accepts_complete_local_bound_gcp_snp_evidence() {
+    fn public_session_verifier_rejects_nonzero_snp_report_id_ma() {
         use crate::session::{
             compute_key_fingerprint, compute_session_id, compute_session_qualifying_data,
             request_binding_digest, AkEvidence, BindingMode, CertificateTrust, RawEvidence,
@@ -3213,7 +3468,7 @@ mod tests {
             verify_type: SessionPcrVerifyType::Static,
             match_data: vec![hex0x(&pcr4)],
         };
-        let mut bundle = SessionEvidenceBundle {
+        let bundle = SessionEvidenceBundle {
             format: 1,
             binding: SessionBinding {
                 mode: BindingMode::Local,
@@ -3344,15 +3599,12 @@ mod tests {
                 binding: None,
             },
         };
-        let verified = crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
-            .expect("complete local-bound GCP SNP evidence must verify");
-
-        assert_eq!(verified.session_id, session_id);
-        assert_eq!(verified.binding_mode, BindingMode::Local);
-        assert_eq!(verified.binding_chain_id, 0);
-        assert_eq!(verified.binding_registry, [0; 20]);
-        assert_eq!(verified.attestation_mode, SessionAttestationMode::Hardware);
-        assert!(bundle.owner.contract_authorization.take().is_none());
+        let failure = crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
+            .expect_err("nonzero SNP REPORT_ID_MA must fail");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.contains("REPORT_ID_MA")));
 
         let mut replayed = inputs.clone();
         replayed.expected_challenge = [0x56; 32];
@@ -3628,7 +3880,7 @@ mod tests {
 
     #[test]
     fn extracts_amd_snp_vcek_request_fields() {
-        let mut report = vec![0u8; SNP_REPORT_MIN_LEN];
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
         report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8]
             .copy_from_slice(&[4, 0, 0, 0, 0, 0, 24, 219]);
         report[SNP_REPORT_REPORTED_TCB_OFFSET + 8] = 0x19;
@@ -3644,6 +3896,55 @@ mod tests {
         assert_eq!(request.microcode, 219);
         assert_eq!(request.cpuid_family, 0x19);
         assert_eq!(request.cpuid_model, 0x01);
+    }
+
+    #[test]
+    fn extracts_verified_snp_debug_and_migrate_ma_states() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        let policy = (1u64 << 17) | (1u64 << 18) | (1u64 << 19);
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+
+        assert_eq!(
+            verification_core::verified_snp_attribute_states(&report).unwrap(),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_verified_snp_report_fields() {
+        let valid_report = || {
+            let mut report = vec![0u8; SNP_REPORT_SIZE];
+            report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+                .copy_from_slice(&2u32.to_le_bytes());
+            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+                .copy_from_slice(&(1u64 << 17).to_le_bytes());
+            report
+        };
+
+        assert!(verification_core::verified_snp_attribute_states(&valid_report()[..1183]).is_err());
+
+        let mut report = valid_report();
+        report[SNP_REPORT_VMPL_OFFSET..SNP_REPORT_VMPL_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("VMPL"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET] = 1;
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("REPORT_ID_MA"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("reserved"));
     }
 
     #[test]

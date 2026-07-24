@@ -127,6 +127,24 @@ pub fn validate_config_with_roots(
         )));
     }
 
+    if config.format < 6 && !w.tee_attributes.is_empty() {
+        return Err(WorkloadError::Validation(
+            "workload.tee-attributes requires format = 6".into(),
+        ));
+    }
+    for (name, allowed_values) in &w.tee_attributes {
+        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).is_none() {
+            return Err(WorkloadError::Validation(format!(
+                "unknown workload.tee-attributes name `{name}`"
+            )));
+        }
+        if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
+            return Err(WorkloadError::Validation(format!(
+                "workload.tee-attributes `{name}` must be [false] or [false, true]"
+            )));
+        }
+    }
+
     // ── gid-group ────────────────────────────────────────
     if let Some(ref gg) = w.gid_group {
         if gg.is_empty() {
@@ -1373,6 +1391,90 @@ image = "my-app:latest"
         let tmp = tempfile::tempdir().unwrap();
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn validates_canonical_tee_attribute_requirements() {
+        for values in ["[false]", "[false, true]"] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.tee-attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            validate_config(&cfg, tmp.path()).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_noncanonical_tee_attribute_requirements() {
+        for (name, values) in [
+            ("atakit.attestation.v1.tee.unknown", "[false]"),
+            ("atakit.attestation.v1.tee.intel-tdx.debug.enabled", "[]"),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[false, false]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true, false]",
+            ),
+        ] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.tee-attributes]
+"{name}" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                validate_config(&cfg, tmp.path()).is_err(),
+                "{name} {values}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tee_attributes_before_format_six() {
+        let toml = r#"
+format = 5
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.tee-attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("requires format = 6"));
     }
 
     #[test]

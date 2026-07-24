@@ -420,20 +420,41 @@ fn parse_attributes(
     let mut out = Vec::with_capacity(values.len());
     let mut keys = BTreeSet::new();
     for value in values {
-        let key = value
-            .get("key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| session_error(format!("{owner} attribute is missing string key")))?;
-        let item = SessionAttribute {
-            key: decode_hex_32(key)?,
-            value: decode_hex_32(
-                value
-                    .get("value")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        session_error(format!("{owner} attribute is missing string value"))
-                    })?,
-            )?,
+        let item = if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "{owner} attribute has unknown reserved name {name}"
+                    ))
+                })?;
+            let enabled = value
+                .get("value")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "{owner} readable reserved attribute {name} is missing Boolean value"
+                    ))
+                })?;
+            SessionAttribute {
+                key: attribute.key(),
+                value: atakit_core::tee_attributes::bool_value(enabled),
+            }
+        } else {
+            let key = value
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| session_error(format!("{owner} attribute is missing string key")))?;
+            SessionAttribute {
+                key: decode_hex_32(key)?,
+                value: decode_hex_32(
+                    value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            session_error(format!("{owner} attribute is missing string value"))
+                        })?,
+                )?,
+            }
         };
         if !keys.insert(item.key) {
             return Err(session_error(format!(
@@ -531,6 +552,41 @@ mod tests {
         assert_eq!(
             pcrs[0].verify_type,
             SessionPcrVerifyType::DynamicSubsequence
+        );
+    }
+
+    #[test]
+    fn readable_reserved_attributes_merge_with_variant_override() {
+        let mut profile = profile();
+        profile.attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+                "value": false
+            }),
+            serde_json::json!({
+                "key": format!("0x{}", "44".repeat(32)),
+                "value": format!("0x{}", "55".repeat(32))
+            }),
+        ];
+        profile.variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": true
+        })];
+
+        let attributes = effective_attributes(&profile, &profile.variants[0]).unwrap();
+
+        assert_eq!(
+            attributes,
+            [
+                SessionAttribute {
+                    key: [0x44; 32],
+                    value: [0x55; 32]
+                },
+                SessionAttribute {
+                    key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
+                    value: atakit_core::tee_attributes::ATTRIBUTE_TRUE
+                }
+            ]
         );
     }
 

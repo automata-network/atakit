@@ -170,12 +170,28 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
         println!("    {}", "none".dimmed());
     } else {
         for req in &spec.requirements {
-            println!(
-                "    Key: {}",
-                format!("0x{}", hex::encode(req.key)).dimmed()
-            );
-            for val in &req.allowedValues {
-                println!("      {}", format!("0x{}", hex::encode(val)).dimmed());
+            let key: [u8; 32] = req.key.into();
+            if let Some(attribute) =
+                atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key)
+            {
+                println!("    {}", attribute.name());
+                for value in &req.allowedValues {
+                    if *value == alloy_ext::core::primitives::B256::ZERO {
+                        println!("      false");
+                    } else if *value == alloy_ext::core::primitives::B256::with_last_byte(1) {
+                        println!("      true");
+                    } else {
+                        println!("      {}", format!("0x{}", hex::encode(value)).dimmed());
+                    }
+                }
+            } else {
+                println!(
+                    "    Key: {}",
+                    format!("0x{}", hex::encode(req.key)).dimmed()
+                );
+                for val in &req.allowedValues {
+                    println!("      {}", format!("0x{}", hex::encode(val)).dimmed());
+                }
             }
         }
     }

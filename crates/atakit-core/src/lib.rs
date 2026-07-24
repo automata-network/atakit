@@ -1,5 +1,6 @@
 mod env;
 mod progress;
+pub mod tee_attributes;
 
 pub use env::{Env, LegacyImageStore};
 pub use progress::{NullReporter, ProgressHandle, ProgressReporter};

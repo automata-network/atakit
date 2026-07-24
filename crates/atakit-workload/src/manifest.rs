@@ -70,6 +70,8 @@ pub struct ManifestConfig {
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
+    #[serde(default, rename = "tee-attributes")]
+    pub tee_attributes: BTreeMap<String, Vec<bool>>,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default = "default_restart")]
@@ -862,6 +864,7 @@ pub fn build_manifest(
             image: resolved_image.to_string(),
             base_image_mode: w.base_image_mode.clone(),
             base_image: w.base_image.clone(),
+            tee_attributes: w.tee_attributes.clone(),
             ports: w.ports.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
@@ -1106,7 +1109,8 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":5"));
+        assert!(output.contains("\"format\":6"));
+        assert!(output.contains("\"tee-attributes\":{}"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
@@ -1123,6 +1127,51 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn tee_attributes_are_canonical_and_change_manifest_measurement_bytes() {
+        let config = |values: &str| {
+            WorkloadConfig::load_from_str(&format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.tee-attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            ))
+            .unwrap()
+        };
+        let build = |config: &WorkloadConfig| {
+            build_manifest(
+                config,
+                "my-app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+
+        let false_only = serialize_canonical_json(&build(&config("[false]"))).unwrap();
+        let false_or_true = serialize_canonical_json(&build(&config("[false, true]"))).unwrap();
+
+        assert!(false_only.contains(
+            "\"tee-attributes\":{\"atakit.attestation.v1.tee.intel-tdx.debug.enabled\":[false]}"
+        ));
+        assert_ne!(false_only, false_or_true);
+        assert_eq!(
+            false_only,
+            serialize_canonical_json(&build(&config("[false]"))).unwrap()
+        );
     }
 
     #[test]

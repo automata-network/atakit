@@ -551,7 +551,28 @@ async fn load_local_workload_policy(
             &inspection.pcr23,
             "trusted workload archive PCR23",
         )?)],
-        attribute_requirements: Vec::new(),
+        attribute_requirements: inspection
+            .manifest
+            .config
+            .tee_attributes
+            .iter()
+            .map(|(name, values)| {
+                let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unknown config.tee-attributes name `{name}`")
+                    })?;
+                if !atakit_core::tee_attributes::validate_allowed_values(values) {
+                    bail!("config.tee-attributes `{name}` must be [false] or [false, true]");
+                }
+                Ok(SessionAttributeRequirement {
+                    key: attribute.key(),
+                    allowed_values: values
+                        .iter()
+                        .map(|value| atakit_core::tee_attributes::bool_value(*value))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -636,11 +657,14 @@ mod tests {
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
         let manifest = serde_json::json!({
-            "meta": {"format": 5, "name": "test", "version": "v0.0.1"},
+            "meta": {"format": 6, "name": "test", "version": "v0.0.1"},
             "config": {
                 "image": "test:v0.0.1",
                 "base-image-mode": "blacklist",
                 "base-image": [],
+                "tee-attributes": {
+                    "atakit.attestation.v1.tee.intel-tdx.debug.enabled": [false, true]
+                },
                 "ports": [],
                 "restart": "no",
                 "command": null,
@@ -825,7 +849,18 @@ mod tests {
             policy.pcr_specs[0].verify_type,
             SessionPcrVerifyType::Static
         );
-        assert!(policy.attribute_requirements.is_empty());
+        assert_eq!(policy.attribute_requirements.len(), 1);
+        assert_eq!(
+            policy.attribute_requirements[0].key,
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY
+        );
+        assert_eq!(
+            policy.attribute_requirements[0].allowed_values,
+            [
+                atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                atakit_core::tee_attributes::ATTRIBUTE_TRUE
+            ]
+        );
 
         let mut mismatched = state;
         mismatched.archive_hash = "0x00".into();

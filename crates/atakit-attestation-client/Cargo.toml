@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 atakit-attestation.workspace = true
+atakit-core.workspace = true
 alloy-ext.workspace = true
 automata-tee-workload-measurement.workspace = true
 base64.workspace = true
