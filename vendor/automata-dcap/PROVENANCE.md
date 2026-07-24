@@ -1,7 +1,7 @@
 # Automata DCAP provenance
 
 - Source: `https://github.com/automata-network/automata-dcap-attestation`
-- Commit: `bd3b13408640aa3d645f726a9f5f2f3697ce7f20`
+- Commit: `7ee427e0d4d4ab51861c81fedc0c6338e67c49b6`
 - Upstream pull request: `https://github.com/automata-network/automata-dcap-attestation/pull/158`
 - License: MIT, retained in `LICENSE`
 

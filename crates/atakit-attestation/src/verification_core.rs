@@ -559,7 +559,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         SystemTime::now(),
         collateral,
         quote,
-        &dcap_rs::DcapVerificationPolicy::production(),
+        &gcp_tdx_dcap_verification_policy(),
     ) {
         Ok(_) => pass(report, "gcp-tee-vendor-report"),
         Err(e) => fail(
@@ -569,6 +569,12 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             format!("GCP TDX DCAP quote verification failed: {e:#}"),
         ),
     }
+}
+
+fn gcp_tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
+    dcap_rs::DcapVerificationPolicy::production().with_tdx_tcb_revocation_policy(
+        dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,
+    )
 }
 
 pub(super) fn parse_gcp_tdx_dcap_collateral(
@@ -2128,4 +2134,17 @@ fn decode_policy_hash(value: &str) -> std::result::Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, got {}", bytes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcp_tdx_verification_rejects_revoked_sgx_pce_partial_matches() {
+        assert_eq!(
+            gcp_tdx_dcap_verification_policy().tdx_tcb_revocation_policy,
+            dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch
+        );
+    }
 }

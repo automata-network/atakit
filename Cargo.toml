@@ -67,7 +67,7 @@ pem = "3"
 rcgen = "0.13"
 
 # Vendored from automata-network/automata-dcap-attestation commit
-# bd3b13408640aa3d645f726a9f5f2f3697ce7f20.
+# 7ee427e0d4d4ab51861c81fedc0c6338e67c49b6.
 dcap-rs = { path = "vendor/automata-dcap/libraries/dcap-rs" }
 automata-dcap-network-registry = { path = "vendor/automata-dcap/libraries/network-registry" }
 pccs-reader-rs = { path = "vendor/automata-dcap/libraries/pccs-reader" }
