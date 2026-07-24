@@ -10,6 +10,8 @@
 //! authorization, and registry state are separate concerns and are neither
 //! required nor inferred here.
 
+use std::time::SystemTime;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
@@ -219,6 +221,7 @@ pub enum SessionPlatformTrust {
     GcpSnp {
         gcp_ak_roots: CertificateTrust,
         amd_ark_roots: CertificateTrust,
+        amd_snp_crls: Vec<Vec<u8>>,
     },
     AzureTdx {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
@@ -227,6 +230,7 @@ pub enum SessionPlatformTrust {
     AzureSnp {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
         amd_ark_roots: CertificateTrust,
+        amd_snp_crls: Vec<Vec<u8>>,
         /// AMD SNP ARK/ASK/VCEK or VLEK certificate table for this report.
         snp_cert_table: Vec<u8>,
     },
@@ -300,6 +304,13 @@ pub struct SessionVerificationFailure {
 /// Development emulation evidence is never accepted by this entry point.
 pub fn verify_session_bundle(
     inputs: SessionVerificationInputs,
+) -> std::result::Result<VerifiedSession, SessionVerificationFailure> {
+    verify_session_bundle_at(inputs, SystemTime::now())
+}
+
+pub(crate) fn verify_session_bundle_at(
+    inputs: SessionVerificationInputs,
+    current_time: SystemTime,
 ) -> std::result::Result<VerifiedSession, SessionVerificationFailure> {
     let mut checks = Vec::new();
     let mut errors = Vec::new();
@@ -376,7 +387,13 @@ pub fn verify_session_bundle(
         );
     }
 
-    verify_platform_attestation(bundle, &inputs.trust.platform, &mut checks, &mut errors);
+    verify_platform_attestation(
+        bundle,
+        &inputs.trust.platform,
+        current_time,
+        &mut checks,
+        &mut errors,
+    );
     verify_raw_quote(bundle, &mut checks, &mut errors);
     verify_quote_projection(bundle, &mut checks, &mut errors);
     verify_raw_certify(bundle, &mut checks, &mut errors);
@@ -463,6 +480,7 @@ fn verify_production_evidence_kind(
 fn verify_platform_attestation(
     bundle: &SessionEvidenceBundle,
     trust: &SessionPlatformTrust,
+    current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -479,6 +497,7 @@ fn verify_platform_attestation(
                 gcp_ak_roots,
                 None,
                 Some(dcap_collateral),
+                current_time,
                 checks,
                 errors,
             );
@@ -486,6 +505,7 @@ fn verify_platform_attestation(
         SessionPlatformTrust::GcpSnp {
             gcp_ak_roots,
             amd_ark_roots,
+            amd_snp_crls,
         } => {
             if !require_platform(bundle, "gcp", "sev-snp", checks, errors) {
                 return;
@@ -493,8 +513,9 @@ fn verify_platform_attestation(
             verify_gcp_platform(
                 bundle,
                 gcp_ak_roots,
-                Some(amd_ark_roots),
+                Some((amd_ark_roots, amd_snp_crls.as_slice())),
                 None,
+                current_time,
                 checks,
                 errors,
             );
@@ -511,6 +532,7 @@ fn verify_platform_attestation(
                 maa_signing_keys,
                 None,
                 Some(dcap_collateral),
+                current_time,
                 checks,
                 errors,
             );
@@ -518,6 +540,7 @@ fn verify_platform_attestation(
         SessionPlatformTrust::AzureSnp {
             maa_signing_keys,
             amd_ark_roots,
+            amd_snp_crls,
             snp_cert_table,
         } => {
             if !require_platform(bundle, "azure", "sev-snp", checks, errors) {
@@ -526,8 +549,13 @@ fn verify_platform_attestation(
             verify_azure_platform(
                 bundle,
                 maa_signing_keys,
-                Some((amd_ark_roots, snp_cert_table.as_slice())),
+                Some(AzureSnpTrust {
+                    amd_ark_roots,
+                    amd_snp_crls,
+                    snp_cert_table,
+                }),
                 None,
+                current_time,
                 checks,
                 errors,
             );
@@ -566,8 +594,9 @@ fn require_platform(
 fn verify_gcp_platform(
     bundle: &SessionEvidenceBundle,
     gcp_ak_roots: &CertificateTrust,
-    amd_ark_roots: Option<&CertificateTrust>,
+    amd_snp_trust: Option<(&CertificateTrust, &[Vec<u8>])>,
     dcap_collateral: Option<&serde_json::Value>,
+    current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -656,13 +685,15 @@ fn verify_gcp_platform(
         &bundle.platform.tee,
         &pcrs,
     );
-    match (amd_ark_roots, dcap_collateral) {
-        (Some(amd), None) => super::verification_core::verify_gcp_snp_vendor_report(
+    match (amd_snp_trust, dcap_collateral) {
+        (Some((amd, crls)), None) => super::verification_core::verify_gcp_snp_vendor_report(
             &mut report,
             &mut core_errors,
             Some(&tee_evidence),
             &amd.certificates,
             &amd.keccak256_hashes,
+            crls,
+            current_time,
         ),
         (None, Some(dcap)) => super::verification_core::verify_gcp_tdx_vendor_report(
             &mut report,
@@ -681,11 +712,18 @@ fn verify_gcp_platform(
     import_core_checks(report, checks, errors);
 }
 
+struct AzureSnpTrust<'a> {
+    amd_ark_roots: &'a CertificateTrust,
+    amd_snp_crls: &'a [Vec<u8>],
+    snp_cert_table: &'a [u8],
+}
+
 fn verify_azure_platform(
     bundle: &SessionEvidenceBundle,
     maa_signing_keys: &[AzureMaaTrustKey],
-    snp_trust: Option<(&CertificateTrust, &[u8])>,
+    snp_trust: Option<AzureSnpTrust<'_>>,
     dcap_collateral: Option<&serde_json::Value>,
+    current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -736,17 +774,19 @@ fn verify_azure_platform(
         &bundle.platform.tee,
     );
     match (snp_trust, dcap_collateral) {
-        (Some((amd, cert_table)), None) => {
+        (Some(snp_trust), None) => {
             let vendor_evidence = super::TeeEvidence {
-                auxiliary: Some(URL_SAFE_NO_PAD.encode(cert_table)),
+                auxiliary: Some(URL_SAFE_NO_PAD.encode(snp_trust.snp_cert_table)),
                 ..tee_evidence
             };
             super::verification_core::verify_gcp_snp_vendor_report(
                 &mut report,
                 &mut core_errors,
                 Some(&vendor_evidence),
-                &amd.certificates,
-                &amd.keccak256_hashes,
+                &snp_trust.amd_ark_roots.certificates,
+                &snp_trust.amd_ark_roots.keccak256_hashes,
+                snp_trust.amd_snp_crls,
+                current_time,
             );
         }
         (None, Some(dcap)) => super::verification_core::verify_gcp_tdx_vendor_report(
@@ -2265,11 +2305,14 @@ mod tests {
 
         let mut checks = Vec::new();
         let mut errors = Vec::new();
+        let amd_roots = CertificateTrust::default();
+        let amd_crls = Vec::new();
         verify_gcp_platform(
             &bundle,
             &CertificateTrust::default(),
-            Some(&CertificateTrust::default()),
+            Some((&amd_roots, &amd_crls)),
             None,
+            SystemTime::now(),
             &mut checks,
             &mut errors,
         );

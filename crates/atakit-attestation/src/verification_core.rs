@@ -87,6 +87,10 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
         );
         return;
     }
+    if let Err(detail) = verify_end_entity_certificate_role(&leaf, "GCP AK leaf") {
+        fail(report, errors, "gcp-ak-cert-chain", detail);
+        return;
+    }
     let ak_key = match parse_tpmt_public_ecc_p256(ak_public) {
         Ok(key) => key,
         Err(detail) => {
@@ -153,6 +157,14 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
                 "gcp-ak-cert-chain",
                 format!("GCP AK chain certificate {idx} or its issuer is not currently valid"),
             );
+            return;
+        }
+        if let Err(detail) = verify_ca_certificate_role(
+            &parent,
+            &format!("GCP AK chain certificate {}", idx + 1),
+            idx,
+        ) {
+            fail(report, errors, "gcp-ak-cert-chain", detail);
             return;
         }
         let child_aki = child.extensions().iter().find_map(|extension| {
@@ -245,6 +257,62 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
     }
 
     pass(report, "gcp-ak-cert-chain");
+}
+
+fn verify_ca_certificate_role(
+    cert: &X509Certificate<'_>,
+    label: &str,
+    ca_certificates_below: usize,
+) -> std::result::Result<(), String> {
+    let constraints = cert
+        .basic_constraints()
+        .map_err(|error| format!("{label} Basic Constraints are invalid: {error}"))?
+        .ok_or_else(|| format!("{label} is missing Basic Constraints"))?;
+    if !constraints.value.ca {
+        return Err(format!("{label} is not a certificate authority"));
+    }
+    if let Some(path_len) = constraints.value.path_len_constraint {
+        let ca_certificates_below = u32::try_from(ca_certificates_below)
+            .map_err(|_| format!("{label} certificate path is too long"))?;
+        if ca_certificates_below > path_len {
+            return Err(format!(
+                "{label} Basic Constraints path length {path_len} is smaller than the {ca_certificates_below} intermediate certificate(s) below it"
+            ));
+        }
+    }
+    let key_usage = cert
+        .key_usage()
+        .map_err(|error| format!("{label} Key Usage is invalid: {error}"))?
+        .ok_or_else(|| format!("{label} is missing Key Usage"))?;
+    if !key_usage.value.key_cert_sign() {
+        return Err(format!(
+            "{label} Key Usage does not permit certificate signing"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_end_entity_certificate_role(
+    cert: &X509Certificate<'_>,
+    label: &str,
+) -> std::result::Result<(), String> {
+    if cert
+        .basic_constraints()
+        .map_err(|error| format!("{label} Basic Constraints are invalid: {error}"))?
+        .is_some_and(|constraints| constraints.value.ca)
+    {
+        return Err(format!("{label} must not be a certificate authority"));
+    }
+    if cert
+        .key_usage()
+        .map_err(|error| format!("{label} Key Usage is invalid: {error}"))?
+        .is_some_and(|key_usage| !key_usage.value.digital_signature())
+    {
+        return Err(format!(
+            "{label} Key Usage does not permit digital signatures"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn parse_gcp_cert_chain(
@@ -470,22 +538,30 @@ pub(super) fn verify_expected_pcr15(
     }
 }
 
+pub(super) struct AmdSnpTrust<'a> {
+    pub(super) ark_roots: &'a [Vec<u8>],
+    pub(super) ark_root_hashes: &'a [[u8; 32]],
+    pub(super) crls: &'a [Vec<u8>],
+}
+
 pub(super) fn verify_gcp_tee_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     tee: &str,
     collateral: &serde_json::Value,
-    trusted_amd_ark_roots: &[Vec<u8>],
-    trusted_amd_ark_root_hashes: &[[u8; 32]],
+    amd_snp_trust: AmdSnpTrust<'_>,
+    current_time: SystemTime,
 ) {
     match tee {
         "sev-snp" => verify_gcp_snp_vendor_report(
             report,
             errors,
             evidence,
-            trusted_amd_ark_roots,
-            trusted_amd_ark_root_hashes,
+            amd_snp_trust.ark_roots,
+            amd_snp_trust.ark_root_hashes,
+            amd_snp_trust.crls,
+            current_time,
         ),
         "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral),
         other => fail(
@@ -528,6 +604,16 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             return;
         }
     };
+    const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
+    if raw_quote.len() > MAX_TDX_QUOTE_BYTES {
+        fail(
+            report,
+            errors,
+            "gcp-tee-vendor-report",
+            format!("GCP TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
+        );
+        return;
+    }
     let collateral = match parse_gcp_tdx_dcap_collateral(collateral) {
         Ok(collateral) => collateral,
         Err(detail) => {
@@ -548,6 +634,31 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             return;
         }
     };
+    if quote.header.tee_type != TDX_TEE_TYPE || !matches!(quote.header.version.get(), 4 | 5) {
+        fail(
+            report,
+            errors,
+            "gcp-tee-vendor-report",
+            format!(
+                "GCP TDX evidence must contain a TDX quote with version 4 or 5; got tee_type 0x{:x} and version {}",
+                quote.header.tee_type,
+                quote.header.version.get()
+            ),
+        );
+        return;
+    }
+    if quote_bytes.iter().any(|byte| *byte != 0) {
+        fail(
+            report,
+            errors,
+            "gcp-tee-vendor-report",
+            format!(
+                "GCP TDX DCAP quote has {} non-zero trailing bytes",
+                quote_bytes.len()
+            ),
+        );
+        return;
+    }
     let collateral = match collateral.to_automata_collateral() {
         Ok(collateral) => collateral,
         Err(error) => {
@@ -596,6 +707,8 @@ pub(super) fn verify_gcp_snp_vendor_report(
     evidence: Option<&TeeEvidence>,
     trusted_amd_ark_roots: &[Vec<u8>],
     trusted_amd_ark_root_hashes: &[[u8; 32]],
+    trusted_amd_snp_crls: &[Vec<u8>],
+    current_time: SystemTime,
 ) {
     let Some(evidence) = evidence else {
         fail(
@@ -639,10 +752,12 @@ pub(super) fn verify_gcp_snp_vendor_report(
         return;
     }
     match verify_snp_report_with_aux_certs(
+        current_time,
         &snp_report,
         &auxblob,
         trusted_amd_ark_roots,
         trusted_amd_ark_root_hashes,
+        trusted_amd_snp_crls,
     ) {
         Ok(()) => pass(report, "gcp-tee-vendor-report"),
         Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
@@ -650,10 +765,12 @@ pub(super) fn verify_gcp_snp_vendor_report(
 }
 
 pub(super) fn verify_snp_report_with_aux_certs(
+    current_time: SystemTime,
     report: &[u8],
     auxblob: &[u8],
     trusted_amd_ark_roots: &[Vec<u8>],
     trusted_amd_ark_root_hashes: &[[u8; 32]],
+    trusted_amd_snp_crls: &[Vec<u8>],
 ) -> std::result::Result<(), String> {
     if report.len() < SNP_REPORT_MIN_LEN {
         return Err(format!(
@@ -667,6 +784,8 @@ pub(super) fn verify_snp_report_with_aux_certs(
             "GCP SNP report sig_algo is {sig_algo}, expected ECDSA P-384 SHA-384 ({SNP_SIG_ALGO_ECDSA_P384_SHA384})"
         ));
     }
+    verify_snp_report_policy(report)?;
+    let expected_product = amd_snp_kds_product(report)?;
 
     let certs = parse_amd_snp_cert_table(auxblob)?;
     let ark = certs
@@ -689,11 +808,17 @@ pub(super) fn verify_snp_report_with_aux_certs(
         };
 
     verify_amd_snp_cert_chain(
+        current_time,
         ark,
         ask,
         vek,
-        trusted_amd_ark_roots,
-        trusted_amd_ark_root_hashes,
+        signer,
+        expected_product,
+        AmdSnpTrust {
+            ark_roots: trusted_amd_ark_roots,
+            ark_root_hashes: trusted_amd_ark_root_hashes,
+            crls: trusted_amd_snp_crls,
+        },
     )?;
     verify_snp_vek_extensions(vek, report, signer)?;
     verify_snp_report_signature(vek, report)?;
@@ -715,6 +840,32 @@ pub(super) fn snp_signing_key_type(
         0b100 => Ok(SnpSigningKeyType::Vlek),
         value => Err(format!("unknown SNP signing key type bits 0x{value:x}")),
     }
+}
+
+pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(), String> {
+    let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP report version")?;
+    if !(2..=5).contains(&version) {
+        return Err(format!(
+            "unsupported SNP report version {version}; expected a version from 2 through 5"
+        ));
+    }
+    let policy_bytes = read_exact_at(report, SNP_REPORT_POLICY_OFFSET, 8, "SNP policy")?;
+    let policy = u64::from_le_bytes(
+        policy_bytes
+            .try_into()
+            .expect("SNP policy slice has the checked length"),
+    );
+    if policy & SNP_POLICY_DEBUG != 0 {
+        return Err("SNP report policy permits host debugging".to_string());
+    }
+    if policy & SNP_POLICY_MIGRATE_MA != 0 {
+        return Err("SNP report policy permits association with a migration agent".to_string());
+    }
+    let vmpl = read_le_u32(report, SNP_REPORT_VMPL_OFFSET, "SNP VMPL")?;
+    if vmpl != 0 {
+        return Err(format!("SNP report VMPL is {vmpl}, expected VMPL 0"));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -770,17 +921,20 @@ pub(super) fn parse_amd_snp_cert_table(
 }
 
 pub(super) fn verify_amd_snp_cert_chain(
+    current_time: SystemTime,
     ark_der: &[u8],
     ask_der: &[u8],
     vek_der: &[u8],
-    trusted_amd_ark_roots: &[Vec<u8>],
-    trusted_amd_ark_root_hashes: &[[u8; 32]],
+    signer: SnpSigningKeyType,
+    expected_product: &str,
+    trust: AmdSnpTrust<'_>,
 ) -> std::result::Result<(), String> {
     let ark_hash: [u8; 32] = Sha256::digest(ark_der).into();
-    if !trusted_amd_ark_roots
+    if !trust
+        .ark_roots
         .iter()
         .any(|trusted| trusted.as_slice() == ark_der)
-        && !trusted_amd_ark_root_hashes.contains(&ark_hash)
+        && !trust.ark_root_hashes.contains(&ark_hash)
     {
         return Err(format!(
             "SNP ARK certificate is not in trusted AMD ARK roots; sha256(ark_der)=0x{}",
@@ -794,20 +948,171 @@ pub(super) fn verify_amd_snp_cert_chain(
         .map_err(|e| format!("SNP ASK certificate did not parse: {e}"))?;
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
+    let validation_time = asn1_time(current_time)?;
+    for (label, cert) in [("SNP ARK", &ark), ("SNP ASK", &ask), ("SNP VEK", &vek)] {
+        if cert.version() != X509Version::V3 {
+            return Err(format!("{label} certificate is not X.509 version 3"));
+        }
+        if !cert.validity().is_valid_at(validation_time) {
+            return Err(format!(
+                "{label} certificate is not valid at the verification time"
+            ));
+        }
+    }
 
     if ark.subject() != ark.issuer() {
         return Err("SNP ARK trusted root is not self-issued".to_string());
+    }
+    let ark_common_name = certificate_common_name(&ark, "SNP ARK")?;
+    let expected_ark_common_name = format!("ARK-{expected_product}");
+    if ark_common_name != expected_ark_common_name {
+        return Err(format!(
+            "SNP ARK common name is {ark_common_name:?}, expected {expected_ark_common_name:?}"
+        ));
+    }
+    verify_ca_certificate_role(&ark, "SNP ARK", 1)?;
+    let ark_key_usage = ark
+        .key_usage()
+        .map_err(|error| format!("SNP ARK Key Usage is invalid: {error}"))?
+        .ok_or_else(|| "SNP ARK is missing Key Usage".to_string())?;
+    if !ark_key_usage.value.crl_sign() {
+        return Err("SNP ARK Key Usage does not permit CRL signing".to_string());
     }
     verify_amd_snp_cert_signature(ark_der, &ark, &ark, "SNP ARK self-signature")?;
     if ask.issuer() != ark.subject() {
         return Err("SNP ASK issuer does not match ARK subject".to_string());
     }
+    let ask_common_name = certificate_common_name(&ask, "SNP ASK")?;
+    let expected_ask_common_name = format!("SEV-{expected_product}");
+    if ask_common_name != expected_ask_common_name {
+        return Err(format!(
+            "SNP ASK common name is {ask_common_name:?}, expected {expected_ask_common_name:?}"
+        ));
+    }
+    verify_ca_certificate_role(&ask, "SNP ASK", 0)?;
     verify_amd_snp_cert_signature(ask_der, &ask, &ark, "SNP ASK signature")?;
+    verify_amd_snp_crls(&ark, &ask, trust.crls, validation_time)?;
     if vek.issuer() != ask.subject() {
         return Err("SNP VEK issuer does not match ASK subject".to_string());
     }
+    verify_end_entity_certificate_role(&vek, "SNP VEK")?;
+    let expected_common_name = match signer {
+        SnpSigningKeyType::Vcek => "SEV-VCEK",
+        SnpSigningKeyType::Vlek => "SEV-VLEK",
+    };
+    let actual_common_name = certificate_common_name(&vek, "SNP VEK")?;
+    if actual_common_name != expected_common_name {
+        return Err(format!(
+            "SNP VEK common name is {actual_common_name:?}, expected {expected_common_name:?}"
+        ));
+    }
     verify_amd_snp_cert_signature(vek_der, &vek, &ask, "SNP VEK signature")?;
     Ok(())
+}
+
+fn asn1_time(time: SystemTime) -> std::result::Result<ASN1Time, String> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "verification time is before the Unix epoch".to_string())?
+        .as_secs();
+    let seconds = i64::try_from(seconds)
+        .map_err(|_| "verification time does not fit an X.509 timestamp".to_string())?;
+    ASN1Time::from_timestamp(seconds)
+        .map_err(|error| format!("verification time is not a valid X.509 timestamp: {error}"))
+}
+
+fn certificate_common_name<'a>(
+    cert: &'a X509Certificate<'_>,
+    label: &str,
+) -> std::result::Result<&'a str, String> {
+    let mut names = cert.subject().iter_common_name();
+    let common_name = names
+        .next()
+        .ok_or_else(|| format!("{label} subject is missing a common name"))?
+        .as_str()
+        .map_err(|error| format!("{label} common name is not a string: {error}"))?;
+    if names.next().is_some() {
+        return Err(format!("{label} subject contains multiple common names"));
+    }
+    Ok(common_name)
+}
+
+fn verify_amd_snp_crls(
+    ark: &X509Certificate<'_>,
+    ask: &X509Certificate<'_>,
+    crl_der_values: &[Vec<u8>],
+    current_time: ASN1Time,
+) -> std::result::Result<(), String> {
+    if crl_der_values.is_empty() {
+        return Err("no AMD SNP certificate revocation list was supplied".to_string());
+    }
+    let public_key = ParsedRsaPublicKey::new(
+        &RSA_PSS_2048_8192_SHA384,
+        ark.tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data
+            .as_ref(),
+    )
+    .map_err(|error| format!("SNP ARK key is not RSA PKCS#1: {error}"))?;
+    let mut matching_errors = Vec::new();
+    for crl_der in crl_der_values {
+        let (_, crl) = match parse_x509_crl(crl_der) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                matching_errors.push(format!("AMD SNP CRL did not parse: {error}"));
+                continue;
+            }
+        };
+        if crl.issuer() != ark.subject() {
+            continue;
+        }
+        if crl.signature_algorithm.algorithm.to_id_string() != "1.2.840.113549.1.1.10"
+            || crl.tbs_cert_list.signature.algorithm.to_id_string() != "1.2.840.113549.1.1.10"
+        {
+            matching_errors.push("AMD SNP CRL does not declare RSA-PSS".to_string());
+            continue;
+        }
+        if crl.last_update() > current_time {
+            matching_errors.push("AMD SNP CRL is not valid yet".to_string());
+            continue;
+        }
+        let Some(next_update) = crl.next_update() else {
+            matching_errors.push("AMD SNP CRL is missing nextUpdate".to_string());
+            continue;
+        };
+        if current_time > next_update {
+            matching_errors.push("AMD SNP CRL is stale".to_string());
+            continue;
+        }
+        if let Err(error) = public_key.verify_sig(
+            crl.tbs_cert_list.as_ref(),
+            crl.signature_value.data.as_ref(),
+        ) {
+            matching_errors.push(format!(
+                "AMD SNP CRL signature verification failed: {error}"
+            ));
+            continue;
+        }
+        if crl
+            .iter_revoked_certificates()
+            .any(|revoked| revoked.serial() == &ask.tbs_certificate.serial)
+        {
+            return Err(format!(
+                "SNP ASK certificate serial {} is revoked",
+                ask.raw_serial_as_string()
+            ));
+        }
+        return Ok(());
+    }
+    let detail = if matching_errors.is_empty() {
+        "no supplied AMD SNP CRL was issued by the trusted ARK".to_string()
+    } else {
+        matching_errors.join("; ")
+    };
+    Err(format!(
+        "no valid AMD SNP CRL matched the trusted ARK: {detail}"
+    ))
 }
 
 pub(super) fn verify_amd_snp_cert_signature(
@@ -816,7 +1121,17 @@ pub(super) fn verify_amd_snp_cert_signature(
     issuer: &X509Certificate<'_>,
     label: &str,
 ) -> std::result::Result<(), String> {
-    let public_key = RsaPublicKey::from_pkcs1_der(
+    const RSA_PSS_OID: &str = "1.2.840.113549.1.1.10";
+    if cert.signature_algorithm.algorithm.to_id_string() != RSA_PSS_OID
+        || cert.tbs_certificate.signature.algorithm.to_id_string() != RSA_PSS_OID
+    {
+        return Err(format!("{label} does not declare RSA-PSS"));
+    }
+    // This AWS-LC parameter requires SHA-384 for both the message and MGF1,
+    // with a salt equal to the 48-byte SHA-384 output. That preserves the AMD
+    // certificate-chain checks previously configured explicitly below.
+    let public_key = ParsedRsaPublicKey::new(
+        &RSA_PSS_2048_8192_SHA384,
         issuer
             .tbs_certificate
             .subject_pki
@@ -825,12 +1140,9 @@ pub(super) fn verify_amd_snp_cert_signature(
             .as_ref(),
     )
     .map_err(|e| format!("{label} issuer key is not RSA PKCS#1: {e}"))?;
-    let signature = RsaPssSignature::try_from(cert.signature_value.data.as_ref())
-        .map_err(|e| format!("{label} value is not a valid RSA-PSS signature: {e}"))?;
-    let verifying_key = RsaPssVerifyingKey::<Sha384>::new_with_salt_len(public_key, 48);
     let tbs_der = tbs_certificate_der(cert_der).map_err(|e| format!("{label}: {e}"))?;
-    verifying_key
-        .verify(tbs_der, &signature)
+    public_key
+        .verify_sig(tbs_der, cert.signature_value.data.as_ref())
         .map_err(|e| format!("{label} failed: {e}"))
 }
 
@@ -891,6 +1203,8 @@ pub(super) fn verify_snp_vek_extensions(
 ) -> std::result::Result<(), String> {
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
+    let product = amd_snp_kds_product(report)?;
+    check_snp_product_extension(&vek, product)?;
     let tcb = SnpTcb::from_report(report)?;
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.1", tcb.bootloader, "bootloader")?;
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.2", tcb.tee, "tee")?;
@@ -939,7 +1253,7 @@ pub(super) fn check_snp_tcb_extension(
         .iter()
         .find(|ext| ext.oid.to_id_string() == oid)
     else {
-        return Ok(());
+        return Err(format!("SNP VEK is missing required {name} extension"));
     };
     let value = match ext.value {
         [0x02, 0x01, value] | [0x02, 0x02, 0x00, value] => *value,
@@ -970,7 +1284,7 @@ pub(super) fn check_snp_octet_extension(
         .iter()
         .find(|ext| ext.oid.to_id_string() == oid)
     else {
-        return Ok(());
+        return Err(format!("SNP VEK is missing required {name} extension"));
     };
     let actual = if ext.value.len() >= 2 && ext.value[0] == 0x04 {
         let len = usize::from(ext.value[1]);
@@ -986,6 +1300,38 @@ pub(super) fn check_snp_octet_extension(
     if actual != expected {
         return Err(format!(
             "SNP VEK {name} extension does not match report value"
+        ));
+    }
+    Ok(())
+}
+
+fn check_snp_product_extension(
+    cert: &X509Certificate<'_>,
+    expected_product: &str,
+) -> std::result::Result<(), String> {
+    let ext = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid.to_id_string() == "1.3.6.1.4.1.3704.1.2")
+        .ok_or_else(|| "SNP VEK is missing required productName extension".to_string())?;
+    let value = match ext.value {
+        [tag @ (0x0c | 0x16), length, value @ ..]
+            if *tag != 0 && usize::from(*length) == value.len() =>
+        {
+            value
+        }
+        raw => {
+            return Err(format!(
+                "SNP VEK productName extension has unsupported encoding: 0x{}",
+                hex::encode(raw)
+            ))
+        }
+    };
+    let product = std::str::from_utf8(value)
+        .map_err(|error| format!("SNP VEK productName is not UTF-8: {error}"))?;
+    if product != expected_product && !product.starts_with(&format!("{expected_product}-")) {
+        return Err(format!(
+            "SNP VEK productName {product:?} does not match report product {expected_product:?}"
         ));
     }
     Ok(())
@@ -1181,19 +1527,6 @@ pub(super) fn verify_azure_maa_jwt_binding(
         return;
     }
 
-    let signature = match RsaSignature::try_from(signature.as_slice()) {
-        Ok(signature) => signature,
-        Err(e) => {
-            fail(
-                report,
-                errors,
-                "azure-maa-jwt",
-                format!("MAA JWT signature is invalid: {e}"),
-            );
-            return;
-        }
-    };
-
     let mut key_errors = Vec::new();
     for key_bytes in trusted_maa_keys {
         let key = match parse_rsa_public_key(key_bytes) {
@@ -1203,11 +1536,7 @@ pub(super) fn verify_azure_maa_jwt_binding(
                 continue;
             }
         };
-        let verifier = RsaVerifyingKey::<rsa::sha2::Sha256>::new(key);
-        if verifier
-            .verify(signing_input.as_bytes(), &signature)
-            .is_ok()
-        {
+        if key.verify_sig(signing_input.as_bytes(), &signature).is_ok() {
             pass(report, "azure-maa-jwt");
             return;
         }
@@ -1459,8 +1788,10 @@ pub(super) fn azure_report_data_claim(
         .map_err(|_| format!("MAA report_data must be 64 bytes, got {}", bytes.len()))
 }
 
-pub(super) fn parse_rsa_public_key(key_bytes: &[u8]) -> std::result::Result<RsaPublicKey, String> {
-    if let Ok(key) = RsaPublicKey::from_pkcs1_der(key_bytes) {
+pub(super) fn parse_rsa_public_key(
+    key_bytes: &[u8],
+) -> std::result::Result<ParsedRsaPublicKey, String> {
+    if let Ok(key) = ParsedRsaPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key_bytes) {
         return Ok(key);
     }
     let jwk: AzureJwk = serde_json::from_slice(key_bytes)
@@ -1515,7 +1846,7 @@ pub(super) fn verify_azure_hclak_quote_signature(
         }
     };
 
-    match public_key.verify(body, &signature) {
+    match public_key.verify_sig(body, &signature) {
         Ok(()) => pass(report, "tpm-quote-signature"),
         Err(e) => fail(
             report,
@@ -1554,7 +1885,7 @@ pub(super) fn verify_azure_hclak_certify_signature(
             return;
         }
     };
-    match public_key.verify(body, &signature) {
+    match public_key.verify_sig(body, &signature) {
         Ok(()) => pass(report, "tpm-certify-signature"),
         Err(error) => fail(
             report,
@@ -1567,7 +1898,7 @@ pub(super) fn verify_azure_hclak_certify_signature(
 
 pub(super) fn parse_azure_hclak_public_key(
     binding: &AkBinding,
-) -> std::result::Result<RsaVerifyingKey<rsa::sha2::Sha256>, String> {
+) -> std::result::Result<ParsedRsaPublicKey, String> {
     let binding = parse_azure_maa_binding(binding)?;
     let hcl_var_data =
         decode_b64("akBinding.hclVarData", &binding.hcl_var_data).map_err(|e| e.to_string())?;
@@ -1591,14 +1922,13 @@ pub(super) fn parse_azure_hclak_public_key(
             hcl_ak.kty.as_deref().unwrap_or("<missing>")
         ));
     }
-    let public_key = rsa_public_key_from_jwk(hcl_ak, "Azure HCLAkPub")?;
-    Ok(RsaVerifyingKey::<rsa::sha2::Sha256>::new(public_key))
+    rsa_public_key_from_jwk(hcl_ak, "Azure HCLAkPub")
 }
 
 pub(super) fn rsa_public_key_from_jwk(
     jwk: &AzureJwk,
     label: &str,
-) -> std::result::Result<RsaPublicKey, String> {
+) -> std::result::Result<ParsedRsaPublicKey, String> {
     let n = jwk
         .n
         .as_deref()
@@ -1609,7 +1939,8 @@ pub(super) fn rsa_public_key_from_jwk(
         .as_deref()
         .ok_or_else(|| format!("{label} is missing exponent e"))
         .and_then(|value| decode_b64("rsa.e", value).map_err(|e| e.to_string()))?;
-    RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
+    RsaPublicKeyComponents { n, e }
+        .to_parsed_public_key(&RSA_PKCS1_2048_8192_SHA256)
         .map_err(|e| format!("{label} RSA key is invalid: {e}"))
 }
 
@@ -1897,7 +2228,7 @@ pub(super) fn parse_tpmt_signature_ecdsa_sha256(
 
 pub(super) fn parse_tpmt_signature_rsassa_sha256(
     tpm_signature: &[u8],
-) -> std::result::Result<RsaSignature, String> {
+) -> std::result::Result<Vec<u8>, String> {
     let mut reader = ByteReader::new(tpm_signature);
     let sig_alg = reader.read_u16("signature.sigAlg")?;
     if sig_alg != TPM_ALG_RSASSA {
@@ -1918,7 +2249,10 @@ pub(super) fn parse_tpmt_signature_rsassa_sha256(
             reader.remaining()
         ));
     }
-    RsaSignature::try_from(sig).map_err(|e| format!("RSA signature: {e}"))
+    if sig.is_empty() {
+        return Err("RSA signature is empty".to_string());
+    }
+    Ok(sig.to_vec())
 }
 
 #[derive(Debug)]

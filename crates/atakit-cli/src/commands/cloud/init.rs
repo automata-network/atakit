@@ -348,6 +348,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &args.gcp_ak_root_cert,
             &args.azure_maa_key,
             &args.amd_ark_root_cert,
+            &args.amd_snp_crl,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let automata_read_strategy = init::tdx_dcap_automata_read_strategy(

@@ -1,5 +1,6 @@
 use dcap_rs::types::collateral::Collateral;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// Stable JSON form used in `collateral.gcpTdxDcap`.
 ///
@@ -58,16 +59,14 @@ fn signed_collateral_json(
     body: &str,
     signature: &[u8],
 ) -> Result<String, String> {
-    let body: serde_json::Value = serde_json::from_str(body)
+    let _: &RawValue = serde_json::from_str(body)
         .map_err(|error| format!("{body_field} is not valid JSON: {error}"))?;
-    let mut signed = serde_json::Map::new();
-    signed.insert(body_field.to_string(), body);
-    signed.insert(
-        "signature".to_string(),
-        serde_json::Value::String(hex::encode(signature)),
-    );
-    serde_json::to_string(&signed)
-        .map_err(|error| format!("serialize signed {body_field}: {error}"))
+    let body_field = serde_json::to_string(body_field)
+        .map_err(|error| format!("serialize {body_field} field name: {error}"))?;
+    Ok(format!(
+        "{{{body_field}:{body},\"signature\":\"{}\"}}",
+        hex::encode(signature)
+    ))
 }
 
 fn issuer_chains_match(left: &str, right: &str) -> bool {
@@ -141,5 +140,19 @@ mod tests {
         let windows_line_endings = certificate.replace('\n', "\r\n");
 
         assert!(issuer_chains_match(&certificate, &windows_line_endings));
+    }
+
+    #[test]
+    fn preserves_signed_collateral_body_bytes() {
+        let body = r#"{"version":3,"id":"TDX","issueDate":"2026-07-02T03:30:39Z"}"#;
+        let signed =
+            signed_collateral_json("tcbInfo", body, &[1, 2]).expect("build signed collateral");
+        assert_eq!(
+            signed,
+            concat!(
+                r#"{"tcbInfo":{"version":3,"id":"TDX","issueDate":"2026-07-02T03:30:39Z"},"#,
+                r#""signature":"0102"}"#
+            )
+        );
     }
 }

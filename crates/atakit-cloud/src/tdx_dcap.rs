@@ -6,15 +6,19 @@ use alloy::providers::ProviderBuilder;
 use atakit_attestation::TdxDcapCollateral;
 use automata_dcap_network_registry::Network;
 use dcap_rs::types::quote::Quote;
+use futures_util::StreamExt;
 use pccs_reader_rs::tcb_pem::generate_tcb_issuer_chain_pem;
 use pccs_reader_rs::{Collaterals, PccsReadStrategy, PccsReader};
+use serde_json::value::RawValue;
 use x509_cert::der::Encode;
-use x509_parser::extensions::{DistributionPointName, GeneralName, ParsedExtension};
-use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::init::TdxDcapAutomataReadStrategy;
 
 const INTEL_PCS_URL: &str = "https://api.trustedservices.intel.com";
+const INTEL_ROOT_CA_CRL_URL: &str =
+    "https://certificates.trustedservices.intel.com/IntelSGXRootCA.der";
+const MAX_DCAP_COLLATERAL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
 
 pub(crate) struct AutomataPccsOverrides<'a> {
     pub(crate) pcs_dao: Option<&'a str>,
@@ -121,11 +125,7 @@ pub(crate) async fn fetch_http_collateral(
     );
     let pck_crl_response = checked_get(&client, &pck_crl_url).await?;
     let pck_crl_issuer_chain = decoded_header(&pck_crl_response, "SGX-PCK-CRL-Issuer-Chain")?;
-    let pck_crl = pck_crl_response
-        .bytes()
-        .await
-        .map_err(|error| format!("read {pck_crl_url}: {error}"))?
-        .to_vec();
+    let pck_crl = read_limited_body(pck_crl_response, &pck_crl_url).await?;
 
     let tcb_info_url = format!(
         "{base_url}/tdx/certification/v4/tcb?fmspc={}",
@@ -136,24 +136,18 @@ pub(crate) async fn fetch_http_collateral(
         &tcb_info_response,
         &["SGX-TCB-Info-Issuer-Chain", "TCB-Info-Issuer-Chain"],
     )?;
-    let raw_tcb_info = tcb_info_response
-        .text()
-        .await
-        .map_err(|error| format!("read {tcb_info_url}: {error}"))?;
+    let raw_tcb_info = read_limited_text(tcb_info_response, &tcb_info_url).await?;
     let (tcb_info, tcb_info_signature) = split_signed_document(&raw_tcb_info, "tcbInfo")?;
 
     let qe_identity_url = format!("{base_url}/tdx/certification/v4/qe/identity?update=standard");
     let qe_identity_response = checked_get(&client, &qe_identity_url).await?;
     let qe_identity_issuer_chain =
         decoded_header(&qe_identity_response, "SGX-Enclave-Identity-Issuer-Chain")?;
-    let raw_qe_identity = qe_identity_response
-        .text()
-        .await
-        .map_err(|error| format!("read {qe_identity_url}: {error}"))?;
+    let raw_qe_identity = read_limited_text(qe_identity_response, &qe_identity_url).await?;
     let (qe_identity, qe_identity_signature) =
         split_signed_document(&raw_qe_identity, "enclaveIdentity")?;
 
-    let root_ca_crl = fetch_root_ca_crl(&client, &base_url, &qe_identity_issuer_chain).await?;
+    let root_ca_crl = fetch_root_ca_crl(&client, &base_url).await?;
 
     Ok(TdxDcapCollateral {
         pck_crl_issuer_chain,
@@ -195,6 +189,7 @@ fn collateral_from_automata_reads(
     })
 }
 
+#[derive(Debug)]
 struct QuoteMaterial {
     fmspc: String,
     pck_ca: &'static str,
@@ -203,9 +198,27 @@ struct QuoteMaterial {
 }
 
 fn quote_material(raw_quote: &[u8]) -> Result<QuoteMaterial, String> {
+    if raw_quote.len() > MAX_TDX_QUOTE_BYTES {
+        return Err(format!("TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"));
+    }
     let mut quote_bytes = raw_quote;
     let quote =
         Quote::read(&mut quote_bytes).map_err(|error| format!("parse TDX quote: {error:#}"))?;
+    if quote.header.tee_type != dcap_rs::types::quote::TDX_TEE_TYPE
+        || !matches!(quote.header.version.get(), 4 | 5)
+    {
+        return Err(format!(
+            "expected a TDX quote with version 4 or 5, got tee_type 0x{:x} and version {}",
+            quote.header.tee_type,
+            quote.header.version.get()
+        ));
+    }
+    if quote_bytes.iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "TDX quote has {} non-zero trailing bytes",
+            quote_bytes.len()
+        ));
+    }
     let pck_data = quote
         .signature
         .get_pck_cert_chain()
@@ -257,6 +270,39 @@ async fn checked_get(client: &reqwest::Client, url: &str) -> Result<reqwest::Res
         .map_err(|error| format!("request {url}: {error}"))
 }
 
+async fn read_limited_text(response: reqwest::Response, url: &str) -> Result<String, String> {
+    let body = read_limited_body(response, url).await?;
+    String::from_utf8(body).map_err(|error| format!("read {url} as UTF-8: {error}"))
+}
+
+async fn read_limited_body(response: reqwest::Response, url: &str) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DCAP_COLLATERAL_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "response from {url} exceeds {MAX_DCAP_COLLATERAL_RESPONSE_BYTES} bytes"
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("read {url}: {error}"))?;
+        let new_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("response size from {url} overflows usize"))?;
+        if new_len > MAX_DCAP_COLLATERAL_RESPONSE_BYTES {
+            return Err(format!(
+                "response from {url} exceeds {MAX_DCAP_COLLATERAL_RESPONSE_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn decoded_header(response: &reqwest::Response, name: &str) -> Result<String, String> {
     decoded_header_any(response, &[name])
 }
@@ -274,78 +320,38 @@ fn decoded_header_any(response: &reqwest::Response, names: &[&str]) -> Result<St
         .map_err(|error| format!("decode PCCS header {name}: {error}"))
 }
 
-async fn fetch_root_ca_crl(
-    client: &reqwest::Client,
-    base_url: &str,
-    qe_identity_issuer_chain: &str,
-) -> Result<Vec<u8>, String> {
+async fn fetch_root_ca_crl(client: &reqwest::Client, base_url: &str) -> Result<Vec<u8>, String> {
     if !base_url.starts_with(INTEL_PCS_URL) {
         let root_ca_crl_url = format!("{base_url}/sgx/certification/v4/rootcacrl");
         if let Ok(response) = checked_get(client, &root_ca_crl_url).await {
-            let body = response
-                .text()
-                .await
-                .map_err(|error| format!("read {root_ca_crl_url}: {error}"))?;
+            let body = read_limited_text(response, &root_ca_crl_url).await?;
             return hex::decode(body.trim())
                 .map_err(|error| format!("decode root CA CRL from {root_ca_crl_url}: {error}"));
         }
     }
 
-    let certificates = pem::parse_many(qe_identity_issuer_chain)
-        .map_err(|error| format!("parse QE identity issuer chain: {error}"))?;
-    let root = certificates
-        .last()
-        .ok_or_else(|| "QE identity issuer chain is empty".to_string())?;
-    let crl_url = crl_distribution_point(root.contents())?
-        .ok_or_else(|| "Intel root certificate has no CRL distribution point".to_string())?;
-    checked_get(client, &crl_url)
-        .await?
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| format!("read root CA CRL from {crl_url}: {error}"))
-}
-
-fn crl_distribution_point(certificate_der: &[u8]) -> Result<Option<String>, String> {
-    let (_, certificate) = X509Certificate::from_der(certificate_der)
-        .map_err(|error| format!("parse Intel root certificate: {error}"))?;
-    for extension in certificate.extensions() {
-        let ParsedExtension::CRLDistributionPoints(points) = extension.parsed_extension() else {
-            continue;
-        };
-        for point in &points.points {
-            let Some(DistributionPointName::FullName(names)) = &point.distribution_point else {
-                continue;
-            };
-            for name in names {
-                if let GeneralName::URI(uri) = name {
-                    return Ok(Some((*uri).to_string()));
-                }
-            }
-        }
-    }
-    Ok(None)
+    let response = checked_get(client, INTEL_ROOT_CA_CRL_URL).await?;
+    read_limited_body(response, INTEL_ROOT_CA_CRL_URL).await
 }
 
 fn split_signed_document(
     document: &str,
     body_field: &'static str,
 ) -> Result<(String, Vec<u8>), String> {
-    let value: serde_json::Value = serde_json::from_str(document)
+    let value: std::collections::BTreeMap<String, &RawValue> = serde_json::from_str(document)
         .map_err(|error| format!("{body_field} response is not valid JSON: {error}"))?;
     let body = value
         .get(body_field)
         .ok_or_else(|| format!("{body_field} response is missing {body_field}"))?;
     let signature = value
         .get("signature")
-        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{body_field} response is missing signature"))?;
-    let signature = signature.strip_prefix("0x").unwrap_or(signature);
+    let signature: String = serde_json::from_str(signature.get())
+        .map_err(|error| format!("{body_field} signature is not a JSON string: {error}"))?;
+    let signature = signature.strip_prefix("0x").unwrap_or(&signature);
     let signature = hex::decode(signature)
         .map_err(|error| format!("{body_field} signature is not valid hex: {error}"))?;
-    let body =
-        serde_json::to_string(body).map_err(|error| format!("serialize {body_field}: {error}"))?;
-    Ok((body, signature))
+    Ok((body.get().to_string(), signature))
 }
 
 fn normalized_pcs_base_url(url: &str) -> String {
@@ -393,19 +399,18 @@ mod tests {
     #[test]
     fn splits_signed_intel_document() {
         let (body, signature) = split_signed_document(
-            r#"{"tcbInfo":{"version":3},"signature":"0x0102"}"#,
+            r#"{"tcbInfo":{"version":3,"id":"TDX"},"signature":"0x0102"}"#,
             "tcbInfo",
         )
         .expect("split signed document");
-        assert_eq!(body, r#"{"version":3}"#);
+        assert_eq!(body, r#"{"version":3,"id":"TDX"}"#);
         assert_eq!(signature, vec![1, 2]);
     }
 
     #[test]
     fn extracts_material_from_the_upstream_tdx_quote_sample() {
-        let quote =
-            hex::decode(include_str!("../../../vendor/automata-dcap/samples/quotev4.hex").trim())
-                .expect("decode quote");
+        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+            .expect("decode quote");
         let material = quote_material(&quote).expect("extract quote material");
         assert_eq!(material.fmspc.len(), 12);
         assert!(matches!(material.pck_ca, "processor" | "platform"));
@@ -415,5 +420,57 @@ mod tests {
         assert!(material
             .pck_certificate_chain
             .contains("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn rejects_non_tdx_quotes_and_nonzero_trailing_bytes() {
+        let sgx_quote = hex::decode(include_str!("../testdata/automata-dcap/quotev3.hex").trim())
+            .expect("decode SGX quote");
+        assert!(quote_material(&sgx_quote)
+            .expect_err("SGX quote must not be accepted as TDX")
+            .contains("expected a TDX quote"));
+
+        let mut padded_tdx_quote =
+            hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+                .expect("decode TDX quote");
+        *padded_tdx_quote.last_mut().expect("sample quote") = 1;
+        assert!(quote_material(&padded_tdx_quote)
+            .expect_err("non-zero trailing bytes must be rejected")
+            .contains("non-zero trailing bytes"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Hoodi RPC endpoint"]
+    async fn live_automata_collateral_verifies_the_tdx_sample() {
+        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+            .expect("decode TDX quote");
+        let collateral = fetch_automata_collateral(
+            "https://ethereum-hoodi-rpc.publicnode.com",
+            "hoodi",
+            AutomataPccsOverrides {
+                pcs_dao: None,
+                pck_dao: None,
+                fmspc_tcb_dao: None,
+                enclave_identity_dao: None,
+            },
+            &TdxDcapAutomataReadStrategy::DirectConcurrent,
+            &quote,
+        )
+        .await
+        .expect("fetch Automata collateral");
+        let collateral = collateral
+            .to_automata_collateral()
+            .expect("convert Automata collateral");
+        let mut quote_bytes = quote.as_slice();
+        let quote = Quote::read(&mut quote_bytes).expect("parse quote");
+        dcap_rs::verify_dcap_quote_with_policy(
+            std::time::SystemTime::now(),
+            collateral,
+            quote,
+            &dcap_rs::DcapVerificationPolicy::production().with_tdx_tcb_revocation_policy(
+                dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,
+            ),
+        )
+        .expect("verify quote with fetched collateral");
     }
 }

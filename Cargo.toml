@@ -13,11 +13,6 @@ members = [
 ]
 exclude = [
     "vendor/lazy_static",
-    "vendor/automata-dcap/libraries/bindings",
-    "vendor/automata-dcap/libraries/dcap-rs",
-    "vendor/automata-dcap/libraries/network-registry",
-    "vendor/automata-dcap/libraries/pccs-reader",
-    "vendor/automata-dcap/libraries/utils",
 ]
 
 [workspace.package]
@@ -28,7 +23,7 @@ edition = "2021"
 # Shared
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_bytes = "0.11"
 base64 = "0.22"
 tracing = "0.1"
@@ -55,22 +50,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 alloy-ext = "1.7.4"
 alloy = { version = "1.7.3", default-features = false }
 automata-tee-workload-measurement = "0.1.2"
+aws-lc-rs = "1"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
-rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 signature = "2"
 x509-parser = { version = "0.16", features = ["verify"] }
 x509-cert = "0.2.5"
 pem = "3"
 rcgen = "0.13"
 
-# Vendored from automata-network/automata-dcap-attestation commit
-# 7ee427e0d4d4ab51861c81fedc0c6338e67c49b6.
-dcap-rs = { path = "vendor/automata-dcap/libraries/dcap-rs" }
-automata-dcap-network-registry = { path = "vendor/automata-dcap/libraries/network-registry" }
-pccs-reader-rs = { path = "vendor/automata-dcap/libraries/pccs-reader" }
+# Pin all Automata DCAP crates to the same reviewed upstream commit.
+dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
+automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
+pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
 
 # Async
 async-trait = "0.1"

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atakit_attestation::{
-    amd_snp_ark_from_cert_table, amd_snp_vcek_cert_table, amd_snp_vcek_request,
-    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation, AkBinding,
-    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TdxDcapCollateral,
-    TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
-    VerificationReport, VerifiedTlsIdentity,
+    amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_vcek_cert_table,
+    amd_snp_vcek_request, select_azure_maa_manual_trust_key, verify_measurement_pack,
+    verify_tls_attestation, AkBinding, AzureMaaTrustKey, CheckResult, EvidenceSummary,
+    MeasurementPolicy, TdxDcapCollateral, TlsAttestationResponse, TrustAnchors, VerificationCheck,
+    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -43,6 +43,10 @@ pub fn initialization_timeout_seconds(
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
+const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_PORTAL_STATUS_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_AMD_COLLATERAL_BYTES: usize = 1024 * 1024;
 
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
@@ -621,11 +625,13 @@ pub fn load_tls_trust_anchors(
     gcp_ak_root_certs: &[String],
     azure_maa_keys: &[String],
     amd_ark_root_certs: &[String],
+    amd_snp_crls: &[String],
 ) -> Result<TrustAnchors, CloudError> {
     Ok(TrustAnchors {
         gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
         azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
         amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+        amd_snp_crls: parse_hex_blobs(amd_snp_crls, "--amd-snp-crl")?,
         ..TrustAnchors::default()
     })
 }
@@ -640,6 +646,40 @@ fn parse_hex_blobs(values: &[String], flag: &str) -> Result<Vec<Vec<u8>>, CloudE
             })
         })
         .collect()
+}
+
+async fn read_response_bytes_limited(
+    response: reqwest::Response,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| format!("read {label}: {error}"))?
+    {
+        append_response_chunk_limited(&mut body, &chunk, maximum_bytes, label)?;
+    }
+    Ok(body)
+}
+
+fn append_response_chunk_limited(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<(), String> {
+    let new_length = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| format!("{label} length overflow"))?;
+    if new_length > maximum_bytes {
+        return Err(format!("{label} exceeds the {maximum_bytes}-byte limit"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn measurement_pack_paths(path: &Path) -> (PathBuf, PathBuf) {
@@ -796,7 +836,14 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     let live_peer_cert_der = peer_cert_der(&resp)?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal TLS attestation error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
         let live_hash = format!("0x{}", hex::encode(live_sha));
         let report = endpoint_failure_report(status.as_u16(), &body, &live_hash);
@@ -836,11 +883,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         });
     }
 
-    let mut response = resp.json::<TlsAttestationResponse>().await.map_err(|e| {
-        CloudError::PortalTlsAttestationFailed {
-            message: format!("invalid response JSON: {e}"),
-        }
-    })?;
+    let response_body = read_response_bytes_limited(
+        resp,
+        MAX_TLS_ATTESTATION_RESPONSE_BYTES,
+        "portal TLS attestation response",
+    )
+    .await
+    .map_err(|message| CloudError::PortalTlsAttestationFailed { message })?;
+    let mut response =
+        serde_json::from_slice::<TlsAttestationResponse>(&response_body).map_err(|e| {
+            CloudError::PortalTlsAttestationFailed {
+                message: format!("invalid response JSON: {e}"),
+            }
+        })?;
     // Manual keys remain available until the committed session evidence is
     // fetched. The key that verifies fresh TLS evidence may differ from the
     // key that signed the retained session MAA JWT.
@@ -903,6 +958,19 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     } else {
         None
     };
+
+    if let Err(detail) = resolve_amd_snp_crl(&response, &mut trust_anchors).await {
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report =
+            tls_preverification_failure_report(&response, &live_hash, "amd-snp-crl", detail);
+        return handle_tls_attestation_failure(
+            report,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+        );
+    }
 
     if let Err(detail) = resolve_chain_trust_anchors(
         &response,
@@ -1029,19 +1097,27 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
-            let collateral = fetch_automata_collateral(
-                rpc_url,
-                chain,
-                AutomataPccsOverrides {
-                    pcs_dao: pcs_dao.as_deref(),
-                    pck_dao: pck_dao.as_deref(),
-                    fmspc_tcb_dao: fmspc_tcb_dao.as_deref(),
-                    enclave_identity_dao: enclave_identity_dao.as_deref(),
-                },
-                read_strategy,
-                &quote,
+            let collateral = tokio::time::timeout(
+                Duration::from_secs(180),
+                fetch_automata_collateral(
+                    rpc_url,
+                    chain,
+                    AutomataPccsOverrides {
+                        pcs_dao: pcs_dao.as_deref(),
+                        pck_dao: pck_dao.as_deref(),
+                        fmspc_tcb_dao: fmspc_tcb_dao.as_deref(),
+                        enclave_identity_dao: enclave_identity_dao.as_deref(),
+                    },
+                    read_strategy,
+                    &quote,
+                ),
             )
             .await
+            .map_err(|_| {
+                format!(
+                    "fetch GCP TDX DCAP collateral from Automata {chain}: timed out after 180 seconds"
+                )
+            })?
             .map_err(|e| format!("fetch GCP TDX DCAP collateral from Automata {chain}: {e}"))?;
             serde_json::to_value(collateral)
                 .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
@@ -1096,14 +1172,14 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
         .decode(&evidence.report)
         .map_err(|error| format!("decode Azure SNP report: {error}"))?;
     let request = amd_snp_vcek_request(&report)?;
-    let product = amd_kds_product(request.cpuid_family, request.cpuid_model)?;
+    let product = amd_snp_kds_product(&report)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("build AMD KDS client: {error}"))?;
     let chip_id = hex::encode(request.chip_id);
     let vcek_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/{chip_id}");
-    let vcek = client
+    let vcek_response = client
         .get(&vcek_url)
         .query(&[
             ("blSPL", request.bootloader),
@@ -1115,22 +1191,27 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
         .await
         .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?
-        .bytes()
-        .await
-        .map_err(|error| format!("read AMD {product} VCEK: {error}"))?
-        .to_vec();
+        .map_err(|error| format!("fetch AMD {product} VCEK: {error}"))?;
+    let vcek = read_response_bytes_limited(
+        vcek_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} VCEK"),
+    )
+    .await?;
     let chain_url = format!("https://kdsintf.amd.com/vcek/v1/{product}/cert_chain");
-    let chain = client
+    let chain_response = client
         .get(&chain_url)
         .send()
         .await
         .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?
-        .bytes()
-        .await
-        .map_err(|error| format!("read AMD {product} certificate chain: {error}"))?;
+        .map_err(|error| format!("fetch AMD {product} certificate chain: {error}"))?;
+    let chain = read_response_bytes_limited(
+        chain_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} certificate chain"),
+    )
+    .await?;
     let certs = parse_pem_certificates(&chain)?;
     let [ask, ark] = certs.as_slice() else {
         return Err(format!(
@@ -1141,14 +1222,43 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
     amd_snp_vcek_cert_table(ark, ask, &vcek)
 }
 
-fn amd_kds_product(family: u8, model: u8) -> Result<&'static str, String> {
-    match (family, model) {
-        (0x19, 0x00..=0x0f) => Ok("Milan"),
-        (0x19, 0x10..=0x1f) => Ok("Genoa"),
-        _ => Err(format!(
-            "unsupported AMD SNP CPUID family 0x{family:02x}, model 0x{model:02x} for KDS lookup"
-        )),
+async fn resolve_amd_snp_crl(
+    response: &TlsAttestationResponse,
+    trust_anchors: &mut TrustAnchors,
+) -> Result<(), String> {
+    if !response.platform.tee.eq_ignore_ascii_case("sev-snp")
+        || !trust_anchors.amd_snp_crls.is_empty()
+    {
+        return Ok(());
     }
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
+    let report = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|error| format!("decode SNP report for AMD CRL lookup: {error}"))?;
+    let product = amd_snp_kds_product(&report)?;
+    let url = format!("https://kdsintf.amd.com/vcek/v1/{product}/crl");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build AMD KDS client: {error}"))?;
+    let crl_response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?;
+    let crl = read_response_bytes_limited(
+        crl_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} certificate revocation list"),
+    )
+    .await?;
+    trust_anchors.amd_snp_crls.push(crl);
+    Ok(())
 }
 
 fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -1726,7 +1836,16 @@ pub async fn wait_for_portal_terminal_with_client(
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
+                match read_response_bytes_limited(
+                    resp,
+                    MAX_PORTAL_STATUS_RESPONSE_BYTES,
+                    "portal status response",
+                )
+                .await
+                .and_then(|body| {
+                    serde_json::from_slice::<serde_json::Value>(&body)
+                        .map_err(|error| format!("parse portal status response: {error}"))
+                }) {
                     Ok(body) => {
                         let state = body
                             .get("state")
@@ -1902,7 +2021,14 @@ pub async fn post_portal_init_with_client(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal init error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         return Err(CloudError::PortalInitFailed {
             message: format!("portal returned {status}: {body}"),
         });
@@ -1925,16 +2051,25 @@ async fn verify_portal_init_schema(
         .map_err(|error| CloudError::PortalInitFailed {
             message: format!("read portal init schema from {url}: {error}"),
         })?;
-    let status = response
+    let response = response
         .error_for_status()
         .map_err(|error| CloudError::PortalInitFailed {
             message: format!("read portal init schema from {url}: {error}"),
-        })?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| CloudError::PortalInitFailed {
-            message: format!("parse portal status from {url}: {error}"),
         })?;
+    let body = read_response_bytes_limited(
+        response,
+        MAX_PORTAL_STATUS_RESPONSE_BYTES,
+        "portal init schema response",
+    )
+    .await
+    .map_err(|message| CloudError::PortalInitFailed {
+        message: format!("read portal init schema from {url}: {message}"),
+    })?;
+    let status = serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
+        CloudError::PortalInitFailed {
+            message: format!("parse portal status from {url}: {error}"),
+        }
+    })?;
     validate_portal_init_schema(&status)
 }
 
@@ -2609,9 +2744,23 @@ mod tests {
 
     #[test]
     fn selects_amd_kds_product_for_supported_cpuid() {
-        assert_eq!(amd_kds_product(0x19, 0x01).unwrap(), "Milan");
-        assert_eq!(amd_kds_product(0x19, 0x11).unwrap(), "Genoa");
-        assert!(amd_kds_product(0x1a, 0x01).is_err());
+        let mut report = vec![0u8; 0x4a0];
+        report[0x188] = 0x19;
+        report[0x189] = 0x01;
+        assert_eq!(amd_snp_kds_product(&report).unwrap(), "Milan");
+        report[0x189] = 0x11;
+        assert_eq!(amd_snp_kds_product(&report).unwrap(), "Genoa");
+        report[0x188] = 0x1a;
+        assert!(amd_snp_kds_product(&report).is_err());
+    }
+
+    #[test]
+    fn response_body_limit_rejects_the_first_excess_byte() {
+        let mut body = Vec::new();
+        append_response_chunk_limited(&mut body, b"1234", 4, "test response").unwrap();
+        let error = append_response_chunk_limited(&mut body, b"5", 4, "test response").unwrap_err();
+        assert_eq!(body, b"1234");
+        assert!(error.contains("4-byte limit"), "{error}");
     }
 
     #[test]

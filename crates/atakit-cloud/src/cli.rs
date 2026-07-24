@@ -215,6 +215,10 @@ pub struct DeployArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_ark_root_cert: Vec<String>,
 
+    /// AMD SEV-SNP certificate revocation list, as hex DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_snp_crl: Vec<String>,
+
     /// TDX DCAP collateral JSON file for offline GCP TDX TLS verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
@@ -455,6 +459,10 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_ark_root_cert: Vec<String>,
 
+    /// AMD SEV-SNP certificate revocation list, as hex DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_snp_crl: Vec<String>,
+
     /// TDX DCAP collateral JSON file for offline GCP TDX TLS verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
@@ -558,6 +566,10 @@ pub struct SessionVerificationArgs {
     /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
     #[arg(long, value_name = "HEX")]
     pub amd_ark_root_cert: Vec<String>,
+
+    /// AMD SEV-SNP certificate revocation list, as hex DER.
+    #[arg(long, value_name = "HEX")]
+    pub amd_snp_crl: Vec<String>,
 
     /// TDX DCAP collateral JSON file.
     #[arg(long, value_name = "PATH")]

@@ -65,6 +65,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &args.verification.gcp_ak_root_cert,
         &args.verification.azure_maa_key,
         &args.verification.amd_ark_root_cert,
+        &args.verification.amd_snp_crl,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
