@@ -421,23 +421,80 @@ fn parse_attributes(
     let mut keys = BTreeSet::new();
     for value in values {
         let item = if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
-            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
-                .ok_or_else(|| {
-                    session_error(format!(
+            use atakit_core::tee_attributes::{
+                ReservedAttributeValueKind, VerifiedTeeAttribute, TEE_ATTRIBUTE_NAMESPACE,
+            };
+            match VerifiedTeeAttribute::from_name(name) {
+                Some(attribute)
+                    if attribute.value_kind() == ReservedAttributeValueKind::Boolean =>
+                {
+                    let enabled = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "{owner} readable reserved attribute {name} is missing Boolean value"
+                            ))
+                        })?;
+                    SessionAttribute {
+                        key: attribute.key(),
+                        value: atakit_core::tee_attributes::bool_value(enabled),
+                    }
+                }
+                Some(VerifiedTeeAttribute::IntelTdxTcbStatusAllowed) => {
+                    if owner == "variant" {
+                        return Err(session_error(format!(
+                            "{owner} cannot override reserved attribute {name}"
+                        )));
+                    }
+                    let names = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "{owner} readable reserved attribute {name} value must be a status-name array"
+                            ))
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().ok_or_else(|| {
+                                session_error(format!(
+                                    "{owner} readable reserved attribute {name} status names must be strings"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mask = atakit_core::tee_attributes::tdx_tcb_status_mask(names)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "{owner} readable reserved attribute {name} must contain unique supported status names and include ok"
+                            ))
+                        })?;
+                    SessionAttribute {
+                        key: atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY,
+                        value: atakit_core::tee_attributes::u16_value(mask),
+                    }
+                }
+                Some(_) => unreachable!("all reserved attributes handled"),
+                None if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) => {
+                    return Err(session_error(format!(
                         "{owner} attribute has unknown reserved name {name}"
-                    ))
-                })?;
-            let enabled = value
-                .get("value")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| {
-                    session_error(format!(
-                        "{owner} readable reserved attribute {name} is missing Boolean value"
-                    ))
-                })?;
-            SessionAttribute {
-                key: attribute.key(),
-                value: atakit_core::tee_attributes::bool_value(enabled),
+                    )));
+                }
+                None => {
+                    let string_value = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "{owner} custom readable attribute {name} value must be a string"
+                            ))
+                        })?;
+                    SessionAttribute {
+                        key: atakit_core::tee_attributes::attribute_key(name),
+                        value: atakit_core::tee_attributes::attribute_string_value(string_value),
+                    }
+                }
             }
         } else {
             let key = value

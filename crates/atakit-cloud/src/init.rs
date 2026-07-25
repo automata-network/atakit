@@ -7,7 +7,7 @@ use std::time::Duration;
 use atakit_attestation::{
     amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_vcek_cert_table,
     amd_snp_vcek_request, select_azure_maa_manual_trust_key, verify_measurement_pack,
-    verify_tls_attestation, verify_tls_attestation_with_workload_tee_attributes, AkBinding,
+    verify_tls_attestation, verify_tls_attestation_with_workload_attributes, AkBinding,
     AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TdxDcapCollateral,
     TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
     VerificationReport, VerifiedTlsIdentity,
@@ -809,7 +809,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     host: &str,
     status_port: u16,
     measurement_policy: Option<MeasurementPolicy>,
-    workload_tee_attributes: Option<BTreeMap<String, Vec<bool>>>,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
     mut trust_anchors: TrustAnchors,
     azure_maa_trust: AzureMaaTrustConfig,
     tdx_dcap_collateral: TdxDcapCollateralConfig,
@@ -1022,9 +1022,9 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         measurement_policy,
         trust_anchors,
     };
-    let verification = match workload_tee_attributes.as_ref() {
+    let verification = match workload_attributes.as_ref() {
         Some(attributes) => {
-            verify_tls_attestation_with_workload_tee_attributes(verification_inputs, attributes)
+            verify_tls_attestation_with_workload_attributes(verification_inputs, attributes)
         }
         None => verify_tls_attestation(verification_inputs),
     };

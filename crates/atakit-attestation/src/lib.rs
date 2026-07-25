@@ -606,13 +606,13 @@ pub fn verify_tls_attestation(
 
 /// Verifies TLS evidence and applies the selected workload manifest's verified
 /// TEE attribute requirements before returning the trusted TLS identity.
-pub fn verify_tls_attestation_with_workload_tee_attributes(
+pub fn verify_tls_attestation_with_workload_attributes(
     inputs: VerificationInputs,
-    workload_tee_attributes: &BTreeMap<String, Vec<bool>>,
+    workload_attributes: &atakit_core::tee_attributes::AttributeRequirements,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
-    verify_tls_attestation_with_workload_tee_attributes_at(
+    verify_tls_attestation_with_workload_attributes_at(
         inputs,
-        workload_tee_attributes,
+        workload_attributes,
         SystemTime::now(),
     )
 }
@@ -624,22 +624,23 @@ fn verify_tls_attestation_at(
     verify_tls_attestation_internal(inputs, None, current_time)
 }
 
-fn verify_tls_attestation_with_workload_tee_attributes_at(
+fn verify_tls_attestation_with_workload_attributes_at(
     inputs: VerificationInputs,
-    workload_tee_attributes: &BTreeMap<String, Vec<bool>>,
+    workload_attributes: &atakit_core::tee_attributes::AttributeRequirements,
     current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
-    verify_tls_attestation_internal(inputs, Some(workload_tee_attributes), current_time)
+    verify_tls_attestation_internal(inputs, Some(workload_attributes), current_time)
 }
 
 fn verify_tls_attestation_internal(
     inputs: VerificationInputs,
-    workload_tee_attributes: Option<&BTreeMap<String, Vec<bool>>>,
+    workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
     current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
     let mut verified_base_image_id = None;
     let mut verified_platform_profile_id = None;
     let mut verified_variant_id = None;
+    let mut verified_tdx_tcb_status_bit = None;
     let mut report = VerificationReport {
         checks: Vec::new(),
         evidence: EvidenceSummary {
@@ -997,7 +998,7 @@ fn verify_tls_attestation_internal(
             &inputs.response.platform.tee,
             &inputs.response.tpm.pcrs,
         );
-        verification_core::verify_gcp_tee_vendor_report(
+        verified_tdx_tcb_status_bit = verification_core::verify_gcp_tee_vendor_report(
             &mut report,
             &mut errors,
             inputs.response.tee_evidence.as_ref(),
@@ -1024,12 +1025,15 @@ fn verify_tls_attestation_internal(
                     &inputs.response.platform.tee,
                 );
                 match inputs.response.platform.tee.as_str() {
-                    "tdx" => verification_core::verify_azure_tdx_vendor_report(
-                        &mut report,
-                        &mut errors,
-                        Some(evidence),
-                        &inputs.response.collateral,
-                    ),
+                    "tdx" => {
+                        verified_tdx_tcb_status_bit =
+                            verification_core::verify_azure_tdx_vendor_report(
+                                &mut report,
+                                &mut errors,
+                                Some(evidence),
+                                &inputs.response.collateral,
+                            );
+                    }
                     "sev-snp" => verification_core::verify_azure_snp_vendor_report(
                         &mut report,
                         &mut errors,
@@ -1259,14 +1263,15 @@ fn verify_tls_attestation_internal(
             Err(e) => fail(&mut report, &mut errors, "variant-id", e.to_string()),
         }
 
-        verify_measurement_tee_attributes(
+        verify_measurement_attributes(
             &mut report,
             &mut errors,
             profile,
             variant,
             &inputs.response.platform.tee,
             inputs.response.tee_evidence.as_ref(),
-            workload_tee_attributes,
+            verified_tdx_tcb_status_bit,
+            workload_attributes,
         );
 
         match effective_pcr_specs(profile, variant) {
@@ -1342,20 +1347,21 @@ fn effective_pcr_specs<'a>(
     Ok(specs.into_values().collect())
 }
 
-fn verify_measurement_tee_attributes(
+fn verify_measurement_attributes(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     profile: &MeasurementProfile,
     variant: &MeasurementVariant,
     tee: &str,
     evidence: Option<&TeeEvidence>,
-    workload_tee_attributes: Option<&BTreeMap<String, Vec<bool>>>,
+    verified_tdx_tcb_status_bit: Option<u16>,
+    workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
 ) {
     let Some(evidence) = evidence else {
         fail(
             report,
             errors,
-            "measurement-tee-attributes",
+            "measurement-attributes",
             "TEE evidence is missing".to_string(),
         );
         return;
@@ -1363,12 +1369,7 @@ fn verify_measurement_tee_attributes(
     let report_bytes = match decode_b64("teeEvidence.report", &evidence.report) {
         Ok(bytes) => bytes,
         Err(error) => {
-            fail(
-                report,
-                errors,
-                "measurement-tee-attributes",
-                error.to_string(),
-            );
+            fail(report, errors, "measurement-attributes", error.to_string());
             return;
         }
     };
@@ -1376,43 +1377,41 @@ fn verify_measurement_tee_attributes(
     {
         Ok(states) => states,
         Err(detail) => {
-            fail(report, errors, "measurement-tee-attributes", detail);
+            fail(report, errors, "measurement-attributes", detail);
             return;
         }
     };
     let effective_attributes = match effective_measurement_attributes(profile, variant) {
         Ok(attributes) => attributes,
         Err(detail) => {
-            fail(report, errors, "measurement-tee-attributes", detail);
+            fail(report, errors, "measurement-attributes", detail);
             return;
         }
     };
-    if let Some(requirements) = workload_tee_attributes {
-        for (name, allowed_values) in requirements {
-            if atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).is_none() {
-                fail(
-                    report,
-                    errors,
-                    "workload-tee-attributes",
-                    format!("unknown workload TEE attribute name {name}"),
-                );
-            } else if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
-                fail(
-                    report,
-                    errors,
-                    "workload-tee-attributes",
-                    format!(
-                        "workload TEE attribute {name} must allow exactly [false] or [false, true]"
-                    ),
-                );
+    let tee_platform = match tee {
+        "tdx" => Some(atakit_core::tee_attributes::TeePlatform::IntelTdx),
+        "sev-snp" => Some(atakit_core::tee_attributes::TeePlatform::AmdSevSnp),
+        _ => None,
+    };
+    let mut encoded_requirements = BTreeMap::new();
+    if let Some(requirements) = workload_attributes {
+        for (name, values) in requirements {
+            match atakit_core::tee_attributes::encode_requirement(name, values) {
+                Ok((key, allowed_values)) => {
+                    encoded_requirements.insert(key, allowed_values);
+                }
+                Err(detail) => fail(report, errors, "workload-attributes", detail),
             }
         }
     }
 
-    for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL
+    for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN
         .into_iter()
         .zip(verified_states)
     {
+        if Some(attribute.platform()) != tee_platform {
+            continue;
+        }
         let verified_value = atakit_core::tee_attributes::bool_value(enabled);
         let declared_value = effective_attributes
             .get(&attribute.key())
@@ -1430,23 +1429,90 @@ fn verify_measurement_tee_attributes(
                 hex::encode(verified_value)
             ),
         );
-        if let Some(requirements) = workload_tee_attributes {
-            let allowed = requirements
-                .get(attribute.name())
-                .map_or(!enabled, |values| values.contains(&enabled));
+        let allowed = encoded_requirements
+            .get(&attribute.key())
+            .map_or(!enabled, |values| values.contains(&verified_value));
+        check(
+            report,
+            errors,
+            &format!("tee-attribute-workload-{}", attribute.name()),
+            allowed,
+            format!(
+                "workload requirement for {} does not permit verified value {}",
+                attribute.name(),
+                enabled
+            ),
+        );
+    }
+
+    if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::IntelTdx) {
+        if let Some(actual_bit) = verified_tdx_tcb_status_bit {
+            let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
+            let base_mask = effective_attributes
+                .get(&key)
+                .and_then(bytes32_to_u16)
+                .unwrap_or(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
             check(
                 report,
                 errors,
-                &format!("tee-attribute-workload-{}", attribute.name()),
-                allowed,
+                "tee-attribute-base-image-intel-tdx-tcb-status",
+                base_mask & actual_bit != 0,
                 format!(
-                    "workload requirement for {} does not permit verified value {}",
-                    attribute.name(),
-                    enabled
+                    "base-image Intel TDX TCB status mask 0x{base_mask:x} does not permit verified status bit 0x{actual_bit:x}"
+                ),
+            );
+            let workload_mask = encoded_requirements
+                .get(&key)
+                .and_then(|values| values.first())
+                .and_then(bytes32_to_u16)
+                .unwrap_or(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
+            check(
+                report,
+                errors,
+                "tee-attribute-workload-intel-tdx-tcb-status",
+                workload_mask & actual_bit != 0,
+                format!(
+                    "workload Intel TDX TCB status mask 0x{workload_mask:x} does not permit verified status bit 0x{actual_bit:x}"
                 ),
             );
         }
     }
+
+    for (key, allowed_values) in encoded_requirements {
+        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key).is_some() {
+            continue;
+        }
+        let Some(actual) = effective_attributes.get(&key) else {
+            fail(
+                report,
+                errors,
+                "workload-attribute",
+                format!(
+                    "base image does not declare required attribute 0x{}",
+                    hex::encode(key)
+                ),
+            );
+            continue;
+        };
+        check(
+            report,
+            errors,
+            &format!("workload-attribute-{}", hex::encode(key)),
+            allowed_values.is_empty() || allowed_values.contains(actual),
+            format!(
+                "workload requirement for attribute 0x{} does not permit value 0x{}",
+                hex::encode(key),
+                hex::encode(actual)
+            ),
+        );
+    }
+}
+
+fn bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
+    value[..30]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| u16::from_be_bytes([value[30], value[31]]))
 }
 
 fn effective_measurement_attributes(
@@ -1468,18 +1534,79 @@ fn parse_measurement_attributes(
     for value in values {
         let (key, value) = if let Some(name) = value.get("name").and_then(serde_json::Value::as_str)
         {
-            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
-                .ok_or_else(|| format!("{owner} attribute has unknown reserved name {name}"))?;
-            let enabled = value
-                .get("value")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| {
-                    format!("{owner} readable reserved attribute {name} is missing Boolean value")
-                })?;
-            (
-                attribute.key(),
-                atakit_core::tee_attributes::bool_value(enabled),
-            )
+            use atakit_core::tee_attributes::{
+                ReservedAttributeValueKind, VerifiedTeeAttribute, TEE_ATTRIBUTE_NAMESPACE,
+            };
+            match VerifiedTeeAttribute::from_name(name) {
+                Some(attribute)
+                    if attribute.value_kind() == ReservedAttributeValueKind::Boolean =>
+                {
+                    let enabled = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} is missing Boolean value"
+                            )
+                        })?;
+                    (
+                        attribute.key(),
+                        atakit_core::tee_attributes::bool_value(enabled),
+                    )
+                }
+                Some(VerifiedTeeAttribute::IntelTdxTcbStatusAllowed) => {
+                    if owner == "variant" {
+                        return Err(format!("{owner} cannot override reserved attribute {name}"));
+                    }
+                    let names = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} value must be a status-name array"
+                            )
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().ok_or_else(|| {
+                                format!(
+                                    "{owner} readable reserved attribute {name} status names must be strings"
+                                )
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let mask = atakit_core::tee_attributes::tdx_tcb_status_mask(names)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} must contain unique supported status names and include ok"
+                            )
+                        })?;
+                    (
+                        atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY,
+                        atakit_core::tee_attributes::u16_value(mask),
+                    )
+                }
+                Some(_) => unreachable!("all reserved attributes handled"),
+                None if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) => {
+                    return Err(format!(
+                        "{owner} attribute has unknown reserved name {name}"
+                    ));
+                }
+                None => {
+                    let string_value = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} custom readable attribute {name} value must be a string"
+                            )
+                        })?;
+                    (
+                        atakit_core::tee_attributes::attribute_key(name),
+                        atakit_core::tee_attributes::attribute_string_value(string_value),
+                    )
+                }
+            }
         } else {
             let key = value
                 .get("key")
@@ -1494,15 +1621,36 @@ fn parse_measurement_attributes(
                 decode_hex_32("attribute.value", value).map_err(|error| error.to_string())?,
             )
         };
-        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key).is_some()
-            && value != atakit_core::tee_attributes::ATTRIBUTE_FALSE
-            && value != atakit_core::tee_attributes::ATTRIBUTE_TRUE
-        {
-            return Err(format!(
-                "{owner} reserved attribute 0x{} has invalid Boolean value 0x{}",
-                hex::encode(key),
-                hex::encode(value)
-            ));
+        if let Some(attribute) = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key) {
+            match attribute.value_kind() {
+                atakit_core::tee_attributes::ReservedAttributeValueKind::Boolean
+                    if value != atakit_core::tee_attributes::ATTRIBUTE_FALSE
+                        && value != atakit_core::tee_attributes::ATTRIBUTE_TRUE =>
+                {
+                    return Err(format!(
+                        "{owner} reserved Boolean attribute 0x{} has invalid value 0x{}",
+                        hex::encode(key),
+                        hex::encode(value)
+                    ));
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                    if owner == "variant" {
+                        return Err(format!(
+                            "{owner} cannot override reserved attribute {}",
+                            attribute.name()
+                        ));
+                    }
+                    let mask = bytes32_to_u16(&value).ok_or_else(|| {
+                        format!("{owner} Intel TDX TCB status mask is not a uint16")
+                    })?;
+                    if atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_none() {
+                        return Err(format!(
+                            "{owner} Intel TDX TCB status mask 0x{mask:x} is invalid"
+                        ));
+                    }
+                }
+                _ => {}
+            }
         }
         if attributes.insert(key, value).is_some() {
             return Err(format!(
@@ -3017,7 +3165,7 @@ mod tests {
             "tee-attribute-workload-{}",
             atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
         );
-        let failure = verify_tls_attestation_with_workload_tee_attributes(
+        let failure = verify_tls_attestation_with_workload_attributes(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3038,9 +3186,12 @@ mod tests {
 
         let allowed = BTreeMap::from([(
             atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
-            vec![false, true],
+            vec![
+                atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                atakit_core::tee_attributes::AttributeValue::Boolean(true),
+            ],
         )]);
-        let failure = verify_tls_attestation_with_workload_tee_attributes(
+        let failure = verify_tls_attestation_with_workload_attributes(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3062,9 +3213,9 @@ mod tests {
 
         let malformed = BTreeMap::from([(
             atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
-            vec![true],
+            vec![atakit_core::tee_attributes::AttributeValue::Boolean(true)],
         )]);
-        let failure = verify_tls_attestation_with_workload_tee_attributes(
+        let failure = verify_tls_attestation_with_workload_attributes(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3081,7 +3232,7 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "workload-tee-attributes"));
+            .any(|error| error.check == "workload-attributes"));
     }
 
     #[test]
@@ -3160,7 +3311,7 @@ mod tests {
             assert_check_passed(&failure, &check_name);
         }
 
-        let failure = verify_tls_attestation_with_workload_tee_attributes(
+        let failure = verify_tls_attestation_with_workload_attributes(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3185,14 +3336,20 @@ mod tests {
         let allowed = BTreeMap::from([
             (
                 atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME.to_string(),
-                vec![false, true],
+                vec![
+                    atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                    atakit_core::tee_attributes::AttributeValue::Boolean(true),
+                ],
             ),
             (
                 atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME.to_string(),
-                vec![false, true],
+                vec![
+                    atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                    atakit_core::tee_attributes::AttributeValue::Boolean(true),
+                ],
             ),
         ]);
-        let failure = verify_tls_attestation_with_workload_tee_attributes(
+        let failure = verify_tls_attestation_with_workload_attributes(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3787,6 +3944,67 @@ mod tests {
         .expect_err("synthetic Azure Intel TDX evidence lacks DCAP collateral");
         assert!(!failure.errors.iter().any(|error| error.check == check_name));
         assert_check_passed(&failure, &check_name);
+    }
+
+    #[test]
+    fn tls_policy_enforces_verified_tdx_tcb_status_masks() {
+        let nonce = [1u8; 32];
+        let response = response_for(nonce, b"cert", "gcp");
+        let evidence = response.tee_evidence.as_ref().expect("GCP TDX evidence");
+        let mut policy = measurement_policy_for_cloud(&format!("0x{}", "aa".repeat(32)), "gcp");
+        let profile = &policy.pack.profiles[0];
+        let variant = &profile.variants[0];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            profile,
+            variant,
+            "tdx",
+            Some(evidence),
+            Some(0x8),
+            None,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-base-image-intel-tdx-tcb-status" }));
+        assert!(errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-workload-intel-tdx-tcb-status" }));
+
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+            "value": ["ok", "configuration-needed"],
+        })];
+        let requirements = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME.to_string(),
+            vec![
+                atakit_core::tee_attributes::AttributeValue::String("ok".to_string()),
+                atakit_core::tee_attributes::AttributeValue::String(
+                    "configuration-needed".to_string(),
+                ),
+            ],
+        )]);
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "tdx",
+            Some(evidence),
+            Some(0x8),
+            Some(&requirements),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

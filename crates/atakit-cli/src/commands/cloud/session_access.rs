@@ -555,22 +555,15 @@ async fn load_local_workload_policy(
         attribute_requirements: inspection
             .manifest
             .config
-            .tee_attributes
+            .attributes
             .iter()
             .map(|(name, values)| {
-                let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown config.tee-attributes name `{name}`")
-                    })?;
-                if !atakit_core::tee_attributes::validate_allowed_values(values) {
-                    bail!("config.tee-attributes `{name}` must be [false] or [false, true]");
-                }
+                let (key, allowed_values) =
+                    atakit_core::tee_attributes::encode_requirement(name, values)
+                        .map_err(anyhow::Error::msg)?;
                 Ok(SessionAttributeRequirement {
-                    key: attribute.key(),
-                    allowed_values: values
-                        .iter()
-                        .map(|value| atakit_core::tee_attributes::bool_value(*value))
-                        .collect(),
+                    key,
+                    allowed_values,
                 })
             })
             .collect::<Result<Vec<_>>>()?,
@@ -663,7 +656,7 @@ mod tests {
                 "image": "test:v0.0.1",
                 "base-image-mode": "blacklist",
                 "base-image": [],
-                "tee-attributes": {
+                "attributes": {
                     "atakit.attestation.v1.tee.intel-tdx.debug.enabled": [false, true]
                 },
                 "ports": [],

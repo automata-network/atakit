@@ -552,24 +552,30 @@ pub(super) fn verify_gcp_tee_vendor_report(
     collateral: &serde_json::Value,
     amd_snp_trust: AmdSnpTrust<'_>,
     current_time: SystemTime,
-) {
+) -> Option<u16> {
     match tee {
-        "sev-snp" => verify_gcp_snp_vendor_report(
-            report,
-            errors,
-            evidence,
-            amd_snp_trust.ark_roots,
-            amd_snp_trust.ark_root_hashes,
-            amd_snp_trust.crls,
-            current_time,
-        ),
+        "sev-snp" => {
+            verify_gcp_snp_vendor_report(
+                report,
+                errors,
+                evidence,
+                amd_snp_trust.ark_roots,
+                amd_snp_trust.ark_root_hashes,
+                amd_snp_trust.crls,
+                current_time,
+            );
+            None
+        }
         "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral),
-        other => fail(
-            report,
-            errors,
-            "gcp-tee-vendor-report",
-            format!("GCP raw TEE vendor verification is unsupported for tee={other}"),
-        ),
+        other => {
+            fail(
+                report,
+                errors,
+                "gcp-tee-vendor-report",
+                format!("GCP raw TEE vendor verification is unsupported for tee={other}"),
+            );
+            None
+        }
     }
 }
 
@@ -578,7 +584,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     collateral: &serde_json::Value,
-) {
+) -> Option<u16> {
     verify_tdx_vendor_report(
         report,
         errors,
@@ -586,7 +592,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         collateral,
         "gcp-tee-vendor-report",
         "GCP",
-    );
+    )
 }
 
 pub(super) fn verify_azure_tdx_vendor_report(
@@ -594,7 +600,7 @@ pub(super) fn verify_azure_tdx_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     collateral: &serde_json::Value,
-) {
+) -> Option<u16> {
     verify_tdx_vendor_report(
         report,
         errors,
@@ -602,7 +608,7 @@ pub(super) fn verify_azure_tdx_vendor_report(
         collateral,
         "azure-tee-vendor-report",
         "Azure",
-    );
+    )
 }
 
 fn verify_tdx_vendor_report(
@@ -612,7 +618,7 @@ fn verify_tdx_vendor_report(
     collateral: &serde_json::Value,
     check_name: &str,
     provider_name: &str,
-) {
+) -> Option<u16> {
     let Some(evidence) = evidence else {
         fail(
             report,
@@ -620,7 +626,7 @@ fn verify_tdx_vendor_report(
             check_name,
             format!("{provider_name} TDX TEE evidence is missing"),
         );
-        return;
+        return None;
     };
     let raw_quote = match decode_b64("teeEvidence.report", &evidence.report) {
         Ok(bytes) if !bytes.is_empty() => bytes,
@@ -631,11 +637,11 @@ fn verify_tdx_vendor_report(
                 check_name,
                 format!("{provider_name} TDX quote is empty"),
             );
-            return;
+            return None;
         }
         Err(e) => {
             fail(report, errors, check_name, e.to_string());
-            return;
+            return None;
         }
     };
     const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
@@ -646,13 +652,13 @@ fn verify_tdx_vendor_report(
             check_name,
             format!("{provider_name} TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
         );
-        return;
+        return None;
     }
     let collateral = match parse_tdx_dcap_collateral(collateral) {
         Ok(collateral) => collateral,
         Err(detail) => {
             fail(report, errors, check_name, detail);
-            return;
+            return None;
         }
     };
     let mut quote_bytes = raw_quote.as_slice();
@@ -665,7 +671,7 @@ fn verify_tdx_vendor_report(
                 check_name,
                 format!("{provider_name} TDX DCAP quote did not parse: {error:#}"),
             );
-            return;
+            return None;
         }
     };
     if quote.header.tee_type != TDX_TEE_TYPE || !matches!(quote.header.version.get(), 4 | 5) {
@@ -679,7 +685,7 @@ fn verify_tdx_vendor_report(
                 quote.header.version.get()
             ),
         );
-        return;
+        return None;
     }
     if quote_bytes.iter().any(|byte| *byte != 0) {
         fail(
@@ -691,13 +697,13 @@ fn verify_tdx_vendor_report(
                 quote_bytes.len()
             ),
         );
-        return;
+        return None;
     }
     let collateral = match collateral.to_automata_collateral() {
         Ok(collateral) => collateral,
         Err(error) => {
             fail(report, errors, check_name, error);
-            return;
+            return None;
         }
     };
     match dcap_rs::verify_dcap_quote_with_policy(
@@ -706,22 +712,31 @@ fn verify_tdx_vendor_report(
         quote,
         &tdx_dcap_verification_policy(),
     ) {
-        Ok(output) if output.tcb_status == 0 || output.tcb_status == 1 => pass(report, check_name),
-        Ok(output) => fail(
-            report,
-            errors,
-            check_name,
-            format!(
-                "{provider_name} TDX trusted computing base status {} is not accepted",
-                output.tcb_status
-            ),
-        ),
-        Err(e) => fail(
-            report,
-            errors,
-            check_name,
-            format!("{provider_name} TDX DCAP quote verification failed: {e:#}"),
-        ),
+        Ok(output) if matches!(output.tcb_status, 0..=5 | 8 | 9) => {
+            pass(report, check_name);
+            Some(1u16 << output.tcb_status)
+        }
+        Ok(output) => {
+            fail(
+                report,
+                errors,
+                check_name,
+                format!(
+                    "{provider_name} TDX trusted computing base status {} cannot be configured",
+                    output.tcb_status
+                ),
+            );
+            None
+        }
+        Err(e) => {
+            fail(
+                report,
+                errors,
+                check_name,
+                format!("{provider_name} TDX DCAP quote verification failed: {e:#}"),
+            );
+            None
+        }
     }
 }
 

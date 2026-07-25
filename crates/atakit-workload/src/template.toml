@@ -175,12 +175,15 @@ image = "{{name}}:latest"
 # mount-path = "/data"
 # read-only = false
 
-# ── verified TEE attributes ──────────────────────────────────────
+# ── attributes ───────────────────────────────────────────────────
 #
-# Missing requirements permit only false. Use [false, true] only when this
-# workload explicitly permits the verified hardware state to be enabled.
-[workload.tee-attributes]
+# Custom attribute values are strings. Reserved verified TEE attributes use
+# the types and rules shown below. A missing Boolean requirement permits only
+# false. A missing Intel TDX TCB status requirement permits only "ok".
+[workload.attributes]
+# "example.operator.attribute" = ["production"]
 # "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+# "atakit.attestation.v1.tee.intel-tdx.tcb.status.allowed" = ["ok"]
 # "atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false]
 # "atakit.attestation.v1.tee.amd-sev-snp.migrate-ma.enabled" = [false, true]
 

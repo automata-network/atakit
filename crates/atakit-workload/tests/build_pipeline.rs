@@ -202,7 +202,7 @@ async fn build_produces_valid_archive() {
     assert!(!result.archive_hash.is_empty());
     let manifest = read_manifest_json(&result.archive_path);
     assert_eq!(manifest["meta"]["format"], 6);
-    assert_eq!(manifest["config"]["tee-attributes"], serde_json::json!({}));
+    assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
     // Verify archive contents
     let file = std::fs::File::open(&result.archive_path).unwrap();
@@ -435,8 +435,8 @@ async fn inspect_archive_matches_build() {
         .contains("\"name\":\"my-workload\""));
     assert_eq!(byte_snapshot_result.sha256, inspect_result.sha256);
     assert_eq!(
-        byte_snapshot_result.manifest.config.tee_attributes,
-        inspect_result.manifest.config.tee_attributes
+        byte_snapshot_result.manifest.config.attributes,
+        inspect_result.manifest.config.attributes
     );
 }
 

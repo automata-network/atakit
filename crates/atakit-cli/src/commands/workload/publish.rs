@@ -132,23 +132,17 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     let requirements = manifest
         .config
-        .tee_attributes
+        .attributes
         .iter()
         .map(|(name, allowed_values)| {
-            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name)
-                .ok_or_else(|| anyhow::anyhow!("unknown config.tee-attributes name `{name}`"))?;
-            if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
-                anyhow::bail!("config.tee-attributes `{name}` must be [false] or [false, true]");
-            }
+            let (key, allowed_values) =
+                atakit_core::tee_attributes::encode_requirement(name, allowed_values)
+                    .map_err(anyhow::Error::msg)?;
             Ok(AttributeRequirement {
-                key: alloy_ext::core::primitives::B256::from(attribute.key()),
+                key: alloy_ext::core::primitives::B256::from(key),
                 allowedValues: allowed_values
-                    .iter()
-                    .map(|value| {
-                        alloy_ext::core::primitives::B256::from(
-                            atakit_core::tee_attributes::bool_value(*value),
-                        )
-                    })
+                    .into_iter()
+                    .map(alloy_ext::core::primitives::B256::from)
                     .collect(),
             })
         })
@@ -251,28 +245,59 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         }
     );
     if spec.requirements.is_empty() {
-        println!("  {:<20}{}", "TEE Attributes:".dimmed(), "none".dimmed());
+        println!("  {:<20}{}", "Attributes:".dimmed(), "none".dimmed());
     } else {
         for (index, requirement) in spec.requirements.iter().enumerate() {
             let key: [u8; 32] = requirement.key.into();
-            let name = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key)
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key);
+            let name = attribute
                 .map(|attribute| attribute.name())
-                .unwrap_or("unknown");
-            let values = requirement
-                .allowedValues
-                .iter()
-                .map(|value| {
-                    if *value == alloy_ext::core::primitives::B256::ZERO {
-                        "false"
-                    } else {
-                        "true"
-                    }
+                .or_else(|| {
+                    manifest
+                        .config
+                        .attributes
+                        .keys()
+                        .find(|name| atakit_core::tee_attributes::attribute_key(name) == key)
+                        .map(String::as_str)
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .unwrap_or("unknown");
+            let values = if attribute.is_none() {
+                manifest
+                    .config
+                    .attributes
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|value| match value {
+                        atakit_core::tee_attributes::AttributeValue::String(value) => {
+                            format!("{value:?}")
+                        }
+                        atakit_core::tee_attributes::AttributeValue::Boolean(value) => {
+                            value.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                requirement
+                    .allowedValues
+                    .iter()
+                    .map(|value| {
+                        let value: [u8; 32] = (*value).into();
+                        attribute
+                            .and_then(|attribute| {
+                                atakit_core::tee_attributes::readable_reserved_value(
+                                    attribute, &value,
+                                )
+                            })
+                            .unwrap_or_else(|| format!("0x{}", hex::encode(value)))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             println!(
                 "  {:<20}{} = [{}]",
-                if index == 0 { "TEE Attributes:" } else { "" },
+                if index == 0 { "Attributes:" } else { "" },
                 name,
                 values
             );

@@ -176,13 +176,11 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
             {
                 println!("    {}", attribute.name());
                 for value in &req.allowedValues {
-                    if *value == alloy_ext::core::primitives::B256::ZERO {
-                        println!("      false");
-                    } else if *value == alloy_ext::core::primitives::B256::with_last_byte(1) {
-                        println!("      true");
-                    } else {
-                        println!("      {}", format!("0x{}", hex::encode(value)).dimmed());
-                    }
+                    let raw: [u8; 32] = (*value).into();
+                    let display =
+                        atakit_core::tee_attributes::readable_reserved_value(attribute, &raw)
+                            .unwrap_or_else(|| format!("0x{}", hex::encode(raw)));
+                    println!("      {}", display.dimmed());
                 }
             } else {
                 println!(

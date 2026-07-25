@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
 use crate::config::{
-    self, DataMount, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig,
+    self, AttributeRequirements, AttributeValue, DataMount, DiskSection, ImageSource,
+    ServiceStorageSection, WorkloadConfig,
 };
 use crate::data::{
     logical_data_path_rel, namespaced_data_path, validate_logical_data_path, DataRoots,
@@ -10,6 +11,81 @@ use crate::data::{
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
+
+pub fn normalize_attributes(
+    attributes: &AttributeRequirements,
+) -> Result<AttributeRequirements, WorkloadError> {
+    use atakit_core::tee_attributes::{
+        tdx_tcb_status_mask, tdx_tcb_status_names, validate_boolean_allowed_values,
+        ReservedAttributeValueKind, VerifiedTeeAttribute, TEE_ATTRIBUTE_NAMESPACE,
+    };
+
+    let mut normalized = attributes.clone();
+    for (name, values) in attributes {
+        let Some(reserved) = VerifiedTeeAttribute::from_name(name) else {
+            if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) {
+                return Err(WorkloadError::Validation(format!(
+                    "unknown workload.attributes name `{name}` in the reserved namespace"
+                )));
+            }
+            if !values
+                .iter()
+                .all(|value| matches!(value, AttributeValue::String(_)))
+            {
+                return Err(WorkloadError::Validation(format!(
+                    "workload.attributes `{name}` custom values must be strings"
+                )));
+            }
+            continue;
+        };
+
+        match reserved.value_kind() {
+            ReservedAttributeValueKind::Boolean => {
+                let bools: Option<Vec<bool>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::Boolean(value) => Some(*value),
+                        AttributeValue::String(_) => None,
+                    })
+                    .collect();
+                if !bools
+                    .as_deref()
+                    .is_some_and(validate_boolean_allowed_values)
+                {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must be [false] or [false, true]"
+                    )));
+                }
+            }
+            ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                let names: Option<Vec<&str>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::String(value) => Some(value.as_str()),
+                        AttributeValue::Boolean(_) => None,
+                    })
+                    .collect();
+                let Some(mask) = names
+                    .as_ref()
+                    .and_then(|names| tdx_tcb_status_mask(names.iter().copied()))
+                else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain unique supported Intel TDX TCB status names and include \"ok\""
+                    )));
+                };
+                normalized.insert(
+                    name.clone(),
+                    tdx_tcb_status_names(mask)
+                        .expect("validated mask")
+                        .into_iter()
+                        .map(|value| AttributeValue::String(value.to_string()))
+                        .collect(),
+                );
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
 fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
@@ -127,23 +203,12 @@ pub fn validate_config_with_roots(
         )));
     }
 
-    if config.format < 6 && !w.tee_attributes.is_empty() {
+    if config.format < 6 && !w.attributes.is_empty() {
         return Err(WorkloadError::Validation(
-            "workload.tee-attributes requires format = 6".into(),
+            "workload.attributes requires format = 6".into(),
         ));
     }
-    for (name, allowed_values) in &w.tee_attributes {
-        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).is_none() {
-            return Err(WorkloadError::Validation(format!(
-                "unknown workload.tee-attributes name `{name}`"
-            )));
-        }
-        if !atakit_core::tee_attributes::validate_allowed_values(allowed_values) {
-            return Err(WorkloadError::Validation(format!(
-                "workload.tee-attributes `{name}` must be [false] or [false, true]"
-            )));
-        }
-    }
+    normalize_attributes(&w.attributes)?;
 
     // ── gid-group ────────────────────────────────────────
     if let Some(ref gg) = w.gid_group {
@@ -1406,7 +1471,7 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
 
-[workload.tee-attributes]
+[workload.attributes]
 "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
 "#
             );
@@ -1444,7 +1509,7 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
 
-[workload.tee-attributes]
+[workload.attributes]
 "{name}" = {values}
 "#
             );
@@ -1458,7 +1523,7 @@ image = "my-app:latest"
     }
 
     #[test]
-    fn rejects_tee_attributes_before_format_six() {
+    fn rejects_attributes_before_format_six() {
         let toml = r#"
 format = 5
 
@@ -1468,7 +1533,7 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
 
-[workload.tee-attributes]
+[workload.attributes]
 "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
 "#;
         let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();

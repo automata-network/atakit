@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DataMount, ImageSource, StringOrArray, WorkloadConfig};
+use crate::config::{AttributeRequirements, DataMount, ImageSource, StringOrArray, WorkloadConfig};
 use crate::data::{logical_data_path_rel, namespaced_data_path};
 use crate::WorkloadError;
 
@@ -70,8 +70,8 @@ pub struct ManifestConfig {
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
-    #[serde(default, rename = "tee-attributes")]
-    pub tee_attributes: BTreeMap<String, Vec<bool>>,
+    #[serde(default)]
+    pub attributes: AttributeRequirements,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default = "default_restart")]
@@ -864,7 +864,8 @@ pub fn build_manifest(
             image: resolved_image.to_string(),
             base_image_mode: w.base_image_mode.clone(),
             base_image: w.base_image.clone(),
-            tee_attributes: w.tee_attributes.clone(),
+            attributes: crate::validate::normalize_attributes(&w.attributes)
+                .expect("validated workload attributes"),
             ports: w.ports.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
@@ -1110,7 +1111,7 @@ image = "my-app:latest"
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
         assert!(output.contains("\"format\":6"));
-        assert!(output.contains("\"tee-attributes\":{}"));
+        assert!(output.contains("\"attributes\":{}"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
@@ -1130,7 +1131,7 @@ image = "my-app:latest"
     }
 
     #[test]
-    fn tee_attributes_are_canonical_and_change_manifest_measurement_bytes() {
+    fn attributes_are_canonical_and_change_manifest_measurement_bytes() {
         let config = |values: &str| {
             WorkloadConfig::load_from_str(&format!(
                 r#"
@@ -1142,7 +1143,7 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "my-app:latest"
 
-[workload.tee-attributes]
+[workload.attributes]
 "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
 "#
             ))
@@ -1165,7 +1166,7 @@ image = "my-app:latest"
         let false_or_true = serialize_canonical_json(&build(&config("[false, true]"))).unwrap();
 
         assert!(false_only.contains(
-            "\"tee-attributes\":{\"atakit.attestation.v1.tee.intel-tdx.debug.enabled\":[false]}"
+            "\"attributes\":{\"atakit.attestation.v1.tee.intel-tdx.debug.enabled\":[false]}"
         ));
         assert_ne!(false_only, false_or_true);
         assert_eq!(

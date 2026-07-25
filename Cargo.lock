@@ -1378,6 +1378,10 @@ dependencies = [
 [[package]]
 name = "atakit-core"
 version = "0.5.5"
+dependencies = [
+ "serde",
+ "sha3",
+]
 
 [[package]]
 name = "atakit-github"

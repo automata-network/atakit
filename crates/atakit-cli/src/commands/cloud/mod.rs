@@ -851,7 +851,7 @@ pub(crate) struct ResolvedWorkload {
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
     /// Verified TEE attribute requirements from the measured manifest.
-    pub tee_attributes: BTreeMap<String, Vec<bool>>,
+    pub attributes: atakit_core::tee_attributes::AttributeRequirements,
     /// Declared unmeasured-data allowlist paths from the manifest, as
     /// deploy-relative paths (the `unmeasured-data/` prefix stripped). The
     /// operator may supply any subset of this set at `/init`.
@@ -904,7 +904,7 @@ pub(crate) fn resolve_workload(
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
-                tee_attributes: result.manifest.config.tee_attributes,
+                attributes: result.manifest.config.attributes,
                 unmeasured_data_paths: unmeasured_paths,
                 workload_dir: None,
             });
@@ -940,7 +940,7 @@ pub(crate) fn resolve_workload(
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
-            tee_attributes: result.manifest.config.tee_attributes,
+            attributes: result.manifest.config.attributes,
             unmeasured_data_paths: unmeasured_paths,
             workload_dir: None,
         });
@@ -1000,7 +1000,7 @@ pub(crate) fn resolve_workload(
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
-        tee_attributes: result.manifest.config.tee_attributes,
+        attributes: result.manifest.config.attributes,
         unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
     })

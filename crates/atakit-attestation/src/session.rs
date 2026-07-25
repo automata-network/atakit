@@ -387,7 +387,7 @@ pub(crate) fn verify_session_bundle_at(
         );
     }
 
-    verify_platform_attestation(
+    let verified_tdx_tcb_status_bit = verify_platform_attestation(
         bundle,
         &inputs.trust.platform,
         current_time,
@@ -405,7 +405,13 @@ pub(crate) fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
-    verify_policies(bundle, &inputs.trust.policy, &mut checks, &mut errors);
+    verify_policies(
+        bundle,
+        &inputs.trust.policy,
+        verified_tdx_tcb_status_bit,
+        &mut checks,
+        &mut errors,
+    );
     verify_request_binding(
         bundle,
         &inputs.bundle,
@@ -483,14 +489,14 @@ fn verify_platform_attestation(
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
-) {
+) -> Option<u16> {
     match trust {
         SessionPlatformTrust::GcpTdx {
             gcp_ak_roots,
             dcap_collateral,
         } => {
             if !require_platform(bundle, "gcp", "tdx", checks, errors) {
-                return;
+                return None;
             }
             verify_gcp_platform(
                 bundle,
@@ -500,7 +506,7 @@ fn verify_platform_attestation(
                 current_time,
                 checks,
                 errors,
-            );
+            )
         }
         SessionPlatformTrust::GcpSnp {
             gcp_ak_roots,
@@ -508,7 +514,7 @@ fn verify_platform_attestation(
             amd_snp_crls,
         } => {
             if !require_platform(bundle, "gcp", "sev-snp", checks, errors) {
-                return;
+                return None;
             }
             verify_gcp_platform(
                 bundle,
@@ -518,14 +524,14 @@ fn verify_platform_attestation(
                 current_time,
                 checks,
                 errors,
-            );
+            )
         }
         SessionPlatformTrust::AzureTdx {
             maa_signing_keys,
             dcap_collateral,
         } => {
             if !require_platform(bundle, "azure", "tdx", checks, errors) {
-                return;
+                return None;
             }
             verify_azure_platform(
                 bundle,
@@ -535,7 +541,7 @@ fn verify_platform_attestation(
                 current_time,
                 checks,
                 errors,
-            );
+            )
         }
         SessionPlatformTrust::AzureSnp {
             maa_signing_keys,
@@ -544,7 +550,7 @@ fn verify_platform_attestation(
             snp_cert_table,
         } => {
             if !require_platform(bundle, "azure", "sev-snp", checks, errors) {
-                return;
+                return None;
             }
             verify_azure_platform(
                 bundle,
@@ -558,15 +564,18 @@ fn verify_platform_attestation(
                 current_time,
                 checks,
                 errors,
-            );
+            )
         }
-        SessionPlatformTrust::AwsSnp { .. } => record(
-            checks,
-            errors,
-            "platform-attestation",
-            false,
-            "AWS session-bundle verification is unsupported until Nitro attestation and raw SNP evidence are verified as one chain",
-        ),
+        SessionPlatformTrust::AwsSnp { .. } => {
+            record(
+                checks,
+                errors,
+                "platform-attestation",
+                false,
+                "AWS session-bundle verification is unsupported until Nitro attestation and raw SNP evidence are verified as one chain",
+            );
+            None
+        }
     }
 }
 
@@ -599,7 +608,7 @@ fn verify_gcp_platform(
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
-) {
+) -> Option<u16> {
     if bundle.ak_evidence.kind != "gcp_cert_chain" {
         record(
             checks,
@@ -608,7 +617,7 @@ fn verify_gcp_platform(
             false,
             "GCP session verification requires ak_evidence.kind=gcp_cert_chain",
         );
-        return;
+        return None;
     }
     let collateral = decode_b64(
         &bundle.ak_evidence.collateral,
@@ -633,13 +642,13 @@ fn verify_gcp_platform(
     let (Some(collateral), Some(ak_public), Some(quote), Some(quote_signature)) =
         (collateral, ak_public, quote, quote_signature)
     else {
-        return;
+        return None;
     };
     let chain = match decode_abi_bytes_array(&collateral) {
         Ok(chain) => chain,
         Err(detail) => {
             record(checks, errors, "gcp-ak-cert-chain", false, &detail);
-            return;
+            return None;
         }
     };
 
@@ -685,31 +694,38 @@ fn verify_gcp_platform(
         &bundle.platform.tee,
         &pcrs,
     );
-    match (amd_snp_trust, dcap_collateral) {
-        (Some((amd, crls)), None) => super::verification_core::verify_gcp_snp_vendor_report(
-            &mut report,
-            &mut core_errors,
-            Some(&tee_evidence),
-            &amd.certificates,
-            &amd.keccak256_hashes,
-            crls,
-            current_time,
-        ),
+    let tdx_tcb_status_bit = match (amd_snp_trust, dcap_collateral) {
+        (Some((amd, crls)), None) => {
+            super::verification_core::verify_gcp_snp_vendor_report(
+                &mut report,
+                &mut core_errors,
+                Some(&tee_evidence),
+                &amd.certificates,
+                &amd.keccak256_hashes,
+                crls,
+                current_time,
+            );
+            None
+        }
         (None, Some(dcap)) => super::verification_core::verify_gcp_tdx_vendor_report(
             &mut report,
             &mut core_errors,
             Some(&tee_evidence),
             dcap,
         ),
-        _ => record(
-            checks,
-            errors,
-            "platform-attestation",
-            false,
-            "GCP trust input is inconsistent with the selected TEE",
-        ),
-    }
+        _ => {
+            record(
+                checks,
+                errors,
+                "platform-attestation",
+                false,
+                "GCP trust input is inconsistent with the selected TEE",
+            );
+            None
+        }
+    };
     import_core_checks(report, checks, errors);
+    tdx_tcb_status_bit
 }
 
 struct AzureSnpTrust<'a> {
@@ -726,9 +742,9 @@ fn verify_azure_platform(
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
-) {
+) -> Option<u16> {
     let Some(binding) = azure_ak_binding(bundle, errors) else {
-        return;
+        return None;
     };
     let quote = decode_b64(
         &bundle.tpm_quote.tpm2b_attest,
@@ -741,7 +757,7 @@ fn verify_azure_platform(
         errors,
     );
     let (Some(quote), Some(quote_signature)) = (quote, quote_signature) else {
-        return;
+        return None;
     };
     let tee_evidence = super::TeeEvidence {
         kind: bundle.tee_evidence.kind.clone(),
@@ -773,7 +789,7 @@ fn verify_azure_platform(
         &tee_evidence,
         &bundle.platform.tee,
     );
-    match (snp_trust, dcap_collateral) {
+    let tdx_tcb_status_bit = match (snp_trust, dcap_collateral) {
         (Some(snp_trust), None) => {
             let collateral = serde_json::json!({
                 "azureSnpCertTable": URL_SAFE_NO_PAD.encode(snp_trust.snp_cert_table)
@@ -790,6 +806,7 @@ fn verify_azure_platform(
                 },
                 current_time,
             );
+            None
         }
         (None, Some(dcap)) => super::verification_core::verify_azure_tdx_vendor_report(
             &mut report,
@@ -797,15 +814,19 @@ fn verify_azure_platform(
             Some(&tee_evidence),
             dcap,
         ),
-        _ => record(
-            checks,
-            errors,
-            "platform-attestation",
-            false,
-            "Azure trust input is inconsistent with the selected TEE",
-        ),
-    }
+        _ => {
+            record(
+                checks,
+                errors,
+                "platform-attestation",
+                false,
+                "Azure trust input is inconsistent with the selected TEE",
+            );
+            None
+        }
+    };
     import_core_checks(report, checks, errors);
+    tdx_tcb_status_bit
 }
 
 fn azure_ak_binding(
@@ -1528,6 +1549,7 @@ fn verify_trusted_binding(
 fn verify_policies(
     bundle: &SessionEvidenceBundle,
     trusted: &TrustedSessionPolicy,
+    verified_tdx_tcb_status_bit: Option<u16>,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -1566,7 +1588,7 @@ fn verify_policies(
         bundle.policy.pcr_specs.is_empty() || bundle.policy.pcr_specs == trusted.pcr_specs,
         "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
     );
-    verify_attribute_policy(bundle, trusted, checks, errors);
+    verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
     if trusted.pcr_specs.is_empty() {
         record(
             checks,
@@ -1620,6 +1642,7 @@ fn verify_policies(
 fn verify_attribute_policy(
     bundle: &SessionEvidenceBundle,
     trusted: &TrustedSessionPolicy,
+    verified_tdx_tcb_status_bit: Option<u16>,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -1666,10 +1689,18 @@ fn verify_attribute_policy(
         &verified_states.as_ref().err().cloned().unwrap_or_default(),
     );
     if let Ok(verified_states) = verified_states {
-        for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL
+        let tee_platform = match bundle.platform.tee.as_str() {
+            "tdx" => Some(atakit_core::tee_attributes::TeePlatform::IntelTdx),
+            "sev-snp" => Some(atakit_core::tee_attributes::TeePlatform::AmdSevSnp),
+            _ => None,
+        };
+        for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN
             .into_iter()
             .zip(verified_states)
         {
+            if Some(attribute.platform()) != tee_platform {
+                continue;
+            }
             let key = attribute.key();
             let verified_value = atakit_core::tee_attributes::bool_value(enabled);
             let declared_value = trusted
@@ -1733,6 +1764,57 @@ fn verify_attribute_policy(
                 },
             );
         }
+
+        if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::IntelTdx) {
+            if let Some(actual_bit) = verified_tdx_tcb_status_bit {
+                let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
+                let base_mask = match trusted
+                    .effective_attributes
+                    .iter()
+                    .find(|item| item.key == key)
+                {
+                    Some(item) => session_bytes32_to_u16(&item.value),
+                    None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
+                };
+                let base_matches = base_mask.is_some_and(|mask| {
+                    atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some()
+                        && mask & actual_bit != 0
+                });
+                record(
+                    checks,
+                    errors,
+                    "tee-attribute-base-image-intel-tdx-tcb-status",
+                    base_matches,
+                    &format!(
+                        "base-image Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
+                    ),
+                );
+                let workload_mask = match trusted
+                    .attribute_requirements
+                    .iter()
+                    .find(|item| item.key == key)
+                {
+                    Some(item) if item.allowed_values.len() == 1 => {
+                        session_bytes32_to_u16(&item.allowed_values[0])
+                    }
+                    Some(_) => None,
+                    None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
+                };
+                let workload_matches = workload_mask.is_some_and(|mask| {
+                    atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some()
+                        && mask & actual_bit != 0
+                });
+                record(
+                    checks,
+                    errors,
+                    "tee-attribute-workload-intel-tdx-tcb-status",
+                    workload_matches,
+                    &format!(
+                        "workload Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
+                    ),
+                );
+            }
+        }
     }
 
     for (index, requirement) in trusted.attribute_requirements.iter().enumerate() {
@@ -1771,6 +1853,13 @@ fn verify_attribute_policy(
             ),
         );
     }
+}
+
+fn session_bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
+    value[..30]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| u16::from_be_bytes([value[30], value[31]]))
 }
 
 fn verified_tee_attribute_states(
@@ -2320,7 +2409,7 @@ mod tests {
         };
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_policies(&bundle, &trusted, &mut checks, &mut errors);
+        verify_policies(&bundle, &trusted, Some(1), &mut checks, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
 
         let untrusted = TrustedSessionPolicy {
@@ -2329,7 +2418,7 @@ mod tests {
         };
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_policies(&bundle, &untrusted, &mut checks, &mut errors);
+        verify_policies(&bundle, &untrusted, Some(1), &mut checks, &mut errors);
         assert!(errors.iter().any(|error| error.starts_with("workload-id:")));
 
         let invalid_attribute = TrustedSessionPolicy {
@@ -2342,7 +2431,13 @@ mod tests {
         };
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_policies(&bundle, &invalid_attribute, &mut checks, &mut errors);
+        verify_policies(
+            &bundle,
+            &invalid_attribute,
+            Some(1),
+            &mut checks,
+            &mut errors,
+        );
         assert!(errors
             .iter()
             .any(|error| error.starts_with("attribute-requirement-0:")));
@@ -2362,7 +2457,13 @@ mod tests {
         };
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_policies(&bundle, &duplicate_attributes, &mut checks, &mut errors);
+        verify_policies(
+            &bundle,
+            &duplicate_attributes,
+            Some(1),
+            &mut checks,
+            &mut errors,
+        );
         assert!(errors
             .iter()
             .any(|error| error.starts_with("trusted-effective-attribute-keys:")));
@@ -2403,7 +2504,7 @@ mod tests {
 
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_attribute_policy(&bundle, &base_policy, &mut checks, &mut errors);
+        verify_attribute_policy(&bundle, &base_policy, Some(1), &mut checks, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
 
         let missing_base_declaration = TrustedSessionPolicy {
@@ -2412,7 +2513,13 @@ mod tests {
         };
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_attribute_policy(&bundle, &missing_base_declaration, &mut checks, &mut errors);
+        verify_attribute_policy(
+            &bundle,
+            &missing_base_declaration,
+            Some(1),
+            &mut checks,
+            &mut errors,
+        );
         assert!(errors.iter().any(|error| {
             error.starts_with("tee-attribute-base-image-atakit.attestation.v1.tee.intel-tdx")
         }));
@@ -2426,12 +2533,81 @@ mod tests {
         verify_attribute_policy(
             &bundle,
             &missing_workload_requirement,
+            Some(1),
             &mut checks,
             &mut errors,
         );
         assert!(errors.iter().any(|error| {
             error.starts_with("tee-attribute-workload-atakit.attestation.v1.tee.intel-tdx")
         }));
+    }
+
+    #[test]
+    fn verified_tdx_tcb_status_requires_canonical_base_and_workload_masks() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+        let bundle = tdx_bundle_for_policy(policy);
+        let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
+        let relaxed_mask = atakit_core::tee_attributes::u16_value(0x9);
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_specs: Vec::new(),
+            effective_attributes: vec![SessionAttribute {
+                key,
+                value: relaxed_mask,
+            }],
+            attribute_requirements: vec![SessionAttributeRequirement {
+                key,
+                allowed_values: vec![relaxed_mask],
+            }],
+        };
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &trusted, Some(0x8), &mut checks, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let invalid_base = TrustedSessionPolicy {
+            effective_attributes: vec![SessionAttribute {
+                key,
+                value: atakit_core::tee_attributes::u16_value(0x401),
+            }],
+            ..trusted.clone()
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &invalid_base, Some(0x8), &mut checks, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| { error.starts_with("tee-attribute-base-image-intel-tdx-tcb-status:") }));
+
+        let invalid_workload = TrustedSessionPolicy {
+            attribute_requirements: vec![SessionAttributeRequirement {
+                key,
+                allowed_values: vec![relaxed_mask, relaxed_mask],
+            }],
+            ..trusted
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(
+            &bundle,
+            &invalid_workload,
+            Some(0x8),
+            &mut checks,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.starts_with("tee-attribute-workload-intel-tdx-tcb-status:") }));
     }
 
     #[test]
@@ -2444,7 +2620,7 @@ mod tests {
             pcr_specs: Vec::new(),
         };
 
-        for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::ALL {
+        for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN {
             for actual in [false, true] {
                 for base_mode in 0..3 {
                     for workload_mode in 0..3 {
@@ -2477,6 +2653,9 @@ mod tests {
                                     bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
                                 }
                                 bundle
+                            }
+                            atakit_core::tee_attributes::VerifiedTeeAttribute::IntelTdxTcbStatusAllowed => {
+                                unreachable!("Boolean test matrix excludes TCB status masks")
                             }
                         };
 
@@ -2515,7 +2694,13 @@ mod tests {
 
                         let mut checks = Vec::new();
                         let mut errors = Vec::new();
-                        verify_attribute_policy(&bundle, &trusted, &mut checks, &mut errors);
+                        verify_attribute_policy(
+                            &bundle,
+                            &trusted,
+                            Some(1),
+                            &mut checks,
+                            &mut errors,
+                        );
 
                         let base_matches = if actual {
                             base_mode == 2
