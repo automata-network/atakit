@@ -125,21 +125,24 @@ pub fn create_archive(
     Ok(archive_path)
 }
 
-/// Open an archive file with auto-detected decompression (zstd or gzip).
-pub(crate) fn open_decoder(
-    mut file: std::fs::File,
-) -> Result<Box<dyn std::io::Read>, WorkloadError> {
-    use std::io::{Read, Seek, SeekFrom};
+/// Open an archive reader with auto-detected decompression (zstd or gzip).
+pub(crate) fn open_decoder<'a, R>(
+    mut reader: R,
+) -> Result<Box<dyn std::io::Read + 'a>, WorkloadError>
+where
+    R: std::io::Read + std::io::Seek + 'a,
+{
+    use std::io::SeekFrom;
 
     let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).map_err(WorkloadError::Io)?;
-    file.seek(SeekFrom::Start(0)).map_err(WorkloadError::Io)?;
+    reader.read_exact(&mut magic).map_err(WorkloadError::Io)?;
+    reader.seek(SeekFrom::Start(0)).map_err(WorkloadError::Io)?;
 
     if magic[..2] == [0x1F, 0x8B] {
-        Ok(Box::new(flate2::read::GzDecoder::new(file)))
+        Ok(Box::new(flate2::read::GzDecoder::new(reader)))
     } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {
         Ok(Box::new(
-            zstd::Decoder::new(file).map_err(WorkloadError::Io)?,
+            zstd::Decoder::new(reader).map_err(WorkloadError::Io)?,
         ))
     } else {
         Err(WorkloadError::Validation(

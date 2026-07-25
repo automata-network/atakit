@@ -16,7 +16,6 @@ use atakit_cloud::{
 };
 use atakit_core::Env;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use super::{
     effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
@@ -215,6 +214,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // `workload_boot_min` carries the raw workload manifest boot-disk-size string
     // (if any); the effective size is resolved later once the target is known.
     let workload_tee_attributes: BTreeMap<String, Vec<bool>>;
+    let archive_sha256: Option<[u8; 32]>;
     let (
         archive_path,
         workload_name,
@@ -247,6 +247,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_name = String::new();
         workload_version = String::new();
         archive_hash = String::new();
+        archive_sha256 = None;
         workload_ports = Vec::new();
         workload_disks = Vec::new();
         workload_boot_min = None;
@@ -261,6 +262,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
         workload_name = resolved.name;
         workload_version = resolved.version;
+        archive_sha256 = Some(resolved.archive_sha256);
         workload_ports = resolved.ports;
         workload_disks = resolved
             .disks
@@ -295,9 +297,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
         unmeasured_data_paths = resolved.unmeasured_data_paths;
         let ap = resolved.archive_path;
-        let bytes = std::fs::read(&ap)
-            .with_context(|| format!("failed to read archive: {}", ap.display()))?;
-        archive_hash = format!("{:x}", Sha256::digest(&bytes));
+        archive_hash = hex::encode(resolved.archive_sha256);
         archive_path = ap.display().to_string();
     }
 
@@ -932,6 +932,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     args.init_timeout,
                     init_config.owner_operations.op_expiry_seconds,
                 );
+                let expected_archive_sha256 = archive_sha256.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("workload initialization is missing its inspected archive hash")
+                })?;
 
                 let verified_tls = if args.unsafe_skip_tls_attestation {
                     super::warn_unsafe_skip_tls_attestation();
@@ -1001,6 +1004,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     status_port,
                     init_port,
                     ap,
+                    expected_archive_sha256,
                     unmeasured_tar.as_deref(),
                     &init_config,
                     std::time::Duration::from_secs(args.init_upload_timeout),

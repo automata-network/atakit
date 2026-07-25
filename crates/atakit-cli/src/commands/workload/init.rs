@@ -5,7 +5,6 @@ use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_core::Env;
 use atakit_workload::cli::InitArgs;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
@@ -25,6 +24,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 2. Resolve workload.
     let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
     let archive_path = resolved.archive_path;
+    let archive_sha256 = resolved.archive_sha256;
     let workload_name = resolved.name;
     let workload_version = resolved.version;
     let workload_tee_attributes = resolved.tee_attributes;
@@ -39,10 +39,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let unmeasured_tar =
         resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
 
-    // 3. Compute archive hash (display-only).
-    let bytes = std::fs::read(&archive_path)
-        .map_err(|e| anyhow::anyhow!("failed to read archive {}: {e}", archive_path.display()))?;
-    let archive_hash = format!("{:x}", Sha256::digest(&bytes));
+    // 3. Display the hash of the exact archive snapshot inspected above.
+    let archive_hash = hex::encode(archive_sha256);
 
     // 4. Resolve init env. No target available, so fall back to [cloud.defaults] only.
     let defaults = &config.cloud.defaults;
@@ -260,6 +258,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         status_port,
         init_port,
         &archive_path.display().to_string(),
+        &archive_sha256,
         unmeasured_tar.as_deref(),
         &init_config,
         std::time::Duration::from_secs(args.init_upload_timeout),

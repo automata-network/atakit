@@ -19,7 +19,9 @@ pub mod validate;
 pub use build::{build_workload, BuildOptions, BuildResult};
 pub use error::WorkloadError;
 pub use image::ContainerEngine;
-pub use inspect::{inspect_workload, InspectOptions, InspectResult};
+pub use inspect::{
+    inspect_workload, inspect_workload_archive_bytes, InspectOptions, InspectResult,
+};
 pub use repository::{
     hex_equal, GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta,
     RepositoryFilters, UploadContext, WorkloadCoords, WorkloadRepository,

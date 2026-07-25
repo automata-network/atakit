@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Cursor, Read, Seek};
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -67,7 +67,19 @@ fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, Work
         path: archive_path.to_path_buf(),
         source: e,
     })?;
-    let decoder = crate::archive::open_decoder(file)?;
+    inspect_archive_reader(file)
+}
+
+/// Inspect an `.atawl` archive from one immutable byte snapshot.
+pub fn inspect_workload_archive_bytes(bytes: &[u8]) -> Result<InspectResult, WorkloadError> {
+    inspect_archive_reader(Cursor::new(bytes))
+}
+
+fn inspect_archive_reader<R>(reader: R) -> Result<InspectResult, WorkloadError>
+where
+    R: Read + Seek,
+{
+    let decoder = crate::archive::open_decoder(reader)?;
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest_json = None;

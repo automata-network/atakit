@@ -1925,6 +1925,11 @@ pub async fn post_portal_init(
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
 ) -> Result<(), CloudError> {
+    let archive_bytes = std::fs::read(archive_path).map_err(|source| CloudError::IoPath {
+        path: archive_path.into(),
+        source,
+    })?;
+    let archive_sha256: [u8; 32] = Sha256::digest(&archive_bytes).into();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(300))
@@ -1939,6 +1944,7 @@ pub async fn post_portal_init(
         status_port,
         init_port,
         archive_path,
+        &archive_sha256,
         unmeasured_tar,
         init_config,
         Duration::from_secs(300),
@@ -1955,20 +1961,16 @@ pub async fn post_portal_init_with_client(
     status_port: u16,
     init_port: u16,
     archive_path: &str,
+    expected_archive_sha256: &[u8; 32],
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
     upload_timeout: Duration,
     progress: &dyn ProgressReporter,
 ) -> Result<(), CloudError> {
+    let archive_bytes =
+        read_validated_workload_archive(archive_path, expected_archive_sha256).await?;
     verify_portal_init_schema(client, host, status_port).await?;
     let url = format!("https://{host}:{init_port}/init");
-    // Read archive file.
-    let archive_bytes = tokio::fs::read(archive_path)
-        .await
-        .map_err(|e| CloudError::IoPath {
-            path: archive_path.into(),
-            source: e,
-        })?;
 
     // Build config JSON.
     let config_json = build_portal_config_json(init_config);
@@ -2058,6 +2060,28 @@ pub async fn post_portal_init_with_client(
 
     tracing::info!("workload initialized on CVM at {host}:{init_port}");
     Ok(())
+}
+
+async fn read_validated_workload_archive(
+    archive_path: &str,
+    expected_archive_sha256: &[u8; 32],
+) -> Result<Vec<u8>, CloudError> {
+    let archive_bytes =
+        tokio::fs::read(archive_path)
+            .await
+            .map_err(|source| CloudError::IoPath {
+                path: archive_path.into(),
+                source,
+            })?;
+    let actual_archive_sha256: [u8; 32] = Sha256::digest(&archive_bytes).into();
+    if actual_archive_sha256 != *expected_archive_sha256 {
+        return Err(CloudError::WorkloadArchiveChanged {
+            path: archive_path.into(),
+            expected: hex::encode(expected_archive_sha256),
+            actual: hex::encode(actual_archive_sha256),
+        });
+    }
+    Ok(archive_bytes)
 }
 
 async fn verify_portal_init_schema(
@@ -2793,6 +2817,32 @@ mod tests {
     #[test]
     fn initialization_timeout_covers_proof_owner_operation_and_buffer() {
         assert_eq!(initialization_timeout_seconds(None, 300), 1_260);
+    }
+
+    #[tokio::test]
+    async fn workload_archive_must_match_the_policy_validated_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("workload.atawl");
+        tokio::fs::write(&archive_path, b"validated archive")
+            .await
+            .unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"validated archive").into();
+
+        let bytes = read_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"validated archive");
+
+        tokio::fs::write(&archive_path, b"replacement archive")
+            .await
+            .unwrap();
+        let error = read_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CloudError::WorkloadArchiveChanged { .. }));
+        assert!(error
+            .to_string()
+            .contains("workload archive changed after policy validation"));
     }
 
     #[test]
