@@ -68,9 +68,21 @@ const SNP_REPORT_VMPL_OFFSET: usize = 0x30;
 const SNP_REPORT_ID_MA_OFFSET: usize = 0x160;
 const SNP_REPORT_ID_MA_LEN: usize = 32;
 const SNP_REPORT_SIG_ALGO_OFFSET: usize = 0x34;
+const SNP_REPORT_CURRENT_TCB_OFFSET: usize = 0x38;
+const SNP_REPORT_PLATFORM_INFO_OFFSET: usize = 0x40;
 const SNP_REPORT_KEY_SETTINGS_OFFSET: usize = 0x48;
+const SNP_REPORT_RESERVED_1_OFFSET: usize = 0x4c;
 const SNP_REPORT_REPORTED_TCB_OFFSET: usize = 0x180;
+const SNP_REPORT_CPUID_OFFSET: usize = 0x188;
+const SNP_REPORT_CPUID_RESERVED_OFFSET: usize = 0x18b;
+const SNP_REPORT_CPUID_RESERVED_LEN: usize = 21;
 const SNP_REPORT_CHIP_ID_OFFSET: usize = 0x1a0;
+const SNP_REPORT_COMMITTED_TCB_OFFSET: usize = 0x1e0;
+const SNP_REPORT_CURRENT_VERSION_RESERVED_OFFSET: usize = 0x1eb;
+const SNP_REPORT_COMMITTED_VERSION_RESERVED_OFFSET: usize = 0x1ef;
+const SNP_REPORT_LAUNCH_TCB_OFFSET: usize = 0x1f0;
+const SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET: usize = 0x1f8;
+const SNP_REPORT_CURRENT_MITIGATION_VECTOR_END: usize = 0x208;
 const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
 const SNP_POLICY_DEBUG: u64 = 1 << 19;
 const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
@@ -399,7 +411,45 @@ pub struct TrustAnchors {
     pub amd_ark_root_hashes: Vec<[u8; 32]>,
     /// AMD-signed DER certificate revocation lists for the trusted ARK roots.
     pub amd_snp_crls: Vec<Vec<u8>>,
+    /// Global AMD SEV-SNP security policies supplied by the verifier or read
+    /// from AmdSnpSecurityPolicyRegistry.
+    pub amd_snp_security_policies: Vec<AmdSnpSecurityPolicy>,
     pub aws_nitro_roots: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmdSnpSecurityPolicy {
+    /// Exact family || model || stepping value from the signed report.
+    pub cpuid: u32,
+    /// Packed CURRENT, REPORTED, COMMITTED, and LAUNCH minimum TCB values.
+    pub minimum_tcb: [u8; 32],
+    /// Packed PLATFORM_INFO required-clear and required-set masks.
+    pub platform_info_policy: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmdSnpSecurityState {
+    pub debug: bool,
+    pub migrate_ma: bool,
+    pub tcb_values: [u8; 32],
+    pub platform_info: u64,
+    pub cpuid: u32,
+}
+
+/// Extract and validate the security fields that drive AMD SEV-SNP policy.
+///
+/// Callers must also verify the report signature and certificate chain.
+pub fn amd_snp_security_state(report: &[u8]) -> std::result::Result<AmdSnpSecurityState, String> {
+    let state = verification_core::verified_snp_security_state(report)?;
+    Ok(AmdSnpSecurityState {
+        debug: state.debug,
+        migrate_ma: state.migrate_ma,
+        tcb_values: state.tcb_values,
+        platform_info: state.platform_info,
+        cpuid: state.cpuid,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1272,6 +1322,7 @@ fn verify_tls_attestation_internal(
             inputs.response.tee_evidence.as_ref(),
             verified_tdx_tcb_status_bit,
             workload_attributes,
+            &inputs.trust_anchors.amd_snp_security_policies,
         );
 
         match effective_pcr_specs(profile, variant) {
@@ -1356,6 +1407,7 @@ fn verify_measurement_attributes(
     evidence: Option<&TeeEvidence>,
     verified_tdx_tcb_status_bit: Option<u16>,
     workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
+    amd_snp_security_policies: &[AmdSnpSecurityPolicy],
 ) {
     let Some(evidence) = evidence else {
         fail(
@@ -1478,6 +1530,31 @@ fn verify_measurement_attributes(
         }
     }
 
+    if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::AmdSevSnp) {
+        match verification_core::verified_snp_security_state(&report_bytes) {
+            Ok(state) => {
+                let global_policy =
+                    select_amd_snp_security_policy(amd_snp_security_policies, state.cpuid);
+                match global_policy {
+                    Ok(global_policy) => {
+                        verify_amd_snp_measurement_policy(
+                            report,
+                            errors,
+                            state,
+                            global_policy,
+                            &effective_attributes,
+                            &encoded_requirements,
+                        );
+                    }
+                    Err(detail) => {
+                        fail(report, errors, "amd-sev-snp-global-security-policy", detail)
+                    }
+                }
+            }
+            Err(detail) => fail(report, errors, "amd-sev-snp-security-state", detail),
+        }
+    }
+
     for (key, allowed_values) in encoded_requirements {
         if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key).is_some() {
             continue;
@@ -1506,6 +1583,132 @@ fn verify_measurement_attributes(
             ),
         );
     }
+}
+
+fn select_amd_snp_security_policy(
+    policies: &[AmdSnpSecurityPolicy],
+    cpuid: u32,
+) -> std::result::Result<&AmdSnpSecurityPolicy, String> {
+    let mut matching = policies.iter().filter(|policy| policy.cpuid == cpuid);
+    let policy = matching.next().ok_or_else(|| {
+        format!(
+            "no active AmdSnpSecurityPolicyRegistry policy was supplied for CPUID 0x{cpuid:06x}"
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "multiple AMD SEV-SNP security policies were supplied for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&policy.minimum_tcb) {
+        return Err(format!(
+            "AMD SEV-SNP global minimum TCB is invalid for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+        &policy.platform_info_policy,
+    ) {
+        return Err(format!(
+            "AMD SEV-SNP global PLATFORM_INFO policy is invalid for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    Ok(policy)
+}
+
+fn verify_amd_snp_measurement_policy(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    state: verification_core::VerifiedAmdSnpSecurityState,
+    global_policy: &AmdSnpSecurityPolicy,
+    effective_attributes: &BTreeMap<[u8; 32], [u8; 32]>,
+    encoded_requirements: &BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+) {
+    use atakit_core::tee_attributes::{
+        amd_sev_snp_platform_info_matches, amd_sev_snp_tcb_max, amd_sev_snp_tcb_meets_minimum,
+        merge_amd_sev_snp_platform_info_policies, AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+        AMD_SEV_SNP_TCB_MINIMUM_KEY,
+    };
+
+    let base_tcb = effective_attributes
+        .get(&AMD_SEV_SNP_TCB_MINIMUM_KEY)
+        .copied()
+        .unwrap_or([0; 32]);
+    let effective_base_tcb = amd_sev_snp_tcb_max(&global_policy.minimum_tcb, &base_tcb);
+    let base_tcb_matches = effective_base_tcb
+        .as_ref()
+        .is_some_and(|minimum| amd_sev_snp_tcb_meets_minimum(&state.tcb_values, minimum));
+    check(
+        report,
+        errors,
+        "tee-attribute-base-image-amd-sev-snp-tcb-minimum",
+        base_tcb_matches,
+        format!(
+            "verified AMD SEV-SNP TCB 0x{} does not meet the global and base-image minimum",
+            hex::encode(state.tcb_values)
+        ),
+    );
+
+    let workload_tcb = encoded_requirements
+        .get(&AMD_SEV_SNP_TCB_MINIMUM_KEY)
+        .and_then(|values| (values.len() == 1).then_some(values[0]))
+        .unwrap_or([0; 32]);
+    let effective_workload_tcb = amd_sev_snp_tcb_max(&global_policy.minimum_tcb, &workload_tcb);
+    let workload_tcb_matches = effective_workload_tcb
+        .as_ref()
+        .is_some_and(|minimum| amd_sev_snp_tcb_meets_minimum(&state.tcb_values, minimum));
+    check(
+        report,
+        errors,
+        "tee-attribute-workload-amd-sev-snp-tcb-minimum",
+        workload_tcb_matches,
+        format!(
+            "verified AMD SEV-SNP TCB 0x{} does not meet the global and workload minimum",
+            hex::encode(state.tcb_values)
+        ),
+    );
+
+    let base_platform_info = effective_attributes
+        .get(&AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
+        .copied()
+        .unwrap_or([0; 32]);
+    let effective_base_platform_info = merge_amd_sev_snp_platform_info_policies(
+        &global_policy.platform_info_policy,
+        &base_platform_info,
+    );
+    let base_platform_info_matches = effective_base_platform_info
+        .as_ref()
+        .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
+    check(
+        report,
+        errors,
+        "tee-attribute-base-image-amd-sev-snp-platform-info-policy",
+        base_platform_info_matches,
+        format!(
+            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the global and base-image policy",
+            state.platform_info
+        ),
+    );
+
+    let workload_platform_info = encoded_requirements
+        .get(&AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
+        .and_then(|values| (values.len() == 1).then_some(values[0]))
+        .unwrap_or([0; 32]);
+    let effective_workload_platform_info = effective_base_platform_info
+        .as_ref()
+        .and_then(|base| merge_amd_sev_snp_platform_info_policies(base, &workload_platform_info));
+    let workload_platform_info_matches = effective_workload_platform_info
+        .as_ref()
+        .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
+    check(
+        report,
+        errors,
+        "tee-attribute-workload-amd-sev-snp-platform-info-policy",
+        workload_platform_info_matches,
+        format!(
+            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the global, base-image, and workload policy",
+            state.platform_info
+        ),
+    );
 }
 
 fn bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
@@ -1586,7 +1789,37 @@ fn parse_measurement_attributes(
                         atakit_core::tee_attributes::u16_value(mask),
                     )
                 }
-                Some(_) => unreachable!("all reserved attributes handled"),
+                Some(attribute) => {
+                    if owner == "variant" {
+                        return Err(format!("{owner} cannot override reserved attribute {name}"));
+                    }
+                    let packed = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(atakit_core::tee_attributes::parse_bytes32_hex)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} value must be a 0x-prefixed bytes32 string"
+                            )
+                        })?;
+                    let valid = match attribute.value_kind() {
+                        ReservedAttributeValueKind::AmdSevSnpTcb => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&packed)
+                        }
+                        ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+                                &packed,
+                            )
+                        }
+                        _ => unreachable!("Boolean and Intel TDX TCB values handled above"),
+                    };
+                    if !valid {
+                        return Err(format!(
+                            "{owner} readable reserved attribute {name} value is invalid"
+                        ));
+                    }
+                    (attribute.key(), packed)
+                }
                 None if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) => {
                     return Err(format!(
                         "{owner} attribute has unknown reserved name {name}"
@@ -1646,6 +1879,32 @@ fn parse_measurement_attributes(
                     if atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_none() {
                         return Err(format!(
                             "{owner} Intel TDX TCB status mask 0x{mask:x} is invalid"
+                        ));
+                    }
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpTcb => {
+                    if owner == "variant" {
+                        return Err(format!(
+                            "{owner} cannot override reserved attribute {}",
+                            attribute.name()
+                        ));
+                    }
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&value) {
+                        return Err(format!(
+                            "{owner} AMD SEV-SNP TCB minimum is invalid"
+                        ));
+                    }
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                    if owner == "variant" {
+                        return Err(format!(
+                            "{owner} cannot override reserved attribute {}",
+                            attribute.name()
+                        ));
+                    }
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(&value) {
+                        return Err(format!(
+                            "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
                         ));
                     }
                 }
@@ -1966,6 +2225,18 @@ mod tests {
     use p256::pkcs8::DecodePrivateKey;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
     use signature::{hazmat::PrehashSigner, Signer};
+
+    fn synthetic_snp_security_report(policy: u64) -> Vec<u8> {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&3u32.to_le_bytes());
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+        report[SNP_REPORT_SIG_ALGO_OFFSET..SNP_REPORT_SIG_ALGO_OFFSET + 4]
+            .copy_from_slice(&SNP_SIG_ALGO_ECDSA_P384_SHA384.to_le_bytes());
+        report[SNP_REPORT_CPUID_OFFSET..SNP_REPORT_CPUID_OFFSET + 3].copy_from_slice(&[0x19, 0, 0]);
+        report
+    }
 
     fn response_for(nonce: [u8; 32], cert: &[u8], cloud: &str) -> TlsAttestationResponse {
         let cert_sha: [u8; 32] = Sha256::digest(cert).into();
@@ -2524,11 +2795,7 @@ mod tests {
         let hcl_var_data = URL_SAFE_NO_PAD
             .decode(binding_json["hclVarData"].as_str().unwrap())
             .unwrap();
-        let mut snp_report = vec![0u8; SNP_REPORT_SIZE];
-        snp_report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-            .copy_from_slice(&(1u64 << 17).to_le_bytes());
+        let mut snp_report = synthetic_snp_security_report(1u64 << 17);
         let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
         snp_report[0x50..0x70].copy_from_slice(&hcl_hash);
         let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
@@ -3243,12 +3510,8 @@ mod tests {
         let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
         response.platform.tee = "sev-snp".to_string();
         response.platform.machine_type = "n2d-standard-4".to_string();
-        let mut snp_report = vec![0u8; SNP_REPORT_SIZE];
-        snp_report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8].copy_from_slice(
-            &((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA).to_le_bytes(),
-        );
+        let snp_report =
+            synthetic_snp_security_report((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA);
         response.tee_evidence = Some(TeeEvidence {
             kind: "configfs-tsm".to_string(),
             report: URL_SAFE_NO_PAD.encode(snp_report),
@@ -3968,6 +4231,7 @@ mod tests {
             Some(evidence),
             Some(0x8),
             None,
+            &[],
         );
         assert!(errors
             .iter()
@@ -4003,8 +4267,87 @@ mod tests {
             Some(evidence),
             Some(0x8),
             Some(&requirements),
+            &[],
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn tls_policy_enforces_global_amd_snp_tcb_and_platform_info_policy() {
+        let mut snp_report = synthetic_snp_security_report(1u64 << 17);
+        let raw_tcb = [4, 0, 0, 0, 0, 0, 29, 222];
+        for offset in [
+            SNP_REPORT_CURRENT_TCB_OFFSET,
+            SNP_REPORT_REPORTED_TCB_OFFSET,
+            SNP_REPORT_COMMITTED_TCB_OFFSET,
+            SNP_REPORT_LAUNCH_TCB_OFFSET,
+        ] {
+            snp_report[offset..offset + 8].copy_from_slice(&raw_tcb);
+        }
+        snp_report[SNP_REPORT_PLATFORM_INFO_OFFSET..SNP_REPORT_PLATFORM_INFO_OFFSET + 8]
+            .copy_from_slice(&0x20u64.to_le_bytes());
+        let evidence = TeeEvidence {
+            kind: "configfs-tsm".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: None,
+        };
+        let policy = measurement_policy_for_platform(
+            &format!("0x{}", "aa".repeat(32)),
+            "gcp",
+            "sev-snp",
+            "n2d-standard-4",
+        );
+        let minimum_tcb = atakit_core::tee_attributes::parse_bytes32_hex(
+            "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+        )
+        .unwrap();
+        let platform_info_policy = atakit_core::tee_attributes::parse_bytes32_hex(
+            "0x0000000000000000000000000000000000000000000000000000000000000020",
+        )
+        .unwrap();
+        let global = AmdSnpSecurityPolicy {
+            cpuid: 0x190000,
+            minimum_tcb,
+            platform_info_policy,
+        };
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            None,
+            &[global],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            None,
+            &[],
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.check == "amd-sev-snp-global-security-policy"));
     }
 
     #[test]
@@ -4407,6 +4750,7 @@ mod tests {
                     pcr_specs: vec![pcr4_policy],
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
+                    amd_snp_security_policies: Vec::new(),
                 },
                 binding: None,
             },
@@ -4712,12 +5056,8 @@ mod tests {
 
     #[test]
     fn extracts_verified_snp_debug_and_migrate_ma_states() {
-        let mut report = vec![0u8; SNP_REPORT_SIZE];
-        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
         let policy = (1u64 << 17) | (1u64 << 18) | (1u64 << 19);
-        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-            .copy_from_slice(&policy.to_le_bytes());
+        let report = synthetic_snp_security_report(policy);
 
         assert_eq!(
             verification_core::verified_snp_attribute_states(&report).unwrap(),
@@ -4727,14 +5067,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_verified_snp_report_fields() {
-        let valid_report = || {
-            let mut report = vec![0u8; SNP_REPORT_SIZE];
-            report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-                .copy_from_slice(&2u32.to_le_bytes());
-            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-                .copy_from_slice(&(1u64 << 17).to_le_bytes());
-            report
-        };
+        let valid_report = || synthetic_snp_security_report(1u64 << 17);
 
         assert!(verification_core::verified_snp_attribute_states(&valid_report()[..1183]).is_err());
 
@@ -4767,6 +5100,30 @@ mod tests {
         let parsed = verification_core::parse_amd_snp_cert_table(&table).unwrap();
         assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
         assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
+    }
+
+    #[test]
+    fn measurement_attributes_accept_profile_packed_policy_and_reject_variant_override() {
+        let packed = "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004";
+        let readable = serde_json::json!({
+            "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+            "value": packed,
+        });
+        let parsed = parse_measurement_attributes(&[readable.clone()], "profile").unwrap();
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY],
+            atakit_core::tee_attributes::parse_bytes32_hex(packed).unwrap()
+        );
+        assert!(parse_measurement_attributes(&[readable], "variant").is_err());
+
+        let hexadecimal = serde_json::json!({
+            "key": format!(
+                "0x{}",
+                hex::encode(atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY)
+            ),
+            "value": packed,
+        });
+        assert!(parse_measurement_attributes(&[hexadecimal], "variant").is_err());
     }
 
     #[test]

@@ -1509,9 +1509,18 @@ pub(super) fn read_le_u64(
     Ok(u64::from_le_bytes(bytes.try_into().expect("slice length")))
 }
 
-pub(super) fn verified_snp_attribute_states(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct VerifiedAmdSnpSecurityState {
+    pub(super) debug: bool,
+    pub(super) migrate_ma: bool,
+    pub(super) tcb_values: [u8; 32],
+    pub(super) platform_info: u64,
+    pub(super) cpuid: u32,
+}
+
+pub(super) fn verified_snp_security_state(
     report: &[u8],
-) -> std::result::Result<(bool, bool), String> {
+) -> std::result::Result<VerifiedAmdSnpSecurityState, String> {
     if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
             "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
@@ -1519,8 +1528,10 @@ pub(super) fn verified_snp_attribute_states(
         ));
     }
     let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP version")?;
-    if !(2..=5).contains(&version) {
-        return Err(format!("SNP report version {version} is unsupported"));
+    if !(3..=5).contains(&version) {
+        return Err(format!(
+            "SNP report version {version} is unsupported; expected a version from 3 through 5"
+        ));
     }
     let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
     if policy & (1 << 17) == 0 || policy >> 26 != 0 {
@@ -1532,6 +1543,25 @@ pub(super) fn verified_snp_attribute_states(
     if vmpl != 0 {
         return Err(format!("SNP VMPL {vmpl} is unsupported; expected 0"));
     }
+    let signature_algorithm = read_le_u32(
+        report,
+        SNP_REPORT_SIG_ALGO_OFFSET,
+        "SNP signature algorithm",
+    )?;
+    if signature_algorithm != SNP_SIG_ALGO_ECDSA_P384_SHA384 {
+        return Err(format!(
+            "SNP signature algorithm is {signature_algorithm}, expected {SNP_SIG_ALGO_ECDSA_P384_SHA384}"
+        ));
+    }
+    let key_settings = read_le_u32(report, SNP_REPORT_KEY_SETTINGS_OFFSET, "SNP key settings")?;
+    let signing_key = (key_settings >> 2) & 7;
+    if key_settings >> 5 != 0 || signing_key > 1 || key_settings & 2 != 0 {
+        return Err(format!(
+            "SNP key settings contain unsupported bits: 0x{key_settings:08x}"
+        ));
+    }
+    require_zero_bytes(report, SNP_REPORT_RESERVED_1_OFFSET, 4, "SNP reserved1")?;
+
     let report_id_ma = read_exact_at(
         report,
         SNP_REPORT_ID_MA_OFFSET,
@@ -1543,10 +1573,125 @@ pub(super) fn verified_snp_attribute_states(
             "SNP REPORT_ID_MA is nonzero; migration-agent association is unsupported".into(),
         );
     }
-    Ok((
-        policy & SNP_POLICY_DEBUG != 0,
-        policy & SNP_POLICY_MIGRATE_MA != 0,
-    ))
+
+    let platform_info = read_le_u64(report, SNP_REPORT_PLATFORM_INFO_OFFSET, "SNP platform_info")?;
+    if platform_info & !atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_SUPPORTED_MASK != 0 {
+        return Err(format!(
+            "SNP PLATFORM_INFO contains unsupported bits: 0x{platform_info:016x}"
+        ));
+    }
+
+    let cpuid_bytes = read_exact_at(report, SNP_REPORT_CPUID_OFFSET, 3, "SNP CPUID")?;
+    let cpuid = (u32::from(cpuid_bytes[0]) << 16)
+        | (u32::from(cpuid_bytes[1]) << 8)
+        | u32::from(cpuid_bytes[2]);
+    if cpuid_bytes[0] != 0x19 || cpuid_bytes[1] > 0x1f {
+        return Err(format!(
+            "SNP CPUID 0x{cpuid:06x} is not a supported Milan or Genoa processor"
+        ));
+    }
+    require_zero_bytes(
+        report,
+        SNP_REPORT_CPUID_RESERVED_OFFSET,
+        SNP_REPORT_CPUID_RESERVED_LEN,
+        "SNP CPUID reserved field",
+    )?;
+    require_zero_bytes(
+        report,
+        SNP_REPORT_CURRENT_VERSION_RESERVED_OFFSET,
+        1,
+        "SNP current version reserved field",
+    )?;
+    require_zero_bytes(
+        report,
+        SNP_REPORT_COMMITTED_VERSION_RESERVED_OFFSET,
+        1,
+        "SNP committed version reserved field",
+    )?;
+
+    let current = normalized_snp_tcb(report, SNP_REPORT_CURRENT_TCB_OFFSET, "current_tcb")?;
+    let reported = normalized_snp_tcb(report, SNP_REPORT_REPORTED_TCB_OFFSET, "reported_tcb")?;
+    let committed = normalized_snp_tcb(report, SNP_REPORT_COMMITTED_TCB_OFFSET, "committed_tcb")?;
+    let launch = normalized_snp_tcb(report, SNP_REPORT_LAUNCH_TCB_OFFSET, "launch_tcb")?;
+    if !snp_tcb_lane_meets(committed, reported) {
+        return Err(format!(
+            "SNP reported_tcb 0x{reported:08x} exceeds committed_tcb 0x{committed:08x}"
+        ));
+    }
+    if !snp_tcb_lane_meets(current, committed) {
+        return Err(format!(
+            "SNP committed_tcb 0x{committed:08x} exceeds current_tcb 0x{current:08x}"
+        ));
+    }
+    let mut tcb_values = [0u8; 32];
+    for (index, value) in [current, reported, committed, launch]
+        .into_iter()
+        .enumerate()
+    {
+        tcb_values[index * 8..index * 8 + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    let reserved_offset = if version < 5 {
+        SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET
+    } else {
+        SNP_REPORT_CURRENT_MITIGATION_VECTOR_END
+    };
+    require_zero_bytes(
+        report,
+        reserved_offset,
+        SNP_REPORT_SIGNATURE_OFFSET - reserved_offset,
+        "SNP mitigation-vector reserved field",
+    )?;
+
+    Ok(VerifiedAmdSnpSecurityState {
+        debug: policy & SNP_POLICY_DEBUG != 0,
+        migrate_ma: policy & SNP_POLICY_MIGRATE_MA != 0,
+        tcb_values,
+        platform_info,
+        cpuid,
+    })
+}
+
+fn normalized_snp_tcb(
+    report: &[u8],
+    offset: usize,
+    field: &str,
+) -> std::result::Result<u64, String> {
+    let raw = read_exact_at(report, offset, 8, field)?;
+    if raw[2..6].iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "SNP {field} contains nonzero reserved or unsupported fields: 0x{}",
+            hex::encode(raw)
+        ));
+    }
+    Ok(u64::from(raw[0])
+        | (u64::from(raw[1]) << 8)
+        | (u64::from(raw[6]) << 16)
+        | (u64::from(raw[7]) << 24))
+}
+
+fn snp_tcb_lane_meets(actual: u64, minimum: u64) -> bool {
+    (0..4).all(|index| ((actual >> (index * 8)) & 0xff) >= ((minimum >> (index * 8)) & 0xff))
+}
+
+fn require_zero_bytes(
+    report: &[u8],
+    offset: usize,
+    len: usize,
+    field: &str,
+) -> std::result::Result<(), String> {
+    let value = read_exact_at(report, offset, len, field)?;
+    if value.iter().any(|byte| *byte != 0) {
+        return Err(format!("{field} contains nonzero bytes"));
+    }
+    Ok(())
+}
+
+pub(super) fn verified_snp_attribute_states(
+    report: &[u8],
+) -> std::result::Result<(bool, bool), String> {
+    let state = verified_snp_security_state(report)?;
+    Ok((state.debug, state.migrate_ma))
 }
 
 pub(super) fn verified_tee_attribute_states(

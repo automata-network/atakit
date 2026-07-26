@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atakit_attestation::{
-    amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_vcek_cert_table,
-    amd_snp_vcek_request, select_azure_maa_manual_trust_key, verify_measurement_pack,
-    verify_tls_attestation, verify_tls_attestation_with_workload_attributes, AkBinding,
-    AzureMaaTrustKey, CheckResult, EvidenceSummary, MeasurementPolicy, TdxDcapCollateral,
-    TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
-    VerificationReport, VerifiedTlsIdentity,
+    amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_security_state,
+    amd_snp_vcek_cert_table, amd_snp_vcek_request, select_azure_maa_manual_trust_key,
+    verify_measurement_pack, verify_tls_attestation,
+    verify_tls_attestation_with_workload_attributes, AkBinding, AzureMaaTrustKey, CheckResult,
+    EvidenceSummary, MeasurementPolicy, TdxDcapCollateral, TlsAttestationResponse, TrustAnchors,
+    VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -1353,6 +1353,25 @@ async fn resolve_chain_trust_anchors(
             .await
             .map_err(|error| error.to_string())?;
         trust_anchors.amd_ark_root_hashes.push(ark_hash);
+    }
+
+    if response.platform.tee.eq_ignore_ascii_case("sev-snp") {
+        let evidence = response
+            .tee_evidence
+            .as_ref()
+            .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
+        let report = URL_SAFE_NO_PAD
+            .decode(&evidence.report)
+            .map_err(|error| format!("decode SNP report for global policy lookup: {error}"))?;
+        let state = amd_snp_security_state(&report)?;
+        let policy = client
+            .resolve_amd_snp_security_policy(state.cpuid)
+            .await
+            .map_err(|error| error.to_string())?;
+        trust_anchors
+            .amd_snp_security_policies
+            .retain(|existing| existing.cpuid != state.cpuid);
+        trust_anchors.amd_snp_security_policies.push(policy);
     }
 
     Ok(())

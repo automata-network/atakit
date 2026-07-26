@@ -279,6 +279,7 @@ fn trusted_policy(
         pcr_specs,
         effective_attributes: effective_attributes(profile, variant)?,
         attribute_requirements: workload.attribute_requirements,
+        amd_snp_security_policies: context.trust_anchors.amd_snp_security_policies.clone(),
     })
 }
 
@@ -475,7 +476,42 @@ fn parse_attributes(
                         value: atakit_core::tee_attributes::u16_value(mask),
                     }
                 }
-                Some(_) => unreachable!("all reserved attributes handled"),
+                Some(attribute) => {
+                    if owner == "variant" {
+                        return Err(session_error(format!(
+                            "{owner} cannot override reserved attribute {name}"
+                        )));
+                    }
+                    let packed = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(atakit_core::tee_attributes::parse_bytes32_hex)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "{owner} readable reserved attribute {name} value must be a 0x-prefixed bytes32 string"
+                            ))
+                        })?;
+                    let valid = match attribute.value_kind() {
+                        ReservedAttributeValueKind::AmdSevSnpTcb => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&packed)
+                        }
+                        ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+                                &packed,
+                            )
+                        }
+                        _ => unreachable!("Boolean and Intel TDX TCB values handled above"),
+                    };
+                    if !valid {
+                        return Err(session_error(format!(
+                            "{owner} readable reserved attribute {name} value is invalid"
+                        )));
+                    }
+                    SessionAttribute {
+                        key: attribute.key(),
+                        value: packed,
+                    }
+                }
                 None if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) => {
                     return Err(session_error(format!(
                         "{owner} attribute has unknown reserved name {name}"
@@ -501,7 +537,7 @@ fn parse_attributes(
                 .get("key")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| session_error(format!("{owner} attribute is missing string key")))?;
-            SessionAttribute {
+            let item = SessionAttribute {
                 key: decode_hex_32(key)?,
                 value: decode_hex_32(
                     value
@@ -511,7 +547,69 @@ fn parse_attributes(
                             session_error(format!("{owner} attribute is missing string value"))
                         })?,
                 )?,
+            };
+            if let Some(attribute) =
+                atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&item.key)
+            {
+                use atakit_core::tee_attributes::ReservedAttributeValueKind;
+                match attribute.value_kind() {
+                    ReservedAttributeValueKind::Boolean
+                        if item.value != atakit_core::tee_attributes::ATTRIBUTE_FALSE
+                            && item.value != atakit_core::tee_attributes::ATTRIBUTE_TRUE =>
+                    {
+                        return Err(session_error(format!(
+                            "{owner} reserved Boolean attribute {} has invalid value",
+                            attribute.name()
+                        )));
+                    }
+                    ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                        if owner == "variant" {
+                            return Err(session_error(format!(
+                                "{owner} cannot override reserved attribute {}",
+                                attribute.name()
+                            )));
+                        }
+                        let mask = u16::from_be_bytes([item.value[30], item.value[31]]);
+                        if item.value[..30].iter().any(|byte| *byte != 0)
+                            || atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_none()
+                        {
+                            return Err(session_error(format!(
+                                "{owner} Intel TDX TCB status mask is invalid"
+                            )));
+                        }
+                    }
+                    ReservedAttributeValueKind::AmdSevSnpTcb => {
+                        if owner == "variant" {
+                            return Err(session_error(format!(
+                                "{owner} cannot override reserved attribute {}",
+                                attribute.name()
+                            )));
+                        }
+                        if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&item.value) {
+                            return Err(session_error(format!(
+                                "{owner} AMD SEV-SNP TCB minimum is invalid"
+                            )));
+                        }
+                    }
+                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                        if owner == "variant" {
+                            return Err(session_error(format!(
+                                "{owner} cannot override reserved attribute {}",
+                                attribute.name()
+                            )));
+                        }
+                        if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+                            &item.value,
+                        ) {
+                            return Err(session_error(format!(
+                                "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
             }
+            item
         };
         if !keys.insert(item.key) {
             return Err(session_error(format!(
@@ -624,6 +722,10 @@ mod tests {
                 "key": format!("0x{}", "44".repeat(32)),
                 "value": format!("0x{}", "55".repeat(32))
             }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004"
+            }),
         ];
         profile.variants[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
@@ -640,11 +742,39 @@ mod tests {
                     value: [0x55; 32]
                 },
                 SessionAttribute {
+                    key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
+                    value: atakit_core::tee_attributes::parse_bytes32_hex(
+                        "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004"
+                    )
+                    .unwrap()
+                },
+                SessionAttribute {
                     key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
                     value: atakit_core::tee_attributes::ATTRIBUTE_TRUE
                 }
             ]
         );
+    }
+
+    #[test]
+    fn packed_amd_snp_policy_cannot_be_a_variant_override() {
+        let mut value = profile();
+        let readable = serde_json::json!({
+            "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+            "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+        });
+        value.variants[0].attributes = vec![readable];
+        assert!(effective_attributes(&value, &value.variants[0]).is_err());
+
+        let hexadecimal = serde_json::json!({
+            "key": format!(
+                "0x{}",
+                hex::encode(atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY)
+            ),
+            "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+        });
+        value.variants[0].attributes = vec![hexadecimal];
+        assert!(effective_attributes(&value, &value.variants[0]).is_err());
     }
 
     #[test]
