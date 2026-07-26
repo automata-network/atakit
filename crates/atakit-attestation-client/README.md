@@ -14,7 +14,7 @@ The client:
 - loads the registered base-image measurement policy;
 - loads and validates the registered `WorkloadSpec`;
 - checks GCP vTPM AK and AMD ARK roots against the verifier contracts;
-- resolves the active global AMD SEV-SNP security policy for the exact CPUID
+- resolves the active AMD SEV-SNP registry default for the exact CPUID
   in a verified report;
 - resolves Azure MAA signing keys, including revocation, issuer, and expiry;
 - produces `TrustedSessionBinding`; and
@@ -65,10 +65,11 @@ The base-image measurement policy preserves custom attributes and all six
 reserved TEE attributes from both `PlatformProfile.attributes` and
 `MeasurementVariant.attributes`. When the selected variant and profile contain
 the same key, the variant value is effective. Missing reserved values use the
-same safe defaults as on-chain registration: `false` for Boolean states, `ok`
-only for Intel TDX TCB status, and packed zero for AMD SEV-SNP TCB and
-`PLATFORM_INFO` policy. The active AMD SEV-SNP registry policy remains a
-separate mandatory floor.
+same safe defaults as on-chain registration: `false` for Boolean states and
+`ok` only for Intel TDX TCB status. A missing AMD SEV-SNP packed value resolves
+to the active exact-CPUID registry default. An explicit value replaces the
+default on its policy side; the registry value is not an independent mandatory
+floor.
 
 ## Verify a current session
 
