@@ -1362,7 +1362,7 @@ async fn resolve_chain_trust_anchors(
             .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
         let report = URL_SAFE_NO_PAD
             .decode(&evidence.report)
-            .map_err(|error| format!("decode SNP report for global policy lookup: {error}"))?;
+            .map_err(|error| format!("decode SNP report for registry default lookup: {error}"))?;
         let state = amd_snp_security_state(&report)?;
         let policy = client
             .resolve_amd_snp_security_policy(state.cpuid)

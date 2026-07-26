@@ -261,7 +261,7 @@ pub struct TrustedSessionPolicy {
     pub pcr_specs: Vec<SessionPcrPolicy>,
     pub effective_attributes: Vec<SessionAttribute>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
-    /// Global AMD SEV-SNP policy supplied by the verifier or read from
+    /// AMD SEV-SNP registry defaults supplied by the verifier or read from
     /// AmdSnpSecurityPolicyRegistry.
     pub amd_snp_security_policies: Vec<super::AmdSnpSecurityPolicy>,
 }
@@ -1825,13 +1825,17 @@ fn verify_attribute_policy(
                     &trusted.amd_snp_security_policies,
                     state.cpuid,
                 ) {
-                    Ok(global_policy) => {
-                        verify_amd_snp_session_policy(state, global_policy, trusted, checks, errors)
-                    }
+                    Ok(registry_default) => verify_amd_snp_session_policy(
+                        state,
+                        registry_default,
+                        trusted,
+                        checks,
+                        errors,
+                    ),
                     Err(detail) => record(
                         checks,
                         errors,
-                        "amd-sev-snp-global-security-policy",
+                        "amd-sev-snp-registry-default",
                         false,
                         &detail,
                     ),
@@ -1881,13 +1885,13 @@ fn verify_attribute_policy(
 
 fn verify_amd_snp_session_policy(
     state: super::AmdSnpSecurityState,
-    global_policy: &super::AmdSnpSecurityPolicy,
+    registry_default: &super::AmdSnpSecurityPolicy,
     trusted: &TrustedSessionPolicy,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
     use atakit_core::tee_attributes::{
-        amd_sev_snp_platform_info_matches, amd_sev_snp_tcb_max, amd_sev_snp_tcb_meets_minimum,
+        amd_sev_snp_platform_info_matches, amd_sev_snp_tcb_meets_minimum,
         merge_amd_sev_snp_platform_info_policies, AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
         AMD_SEV_SNP_TCB_MINIMUM_KEY,
     };
@@ -1897,18 +1901,15 @@ fn verify_amd_snp_session_policy(
         .iter()
         .find(|item| item.key == AMD_SEV_SNP_TCB_MINIMUM_KEY)
         .map(|item| item.value)
-        .unwrap_or([0; 32]);
-    let effective_base_tcb = amd_sev_snp_tcb_max(&global_policy.minimum_tcb, &base_tcb);
-    let base_tcb_matches = effective_base_tcb
-        .as_ref()
-        .is_some_and(|minimum| amd_sev_snp_tcb_meets_minimum(&state.tcb_values, minimum));
+        .unwrap_or(registry_default.minimum_tcb);
+    let base_tcb_matches = amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &base_tcb);
     record(
         checks,
         errors,
         "tee-attribute-base-image-amd-sev-snp-tcb-minimum",
         base_tcb_matches,
         &format!(
-            "verified AMD SEV-SNP TCB 0x{} does not meet the global and base-image minimum",
+            "verified AMD SEV-SNP TCB 0x{} does not meet the resolved base-image minimum",
             hex::encode(state.tcb_values)
         ),
     );
@@ -1918,18 +1919,15 @@ fn verify_amd_snp_session_policy(
         .iter()
         .find(|item| item.key == AMD_SEV_SNP_TCB_MINIMUM_KEY)
         .and_then(|item| (item.allowed_values.len() == 1).then_some(item.allowed_values[0]))
-        .unwrap_or([0; 32]);
-    let effective_workload_tcb = amd_sev_snp_tcb_max(&global_policy.minimum_tcb, &workload_tcb);
-    let workload_tcb_matches = effective_workload_tcb
-        .as_ref()
-        .is_some_and(|minimum| amd_sev_snp_tcb_meets_minimum(&state.tcb_values, minimum));
+        .unwrap_or(registry_default.minimum_tcb);
+    let workload_tcb_matches = amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb);
     record(
         checks,
         errors,
         "tee-attribute-workload-amd-sev-snp-tcb-minimum",
         workload_tcb_matches,
         &format!(
-            "verified AMD SEV-SNP TCB 0x{} does not meet the global and workload minimum",
+            "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
             hex::encode(state.tcb_values)
         ),
     );
@@ -1939,21 +1937,16 @@ fn verify_amd_snp_session_policy(
         .iter()
         .find(|item| item.key == AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
         .map(|item| item.value)
-        .unwrap_or([0; 32]);
-    let effective_base_platform_info = merge_amd_sev_snp_platform_info_policies(
-        &global_policy.platform_info_policy,
-        &base_platform_info,
-    );
-    let base_platform_info_matches = effective_base_platform_info
-        .as_ref()
-        .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
+        .unwrap_or(registry_default.platform_info_policy);
+    let base_platform_info_matches =
+        amd_sev_snp_platform_info_matches(state.platform_info, &base_platform_info);
     record(
         checks,
         errors,
         "tee-attribute-base-image-amd-sev-snp-platform-info-policy",
         base_platform_info_matches,
         &format!(
-            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the global and base-image policy",
+            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} does not meet the resolved base-image policy",
             state.platform_info
         ),
     );
@@ -1963,10 +1956,9 @@ fn verify_amd_snp_session_policy(
         .iter()
         .find(|item| item.key == AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
         .and_then(|item| (item.allowed_values.len() == 1).then_some(item.allowed_values[0]))
-        .unwrap_or([0; 32]);
-    let effective_workload_platform_info = effective_base_platform_info
-        .as_ref()
-        .and_then(|base| merge_amd_sev_snp_platform_info_policies(base, &workload_platform_info));
+        .unwrap_or(registry_default.platform_info_policy);
+    let effective_workload_platform_info =
+        merge_amd_sev_snp_platform_info_policies(&base_platform_info, &workload_platform_info);
     let workload_platform_info_matches = effective_workload_platform_info
         .as_ref()
         .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
@@ -1976,7 +1968,7 @@ fn verify_amd_snp_session_policy(
         "tee-attribute-workload-amd-sev-snp-platform-info-policy",
         workload_platform_info_matches,
         &format!(
-            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the global, base-image, and workload policy",
+            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
             state.platform_info
         ),
     );
@@ -2756,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_amd_snp_global_policy_applies_to_session_evidence() {
+    fn verified_amd_snp_registry_defaults_apply_to_session_evidence() {
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
             base_image_id: format!("0x{}", "02".repeat(32)),
@@ -2804,14 +2796,112 @@ mod tests {
         verify_attribute_policy(&bundle, &trusted, None, &mut checks, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
 
-        let mut missing_global = trusted;
-        missing_global.amd_snp_security_policies.clear();
+        let mut missing_default = trusted;
+        missing_default.amd_snp_security_policies.clear();
         let mut checks = Vec::new();
         let mut errors = Vec::new();
-        verify_attribute_policy(&bundle, &missing_global, None, &mut checks, &mut errors);
+        verify_attribute_policy(&bundle, &missing_default, None, &mut checks, &mut errors);
         assert!(errors
             .iter()
-            .any(|error| error.starts_with("amd-sev-snp-global-security-policy:")));
+            .any(|error| error.starts_with("amd-sev-snp-registry-default:")));
+    }
+
+    #[test]
+    fn verified_amd_snp_policy_allows_only_coordinated_relaxation() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+        let mut bundle = snp_bundle_for_policy(policy);
+        let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
+        let lower_raw_tcb = [3, 0, 0, 0, 0, 0, 29, 222];
+        for offset in [
+            crate::SNP_REPORT_CURRENT_TCB_OFFSET,
+            crate::SNP_REPORT_REPORTED_TCB_OFFSET,
+            crate::SNP_REPORT_COMMITTED_TCB_OFFSET,
+            crate::SNP_REPORT_LAUNCH_TCB_OFFSET,
+        ] {
+            report[offset..offset + 8].copy_from_slice(&lower_raw_tcb);
+        }
+        report[crate::SNP_REPORT_PLATFORM_INFO_OFFSET..crate::SNP_REPORT_PLATFORM_INFO_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+
+        let lower_tcb = atakit_core::tee_attributes::parse_bytes32_hex(
+            "0x00000000de1d000300000000de1d000300000000de1d000300000000de1d0003",
+        )
+        .unwrap();
+        let lower_platform = [0; 32];
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_specs: Vec::new(),
+            effective_attributes: vec![
+                SessionAttribute {
+                    key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
+                    value: lower_tcb,
+                },
+                SessionAttribute {
+                    key: atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+                    value: lower_platform,
+                },
+            ],
+            attribute_requirements: vec![
+                SessionAttributeRequirement {
+                    key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
+                    allowed_values: vec![lower_tcb],
+                },
+                SessionAttributeRequirement {
+                    key: atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+                    allowed_values: vec![lower_platform],
+                },
+            ],
+            amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
+                cpuid: 0x190000,
+                minimum_tcb: atakit_core::tee_attributes::parse_bytes32_hex(
+                    "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+                )
+                .unwrap(),
+                platform_info_policy: atakit_core::tee_attributes::parse_bytes32_hex(
+                    "0x0000000000000000000000000000000000000000000000000000000000000020",
+                )
+                .unwrap(),
+            }],
+        };
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &trusted, None, &mut checks, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut base_only = trusted.clone();
+        base_only.attribute_requirements.clear();
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &base_only, None, &mut checks, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| { error.starts_with("tee-attribute-workload-amd-sev-snp-tcb-minimum:") }));
+        assert!(errors.iter().any(|error| {
+            error.starts_with("tee-attribute-workload-amd-sev-snp-platform-info-policy:")
+        }));
+
+        let mut workload_only = trusted;
+        workload_only.effective_attributes.clear();
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &workload_only, None, &mut checks, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.starts_with("tee-attribute-base-image-amd-sev-snp-tcb-minimum:")
+        }));
+        assert!(errors.iter().any(|error| {
+            error.starts_with("tee-attribute-base-image-amd-sev-snp-platform-info-policy:")
+        }));
     }
 
     #[test]

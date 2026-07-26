@@ -350,8 +350,8 @@ impl AttestationClient {
         )))
     }
 
-    /// Read the active global AMD SEV-SNP security policy for the report's
-    /// exact family, model, and stepping value.
+    /// Read the active AMD SEV-SNP policy defaults for the report's exact
+    /// family, model, and stepping value.
     pub async fn resolve_amd_snp_security_policy(
         &self,
         cpuid: u32,
