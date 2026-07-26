@@ -236,6 +236,21 @@ both policies constrain the same PCR. Deployment-management verification with
 `WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
 collateral.
 
+TLS bootstrap applies the same verified TEE attribute policy before any
+`POST /init` data is sent. The verifier extracts the Intel TDX debug state and
+DCAP TCB status, or the AMD SEV-SNP debug, `MIGRATE_MA`, TCB,
+`PLATFORM_INFO`, and CPUID state, from the signed report. It compares that
+state with the effective signed platform profile and measurement variant. When
+a workload manifest is selected, it also applies
+`manifest.config.attributes`. When no workload is selected, missing workload
+requirements use safe defaults: disabled Boolean states, Intel TDX `ok` only,
+and the active global AMD SEV-SNP floor. For AMD SEV-SNP, the verifier either
+receives the exact-CPUID global policy as an explicit trust input or reads it
+from the `AmdSnpSecurityPolicyRegistry` derived from the selected
+`SessionRegistry`. Custom attributes and all six reserved TEE attributes use
+measurement-variant-first lookup. The variant value replaces the matching
+profile value before the workload and global policies are combined.
+
 `atakit cloud session status` resolves only the deployment and verified portal
 TLS connection before reading portal request state. It displays `idle`,
 `waiting`, `running`, and `failed` without loading `WorkloadRegistry` policy.

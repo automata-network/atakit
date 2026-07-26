@@ -431,7 +431,7 @@ image    = "automata-linux:v0.2.6-debug"
 Each workload is defined by a single `atakit-workload.toml` file:
 
 ```toml
-format = 4
+format = 6
 
 [package]
 measured-data = ["/config/cert.pem"]
@@ -449,6 +449,10 @@ unmeasured-env-file = "/runtime.env"
 
 [workload.environment]
 RUST_LOG = "info"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+"atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false]
 ```
 
 Package data paths are logical absolute paths. `/config/cert.pem` is read from
@@ -462,6 +466,12 @@ declarations from another root, and on `cloud deploy`, `cloud init`, or
 `workload init` to supply an operator-specific allowlisted subset.
 `--unmeasured-data-dir` remains as a deprecated alias for the deploy/init
 commands.
+
+Format 6 always emits the measured `manifest.json` `config.attributes` map,
+even when `[workload.attributes]` is absent. Custom attribute names accept
+string arrays. The six reserved verified TEE names use Boolean arrays, Intel
+TDX TCB status names, or one packed AMD SEV-SNP bytes32 value as defined by the
+full specification.
 
 See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for the full specification.
 

@@ -72,12 +72,23 @@ included in the archive; the manifest commits only to its allowlisted paths.
 from explicit typed inputs. It performs no network access.
 
 `atakit-attestation-client` owns read-only access to verifier-selected chain
-state. It derives `BaseImageRegistry` and `WorkloadRegistry` from the selected
-`SessionRegistry`, resolves registered measurement and workload policy, checks
-platform trust roots, resolves Azure MAA signing keys, fetches fresh
-challenge-bound current-session evidence, and calls `atakit-attestation`. The
-configured RPC endpoint remains a verifier-selected trusted data source; the
-client does not verify consensus or storage proofs.
+state. It derives `BaseImageRegistry`, `WorkloadRegistry`, and
+`AmdSnpSecurityPolicyRegistry` from the selected `SessionRegistry`. It resolves
+registered measurement and workload policy, resolves the active global AMD
+SEV-SNP policy for the exact signed CPUID, checks platform trust roots,
+resolves Azure MAA signing keys, fetches fresh challenge-bound current-session
+evidence, and calls `atakit-attestation`. The configured RPC endpoint remains
+a verifier-selected trusted data source; the client does not verify consensus
+or storage proofs.
+
+`atakit-attestation` extracts verified Intel TDX debug and TCB status or AMD
+SEV-SNP debug, `MIGRATE_MA`, TCB, `PLATFORM_INFO`, and CPUID state from the
+signed report. It evaluates only the reserved attributes for the verified TEE
+platform. The effective base-image value comes from the selected platform
+profile plus measurement-variant overrides. This lookup applies to custom
+attributes and all six reserved TEE attributes. A missing workload policy uses
+the safe defaults: disabled Boolean states, Intel TDX `ok` only, and the
+active global AMD SEV-SNP floor.
 
 ### Cloud
 
