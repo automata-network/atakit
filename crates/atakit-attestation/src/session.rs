@@ -294,6 +294,7 @@ pub struct VerifiedSession {
 pub struct SessionVerificationCheck {
     pub name: String,
     pub valid: bool,
+    /// Failure reason. Successful checks always use `None`.
     pub detail: Option<String>,
 }
 
@@ -2161,7 +2162,7 @@ fn record(
     checks.push(SessionVerificationCheck {
         name: name.into(),
         valid,
-        detail: (!detail.is_empty()).then(|| detail.into()),
+        detail: (!valid && !detail.is_empty()).then(|| detail.into()),
     });
     if !valid {
         errors.push(format!("{name}: {detail}"));
@@ -2226,6 +2227,34 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_checks_omit_failure_detail() {
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        record(
+            &mut checks,
+            &mut errors,
+            "successful-check",
+            true,
+            "this text describes a failure",
+        );
+        record(
+            &mut checks,
+            &mut errors,
+            "failed-check",
+            false,
+            "the check failed",
+        );
+
+        assert_eq!(checks.len(), 2);
+        assert!(checks[0].valid);
+        assert_eq!(checks[0].detail, None);
+        assert!(!checks[1].valid);
+        assert_eq!(checks[1].detail.as_deref(), Some("the check failed"));
+        assert_eq!(errors, ["failed-check: the check failed"]);
+    }
 
     #[test]
     fn chain_binding_must_match_verifier_selected_coordinates() {
