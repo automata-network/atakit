@@ -43,6 +43,7 @@ pub type Result<T> = std::result::Result<T, AttestationError>;
 const TPM_GENERATED_VALUE: u32 = 0xff54_4347;
 const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
 const TPM_ALG_SHA256: u16 = 0x000b;
+const TPM_ALG_SHA384: u16 = 0x000c;
 const TPM_ALG_NULL: u16 = 0x0010;
 const TPM_ALG_RSASSA: u16 = 0x0014;
 const TPM_ALG_ECDSA: u16 = 0x0018;
@@ -557,6 +558,9 @@ struct AzureMaaJwtHeader {
 #[derive(Debug, Deserialize)]
 struct AzureMaaJwtClaims {
     iss: String,
+    exp: u64,
+    nbf: u64,
+    iat: u64,
     #[serde(rename = "x-ms-attestation-type")]
     attestation_type: String,
     #[serde(rename = "x-ms-compliance-status")]
@@ -667,19 +671,23 @@ pub fn verify_tls_attestation_with_workload_attributes(
     )
 }
 
-fn verify_tls_attestation_at(
+/// Verifies TLS evidence at a caller-selected time. Every certificate,
+/// collateral, and token time check uses this same value.
+pub fn verify_tls_attestation_at(
     inputs: VerificationInputs,
-    current_time: SystemTime,
+    verification_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
-    verify_tls_attestation_internal(inputs, None, current_time)
+    verify_tls_attestation_internal(inputs, None, verification_time)
 }
 
-fn verify_tls_attestation_with_workload_attributes_at(
+/// Verifies TLS evidence and workload attributes at a caller-selected time.
+/// Every certificate, collateral, and token time check uses this same value.
+pub fn verify_tls_attestation_with_workload_attributes_at(
     inputs: VerificationInputs,
     workload_attributes: &atakit_core::tee_attributes::AttributeRequirements,
-    current_time: SystemTime,
+    verification_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
-    verify_tls_attestation_internal(inputs, Some(workload_attributes), current_time)
+    verify_tls_attestation_internal(inputs, Some(workload_attributes), verification_time)
 }
 
 fn verify_tls_attestation_internal(
@@ -687,6 +695,7 @@ fn verify_tls_attestation_internal(
     workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
     current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    let mut authenticated_pcrs = None;
     let mut verified_base_image_id = None;
     let mut verified_platform_profile_id = None;
     let mut verified_variant_id = None;
@@ -859,7 +868,7 @@ fn verify_tls_attestation_internal(
                     "qualifyingData does not match nonce and TLS cert hash".to_string(),
                 );
                 if let Some(tpm_quote_bytes) = &tpm_quote_bytes {
-                    verification_core::verify_tpm_quote(
+                    authenticated_pcrs = verification_core::verify_tpm_quote(
                         &mut report,
                         &mut errors,
                         tpm_quote_bytes,
@@ -960,6 +969,7 @@ fn verify_tls_attestation_internal(
                 binding,
                 &inputs.trust_anchors.azure_maa_keys,
                 &inputs.response.platform.tee,
+                current_time,
             );
             verification_core::verify_azure_hclak_quote_signature(
                 &mut report,
@@ -983,6 +993,7 @@ fn verify_tls_attestation_internal(
                 ak_public,
                 &inputs.trust_anchors.gcp_roots,
                 &inputs.trust_anchors.gcp_root_hashes,
+                current_time,
             );
             verification_core::verify_tpm_quote_signature(
                 &mut report,
@@ -1046,7 +1057,7 @@ fn verify_tls_attestation_internal(
             &mut errors,
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
-            &inputs.response.tpm.pcrs,
+            authenticated_pcrs.as_deref().unwrap_or(&[]),
         );
         verified_tdx_tcb_status_bit = verification_core::verify_gcp_tee_vendor_report(
             &mut report,
@@ -1082,6 +1093,7 @@ fn verify_tls_attestation_internal(
                                 &mut errors,
                                 Some(evidence),
                                 &inputs.response.collateral,
+                                current_time,
                             );
                     }
                     "sev-snp" => verification_core::verify_azure_snp_vendor_report(
@@ -1338,7 +1350,7 @@ fn verify_tls_attestation_internal(
                         &mut report,
                         &mut errors,
                         spec,
-                        &inputs.response.tpm.pcrs,
+                        authenticated_pcrs.as_deref().unwrap_or(&[]),
                         &inputs.response.tpm.event_log_hashes,
                     );
                 }
@@ -2105,14 +2117,18 @@ fn decode_b64_32(field: &'static str, value: &str) -> Result<[u8; 32]> {
 }
 
 fn decode_hex_32(field: &'static str, value: &str) -> Result<[u8; 32]> {
+    decode_hex_array(field, value)
+}
+
+fn decode_hex_array<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
     let raw = value.strip_prefix("0x").unwrap_or(value);
     let bytes = hex::decode(raw).map_err(|e| AttestationError::Hex {
         field,
         detail: e.to_string(),
     })?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| AttestationError::Hex {
+    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| AttestationError::Hex {
         field,
-        detail: format!("expected 32 bytes, got {}", bytes.len()),
+        detail: format!("expected {N} bytes, got {}", bytes.len()),
     })
 }
 
@@ -2597,6 +2613,7 @@ mod tests {
             &ak_public,
             &[root.der().as_ref().to_vec()],
             &[],
+            SystemTime::now(),
         );
 
         assert!(
@@ -2750,7 +2767,7 @@ mod tests {
             .unwrap();
         let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
         let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
-        let report_start = gcp_tdx_report_start(&quote).expect("TDX quote body");
+        let report_start = tdx_quote_report_start(&quote).expect("TDX quote body");
         let report_data_start = report_start + TDX_REPORT_REPORT_DATA_OFFSET;
         let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
         quote[report_data_start..report_data_start + 32].copy_from_slice(&hcl_hash);
@@ -2775,6 +2792,22 @@ mod tests {
     }
 
     fn fake_azure_maa_jwt(hcl_var_data: &[u8], tee: &str) -> (String, Vec<u8>) {
+        fake_azure_maa_jwt_with_times(
+            hcl_var_data,
+            tee,
+            1_700_000_000,
+            1_700_000_000,
+            4_102_444_800,
+        )
+    }
+
+    fn fake_azure_maa_jwt_with_times(
+        hcl_var_data: &[u8],
+        tee: &str,
+        iat: u64,
+        nbf: u64,
+        exp: u64,
+    ) -> (String, Vec<u8>) {
         let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test MAA RSA key");
         let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let trusted_key = serde_json::to_vec(&serde_json::json!({
@@ -2802,6 +2835,10 @@ mod tests {
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
                 "iss": "https://sharedeus.eus.attest.azure.net",
+                "iat": iat,
+                "nbf": nbf,
+                "exp": exp,
+                "x-ms-runtime": {"exp": 4_102_444_800u64},
                 "x-ms-attestation-type": attestation_type,
                 "x-ms-compliance-status": "azure-compliant-cvm",
                 report_data_claim: hex::encode(report_data)
@@ -2851,6 +2888,14 @@ mod tests {
     }
 
     fn fake_tpm_quote(qualifying_data: &[u8; 32], pcrs: &[(u8, [u8; 32])]) -> Vec<u8> {
+        fake_tpm_quote_banks(qualifying_data, pcrs, &[])
+    }
+
+    fn fake_tpm_quote_banks(
+        qualifying_data: &[u8; 32],
+        sha256_pcrs: &[(u8, [u8; 32])],
+        sha384_pcrs: &[(u8, [u8; 48])],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&TPM_GENERATED_VALUE.to_be_bytes());
         body.extend_from_slice(&TPM_ST_ATTEST_QUOTE.to_be_bytes());
@@ -2859,16 +2904,41 @@ mod tests {
         body.extend_from_slice(qualifying_data);
         body.extend_from_slice(&[0u8; 17]); // clockInfo
         body.extend_from_slice(&[0u8; 8]); // firmwareVersion
-        body.extend_from_slice(&1u32.to_be_bytes()); // PCR selection count
-        body.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
-        body.push(3); // sizeofSelect for PCRs 0..=23
-        let mut select = [0u8; 3];
-        for (index, _) in pcrs {
-            select[usize::from(index / 8)] |= 1 << (index % 8);
+        let selection_count =
+            u32::from(!sha256_pcrs.is_empty()) + u32::from(!sha384_pcrs.is_empty());
+        body.extend_from_slice(&selection_count.to_be_bytes());
+        for (hash_alg, indices) in [
+            (
+                TPM_ALG_SHA256,
+                sha256_pcrs
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                TPM_ALG_SHA384,
+                sha384_pcrs
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            if indices.is_empty() {
+                continue;
+            }
+            body.extend_from_slice(&hash_alg.to_be_bytes());
+            body.push(3); // sizeofSelect for PCRs 0..=23
+            let mut select = [0u8; 3];
+            for index in indices {
+                select[usize::from(index / 8)] |= 1 << (index % 8);
+            }
+            body.extend_from_slice(&select);
         }
-        body.extend_from_slice(&select);
-        let mut pcr_concat = Vec::with_capacity(pcrs.len() * 32);
-        for (_, value) in pcrs {
+        let mut pcr_concat = Vec::with_capacity(sha256_pcrs.len() * 32 + sha384_pcrs.len() * 48);
+        for (_, value) in sha256_pcrs {
+            pcr_concat.extend_from_slice(value);
+        }
+        for (_, value) in sha384_pcrs {
             pcr_concat.extend_from_slice(value);
         }
         let digest: [u8; 32] = Sha256::digest(&pcr_concat).into();
@@ -2955,29 +3025,34 @@ mod tests {
     }
 
     #[test]
-    fn gcp_tdx_pcr15_binding_parses_full_quote_and_body_fixture() {
+    fn gcp_tdx_pcr15_binding_requires_full_quote() {
         let uuid = [0x42u8; 16];
         let expected = expected_gcp_tdx_pcr15_for_uuid(&uuid);
-        for quote in [
-            fake_gcp_tdx_full_quote_v4(&uuid),
-            fake_gcp_tdx_quote_body(&uuid),
-        ] {
-            let mut report = VerificationReport {
-                checks: Vec::new(),
-                evidence: EvidenceSummary::default(),
-            };
-            let mut errors = Vec::new();
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        let got =
+            expected_gcp_tdx_pcr15(&mut report, &mut errors, &fake_gcp_tdx_full_quote_v4(&uuid))
+                .expect("GCP TDX PCR15 should derive from a full quote");
+        assert_eq!(got, expected);
+        assert!(errors.is_empty(), "{errors:?}");
 
-            let got = expected_gcp_tdx_pcr15(&mut report, &mut errors, &quote)
-                .expect("GCP TDX PCR15 should derive from quote");
-
-            assert_eq!(got, expected);
-            assert!(
-                errors.is_empty(),
-                "unexpected binding errors for quote len {}: {errors:?}",
-                quote.len()
-            );
-        }
+        let mut body_report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut body_errors = Vec::new();
+        assert!(expected_gcp_tdx_pcr15(
+            &mut body_report,
+            &mut body_errors,
+            &fake_gcp_tdx_quote_body(&uuid),
+        )
+        .is_none());
+        assert!(body_errors
+            .iter()
+            .any(|error| error.detail.contains("unsupported version")));
     }
 
     #[test]
@@ -3357,7 +3432,7 @@ mod tests {
         let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
         let evidence = response.tee_evidence.as_mut().expect("TEE evidence");
         let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
-        let report_start = gcp_tdx_report_start(&quote).unwrap();
+        let report_start = tdx_quote_report_start(&quote).unwrap();
         quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
         evidence.report = URL_SAFE_NO_PAD.encode(quote);
 
@@ -3891,6 +3966,115 @@ mod tests {
     }
 
     #[test]
+    fn verifier_does_not_use_unselected_sha384_for_static_policy() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "gcp");
+        response.tpm.pcrs[0].sha384 = Some(format!("0x{}", "bb".repeat(48)));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(48)))),
+            trust_anchors: TrustAnchors::default(),
+        })
+        .expect_err("an unquoted SHA-384 PCR value must not satisfy static policy");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "pcr-4-static"));
+        assert_check_passed(&failure, "tpm-quote-pcr-digest");
+    }
+
+    #[test]
+    fn verifier_authenticates_sha384_only_quote_selection() {
+        let qualifying_data = [0x11; 32];
+        let sha384 = [0x44; 48];
+        let quote = fake_tpm_quote_banks(&qualifying_data, &[], &[(4, sha384)]);
+        let evidence = vec![PcrEvidence {
+            index: 4,
+            sha256: Some(format!("0x{}", "aa".repeat(32))),
+            sha384: Some(hex0x(&sha384)),
+        }];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        let authenticated = verify_tpm_quote(
+            &mut report,
+            &mut errors,
+            &quote,
+            &qualifying_data,
+            &evidence,
+        )
+        .expect("SHA-384 selection should authenticate");
+        assert!(errors.is_empty(), "{errors:?}");
+        let expected_sha384 = hex0x(&sha384);
+        assert_eq!(authenticated[0].sha256, None);
+        assert_eq!(
+            authenticated[0].sha384.as_deref(),
+            Some(expected_sha384.as_str())
+        );
+
+        verify_pcr_spec(
+            &mut report,
+            &mut errors,
+            &PcrSpec {
+                pcr_index: 4,
+                verify_type: "static".into(),
+                match_data: vec![hex0x(&sha384)],
+                event_indices: vec![],
+                total_events: None,
+            },
+            &authenticated,
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn verifier_authenticates_sha256_and_sha384_quote_selections_together() {
+        let qualifying_data = [0x22; 32];
+        let sha256 = [0x33; 32];
+        let sha384 = [0x44; 48];
+        let quote = fake_tpm_quote_banks(&qualifying_data, &[(4, sha256)], &[(4, sha384)]);
+        let evidence = vec![PcrEvidence {
+            index: 4,
+            sha256: Some(hex0x(&sha256)),
+            sha384: Some(hex0x(&sha384)),
+        }];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        let authenticated = verify_tpm_quote(
+            &mut report,
+            &mut errors,
+            &quote,
+            &qualifying_data,
+            &evidence,
+        )
+        .expect("both selected banks should authenticate");
+        assert!(errors.is_empty(), "{errors:?}");
+        let expected_sha256 = hex0x(&sha256);
+        let expected_sha384 = hex0x(&sha384);
+        assert_eq!(
+            authenticated[0].sha256.as_deref(),
+            Some(expected_sha256.as_str())
+        );
+        assert_eq!(
+            authenticated[0].sha384.as_deref(),
+            Some(expected_sha384.as_str())
+        );
+    }
+
+    #[test]
     fn verifier_rejects_pcr_values_outside_quote_selection() {
         let nonce = [1u8; 32];
         let cert = b"cert";
@@ -4137,7 +4321,7 @@ mod tests {
         bind_azure_tdx_evidence_to_ak_binding(&mut response);
         let evidence = response.tee_evidence.as_mut().expect("Azure TDX evidence");
         let mut tee_quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
-        let report_start = gcp_tdx_report_start(&tee_quote).expect("TDX quote body");
+        let report_start = tdx_quote_report_start(&tee_quote).expect("TDX quote body");
         tee_quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] |= 1;
         evidence.report = URL_SAFE_NO_PAD.encode(tee_quote);
         let check_name = format!(
@@ -4608,7 +4792,7 @@ mod tests {
             .unwrap_err()
             .contains("2 HCLAkPub entries"));
         let mut raw_tdx_quote = fake_gcp_tdx_full_quote_v4(&[0u8; 16]);
-        let report_start = gcp_tdx_report_start(&raw_tdx_quote).expect("TDX report start");
+        let report_start = tdx_quote_report_start(&raw_tdx_quote).expect("TDX report start");
         let report_data_start = report_start + TDX_REPORT_REPORT_DATA_OFFSET;
         raw_tdx_quote[report_data_start..report_data_start + 32]
             .copy_from_slice(&Sha256::digest(&hcl_var_data));
@@ -4635,6 +4819,7 @@ mod tests {
             &binding,
             std::slice::from_ref(&trust),
             "tdx",
+            SystemTime::now(),
         );
         verify_azure_tee_var_data_binding(&mut report, &mut errors, &evidence, "tdx");
         assert!(errors.is_empty(), "{errors:?}");
@@ -4650,6 +4835,7 @@ mod tests {
             &binding,
             &[trust.clone(), trust.clone()],
             "tdx",
+            SystemTime::now(),
         );
         assert!(duplicate_errors
             .iter()
@@ -4669,6 +4855,7 @@ mod tests {
                 ..trust
             }],
             "tdx",
+            SystemTime::now(),
         );
         assert!(expired_errors
             .iter()
@@ -4694,6 +4881,93 @@ mod tests {
         assert!(mismatch_errors
             .iter()
             .any(|error| error.check == "azure-tee-var-data-binding"));
+    }
+
+    #[test]
+    fn azure_maa_jwt_uses_verifier_selected_time() {
+        let hcl_var_data = b"{\"keys\":[]}";
+        let (jwt, trusted_key) = fake_azure_maa_jwt_with_times(hcl_var_data, "tdx", 100, 100, 200);
+        let binding = AkBinding {
+            kind: "azure-maa-jwt".into(),
+            data: URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "jwt": jwt,
+                    "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data),
+                }))
+                .unwrap(),
+            ),
+        };
+
+        for timestamp in [100, 199] {
+            let mut report = VerificationReport {
+                checks: Vec::new(),
+                evidence: EvidenceSummary::default(),
+            };
+            let mut errors = Vec::new();
+            verify_azure_maa_jwt_binding(
+                &mut report,
+                &mut errors,
+                &binding,
+                std::slice::from_ref(&trusted_key),
+                "tdx",
+                UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            );
+            assert!(errors.is_empty(), "timestamp {timestamp}: {errors:?}");
+        }
+
+        for (timestamp, expected) in [(99, "not valid before"), (200, "expired")] {
+            let mut report = VerificationReport {
+                checks: Vec::new(),
+                evidence: EvidenceSummary::default(),
+            };
+            let mut errors = Vec::new();
+            verify_azure_maa_jwt_binding(
+                &mut report,
+                &mut errors,
+                &binding,
+                std::slice::from_ref(&trusted_key),
+                "tdx",
+                UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            );
+            assert!(
+                errors.iter().any(|error| error.detail.contains(expected)),
+                "timestamp {timestamp}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_maa_jwt_rejects_future_issued_at_time() {
+        let hcl_var_data = b"{\"keys\":[]}";
+        let (jwt, trusted_key) = fake_azure_maa_jwt_with_times(hcl_var_data, "tdx", 151, 100, 200);
+        let binding = AkBinding {
+            kind: "azure-maa-jwt".into(),
+            data: URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "jwt": jwt,
+                    "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data),
+                }))
+                .unwrap(),
+            ),
+        };
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        verify_azure_maa_jwt_binding(
+            &mut report,
+            &mut errors,
+            &binding,
+            std::slice::from_ref(&trusted_key),
+            "tdx",
+            UNIX_EPOCH + std::time::Duration::from_secs(150),
+        );
+
+        assert!(errors
+            .iter()
+            .any(|error| error.detail.contains("issued in the future")));
     }
 
     #[test]

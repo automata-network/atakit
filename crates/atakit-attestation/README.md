@@ -5,6 +5,17 @@ from explicit typed inputs. It performs no network access. The caller chooses
 the measurement policy, workload policy, platform trust roots, Azure MAA keys,
 AMD SEV-SNP registry defaults, expected chain binding, and current time.
 
+The production entry points sample `SystemTime::now()` once. The corresponding
+`*_at` entry points accept a caller-selected verification time. Intel TDX DCAP,
+AMD SEV-SNP certificates and revocation lists, GCP AK certificates, Azure MAA
+signing-key validity, and Azure MAA JWT validity all use that one value.
+
+TLS TPM quote verification parses every selected PCR bank. SHA-256 and SHA-384
+selections may appear alone or together. It reconstructs the signed quote
+digest in selection order and gives PCR policy evaluation only the
+authenticated bank/index projection. An unselected bank value may be retained
+for diagnostics but cannot satisfy policy.
+
 ## Verified TEE attribute policy
 
 The verifier first checks the vendor-signed Intel TDX quote or AMD SEV-SNP
@@ -41,6 +52,11 @@ TDX 1.5 `MR_SERVICETD`, AMD SEV-SNP `VMPL`, any `REPORT_ID_MA` other than
 the all-zero or all-`0xff` no-association sentinel, invalid
 reserved fields, invalid TCB order, unsupported CPUID values, and invalid
 cryptographic or collateral verification.
+
+Azure MAA JWTs must contain top-level numeric unsigned 64-bit `iat`, `nbf`, and
+`exp` claims. Nested fields cannot substitute for them. Verification requires
+`nbf < exp`, `iat < exp`,
+`iat <= verification_time`, and `nbf <= verification_time < exp`.
 
 The canonical wire formats and policy rules live in:
 

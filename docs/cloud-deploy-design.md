@@ -271,7 +271,10 @@ session verification resolves that bundle's exact MAA key and verifies its JWT
 with that key. A fresh TLS MAA key is not a fallback for the committed session
 MAA key. Every manual `--azure-maa-key` value remains available until both JWTs
 have been checked, so valid key rotation between session creation and a later
-command does not make the committed session unverifiable.
+command does not make the committed session unverifiable. Both verifications
+also require numeric `iat`, `nbf`, and `exp` claims and enforce
+`nbf <= verification_time < exp` using the same caller-selected time as the
+other certificate and collateral checks.
 
 Portal status and init ports default to `2024` and `1024` and can be overridden
 per invocation with `--status-port` and `--init-port`. The selected ports are

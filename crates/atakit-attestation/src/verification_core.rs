@@ -9,6 +9,7 @@ pub(super) fn verify_gcp_ak_cert_chain(
     ak_public: &[u8],
     trusted_roots: &[Vec<u8>],
     trusted_root_hashes: &[[u8; 32]],
+    verification_time: SystemTime,
 ) {
     if binding.kind != "gcp-cert-chain" {
         fail(
@@ -36,6 +37,7 @@ pub(super) fn verify_gcp_ak_cert_chain(
         ak_public,
         trusted_roots,
         trusted_root_hashes,
+        verification_time,
     );
 }
 
@@ -46,7 +48,15 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
     ak_public: &[u8],
     trusted_roots: &[Vec<u8>],
     trusted_root_hashes: &[[u8; 32]],
+    verification_time: SystemTime,
 ) {
+    let validation_time = match asn1_time(verification_time) {
+        Ok(time) => time,
+        Err(detail) => {
+            fail(report, errors, "gcp-ak-cert-chain", detail);
+            return;
+        }
+    };
     if trusted_roots.is_empty() && trusted_root_hashes.is_empty() {
         fail(
             report,
@@ -78,12 +88,12 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
             return;
         }
     };
-    if !leaf.validity().is_valid() {
+    if !leaf.validity().is_valid_at(validation_time) {
         fail(
             report,
             errors,
             "gcp-ak-cert-chain",
-            "GCP AK leaf certificate is not currently valid".to_string(),
+            "GCP AK leaf certificate is not valid at the verification time".to_string(),
         );
         return;
     }
@@ -150,12 +160,16 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
             );
             return;
         }
-        if !child.validity().is_valid() || !parent.validity().is_valid() {
+        if !child.validity().is_valid_at(validation_time)
+            || !parent.validity().is_valid_at(validation_time)
+        {
             fail(
                 report,
                 errors,
                 "gcp-ak-cert-chain",
-                format!("GCP AK chain certificate {idx} or its issuer is not currently valid"),
+                format!(
+                    "GCP AK chain certificate {idx} or its issuer is not valid at the verification time"
+                ),
             );
             return;
         }
@@ -384,7 +398,7 @@ pub(super) fn expected_gcp_tdx_pcr15(
     errors: &mut Vec<VerificationError>,
     quote: &[u8],
 ) -> Option<[u8; 32]> {
-    let report_start = match gcp_tdx_report_start(quote) {
+    let report_start = match tdx_quote_report_start(quote) {
         Ok(start) => start,
         Err(detail) => {
             fail(report, errors, "gcp-tee-vtpm-binding", detail);
@@ -445,13 +459,11 @@ pub(super) fn expected_gcp_tdx_pcr15(
     Some(Sha256::digest(&pcr_input).into())
 }
 
-pub(super) fn gcp_tdx_report_start(quote: &[u8]) -> std::result::Result<usize, String> {
-    let Some(version) = read_le_u16_opt(quote, 0) else {
-        return Ok(0);
-    };
-    let Some(tee_type) = read_le_u32_opt(quote, 4) else {
-        return Ok(0);
-    };
+pub(super) fn tdx_quote_report_start(quote: &[u8]) -> std::result::Result<usize, String> {
+    let version = read_le_u16_opt(quote, 0)
+        .ok_or_else(|| "TDX quote is too short for its version".to_string())?;
+    let tee_type = read_le_u32_opt(quote, 4)
+        .ok_or_else(|| "TDX quote is too short for its tee_type".to_string())?;
     match version {
         4 if tee_type == TDX_TEE_TYPE => Ok(TDX_QUOTE_HEADER_LEN),
         5 if tee_type == TDX_TEE_TYPE => {
@@ -466,11 +478,8 @@ pub(super) fn gcp_tdx_report_start(quote: &[u8]) -> std::result::Result<usize, S
                 )),
             }
         }
-        4 | 5 => Err(format!("GCP TDX quote has non-TDX tee_type 0x{tee_type:x}")),
-        // Unit fixtures and some low-level callers pass only the TDREPORT
-        // body. Real endpoint evidence is a full TDQUOTE and takes the
-        // branches above.
-        _ => Ok(0),
+        4 | 5 => Err(format!("TDX quote has non-TDX tee_type 0x{tee_type:x}")),
+        other => Err(format!("TDX quote has unsupported version {other}")),
     }
 }
 
@@ -566,7 +575,7 @@ pub(super) fn verify_gcp_tee_vendor_report(
             );
             None
         }
-        "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral),
+        "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral, current_time),
         other => {
             fail(
                 report,
@@ -584,6 +593,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     collateral: &serde_json::Value,
+    verification_time: SystemTime,
 ) -> Option<u16> {
     verify_tdx_vendor_report(
         report,
@@ -592,6 +602,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         collateral,
         "gcp-tee-vendor-report",
         "GCP",
+        verification_time,
     )
 }
 
@@ -600,6 +611,7 @@ pub(super) fn verify_azure_tdx_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     collateral: &serde_json::Value,
+    verification_time: SystemTime,
 ) -> Option<u16> {
     verify_tdx_vendor_report(
         report,
@@ -608,6 +620,7 @@ pub(super) fn verify_azure_tdx_vendor_report(
         collateral,
         "azure-tee-vendor-report",
         "Azure",
+        verification_time,
     )
 }
 
@@ -618,6 +631,7 @@ fn verify_tdx_vendor_report(
     collateral: &serde_json::Value,
     check_name: &str,
     provider_name: &str,
+    verification_time: SystemTime,
 ) -> Option<u16> {
     let Some(evidence) = evidence else {
         fail(
@@ -707,7 +721,7 @@ fn verify_tdx_vendor_report(
         }
     };
     match dcap_rs::verify_dcap_quote_with_policy(
-        SystemTime::now(),
+        verification_time,
         collateral,
         quote,
         &tdx_dcap_verification_policy(),
@@ -1423,11 +1437,7 @@ fn check_snp_product_extension(
         .find(|ext| ext.oid.to_id_string() == "1.3.6.1.4.1.3704.1.2")
         .ok_or_else(|| "SNP VEK is missing required productName extension".to_string())?;
     let value = match ext.value {
-        [tag @ (0x0c | 0x16), length, value @ ..]
-            if *tag != 0 && usize::from(*length) == value.len() =>
-        {
-            value
-        }
+        [0x0c | 0x16, length, value @ ..] if usize::from(*length) == value.len() => value,
         raw => {
             return Err(format!(
                 "SNP VEK productName extension has unsupported encoding: 0x{}",
@@ -1702,7 +1712,7 @@ pub(super) fn verified_tee_attribute_states(
 ) -> std::result::Result<[bool; 3], String> {
     match tee {
         "tdx" => {
-            let report_start = gcp_tdx_report_start(report)?;
+            let report_start = tdx_quote_report_start(report)?;
             let attributes = read_exact_at(
                 report,
                 report_start + TDX_REPORT_ATTRIBUTES_OFFSET,
@@ -1772,6 +1782,7 @@ pub(super) fn verify_azure_maa_jwt_binding(
     binding: &AkBinding,
     trusted_maa_keys: &[Vec<u8>],
     tee: &str,
+    verification_time: SystemTime,
 ) {
     let binding = match parse_azure_maa_binding(binding) {
         Ok(binding) => binding,
@@ -1832,6 +1843,10 @@ pub(super) fn verify_azure_maa_jwt_binding(
                 claims.compliance_status
             ),
         );
+        return;
+    }
+    if let Err(detail) = verify_azure_maa_token_time(&claims, verification_time) {
+        fail(report, errors, "azure-maa-jwt", detail);
         return;
     }
 
@@ -1921,6 +1936,7 @@ pub(super) fn verify_azure_maa_session_binding(
     binding: &AkBinding,
     trusted_keys: &[AzureMaaTrustKey],
     tee: &str,
+    verification_time: SystemTime,
 ) {
     let parsed_binding = match parse_azure_maa_binding(binding) {
         Ok(binding) => binding,
@@ -1975,19 +1991,19 @@ pub(super) fn verify_azure_maa_session_binding(
         return;
     }
     let key = matching_keys[0];
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+    let verification_timestamp = match verification_time.duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
         Err(error) => {
             fail(
                 report,
                 errors,
                 "azure-maa-trust-selection",
-                format!("system clock is before Unix epoch: {error}"),
+                format!("verification time is before Unix epoch: {error}"),
             );
             return;
         }
     };
-    if now > key.not_after {
+    if verification_timestamp > key.not_after {
         fail(
             report,
             errors,
@@ -2003,7 +2019,49 @@ pub(super) fn verify_azure_maa_session_binding(
         binding,
         std::slice::from_ref(&key.public_key),
         tee,
+        verification_time,
     );
+}
+
+fn verify_azure_maa_token_time(
+    claims: &AzureMaaJwtClaims,
+    verification_time: SystemTime,
+) -> std::result::Result<(), String> {
+    let verification_timestamp = verification_time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("verification time is before Unix epoch: {error}"))?
+        .as_secs();
+    if claims.nbf >= claims.exp {
+        return Err(format!(
+            "MAA JWT validity window is invalid: nbf={} must be earlier than exp={}",
+            claims.nbf, claims.exp
+        ));
+    }
+    if claims.iat >= claims.exp {
+        return Err(format!(
+            "MAA JWT issued-at time is invalid: iat={} must be earlier than exp={}",
+            claims.iat, claims.exp
+        ));
+    }
+    if verification_timestamp < claims.nbf {
+        return Err(format!(
+            "MAA JWT is not valid before nbf={}; verification time is {verification_timestamp}",
+            claims.nbf
+        ));
+    }
+    if verification_timestamp >= claims.exp {
+        return Err(format!(
+            "MAA JWT expired at exp={}; verification time is {verification_timestamp}",
+            claims.exp
+        ));
+    }
+    if claims.iat > verification_timestamp {
+        return Err(format!(
+            "MAA JWT was issued in the future at iat={}; verification time is {verification_timestamp}",
+            claims.iat
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn verify_azure_tee_var_data_binding(
@@ -2046,7 +2104,7 @@ pub(super) fn verify_azure_tee_var_data_binding(
         }
     };
     let report_data = match tee {
-        "tdx" => gcp_tdx_report_start(&raw_report).and_then(|start| {
+        "tdx" => tdx_quote_report_start(&raw_report).and_then(|start| {
             read_exact_at(
                 &raw_report,
                 start + TDX_REPORT_REPORT_DATA_OFFSET,
@@ -2362,7 +2420,7 @@ pub(super) fn verify_tpm_quote(
     tpm2b_attest: &[u8],
     expected_qualifying_data: &[u8; 32],
     pcrs: &[PcrEvidence],
-) {
+) -> Option<Vec<PcrEvidence>> {
     let parsed = match parse_tpm_quote(tpm2b_attest) {
         Ok(parsed) => {
             pass(report, "tpm-quote-structure");
@@ -2371,8 +2429,9 @@ pub(super) fn verify_tpm_quote(
         Err(detail) => {
             fail(report, errors, "tpm-quote-structure", detail);
             skipped(report, "tpm-quote-challenge", "TPM quote did not parse");
+            skipped(report, "tpm-quote-pcr-selection", "TPM quote did not parse");
             skipped(report, "tpm-quote-pcr-digest", "TPM quote did not parse");
-            return;
+            return None;
         }
     };
 
@@ -2384,14 +2443,19 @@ pub(super) fn verify_tpm_quote(
         "TPM quote extraData does not match expected qualifyingData".to_string(),
     );
 
-    if parsed.sha256_pcr_indices.is_empty() {
+    if parsed.pcr_selections.is_empty()
+        || parsed
+            .pcr_selections
+            .iter()
+            .all(|selection| selection.indices.is_empty())
+    {
         fail(
             report,
             errors,
             "tpm-quote-pcr-digest",
-            "TPM quote does not select any SHA-256 PCRs".to_string(),
+            "TPM quote does not select any PCRs".to_string(),
         );
-        return;
+        return None;
     }
     if parsed.pcr_digest.len() != 32 {
         fail(
@@ -2399,11 +2463,11 @@ pub(super) fn verify_tpm_quote(
             errors,
             "tpm-quote-pcr-digest",
             format!(
-                "TPM quote SHA-256 PCR digest is {} bytes, expected 32",
+                "TPM quote PCR digest is {} bytes, expected 32 for the supported SHA-256 quote signature schemes",
                 parsed.pcr_digest.len()
             ),
         );
-        return;
+        return None;
     }
 
     let supplied_indices = pcrs.iter().map(|pcr| pcr.index).collect::<Vec<_>>();
@@ -2417,64 +2481,130 @@ pub(super) fn verify_tpm_quote(
             "supplied PCR values must have unique, strictly increasing indices in 0..=23"
                 .to_string(),
         );
-        return;
+        return None;
     }
-    if supplied_indices != parsed.sha256_pcr_indices {
+
+    let mut selected_algorithms = BTreeSet::new();
+    let mut selected_indices = BTreeSet::new();
+    for selection in &parsed.pcr_selections {
+        if !selected_algorithms.insert(selection.hash_alg) {
+            fail(
+                report,
+                errors,
+                "tpm-quote-pcr-selection",
+                format!(
+                    "TPM quote contains more than one PCR selection for hash algorithm 0x{:04x}",
+                    selection.hash_alg
+                ),
+            );
+            return None;
+        }
+        if !matches!(selection.hash_alg, TPM_ALG_SHA256 | TPM_ALG_SHA384) {
+            fail(
+                report,
+                errors,
+                "tpm-quote-pcr-selection",
+                format!(
+                    "TPM quote selects unsupported PCR bank algorithm 0x{:04x}",
+                    selection.hash_alg
+                ),
+            );
+            return None;
+        }
+        selected_indices.extend(selection.indices.iter().copied());
+    }
+    let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
+    if supplied_indices != selected_indices {
         fail(
             report,
             errors,
             "tpm-quote-pcr-selection",
             format!(
-                "supplied PCR indices {supplied_indices:?} differ from Quote SHA-256 selection {:?}",
-                parsed.sha256_pcr_indices
+                "supplied PCR indices {supplied_indices:?} differ from the union of Quote PCR selections {selected_indices:?}"
             ),
         );
-        return;
+        return None;
     }
     pass(report, "tpm-quote-pcr-selection");
 
-    let mut pcr_concat = Vec::with_capacity(parsed.sha256_pcr_indices.len() * 32);
-    for index in &parsed.sha256_pcr_indices {
-        let Some(pcr) = pcrs.iter().find(|pcr| &pcr.index == index) else {
-            fail(
-                report,
-                errors,
-                "tpm-quote-pcr-digest",
-                format!("TPM quote selects PCR {index}, but response.pcrs omits it"),
-            );
-            return;
-        };
-        let Some(value) = &pcr.sha256 else {
-            fail(
-                report,
-                errors,
-                "tpm-quote-pcr-digest",
-                format!("TPM quote selects PCR {index}, but response.pcrs has no sha256 value"),
-            );
-            return;
-        };
-        match decode_hex_32("pcr.sha256", value) {
-            Ok(bytes) => pcr_concat.extend_from_slice(&bytes),
-            Err(e) => {
+    let mut authenticated_pcrs = supplied_indices
+        .iter()
+        .map(|index| PcrEvidence {
+            index: *index,
+            sha256: None,
+            sha384: None,
+        })
+        .collect::<Vec<_>>();
+    let mut pcr_concat = Vec::new();
+    for selection in &parsed.pcr_selections {
+        for index in &selection.indices {
+            let pcr = pcrs
+                .iter()
+                .find(|pcr| pcr.index == *index)
+                .expect("supplied indices equal selected indices");
+            let (field, value, decoded) = match selection.hash_alg {
+                TPM_ALG_SHA256 => (
+                    "pcr.sha256",
+                    pcr.sha256.as_ref(),
+                    pcr.sha256
+                        .as_deref()
+                        .map(|value| decode_hex_array::<32>("pcr.sha256", value).map(Vec::from)),
+                ),
+                TPM_ALG_SHA384 => (
+                    "pcr.sha384",
+                    pcr.sha384.as_ref(),
+                    pcr.sha384
+                        .as_deref()
+                        .map(|value| decode_hex_array::<48>("pcr.sha384", value).map(Vec::from)),
+                ),
+                _ => unreachable!("unsupported algorithms rejected above"),
+            };
+            let Some(decoded) = decoded else {
                 fail(
                     report,
                     errors,
                     "tpm-quote-pcr-digest",
-                    format!("PCR {index}: {e}"),
+                    format!("TPM quote selects PCR {index} in {field}, but response.pcrs omits it"),
                 );
-                return;
+                return None;
+            };
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    fail(
+                        report,
+                        errors,
+                        "tpm-quote-pcr-digest",
+                        format!("PCR {index}: {error}"),
+                    );
+                    return None;
+                }
+            };
+            pcr_concat.extend_from_slice(&decoded);
+            let authenticated = authenticated_pcrs
+                .iter_mut()
+                .find(|pcr| pcr.index == *index)
+                .expect("authenticated projection contains selected index");
+            match selection.hash_alg {
+                TPM_ALG_SHA256 => authenticated.sha256 = value.cloned(),
+                TPM_ALG_SHA384 => authenticated.sha384 = value.cloned(),
+                _ => unreachable!("unsupported algorithms rejected above"),
             }
         }
     }
 
     let expected_digest: [u8; 32] = Sha256::digest(&pcr_concat).into();
-    check(
-        report,
-        errors,
-        "tpm-quote-pcr-digest",
-        parsed.pcr_digest == expected_digest,
-        "TPM quote PCR digest does not match response PCR values".to_string(),
-    );
+    if parsed.pcr_digest != expected_digest {
+        fail(
+            report,
+            errors,
+            "tpm-quote-pcr-digest",
+            "TPM quote PCR digest does not match the selected response PCR-bank values".to_string(),
+        );
+        return None;
+    }
+    pass(report, "tpm-quote-pcr-digest");
+    Some(authenticated_pcrs)
 }
 
 pub(super) fn verify_tpm_quote_signature(
@@ -2670,8 +2800,14 @@ pub(super) fn parse_tpmt_signature_rsassa_sha256(
 #[derive(Debug)]
 pub(super) struct ParsedTpmQuote {
     extra_data: Vec<u8>,
-    sha256_pcr_indices: Vec<u8>,
+    pcr_selections: Vec<ParsedPcrSelection>,
     pcr_digest: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ParsedPcrSelection {
+    hash_alg: u16,
+    indices: Vec<u8>,
 }
 
 pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
@@ -2697,26 +2833,26 @@ pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<Parsed
     reader.read_exact("firmwareVersion", 8)?;
 
     let selection_count = reader.read_u32("attested.quote.pcrSelect.count")?;
-    let mut sha256_pcr_indices = Vec::new();
+    let mut pcr_selections = Vec::new();
     for selection_idx in 0..selection_count {
         let hash_alg = reader.read_u16("attested.quote.pcrSelect.hash")?;
         let select_len = reader.read_u8("attested.quote.pcrSelect.sizeofSelect")? as usize;
         let select = reader.read_exact("attested.quote.pcrSelect.pcrSelect", select_len)?;
-        if hash_alg == TPM_ALG_SHA256 {
-            for (byte_idx, byte) in select.iter().enumerate() {
-                for bit in 0..8 {
-                    if byte & (1 << bit) != 0 {
-                        let index = byte_idx * 8 + bit;
-                        let index = u8::try_from(index).map_err(|_| {
-                            format!(
-                                "SHA-256 PCR selection {selection_idx} contains out-of-range PCR index {index}"
-                            )
-                        })?;
-                        sha256_pcr_indices.push(index);
+        let mut indices = Vec::new();
+        for (byte_idx, byte) in select.iter().enumerate() {
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 {
+                    let index = byte_idx * 8 + bit;
+                    if index > 23 {
+                        return Err(format!(
+                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected 0..=23"
+                        ));
                     }
+                    indices.push(index as u8);
                 }
             }
         }
+        pcr_selections.push(ParsedPcrSelection { hash_alg, indices });
     }
     let pcr_digest = reader.read_tpm2b("attested.quote.pcrDigest")?.to_vec();
     if !reader.is_empty() {
@@ -2728,7 +2864,7 @@ pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<Parsed
 
     Ok(ParsedTpmQuote {
         extra_data,
-        sha256_pcr_indices,
+        pcr_selections,
         pcr_digest,
     })
 }

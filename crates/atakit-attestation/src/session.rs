@@ -191,8 +191,9 @@ pub struct SessionVerificationInputs {
 pub struct SessionTrust {
     pub platform: SessionPlatformTrust,
     pub policy: TrustedSessionPolicy,
-    /// Chain coordinates selected by the verifier. Portal evidence never
-    /// selects these values. Local-bound sessions do not use them.
+    /// Chain coordinates selected by the verifier. This value is required for
+    /// chain-bound sessions. Portal evidence never selects these values.
+    /// Local-bound sessions do not use them.
     pub binding: Option<TrustedSessionBinding>,
 }
 
@@ -312,9 +313,11 @@ pub fn verify_session_bundle(
     verify_session_bundle_at(inputs, SystemTime::now())
 }
 
-pub(crate) fn verify_session_bundle_at(
+/// Verifies a production session at a caller-selected time. Every certificate,
+/// collateral, and token time check uses this same value.
+pub fn verify_session_bundle_at(
     inputs: SessionVerificationInputs,
-    current_time: SystemTime,
+    verification_time: SystemTime,
 ) -> std::result::Result<VerifiedSession, SessionVerificationFailure> {
     let mut checks = Vec::new();
     let mut errors = Vec::new();
@@ -394,12 +397,17 @@ pub(crate) fn verify_session_bundle_at(
     let verified_tdx_tcb_status_bit = verify_platform_attestation(
         bundle,
         &inputs.trust.platform,
-        current_time,
+        verification_time,
         &mut checks,
         &mut errors,
     );
-    verify_raw_quote(bundle, &mut checks, &mut errors);
-    verify_quote_projection(bundle, &mut checks, &mut errors);
+    let authenticated_pcrs = verify_raw_quote(bundle, &mut checks, &mut errors);
+    verify_quote_projection(
+        bundle,
+        authenticated_pcrs.as_deref(),
+        &mut checks,
+        &mut errors,
+    );
     verify_raw_certify(bundle, &mut checks, &mut errors);
     verify_delegation(bundle, &mut checks, &mut errors);
 
@@ -668,6 +676,7 @@ fn verify_gcp_platform(
         &ak_public,
         &gcp_ak_roots.certificates,
         &gcp_ak_roots.keccak256_hashes,
+        current_time,
     );
     super::verification_core::verify_tpm_quote_signature(
         &mut report,
@@ -716,6 +725,7 @@ fn verify_gcp_platform(
             &mut core_errors,
             Some(&tee_evidence),
             dcap,
+            current_time,
         ),
         _ => {
             record(
@@ -779,6 +789,7 @@ fn verify_azure_platform(
         &binding,
         maa_signing_keys,
         &bundle.platform.tee,
+        current_time,
     );
     super::verification_core::verify_azure_hclak_quote_signature(
         &mut report,
@@ -817,6 +828,7 @@ fn verify_azure_platform(
             &mut core_errors,
             Some(&tee_evidence),
             dcap,
+            current_time,
         ),
         _ => {
             record(
@@ -1041,7 +1053,7 @@ fn verify_raw_quote(
     bundle: &SessionEvidenceBundle,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
-) {
+) -> Option<Vec<super::PcrEvidence>> {
     let quote = decode_b64(
         &bundle.tpm_quote.tpm2b_attest,
         "tpm_quote.tpm2b_attest",
@@ -1073,7 +1085,7 @@ fn verify_raw_quote(
         );
     }
     let (Some(quote), Some(_signature), Some(qualifying)) = (quote, signature, qualifying) else {
-        return;
+        return None;
     };
     let pcrs = bundle
         .pcr_values
@@ -1089,7 +1101,7 @@ fn verify_raw_quote(
         evidence: super::EvidenceSummary::default(),
     };
     let mut quote_errors = Vec::new();
-    super::verification_core::verify_tpm_quote(
+    let authenticated_pcrs = super::verification_core::verify_tpm_quote(
         &mut report,
         &mut quote_errors,
         &quote,
@@ -1106,10 +1118,12 @@ fn verify_raw_quote(
             check.detail.as_deref().unwrap_or(""),
         );
     }
+    authenticated_pcrs
 }
 
 fn verify_quote_projection(
     bundle: &SessionEvidenceBundle,
+    authenticated_pcrs: Option<&[super::PcrEvidence]>,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
@@ -1134,8 +1148,16 @@ fn verify_quote_projection(
         checks,
         errors,
         "pcr-bank-projection",
-        bundle.pcr_values.iter().all(|pcr| pcr.sha384.is_none()),
-        "session Quote projection currently supports only the SHA-256 PCR bank",
+        authenticated_pcrs.is_some_and(|pcrs| {
+            pcrs.len() == bundle.pcr_values.len()
+                && pcrs
+                    .iter()
+                    .zip(&bundle.pcr_values)
+                    .all(|(authenticated, supplied)| {
+                        authenticated.index == supplied.index && authenticated.sha256.is_some()
+                    })
+        }),
+        "session policy requires the Quote to select an authenticated SHA-256 value for every supplied PCR; the Quote may also select SHA-384",
     );
 }
 
@@ -1531,7 +1553,17 @@ fn verify_trusted_binding(
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
-    let Some(trusted) = trusted.filter(|_| mode == BindingMode::Chain) else {
+    if mode != BindingMode::Chain {
+        return;
+    }
+    let Some(trusted) = trusted else {
+        record(
+            checks,
+            errors,
+            "trusted-binding-present",
+            false,
+            "chain-bound session verification requires verifier-selected chain coordinates",
+        );
         return;
     };
     record(
@@ -2296,6 +2328,27 @@ mod tests {
     }
 
     #[test]
+    fn chain_binding_requires_verifier_selected_coordinates() {
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_trusted_binding(
+            BindingMode::Chain,
+            11_155_111,
+            [0x11; 20],
+            None,
+            &mut checks,
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            ["trusted-binding-present: chain-bound session verification requires verifier-selected chain coordinates"]
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "trusted-binding-present");
+        assert!(!checks[0].valid);
+    }
+
+    #[test]
     fn verifier_selected_chain_does_not_require_chain_binding() {
         let trusted = TrustedSessionBinding {
             chain_id: 11_155_111,
@@ -2418,8 +2471,10 @@ mod tests {
 
     fn tdx_bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {
         let mut bundle = bundle_for_policy(policy);
-        let mut report = vec![0u8; 584];
-        report[crate::TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
+        let mut report = vec![0u8; crate::TDX_QUOTE_HEADER_LEN + 584];
+        report[0..2].copy_from_slice(&4u16.to_le_bytes());
+        report[4..8].copy_from_slice(&crate::TDX_TEE_TYPE.to_le_bytes());
+        report[crate::TDX_QUOTE_HEADER_LEN + crate::TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
         bundle.platform.attestation_mode = SessionAttestationMode::Hardware;
         bundle.platform.tee = "tdx".into();
         bundle.tee_evidence.kind = "tdx".into();
@@ -2644,7 +2699,7 @@ mod tests {
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
-        report[crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+        report[crate::TDX_QUOTE_HEADER_LEN + crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
         bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
 
         let base_policy = TrustedSessionPolicy {
@@ -2953,7 +3008,8 @@ mod tests {
                                 if actual {
                                     let mut report =
                                         URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
-                                    report[crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+                                    report[crate::TDX_QUOTE_HEADER_LEN
+                                        + crate::TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
                                     bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
                                 }
                                 bundle
@@ -3165,7 +3221,7 @@ mod tests {
         let mut checks = Vec::new();
         let mut errors = Vec::new();
         verify_production_evidence_kind(&bundle, &mut checks, &mut errors);
-        verify_raw_quote(&bundle, &mut checks, &mut errors);
+        let _ = verify_raw_quote(&bundle, &mut checks, &mut errors);
         verify_raw_certify(&bundle, &mut checks, &mut errors);
         verify_delegation(&bundle, &mut checks, &mut errors);
         assert!(errors
@@ -3188,6 +3244,62 @@ mod tests {
             hex::encode(chain_submission_request_binding_digest(challenge, jcs)),
             "1d60f0fda5b471ba8f1c5f57edacabbb4ebf2040f67c711bf04c4f595a719b4f"
         );
+    }
+
+    #[test]
+    fn session_projection_accepts_an_additional_authenticated_sha384_bank() {
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        });
+        bundle.event_log_hashes = vec![SessionEventHashes {
+            pcr_index: 7,
+            sha256: Vec::new(),
+        }];
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let authenticated = vec![crate::PcrEvidence {
+            index: 7,
+            sha256: Some(bundle.pcr_values[0].sha256.clone()),
+            sha384: bundle.pcr_values[0].sha384.clone(),
+        }];
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_quote_projection(&bundle, Some(&authenticated), &mut checks, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn session_projection_rejects_sha384_only_authentication() {
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        });
+        bundle.event_log_hashes = vec![SessionEventHashes {
+            pcr_index: 7,
+            sha256: Vec::new(),
+        }];
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let authenticated = vec![crate::PcrEvidence {
+            index: 7,
+            sha256: None,
+            sha384: bundle.pcr_values[0].sha384.clone(),
+        }];
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_quote_projection(&bundle, Some(&authenticated), &mut checks, &mut errors);
+
+        assert!(errors
+            .iter()
+            .any(|error| error.starts_with("pcr-bank-projection:")));
     }
 
     #[test]
