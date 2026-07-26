@@ -16,8 +16,10 @@ pub fn normalize_attributes(
     attributes: &AttributeRequirements,
 ) -> Result<AttributeRequirements, WorkloadError> {
     use atakit_core::tee_attributes::{
-        tdx_tcb_status_mask, tdx_tcb_status_names, validate_boolean_allowed_values,
-        ReservedAttributeValueKind, VerifiedTeeAttribute, TEE_ATTRIBUTE_NAMESPACE,
+        bytes32_hex, parse_bytes32_hex, tdx_tcb_status_mask, tdx_tcb_status_names,
+        valid_amd_sev_snp_platform_info_policy, valid_amd_sev_snp_tcb,
+        validate_boolean_allowed_values, ReservedAttributeValueKind, VerifiedTeeAttribute,
+        TEE_ATTRIBUTE_NAMESPACE,
     };
 
     let mut normalized = attributes.clone();
@@ -80,6 +82,40 @@ pub fn normalize_attributes(
                         .into_iter()
                         .map(|value| AttributeValue::String(value.to_string()))
                         .collect(),
+                );
+            }
+            ReservedAttributeValueKind::AmdSevSnpTcb
+            | ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                if values.len() != 1 {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                }
+                let AttributeValue::String(value) = &values[0] else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let Some(encoded) = parse_bytes32_hex(value) else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let valid = match reserved.value_kind() {
+                    ReservedAttributeValueKind::AmdSevSnpTcb => valid_amd_sev_snp_tcb(&encoded),
+                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                        valid_amd_sev_snp_platform_info_policy(&encoded)
+                    }
+                    _ => unreachable!(),
+                };
+                if !valid {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` contains an invalid packed value"
+                    )));
+                }
+                normalized.insert(
+                    name.clone(),
+                    vec![AttributeValue::String(bytes32_hex(&encoded))],
                 );
             }
         }

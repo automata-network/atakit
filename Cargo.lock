@@ -1379,6 +1379,7 @@ dependencies = [
 name = "atakit-core"
 version = "0.5.5"
 dependencies = [
+ "hex",
  "serde",
  "sha3",
 ]

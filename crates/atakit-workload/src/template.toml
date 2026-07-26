@@ -186,6 +186,8 @@ image = "{{name}}:latest"
 # "atakit.attestation.v1.tee.intel-tdx.tcb.status.allowed" = ["ok"]
 # "atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false]
 # "atakit.attestation.v1.tee.amd-sev-snp.migrate-ma.enabled" = [false, true]
+# "atakit.attestation.v1.tee.amd-sev-snp.tcb.minimum" = ["0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004"]
+# "atakit.attestation.v1.tee.amd-sev-snp.platform-info.policy" = ["0x0000000000000000000000000000000000000000000000010000000000000020"]
 
 # ── dependencies ──────────────────────────────────────────────────
 #
