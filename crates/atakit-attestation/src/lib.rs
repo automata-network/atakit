@@ -1758,9 +1758,6 @@ fn parse_measurement_attributes(
                     )
                 }
                 Some(VerifiedTeeAttribute::IntelTdxTcbStatusAllowed) => {
-                    if owner == "variant" {
-                        return Err(format!("{owner} cannot override reserved attribute {name}"));
-                    }
                     let names = value
                         .get("value")
                         .and_then(serde_json::Value::as_array)
@@ -1790,9 +1787,6 @@ fn parse_measurement_attributes(
                     )
                 }
                 Some(attribute) => {
-                    if owner == "variant" {
-                        return Err(format!("{owner} cannot override reserved attribute {name}"));
-                    }
                     let packed = value
                         .get("value")
                         .and_then(serde_json::Value::as_str)
@@ -1867,12 +1861,6 @@ fn parse_measurement_attributes(
                     ));
                 }
                 atakit_core::tee_attributes::ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
-                    if owner == "variant" {
-                        return Err(format!(
-                            "{owner} cannot override reserved attribute {}",
-                            attribute.name()
-                        ));
-                    }
                     let mask = bytes32_to_u16(&value).ok_or_else(|| {
                         format!("{owner} Intel TDX TCB status mask is not a uint16")
                     })?;
@@ -1883,12 +1871,6 @@ fn parse_measurement_attributes(
                     }
                 }
                 atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpTcb => {
-                    if owner == "variant" {
-                        return Err(format!(
-                            "{owner} cannot override reserved attribute {}",
-                            attribute.name()
-                        ));
-                    }
                     if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&value) {
                         return Err(format!(
                             "{owner} AMD SEV-SNP TCB minimum is invalid"
@@ -1896,12 +1878,6 @@ fn parse_measurement_attributes(
                     }
                 }
                 atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
-                    if owner == "variant" {
-                        return Err(format!(
-                            "{owner} cannot override reserved attribute {}",
-                            attribute.name()
-                        ));
-                    }
                     if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(&value) {
                         return Err(format!(
                             "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
@@ -4242,6 +4218,10 @@ mod tests {
 
         policy.pack.profiles[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+            "value": ["ok"],
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
             "value": ["ok", "configuration-needed"],
         })];
         let requirements = BTreeMap::from([(
@@ -4291,7 +4271,7 @@ mod tests {
             report: URL_SAFE_NO_PAD.encode(snp_report),
             auxiliary: None,
         };
-        let policy = measurement_policy_for_platform(
+        let mut policy = measurement_policy_for_platform(
             &format!("0x{}", "aa".repeat(32)),
             "gcp",
             "sev-snp",
@@ -4310,6 +4290,26 @@ mod tests {
             minimum_tcb,
             platform_info_policy,
         };
+        policy.pack.profiles[0].attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": "0x00000000df1e000500000000de1d000400000000de1d000400000000de1d0004",
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": "0x0000000000000000000000000000000000000000000000200000000000000000",
+            }),
+        ];
+        policy.pack.profiles[0].variants[0].attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": "0x0000000000000000000000000000000000000000000000000000000000000020",
+            }),
+        ];
 
         let mut report = VerificationReport {
             checks: Vec::new(),
@@ -5103,27 +5103,54 @@ mod tests {
     }
 
     #[test]
-    fn measurement_attributes_accept_profile_packed_policy_and_reject_variant_override() {
-        let packed = "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004";
-        let readable = serde_json::json!({
-            "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
-            "value": packed,
-        });
-        let parsed = parse_measurement_attributes(&[readable.clone()], "profile").unwrap();
+    fn measurement_attributes_accept_all_reserved_variant_policy_encodings() {
+        let tcb = "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004";
+        let platform_info = "0x0000000000000000000000000000000000000000000000010000000000000020";
+        let readable = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+                "value": ["ok", "configuration-needed"],
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": tcb,
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": platform_info,
+            }),
+        ];
+        let parsed = parse_measurement_attributes(&readable, "variant").unwrap();
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY],
+            atakit_core::tee_attributes::u16_value(0x9)
+        );
         assert_eq!(
             parsed[&atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY],
-            atakit_core::tee_attributes::parse_bytes32_hex(packed).unwrap()
+            atakit_core::tee_attributes::parse_bytes32_hex(tcb).unwrap()
         );
-        assert!(parse_measurement_attributes(&[readable], "variant").is_err());
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY],
+            atakit_core::tee_attributes::parse_bytes32_hex(platform_info).unwrap()
+        );
 
-        let hexadecimal = serde_json::json!({
-            "key": format!(
-                "0x{}",
-                hex::encode(atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY)
-            ),
-            "value": packed,
-        });
-        assert!(parse_measurement_attributes(&[hexadecimal], "variant").is_err());
+        let hexadecimal = readable
+            .iter()
+            .map(|attribute| {
+                let name = attribute["name"].as_str().unwrap();
+                let reserved =
+                    atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).unwrap();
+                let value = parsed[&reserved.key()];
+                serde_json::json!({
+                    "key": format!("0x{}", hex::encode(reserved.key())),
+                    "value": format!("0x{}", hex::encode(value)),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_measurement_attributes(&hexadecimal, "variant").unwrap(),
+            parsed
+        );
     }
 
     #[test]
