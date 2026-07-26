@@ -3049,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_snp_vendor_wrapper_verifies_signature_before_rejecting_report_id_ma() {
+    fn azure_snp_vendor_wrapper_accepts_ff_report_id_ma_absence_sentinel() {
         let (snp_report, ark, cert_table) = fixture_gcp_snp_report_and_certs();
         verify_snp_report_with_aux_certs(
             snp_fixture_time(),
@@ -3087,8 +3087,9 @@ mod tests {
             snp_fixture_time(),
         );
 
-        assert!(errors.iter().any(|error| {
-            error.check == "azure-tee-vendor-report" && error.detail.contains("REPORT_ID_MA")
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(report.checks.iter().any(|check| {
+            check.name == "azure-tee-vendor-report" && check.result == CheckResult::Pass
         }));
     }
 
@@ -3234,13 +3235,13 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_gcp_snp_fixture_with_nonzero_report_id_ma() {
+    fn verifier_accepts_gcp_snp_fixture_with_ff_report_id_ma_absence_sentinel() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots, amd_ark) = gcp_snp_response_roots_and_ark(nonce, cert);
 
-        let failure = verify_tls_attestation_at(
+        verify_tls_attestation_at(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
@@ -3255,16 +3256,17 @@ mod tests {
                     gcp_roots,
                     amd_ark_roots: vec![amd_ark],
                     amd_snp_crls: vec![fixture_amd_milan_crl()],
+                    amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
+                        cpuid: 0x190101,
+                        minimum_tcb: [0; 32],
+                        platform_info_policy: [0; 32],
+                    }],
                     ..TrustAnchors::default()
                 },
             },
             snp_fixture_time(),
         )
-        .expect_err("nonzero SNP REPORT_ID_MA must fail");
-
-        assert!(failure.errors.iter().any(|error| {
-            error.check == "gcp-tee-vendor-report" && error.detail.contains("REPORT_ID_MA")
-        }));
+        .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
     }
 
     #[test]
@@ -4551,7 +4553,7 @@ mod tests {
     }
 
     #[test]
-    fn public_session_verifier_rejects_nonzero_snp_report_id_ma() {
+    fn public_session_verifier_accepts_ff_report_id_ma_absence_sentinel() {
         use crate::session::{
             compute_key_fingerprint, compute_session_id, compute_session_qualifying_data,
             request_binding_digest, AkEvidence, BindingMode, CertificateTrust, RawEvidence,
@@ -4750,17 +4752,17 @@ mod tests {
                     pcr_specs: vec![pcr4_policy],
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
-                    amd_snp_security_policies: Vec::new(),
+                    amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
+                        cpuid: 0x190101,
+                        minimum_tcb: [0; 32],
+                        platform_info_policy: [0; 32],
+                    }],
                 },
                 binding: None,
             },
         };
-        let failure = crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
-            .expect_err("nonzero SNP REPORT_ID_MA must fail");
-        assert!(failure
-            .errors
-            .iter()
-            .any(|error| error.contains("REPORT_ID_MA")));
+        crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
+            .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
 
         let mut replayed = inputs.clone();
         replayed.expected_challenge = [0x56; 32];
@@ -5072,17 +5074,29 @@ mod tests {
         assert!(verification_core::verified_snp_attribute_states(&valid_report()[..1183]).is_err());
 
         let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(0xff);
+        verification_core::verified_snp_attribute_states(&report)
+            .expect("all-0xff REPORT_ID_MA must mean no migration-agent association");
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(1);
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("REPORT_ID_MA"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(0xff);
+        report[SNP_REPORT_ID_MA_OFFSET] = 0;
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("REPORT_ID_MA"));
+
+        let mut report = valid_report();
         report[SNP_REPORT_VMPL_OFFSET..SNP_REPORT_VMPL_OFFSET + 4]
             .copy_from_slice(&1u32.to_le_bytes());
         assert!(verification_core::verified_snp_attribute_states(&report)
             .unwrap_err()
             .contains("VMPL"));
-
-        let mut report = valid_report();
-        report[SNP_REPORT_ID_MA_OFFSET] = 1;
-        assert!(verification_core::verified_snp_attribute_states(&report)
-            .unwrap_err()
-            .contains("REPORT_ID_MA"));
 
         let mut report = valid_report();
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]

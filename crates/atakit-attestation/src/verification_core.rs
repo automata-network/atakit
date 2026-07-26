@@ -1568,9 +1568,11 @@ pub(super) fn verified_snp_security_state(
         SNP_REPORT_ID_MA_LEN,
         "SNP report_id_ma",
     )?;
-    if report_id_ma.iter().any(|byte| *byte != 0) {
+    let no_migration_agent =
+        report_id_ma.iter().all(|byte| *byte == 0) || report_id_ma.iter().all(|byte| *byte == 0xff);
+    if !no_migration_agent {
         return Err(
-            "SNP REPORT_ID_MA is nonzero; migration-agent association is unsupported".into(),
+            "SNP REPORT_ID_MA is neither the all-zero nor the all-0xff no-association sentinel; migration-agent association is unsupported".into(),
         );
     }
 

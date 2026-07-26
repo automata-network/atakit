@@ -33,7 +33,8 @@ required-clear masks and rejects conflicts.
 
 The verifier still rejects report states that policy cannot authorize. These
 include Intel TDX reserved attribute bits, missing `SEPT_VE_DISABLE`, nonzero
-TDX 1.5 `MR_SERVICETD`, AMD SEV-SNP `VMPL`, nonzero `REPORT_ID_MA`, invalid
+TDX 1.5 `MR_SERVICETD`, AMD SEV-SNP `VMPL`, any `REPORT_ID_MA` other than
+the all-zero or all-`0xff` no-association sentinel, invalid
 reserved fields, invalid TCB order, unsupported CPUID values, and invalid
 cryptographic or collateral verification.
 
