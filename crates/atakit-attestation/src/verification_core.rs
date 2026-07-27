@@ -2943,9 +2943,13 @@ pub(super) fn evaluate_pcr_policy(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     match policy.verify_type {
         SessionPcrVerifyType::Static => {
-            let Some(value) = expected.first() else {
-                return Err("STATIC policy has no match_data".into());
-            };
+            if expected.len() != 1 {
+                return Err(format!(
+                    "STATIC policy requires exactly one match_data entry, got {}",
+                    expected.len()
+                ));
+            }
+            let value = &expected[0];
             if measured_value != *value {
                 return Err("STATIC PCR value mismatch".into());
             }

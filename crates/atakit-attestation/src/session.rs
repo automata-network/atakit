@@ -2523,6 +2523,15 @@ mod tests {
             match_data: vec![hex(final_value)],
         };
         evaluate_session_pcr_policy(&static_policy, final_value, &events).unwrap();
+        for malformed in [Vec::new(), vec![hex(final_value), hex(final_value)]] {
+            let policy = SessionPcrPolicy {
+                match_data: malformed,
+                ..static_policy.clone()
+            };
+            assert!(evaluate_session_pcr_policy(&policy, final_value, &events)
+                .unwrap_err()
+                .contains("requires exactly one match_data entry"));
+        }
 
         let subset = SessionPcrPolicy {
             pcr_index: 10,

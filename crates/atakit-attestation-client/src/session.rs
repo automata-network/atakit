@@ -367,6 +367,17 @@ fn effective_pcr_specs(
                 spec.pcr_index, variant.name
             )));
         }
+        // A profile invariant always holds. `override_pcrs` is a historical field name: its
+        // entries must be disjoint from `profile.invariants`. Overwriting here would accept a
+        // committed session that on-chain registration rejects
+        // (SessionRegistry.PcrVariantOverridesInvariant).
+        if specs.contains_key(&spec.pcr_index) {
+            return Err(session_error(format!(
+                "variant {} pins PCR {} that profile {} declares invariant; \
+                 profile invariants always hold and cannot be overridden",
+                variant.name, spec.pcr_index, profile.name
+            )));
+        }
         specs.insert(spec.pcr_index, spec);
     }
     if specs.is_empty() {
@@ -375,9 +386,17 @@ fn effective_pcr_specs(
     specs
         .into_values()
         .map(|spec| {
+            let verify_type = parse_verify_type(&spec.verify_type)?;
+            if verify_type == SessionPcrVerifyType::Static && spec.match_data.len() != 1 {
+                return Err(session_error(format!(
+                    "STATIC PCR {} in the effective session policy requires exactly one matchData entry, got {}",
+                    spec.pcr_index,
+                    spec.match_data.len()
+                )));
+            }
             Ok(SessionPcrPolicy {
                 pcr_index: spec.pcr_index,
-                verify_type: parse_verify_type(&spec.verify_type)?,
+                verify_type,
                 match_data: spec.match_data.clone(),
             })
         })
@@ -679,6 +698,66 @@ mod tests {
         assert_eq!(
             pcrs[0].verify_type,
             SessionPcrVerifyType::DynamicSubsequence
+        );
+    }
+
+    /// A profile invariant always holds. A committed-session policy whose variant pins an index
+    /// the profile declares invariant must fail closed here, otherwise offline verification would
+    /// accept a session that on-chain `registerSession` rejects with
+    /// `PcrVariantOverridesInvariant`.
+    #[test]
+    fn effective_pcr_specs_rejects_variant_pinning_an_invariant() {
+        let mut profile = profile();
+        profile.variants[0].override_pcrs = vec![PcrSpec {
+            pcr_index: 4,
+            verify_type: "static".into(),
+            match_data: vec![format!("0x{}", "bb".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        }];
+
+        let error = effective_pcr_specs(&profile, &profile.variants[0])
+            .expect_err("overlap with a profile invariant must be rejected");
+        assert!(
+            error.to_string().contains("declares invariant"),
+            "unexpected: {error}"
+        );
+    }
+
+    /// A variant pinning an index the profile leaves unpinned still resolves.
+    #[test]
+    fn effective_pcr_specs_allows_disjoint_variant() {
+        let mut profile = profile();
+        profile.variants[0].override_pcrs = vec![PcrSpec {
+            pcr_index: 10,
+            verify_type: "static".into(),
+            match_data: vec![format!("0x{}", "cc".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        }];
+
+        let pcrs = effective_pcr_specs(&profile, &profile.variants[0])
+            .expect("disjoint variant is allowed");
+        let indices: Vec<u8> = pcrs.iter().map(|spec| spec.pcr_index).collect();
+        assert_eq!(indices, vec![4, 10]);
+    }
+
+    #[test]
+    fn effective_pcr_specs_rejects_static_without_exactly_one_match_data_entry() {
+        let mut profile = profile();
+        profile.invariants[0].verify_type = "static".into();
+        profile.invariants[0].match_data = vec![
+            format!("0x{}", "aa".repeat(32)),
+            format!("0x{}", "bb".repeat(32)),
+        ];
+
+        let error = effective_pcr_specs(&profile, &profile.variants[0])
+            .expect_err("STATIC with two matchData entries must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one matchData entry, got 2"),
+            "unexpected: {error}"
         );
     }
 

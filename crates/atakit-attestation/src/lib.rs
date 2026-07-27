@@ -1404,6 +1404,18 @@ fn effective_pcr_specs<'a>(
                 spec.pcr_index, variant.name
             ));
         }
+        // A profile invariant always holds. `override_pcrs` is a historical field name: its
+        // entries must be disjoint from `profile.invariants` and may only pin indices the
+        // profile leaves unpinned. Overwriting here would silently drop the stricter
+        // platform-level spec and disagree with on-chain evaluation, which rejects the
+        // overlap (SessionRegistry.PcrVariantOverridesInvariant).
+        if specs.contains_key(&spec.pcr_index) {
+            return Err(format!(
+                "variant {} pins PCR index {} that profile {} declares invariant; \
+                 profile invariants always hold and cannot be overridden",
+                variant.name, spec.pcr_index, profile.name
+            ));
+        }
         specs.insert(spec.pcr_index, spec);
     }
 
@@ -1991,6 +2003,18 @@ fn verify_pcr_spec(
     event_log_hashes: &[PcrEventHashes],
 ) {
     let check_name = format!("pcr-{}-{}", spec.pcr_index, spec.verify_type);
+    if spec.verify_type.eq_ignore_ascii_case("static") && spec.match_data.len() != 1 {
+        fail(
+            report,
+            errors,
+            &check_name,
+            format!(
+                "STATIC PCR spec requires exactly one matchData entry, got {}",
+                spec.match_data.len()
+            ),
+        );
+        return;
+    }
     if spec.match_data.is_empty() {
         fail(
             report,
@@ -3717,10 +3741,16 @@ mod tests {
     }
 
     #[test]
-    fn verifier_applies_variant_pcr_override() {
+    /// A profile invariant always holds. A variant that pins an index the profile already
+    /// declares invariant must be rejected, not resolved in the variant's favour — on-chain
+    /// registration rejects the same overlap, so accepting it here would let offline TLS
+    /// verification and `registerSession` disagree about the same measurement pack.
+    fn verifier_rejects_variant_pcr_that_pins_an_invariant() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        // Invariant PCR4 is deliberately wrong; the variant tries to relax it to the value the
+        // machine actually reports. Previously the override won and `pcr-4-static` passed.
         let mut policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
         policy.pack.profiles[0].variants[0]
             .override_pcrs
@@ -3742,10 +3772,100 @@ mod tests {
                 ..TrustAnchors::default()
             },
         })
-        .expect_err("GCP TDX must fail closed without DCAP collateral");
+        .expect_err("variant pinning an invariant PCR must fail closed");
 
-        assert_only_gcp_vendor_gap(&failure);
-        assert_check_passed(&failure, "pcr-4-static");
+        let overlap = failure
+            .errors
+            .iter()
+            .find(|error| error.check == "measurement-pcrs")
+            .expect("expected a measurement-pcrs failure");
+        assert!(
+            overlap.detail.contains("declares invariant"),
+            "unexpected detail: {}",
+            overlap.detail
+        );
+        // The relaxed spec must never have been evaluated.
+        assert!(
+            !failure
+                .report
+                .checks
+                .iter()
+                .any(|check| check.name == "pcr-4-static"),
+            "the overriding spec was evaluated: {:?}",
+            failure.report.checks
+        );
+    }
+
+    #[test]
+    fn effective_pcr_specs_rejects_variant_pinning_an_invariant() {
+        let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
+        let profile = &policy.pack.profiles[0];
+        let mut variant = profile.variants[0].clone();
+        variant.override_pcrs.push(PcrSpec {
+            pcr_index: 4,
+            verify_type: "static".to_string(),
+            match_data: vec![format!("0x{}", "aa".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        });
+
+        let error = effective_pcr_specs(profile, &variant)
+            .expect_err("overlap with a profile invariant must be rejected");
+        assert!(error.contains("declares invariant"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn effective_pcr_specs_allows_disjoint_variant() {
+        let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
+        let profile = &policy.pack.profiles[0];
+        let mut variant = profile.variants[0].clone();
+        variant.override_pcrs.push(PcrSpec {
+            pcr_index: 10,
+            verify_type: "static".to_string(),
+            match_data: vec![format!("0x{}", "cc".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        });
+
+        let specs = effective_pcr_specs(profile, &variant).expect("disjoint variant is allowed");
+        let indices: Vec<u8> = specs.iter().map(|spec| spec.pcr_index).collect();
+        assert_eq!(indices, vec![4, 10]);
+    }
+
+    #[test]
+    fn verifier_rejects_static_without_exactly_one_match_data_entry() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
+        policy.pack.profiles[0].invariants[0]
+            .match_data
+            .push(format!("0x{}", "bb".repeat(32)));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                gcp_roots,
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("STATIC with two matchData entries must fail closed");
+
+        let check = failure
+            .errors
+            .iter()
+            .find(|error| error.check == "pcr-4-static")
+            .expect("expected pcr-4-static failure");
+        assert!(
+            check
+                .detail
+                .contains("requires exactly one matchData entry, got 2"),
+            "unexpected detail: {}",
+            check.detail
+        );
     }
 
     #[test]
