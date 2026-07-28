@@ -239,7 +239,8 @@ collateral.
 TLS bootstrap applies the same verified TEE attribute policy before any
 `POST /init` data is sent. The verifier extracts the Intel TDX debug state and
 DCAP TCB status, or the AMD SEV-SNP debug, `MIGRATE_MA`, TCB,
-`PLATFORM_INFO`, and CPUID state, from the signed report. It compares that
+`PLATFORM_INFO`, CPUID, report-version, `LAUNCH_MIT_VECTOR`, and
+`CURRENT_MIT_VECTOR` state, from the signed report. It compares that
 state with the effective signed platform profile and measurement variant. When
 a workload manifest is selected, it also applies
 `manifest.config.attributes`. When no workload is selected, missing workload
@@ -253,7 +254,9 @@ from the `AmdSnpSecurityPolicyRegistry` derived from the selected
 measurement-variant-first lookup. The variant value replaces the matching
 profile value. With a workload, an explicit workload packed value replaces its
 registry default; without a workload, the resolved base-image value applies by
-itself.
+itself. The registry mitigation-vector masks always apply. A nonzero mask
+requires a version-5 report and every required bit in the matching signed
+vector.
 
 `atakit cloud session status` resolves only the deployment and verified portal
 TLS connection before reading portal request state. It displays `idle`,

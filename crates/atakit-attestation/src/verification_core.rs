@@ -1526,6 +1526,9 @@ pub(super) struct VerifiedAmdSnpSecurityState {
     pub(super) tcb_values: [u8; 32],
     pub(super) platform_info: u64,
     pub(super) cpuid: u32,
+    pub(super) report_version: u32,
+    pub(super) launch_mitigation_vector: u64,
+    pub(super) current_mitigation_vector: u64,
 }
 
 pub(super) fn verified_snp_security_state(
@@ -1654,6 +1657,22 @@ pub(super) fn verified_snp_security_state(
         SNP_REPORT_SIGNATURE_OFFSET - reserved_offset,
         "SNP mitigation-vector reserved field",
     )?;
+    let (launch_mitigation_vector, current_mitigation_vector) = if version == 5 {
+        (
+            read_le_u64(
+                report,
+                SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET,
+                "SNP launch_mit_vector",
+            )?,
+            read_le_u64(
+                report,
+                SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET,
+                "SNP current_mit_vector",
+            )?,
+        )
+    } else {
+        (0, 0)
+    };
 
     Ok(VerifiedAmdSnpSecurityState {
         debug: policy & SNP_POLICY_DEBUG != 0,
@@ -1661,6 +1680,9 @@ pub(super) fn verified_snp_security_state(
         tcb_values,
         platform_info,
         cpuid,
+        report_version: version,
+        launch_mitigation_vector,
+        current_mitigation_vector,
     })
 }
 

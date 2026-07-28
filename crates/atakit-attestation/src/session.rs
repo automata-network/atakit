@@ -132,6 +132,7 @@ pub struct SessionKeyDelegation {
     pub tpm_signing_key: SessionPublicKey,
     pub digest: String,
     pub signature: String,
+    pub session_key_possession_signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,8 +341,8 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
         "format",
-        bundle.format == 1,
-        "expected format 1",
+        bundle.format == 2,
+        "expected format 2",
     );
     verify_production_evidence_kind(bundle, &mut checks, &mut errors);
     verify_key_types(bundle, &mut checks, &mut errors);
@@ -1466,6 +1467,24 @@ fn verify_delegation(
                 "session-key delegation signature mismatch",
             );
         }
+
+        let session_key = decode_hex(&bundle.session_key.bytes, "session_key.bytes", errors);
+        let possession_signature = decode_hex(
+            &bundle
+                .session_key_delegation
+                .session_key_possession_signature,
+            "session_key_delegation.session_key_possession_signature",
+            errors,
+        );
+        if let (Some(key), Some(signature)) = (session_key, possession_signature) {
+            record(
+                checks,
+                errors,
+                "session-key-possession-signature",
+                recoverable_es256k_signature_matches(&key, expected, &signature),
+                "session-key possession signature mismatch",
+            );
+        }
     }
 }
 
@@ -1928,6 +1947,22 @@ fn verify_amd_snp_session_policy(
         merge_amd_sev_snp_platform_info_policies, AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
         AMD_SEV_SNP_TCB_MINIMUM_KEY,
     };
+
+    let mitigation_policy = super::validate_amd_snp_mitigation_policy(
+        state.report_version,
+        state.launch_mitigation_vector,
+        state.current_mitigation_vector,
+        registry_default,
+    );
+    record(
+        checks,
+        errors,
+        "amd-sev-snp-mitigation-vector-policy",
+        mitigation_policy.is_ok(),
+        &mitigation_policy.err().unwrap_or_else(|| {
+            "verified AMD SEV-SNP mitigation vectors satisfy the registry policy".to_string()
+        }),
+    );
 
     let base_tcb = trusted
         .effective_attributes
@@ -2406,7 +2441,7 @@ mod tests {
 
     fn bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {
         SessionEvidenceBundle {
-            format: 1,
+            format: 2,
             binding: SessionBinding {
                 mode: BindingMode::Local,
                 chain_id: 0,
@@ -2459,6 +2494,7 @@ mod tests {
                 },
                 digest: format!("0x{}", "00".repeat(32)),
                 signature: String::new(),
+                session_key_possession_signature: String::new(),
             },
             session_id: format!("0x{}", "00".repeat(32)),
             policy,
@@ -2882,6 +2918,8 @@ mod tests {
                     "0x0000000000000000000000000000000000000000000000000000000000000020",
                 )
                 .unwrap(),
+                required_launch_mitigation_vector: 0,
+                required_current_mitigation_vector: 0,
             }],
         };
         let mut checks = Vec::new();
@@ -2897,6 +2935,83 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.starts_with("amd-sev-snp-registry-default:")));
+    }
+
+    #[test]
+    fn verified_amd_snp_mitigation_vectors_apply_to_session_evidence() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_specs: Vec::new(),
+        };
+        let mut bundle = snp_bundle_for_policy(policy);
+        let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
+        report[crate::SNP_REPORT_VERSION_OFFSET..crate::SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&5u32.to_le_bytes());
+        report[crate::SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET
+            ..crate::SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0b1011u64.to_le_bytes());
+        report[crate::SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET
+            ..crate::SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0b1110u64.to_le_bytes());
+        bundle.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_specs: Vec::new(),
+            effective_attributes: Vec::new(),
+            attribute_requirements: Vec::new(),
+            amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
+                cpuid: 0x190000,
+                minimum_tcb: [0; 32],
+                platform_info_policy: [0; 32],
+                required_launch_mitigation_vector: 0b0011,
+                required_current_mitigation_vector: 0b1100,
+            }],
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&bundle, &trusted, None, &mut checks, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "amd-sev-snp-mitigation-vector-policy" && check.valid }));
+
+        let mut missing_current_bit = bundle.clone();
+        let mut report = URL_SAFE_NO_PAD
+            .decode(&missing_current_bit.tee_evidence.report)
+            .unwrap();
+        report[crate::SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET
+            ..crate::SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0b1000u64.to_le_bytes());
+        missing_current_bit.tee_evidence.report = URL_SAFE_NO_PAD.encode(report);
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(
+            &missing_current_bit,
+            &trusted,
+            None,
+            &mut checks,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.starts_with("amd-sev-snp-mitigation-vector-policy:")
+                && error.contains("CURRENT_MIT_VECTOR")
+        }));
+
+        let version_three = snp_bundle_for_policy(bundle.policy.clone());
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_attribute_policy(&version_three, &trusted, None, &mut checks, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.starts_with("amd-sev-snp-mitigation-vector-policy:")
+                && error.contains("version 5 is required")
+        }));
     }
 
     #[test]
@@ -2964,6 +3079,8 @@ mod tests {
                     "0x0000000000000000000000000000000000000000000000000000000000000020",
                 )
                 .unwrap(),
+                required_launch_mitigation_vector: 0,
+                required_current_mitigation_vector: 0,
             }],
         };
 
@@ -3084,6 +3201,8 @@ mod tests {
                                 cpuid: 0x190000,
                                 minimum_tcb: [0; 32],
                                 platform_info_policy: [0; 32],
+                                required_launch_mitigation_vector: 0,
+                                required_current_mitigation_vector: 0,
                             }],
                         };
 

@@ -539,9 +539,9 @@ fn decode_amd_snp_security_policy_return(
     bytes: &[u8],
     cpuid: u32,
 ) -> Result<AmdSnpSecurityPolicy, AttestationClientError> {
-    if bytes.len() != 160 {
+    if bytes.len() != 160 && bytes.len() != 224 {
         return Err(AttestationClientError::Rpc(format!(
-            "AmdSnpSecurityPolicyRegistry.getActivePolicy returned {} bytes; expected 160",
+            "AmdSnpSecurityPolicyRegistry.getActivePolicy returned {} bytes; expected 160 or 224",
             bytes.len()
         )));
     }
@@ -551,6 +551,16 @@ fn decode_amd_snp_security_policy_return(
     platform_info_policy.copy_from_slice(&bytes[32..64]);
     let revision = abi_word_to_u64(&bytes[96..128])?;
     let active = abi_word_bool(&bytes[128..160]).map_err(AttestationClientError::Rpc)?;
+    let required_launch_mitigation_vector = if bytes.len() == 224 {
+        abi_word_to_u64(&bytes[160..192])?
+    } else {
+        0
+    };
+    let required_current_mitigation_vector = if bytes.len() == 224 {
+        abi_word_to_u64(&bytes[192..224])?
+    } else {
+        0
+    };
     if revision == 0 || !active {
         return Err(AttestationClientError::Rpc(format!(
             "AmdSnpSecurityPolicyRegistry returned inactive or revision-zero policy for CPUID 0x{cpuid:06x}"
@@ -569,6 +579,8 @@ fn decode_amd_snp_security_policy_return(
         cpuid,
         minimum_tcb,
         platform_info_policy,
+        required_launch_mitigation_vector,
+        required_current_mitigation_vector,
     })
 }
 
@@ -1119,6 +1131,14 @@ mod tests {
         assert_eq!(decoded.cpuid, 0x190100);
         assert_eq!(decoded.minimum_tcb, [0; 32]);
         assert_eq!(decoded.platform_info_policy, [0; 32]);
+        assert_eq!(decoded.required_launch_mitigation_vector, 0);
+        assert_eq!(decoded.required_current_mitigation_vector, 0);
+
+        returned.extend_from_slice(&abi_word_u64(0x1234));
+        returned.extend_from_slice(&abi_word_u64(0x5678));
+        let decoded = decode_amd_snp_security_policy_return(&returned, 0x190100).unwrap();
+        assert_eq!(decoded.required_launch_mitigation_vector, 0x1234);
+        assert_eq!(decoded.required_current_mitigation_vector, 0x5678);
     }
 
     #[test]

@@ -82,14 +82,17 @@ a verifier-selected trusted data source; the client does not verify consensus
 or storage proofs.
 
 `atakit-attestation` extracts verified Intel TDX debug and TCB status or AMD
-SEV-SNP debug, `MIGRATE_MA`, TCB, `PLATFORM_INFO`, and CPUID state from the
-signed report. It evaluates only the reserved attributes for the verified TEE
-platform. The effective base-image value comes from the selected platform
-profile plus measurement-variant overrides. This lookup applies to custom
-attributes and all six reserved TEE attributes. Missing Boolean workload
+SEV-SNP debug, `MIGRATE_MA`, TCB, `PLATFORM_INFO`, CPUID, report-version, and
+mitigation-vector state from the signed report. It evaluates only the reserved
+attributes for the verified TEE platform. The effective base-image value comes
+from the selected platform profile plus measurement-variant overrides. This
+lookup applies to custom attributes and all six reserved TEE attributes.
+Missing Boolean workload
 policy permits only `false`, and a missing Intel TDX status policy permits only
 `ok`. A missing AMD SEV-SNP packed value resolves to the active exact-CPUID
 registry default. The registry value is not an independent mandatory floor.
+The registry's mitigation-vector masks always apply and require report version
+5 when either mask is nonzero.
 
 ### Cloud
 

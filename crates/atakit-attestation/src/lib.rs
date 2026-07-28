@@ -83,6 +83,7 @@ const SNP_REPORT_CURRENT_VERSION_RESERVED_OFFSET: usize = 0x1eb;
 const SNP_REPORT_COMMITTED_VERSION_RESERVED_OFFSET: usize = 0x1ef;
 const SNP_REPORT_LAUNCH_TCB_OFFSET: usize = 0x1f0;
 const SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET: usize = 0x1f8;
+const SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET: usize = 0x200;
 const SNP_REPORT_CURRENT_MITIGATION_VECTOR_END: usize = 0x208;
 const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
 const SNP_POLICY_DEBUG: u64 = 1 << 19;
@@ -427,6 +428,12 @@ pub struct AmdSnpSecurityPolicy {
     pub minimum_tcb: [u8; 32],
     /// Packed PLATFORM_INFO required-clear and required-set masks.
     pub platform_info_policy: [u8; 32],
+    /// Required bits in a version-5 report's LAUNCH_MIT_VECTOR.
+    #[serde(default)]
+    pub required_launch_mitigation_vector: u64,
+    /// Required bits in a version-5 report's CURRENT_MIT_VECTOR.
+    #[serde(default)]
+    pub required_current_mitigation_vector: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +444,12 @@ pub struct AmdSnpSecurityState {
     pub tcb_values: [u8; 32],
     pub platform_info: u64,
     pub cpuid: u32,
+    #[serde(default)]
+    pub report_version: u32,
+    #[serde(default)]
+    pub launch_mitigation_vector: u64,
+    #[serde(default)]
+    pub current_mitigation_vector: u64,
 }
 
 /// Extract and validate the security fields that drive AMD SEV-SNP policy.
@@ -450,6 +463,9 @@ pub fn amd_snp_security_state(report: &[u8]) -> std::result::Result<AmdSnpSecuri
         tcb_values: state.tcb_values,
         platform_info: state.platform_info,
         cpuid: state.cpuid,
+        report_version: state.report_version,
+        launch_mitigation_vector: state.launch_mitigation_vector,
+        current_mitigation_vector: state.current_mitigation_vector,
     })
 }
 
@@ -1657,6 +1673,22 @@ fn verify_amd_snp_measurement_policy(
         AMD_SEV_SNP_TCB_MINIMUM_KEY,
     };
 
+    let mitigation_policy = validate_amd_snp_mitigation_policy(
+        state.report_version,
+        state.launch_mitigation_vector,
+        state.current_mitigation_vector,
+        registry_default,
+    );
+    check(
+        report,
+        errors,
+        "amd-sev-snp-mitigation-vector-policy",
+        mitigation_policy.is_ok(),
+        mitigation_policy.err().unwrap_or_else(|| {
+            "verified AMD SEV-SNP mitigation vectors satisfy the registry policy".to_string()
+        }),
+    );
+
     let base_tcb = effective_attributes
         .get(&AMD_SEV_SNP_TCB_MINIMUM_KEY)
         .copied()
@@ -1728,6 +1760,40 @@ fn verify_amd_snp_measurement_policy(
             ),
         );
     }
+}
+
+fn validate_amd_snp_mitigation_policy(
+    report_version: u32,
+    launch_mitigation_vector: u64,
+    current_mitigation_vector: u64,
+    policy: &AmdSnpSecurityPolicy,
+) -> std::result::Result<(), String> {
+    if (policy.required_launch_mitigation_vector != 0
+        || policy.required_current_mitigation_vector != 0)
+        && report_version != 5
+    {
+        return Err(format!(
+            "AMD SEV-SNP report version {} cannot satisfy a mitigation-vector policy; version 5 is required",
+            report_version
+        ));
+    }
+    if launch_mitigation_vector & policy.required_launch_mitigation_vector
+        != policy.required_launch_mitigation_vector
+    {
+        return Err(format!(
+            "AMD SEV-SNP LAUNCH_MIT_VECTOR 0x{:016x} is missing required mask 0x{:016x}",
+            launch_mitigation_vector, policy.required_launch_mitigation_vector
+        ));
+    }
+    if current_mitigation_vector & policy.required_current_mitigation_vector
+        != policy.required_current_mitigation_vector
+    {
+        return Err(format!(
+            "AMD SEV-SNP CURRENT_MIT_VECTOR 0x{:016x} is missing required mask 0x{:016x}",
+            current_mitigation_vector, policy.required_current_mitigation_vector
+        ));
+    }
+    Ok(())
 }
 
 fn bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
@@ -3354,6 +3420,8 @@ mod tests {
                         cpuid: 0x190101,
                         minimum_tcb: [0; 32],
                         platform_info_policy: [0; 32],
+                        required_launch_mitigation_vector: 0,
+                        required_current_mitigation_vector: 0,
                     }],
                     ..TrustAnchors::default()
                 },
@@ -4590,6 +4658,8 @@ mod tests {
             cpuid: 0x190000,
             minimum_tcb,
             platform_info_policy,
+            required_launch_mitigation_vector: 0,
+            required_current_mitigation_vector: 0,
         };
         policy.pack.profiles[0].attributes = vec![
             serde_json::json!({
@@ -4699,6 +4769,8 @@ mod tests {
                 "0x0000000000000000000000000000000000000000000000000000000000000020",
             )
             .unwrap(),
+            required_launch_mitigation_vector: 0,
+            required_current_mitigation_vector: 0,
         };
 
         let mut report = VerificationReport {
@@ -5157,6 +5229,11 @@ mod tests {
         let delegation_signature: P256Signature = tpm_signing_key
             .sign_prehash(&delegation_digest)
             .expect("delegation signature");
+        let (possession_signature, possession_recovery_id) = session_signing_key
+            .sign_prehash_recoverable(&delegation_digest)
+            .expect("session-key possession signature");
+        let mut possession_signature = possession_signature.to_bytes().to_vec();
+        possession_signature.push(possession_recovery_id.to_byte());
 
         let pcr4_policy = SessionPcrPolicy {
             pcr_index: 4,
@@ -5164,7 +5241,7 @@ mod tests {
             match_data: vec![hex0x(&pcr4)],
         };
         let bundle = SessionEvidenceBundle {
-            format: 1,
+            format: 2,
             binding: SessionBinding {
                 mode: BindingMode::Local,
                 chain_id: 0,
@@ -5235,6 +5312,7 @@ mod tests {
                 },
                 digest: hex0x(&delegation_digest),
                 signature: hex0x(delegation_signature.to_der().as_bytes()),
+                session_key_possession_signature: hex0x(&possession_signature),
             },
             session_id: hex0x(&session_id),
             policy: SessionPolicy {
@@ -5294,6 +5372,8 @@ mod tests {
                         cpuid: 0x190101,
                         minimum_tcb: [0; 32],
                         platform_info_policy: [0; 32],
+                        required_launch_mitigation_vector: 0,
+                        required_current_mitigation_vector: 0,
                     }],
                 },
                 binding: None,
@@ -5301,6 +5381,16 @@ mod tests {
         };
         crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
             .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
+
+        let mut no_possession = inputs.clone();
+        no_possession.bundle["session_key_delegation"]["session_key_possession_signature"] =
+            serde_json::json!("0x");
+        let failure = crate::session::verify_session_bundle_at(no_possession, snp_fixture_time())
+            .expect_err("the session key must prove possession of its private key");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.contains("session-key-possession-signature")));
 
         let mut replayed = inputs.clone();
         replayed.expected_challenge = [0x56; 32];
@@ -5602,6 +5692,69 @@ mod tests {
         assert_eq!(
             verification_core::verified_snp_attribute_states(&report).unwrap(),
             (true, true)
+        );
+    }
+
+    #[test]
+    fn extracts_verified_snp_version_five_mitigation_vectors() {
+        let mut report = synthetic_snp_security_report(1u64 << 17);
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&5u32.to_le_bytes());
+        report[SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET
+            ..SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        report[SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET
+            ..SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+
+        let state = amd_snp_security_state(&report).expect("version-5 security state");
+        assert_eq!(state.report_version, 5);
+        assert_eq!(state.launch_mitigation_vector, 0x0102_0304_0506_0708);
+        assert_eq!(state.current_mitigation_vector, 0x1112_1314_1516_1718);
+
+        let version_three = amd_snp_security_state(&synthetic_snp_security_report(1u64 << 17))
+            .expect("version-3 security state");
+        assert_eq!(version_three.report_version, 3);
+        assert_eq!(version_three.launch_mitigation_vector, 0);
+        assert_eq!(version_three.current_mitigation_vector, 0);
+    }
+
+    #[test]
+    fn amd_snp_mitigation_policy_requires_version_five_and_required_bits() {
+        let policy = AmdSnpSecurityPolicy {
+            cpuid: 0x190000,
+            minimum_tcb: [0; 32],
+            platform_info_policy: [0; 32],
+            required_launch_mitigation_vector: 0b0011,
+            required_current_mitigation_vector: 0b1100,
+        };
+
+        let version_error = validate_amd_snp_mitigation_policy(3, 0b0011, 0b1100, &policy)
+            .expect_err("a nonzero mitigation policy requires a version-5 report");
+        assert!(
+            version_error.contains("version 5 is required"),
+            "{version_error}"
+        );
+
+        let future_version_error = validate_amd_snp_mitigation_policy(6, 0b0011, 0b1100, &policy)
+            .expect_err("version-5 vector semantics must not apply to a future report version");
+        assert!(
+            future_version_error.contains("version 5 is required"),
+            "{future_version_error}"
+        );
+
+        validate_amd_snp_mitigation_policy(5, 0b1011, 0b1110, &policy)
+            .expect("required masks use bit inclusion");
+
+        let launch_error = validate_amd_snp_mitigation_policy(5, 0b0010, 0b1100, &policy)
+            .expect_err("the launch vector is missing a required bit");
+        assert!(launch_error.contains("LAUNCH_MIT_VECTOR"), "{launch_error}");
+
+        let current_error = validate_amd_snp_mitigation_policy(5, 0b0011, 0b1000, &policy)
+            .expect_err("the current vector is missing a required bit");
+        assert!(
+            current_error.contains("CURRENT_MIT_VECTOR"),
+            "{current_error}"
         );
     }
 
