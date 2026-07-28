@@ -125,6 +125,18 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         other => bail!("unknown base-image-mode: {other}"),
     };
 
+    // WorkloadRegistry rejects this on-chain (EmptyBaseImageWhitelist). Catch it here so the
+    // operator sees the reason instead of a decoded revert, and does not burn the name/version
+    // pair: workload specs are immutable and the identifier stays claimed after deactivation.
+    if base_image_mode == 2 && base_image_ids.is_empty() {
+        bail!(
+            "base-image-mode is \"whitelist\" but no base images are listed; \
+             an empty whitelist denies every base image and the workload could never \
+             register a session. Add entries to `base-image` in the workload manifest, \
+             pass --base-image-id, or use base-image-mode \"any\"."
+        );
+    }
+
     // Build WorkloadSpec using the contract's generated types
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
         AttributeRequirement, PcrSpec, WorkloadSpec,
