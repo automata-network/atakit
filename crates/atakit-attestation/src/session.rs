@@ -758,9 +758,7 @@ fn verify_azure_platform(
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) -> Option<u16> {
-    let Some(binding) = azure_ak_binding(bundle, errors) else {
-        return None;
-    };
+    let binding = azure_ak_binding(bundle, errors)?;
     let quote = decode_b64(
         &bundle.tpm_quote.tpm2b_attest,
         "tpm_quote.tpm2b_attest",

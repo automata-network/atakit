@@ -1438,6 +1438,7 @@ fn effective_pcr_specs<'a>(
     Ok(specs.into_values().collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_measurement_attributes(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
@@ -1955,19 +1956,17 @@ fn parse_measurement_attributes(
                         ));
                     }
                 }
-                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpTcb => {
-                    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&value) {
-                        return Err(format!(
-                            "{owner} AMD SEV-SNP TCB minimum is invalid"
-                        ));
-                    }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpTcb
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&value) =>
+                {
+                    return Err(format!("{owner} AMD SEV-SNP TCB minimum is invalid"));
                 }
-                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
-                    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(&value) {
-                        return Err(format!(
-                            "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
-                        ));
-                    }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(&value) =>
+                {
+                    return Err(format!(
+                        "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
+                    ));
                 }
                 _ => {}
             }

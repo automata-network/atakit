@@ -581,21 +581,21 @@ fn parse_attributes(
                             )));
                         }
                     }
-                    ReservedAttributeValueKind::AmdSevSnpTcb => {
-                        if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&item.value) {
-                            return Err(session_error(format!(
-                                "{owner} AMD SEV-SNP TCB minimum is invalid"
-                            )));
-                        }
+                    ReservedAttributeValueKind::AmdSevSnpTcb
+                        if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&item.value) =>
+                    {
+                        return Err(session_error(format!(
+                            "{owner} AMD SEV-SNP TCB minimum is invalid"
+                        )));
                     }
-                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy
                         if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
                             &item.value,
-                        ) {
-                            return Err(session_error(format!(
-                                "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
-                            )));
-                        }
+                        ) =>
+                    {
+                        return Err(session_error(format!(
+                            "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
+                        )));
                     }
                     _ => {}
                 }
