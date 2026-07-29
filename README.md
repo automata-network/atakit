@@ -469,9 +469,10 @@ commands.
 
 Format 6 always emits the measured `manifest.json` `config.attributes` map,
 even when `[workload.attributes]` is absent. Custom attribute names accept
-string arrays. The six reserved verified TEE names use Boolean arrays, Intel
-TDX TCB status names, or one packed AMD SEV-SNP bytes32 value as defined by the
-full specification.
+string arrays. An empty custom array requires the base image to declare the
+attribute and accepts any declared value; it does not deny every value. The six
+reserved verified TEE names use Boolean arrays, Intel TDX TCB status names, or
+one packed AMD SEV-SNP bytes32 value as defined by the full specification.
 
 See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for the full specification.
 

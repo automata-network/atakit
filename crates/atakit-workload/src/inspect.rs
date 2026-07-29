@@ -231,7 +231,7 @@ async fn inspect_dir(
         unmeasured_data,
         unmeasured_env_files,
         images,
-    );
+    )?;
     let manifest_raw = crate::manifest::serialize_canonical_json(&manifest)?;
 
     build_result_json(manifest_raw)

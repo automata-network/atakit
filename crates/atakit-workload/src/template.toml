@@ -179,7 +179,8 @@ image = "{{name}}:latest"
 #
 # Custom attribute values are strings. Reserved verified TEE attributes use
 # the types and rules shown below. A missing Boolean requirement permits only
-# false. A missing Intel TDX TCB status requirement permits only "ok".
+# false. A missing Intel TDX TCB status requirement permits only "ok". An empty
+# custom array requires the attribute to exist and accepts any declared value.
 [workload.attributes]
 # "example.operator.attribute" = ["production"]
 # "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]

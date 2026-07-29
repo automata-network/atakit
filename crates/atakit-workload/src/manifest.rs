@@ -642,8 +642,9 @@ pub fn build_manifest(
     unmeasured_data: BTreeSet<String>,
     unmeasured_env_files: BTreeMap<String, Vec<String>>,
     images: BTreeMap<String, ManifestImage>,
-) -> Manifest {
+) -> Result<Manifest, WorkloadError> {
     let w = &config.workload;
+    let attributes = crate::validate::normalize_attributes(&w.attributes)?;
     let measured_data = measured_data_from_hashes(&hashes);
 
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
@@ -854,7 +855,7 @@ pub fn build_manifest(
         })
         .collect();
 
-    Manifest {
+    Ok(Manifest {
         meta: ManifestMeta {
             format: crate::FORMAT_VERSION,
             name: w.name.clone(),
@@ -864,8 +865,7 @@ pub fn build_manifest(
             image: resolved_image.to_string(),
             base_image_mode: w.base_image_mode.clone(),
             base_image: w.base_image.clone(),
-            attributes: crate::validate::normalize_attributes(&w.attributes)
-                .expect("validated workload attributes"),
+            attributes,
             ports: w.ports.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
@@ -900,7 +900,7 @@ pub fn build_manifest(
         unmeasured_data,
         unmeasured_env_files,
         images,
-    }
+    })
 }
 
 fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
@@ -989,6 +989,30 @@ fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_manifest(
+        config: &WorkloadConfig,
+        resolved_image: &str,
+        environment: BTreeMap<String, String>,
+        dep_environments: BTreeMap<String, BTreeMap<String, String>>,
+        hashes: BTreeMap<String, String>,
+        unmeasured_data: BTreeSet<String>,
+        unmeasured_env_files: BTreeMap<String, Vec<String>>,
+        images: BTreeMap<String, ManifestImage>,
+    ) -> Manifest {
+        super::build_manifest(
+            config,
+            resolved_image,
+            environment,
+            dep_environments,
+            hashes,
+            unmeasured_data,
+            unmeasured_env_files,
+            images,
+        )
+        .expect("valid test manifest")
+    }
 
     #[test]
     fn strip_dot_slash_works() {
@@ -1173,6 +1197,40 @@ image = "my-app:latest"
             false_only,
             serialize_canonical_json(&build(&config("[false]"))).unwrap()
         );
+    }
+
+    #[test]
+    fn build_manifest_returns_invalid_attribute_error() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [true]
+"#,
+        )
+        .unwrap();
+
+        let error = super::build_manifest(
+            &config,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must be [false] or [false, true]"));
     }
 
     #[test]
