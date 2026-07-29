@@ -979,7 +979,7 @@ pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(),
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct AmdSnpCertTable {
     pub(super) ark: Option<Vec<u8>>,
     pub(super) ask: Option<Vec<u8>>,
@@ -990,23 +990,50 @@ pub(super) struct AmdSnpCertTable {
 pub(super) fn parse_amd_snp_cert_table(
     auxblob: &[u8],
 ) -> std::result::Result<AmdSnpCertTable, String> {
-    let mut table = AmdSnpCertTable::default();
+    if auxblob.len() > MAX_SNP_CERT_TABLE_BYTES {
+        return Err(format!(
+            "SNP certificate table exceeds the {MAX_SNP_CERT_TABLE_BYTES}-byte limit"
+        ));
+    }
+
+    struct Entry {
+        guid: [u8; 16],
+        cert_offset: usize,
+        cert_end: usize,
+    }
+
+    let mut entries = Vec::new();
     let mut offset = 0usize;
-    while offset + 24 <= auxblob.len() {
-        let guid_bytes = &auxblob[offset..offset + 16];
-        if guid_bytes.iter().all(|&b| b == 0) {
-            break;
+    let header_end = loop {
+        let entry_end = offset
+            .checked_add(SNP_CERT_TABLE_ENTRY_BYTES)
+            .ok_or_else(|| "SNP certificate-table header length overflows usize".to_string())?;
+        if entry_end > auxblob.len() {
+            return Err("SNP certificate table is missing its zero terminator".to_string());
         }
-        let cert_offset = u32::from_le_bytes(
-            auxblob[offset + 16..offset + 20]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
-        let cert_len = u32::from_le_bytes(
-            auxblob[offset + 20..offset + 24]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
+
+        let entry = &auxblob[offset..entry_end];
+        let guid_bytes = &entry[..16];
+        if guid_bytes.iter().all(|&b| b == 0) {
+            if entry[16..].iter().any(|&b| b != 0) {
+                return Err(
+                    "SNP certificate-table terminator contains a nonzero offset or length"
+                        .to_string(),
+                );
+            }
+            break entry_end;
+        }
+        if entries.len() >= MAX_SNP_CERT_TABLE_ENTRIES {
+            return Err(format!(
+                "SNP certificate table contains more than {MAX_SNP_CERT_TABLE_ENTRIES} entries"
+            ));
+        }
+        let cert_offset =
+            u32::from_le_bytes(entry[16..20].try_into().expect("slice length")) as usize;
+        let cert_len = u32::from_le_bytes(entry[20..24].try_into().expect("slice length")) as usize;
+        if cert_len == 0 {
+            return Err("SNP certificate-table entry has an empty certificate".to_string());
+        }
         let cert_end = cert_offset
             .checked_add(cert_len)
             .ok_or_else(|| "SNP cert table entry overflows usize".to_string())?;
@@ -1016,18 +1043,60 @@ pub(super) fn parse_amd_snp_cert_table(
                 auxblob.len()
             ));
         }
-        let cert = auxblob[cert_offset..cert_end].to_vec();
-        if guid_bytes == SNP_CERT_TABLE_ARK_GUID {
-            table.ark = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_ASK_GUID {
-            table.ask = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_VCEK_GUID {
-            table.vcek = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_VLEK_GUID {
-            table.vlek = Some(cert);
+        entries.push(Entry {
+            guid: guid_bytes.try_into().expect("slice length"),
+            cert_offset,
+            cert_end,
+        });
+        offset = entry_end;
+    };
+
+    for entry in &entries {
+        if entry.cert_offset < header_end {
+            return Err(format!(
+                "SNP certificate-table entry overlaps the header: offset={} header={header_end}",
+                entry.cert_offset
+            ));
         }
-        offset += 24;
     }
+
+    let mut ranges = entries
+        .iter()
+        .map(|entry| (entry.cert_offset, entry.cert_end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("SNP certificate-table certificate ranges overlap".to_string());
+    }
+
+    fn set_certificate(
+        slot: &mut Option<Vec<u8>>,
+        label: &str,
+        certificate: &[u8],
+    ) -> std::result::Result<(), String> {
+        if slot.is_some() {
+            return Err(format!(
+                "SNP certificate table contains duplicate {label} entries"
+            ));
+        }
+        *slot = Some(certificate.to_vec());
+        Ok(())
+    }
+
+    let mut table = AmdSnpCertTable::default();
+    for entry in entries {
+        let certificate = &auxblob[entry.cert_offset..entry.cert_end];
+        if entry.guid == SNP_CERT_TABLE_ARK_GUID {
+            set_certificate(&mut table.ark, "ARK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_ASK_GUID {
+            set_certificate(&mut table.ask, "ASK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_VCEK_GUID {
+            set_certificate(&mut table.vcek, "VCEK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_VLEK_GUID {
+            set_certificate(&mut table.vlek, "VLEK", certificate)?;
+        }
+    }
+
     Ok(table)
 }
 

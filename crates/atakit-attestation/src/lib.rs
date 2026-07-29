@@ -88,6 +88,9 @@ const SNP_REPORT_CURRENT_MITIGATION_VECTOR_END: usize = 0x208;
 const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
 const SNP_POLICY_DEBUG: u64 = 1 << 19;
 const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
+const SNP_CERT_TABLE_ENTRY_BYTES: usize = 24;
+const MAX_SNP_CERT_TABLE_BYTES: usize = 1024 * 1024;
+const MAX_SNP_CERT_TABLE_ENTRIES: usize = 64;
 const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
     0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0, 0xae,
 ];
@@ -167,17 +170,20 @@ pub fn amd_snp_vcek_cert_table(
     vcek: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
     let entries = [
-        (SNP_CERT_TABLE_ARK_GUID, ark),
-        (SNP_CERT_TABLE_ASK_GUID, ask),
-        (SNP_CERT_TABLE_VCEK_GUID, vcek),
+        ("ARK", SNP_CERT_TABLE_ARK_GUID, ark),
+        ("ASK", SNP_CERT_TABLE_ASK_GUID, ask),
+        ("VCEK", SNP_CERT_TABLE_VCEK_GUID, vcek),
     ];
-    let table_len = 24usize
+    if let Some((label, _, _)) = entries.iter().find(|(_, _, cert)| cert.is_empty()) {
+        return Err(format!("SNP {label} certificate is empty"));
+    }
+    let table_len = SNP_CERT_TABLE_ENTRY_BYTES
         .checked_mul(entries.len() + 1)
         .ok_or_else(|| "SNP certificate-table header length overflow".to_string())?;
     let mut output = vec![0u8; table_len];
     let mut cert_offset = table_len;
-    for (index, (guid, cert)) in entries.iter().enumerate() {
-        let entry_offset = index * 24;
+    for (index, (_, guid, cert)) in entries.iter().enumerate() {
+        let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
         let offset = u32::try_from(cert_offset)
             .map_err(|_| "SNP certificate-table offset exceeds u32".to_string())?;
         let length = u32::try_from(cert.len())
@@ -188,8 +194,13 @@ pub fn amd_snp_vcek_cert_table(
         cert_offset = cert_offset
             .checked_add(cert.len())
             .ok_or_else(|| "SNP certificate-table length overflow".to_string())?;
+        if cert_offset > MAX_SNP_CERT_TABLE_BYTES {
+            return Err(format!(
+                "SNP certificate table exceeds the {MAX_SNP_CERT_TABLE_BYTES}-byte limit"
+            ));
+        }
     }
-    for (_, cert) in entries {
+    for (_, _, cert) in entries {
         output.extend_from_slice(cert);
     }
     Ok(output)
@@ -2635,17 +2646,12 @@ mod tests {
         UNIX_EPOCH + std::time::Duration::from_secs(1_784_851_200)
     }
 
-    fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
-        let entries = [
-            (SNP_CERT_TABLE_ARK_GUID, ark),
-            (SNP_CERT_TABLE_ASK_GUID, ask),
-            (SNP_CERT_TABLE_VCEK_GUID, vcek),
-        ];
-        let table_len = 24 * (entries.len() + 1);
+    fn fake_amd_snp_cert_table(entries: &[([u8; 16], &[u8])]) -> Vec<u8> {
+        let table_len = SNP_CERT_TABLE_ENTRY_BYTES * (entries.len() + 1);
         let mut out = vec![0u8; table_len];
         let mut cert_offset = table_len;
         for (idx, (guid, cert)) in entries.iter().enumerate() {
-            let entry_offset = idx * 24;
+            let entry_offset = idx * SNP_CERT_TABLE_ENTRY_BYTES;
             out[entry_offset..entry_offset + 16].copy_from_slice(guid);
             out[entry_offset + 16..entry_offset + 20]
                 .copy_from_slice(&(cert_offset as u32).to_le_bytes());
@@ -2659,6 +2665,14 @@ mod tests {
         out
     }
 
+    fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
+        fake_amd_snp_cert_table(&[
+            (SNP_CERT_TABLE_ARK_GUID, ark),
+            (SNP_CERT_TABLE_ASK_GUID, ask),
+            (SNP_CERT_TABLE_VCEK_GUID, vcek),
+        ])
+    }
+
     #[test]
     fn parses_amd_snp_auxblob_raw_cert_table_guids() {
         let ark = b"ark";
@@ -2670,6 +2684,100 @@ mod tests {
         assert_eq!(certs.ark.as_deref(), Some(ark.as_slice()));
         assert_eq!(certs.ask.as_deref(), Some(ask.as_slice()));
         assert_eq!(certs.vcek.as_deref(), Some(vcek.as_slice()));
+    }
+
+    #[test]
+    fn rejects_oversized_amd_snp_certificate_table() {
+        let table = vec![0u8; MAX_SNP_CERT_TABLE_BYTES + 1];
+        let error = parse_amd_snp_cert_table(&table).expect_err("oversized table must fail");
+
+        assert!(error.contains("1048576-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_with_too_many_entries() {
+        let entry_count = MAX_SNP_CERT_TABLE_ENTRIES + 1;
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * (entry_count + 1);
+        let mut table = vec![0u8; header_len + entry_count];
+        for index in 0..entry_count {
+            let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
+            table[entry_offset] = 1;
+            table[entry_offset + 16..entry_offset + 20]
+                .copy_from_slice(&((header_len + index) as u32).to_le_bytes());
+            table[entry_offset + 20..entry_offset + 24].copy_from_slice(&1u32.to_le_bytes());
+        }
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("too many entries must fail");
+        assert!(error.contains("more than 64 entries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_without_terminator() {
+        let mut table = vec![0u8; SNP_CERT_TABLE_ENTRY_BYTES + 1];
+        table[..16].copy_from_slice(&SNP_CERT_TABLE_ARK_GUID);
+        table[16..20].copy_from_slice(&(SNP_CERT_TABLE_ENTRY_BYTES as u32).to_le_bytes());
+        table[20..24].copy_from_slice(&1u32.to_le_bytes());
+        table[SNP_CERT_TABLE_ENTRY_BYTES] = 1;
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("missing terminator must fail");
+        assert!(error.contains("missing its zero terminator"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_range_overlapping_header() {
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * 2;
+        let mut table = vec![0u8; header_len + 1];
+        table[..16].copy_from_slice(&SNP_CERT_TABLE_ARK_GUID);
+        table[16..20].copy_from_slice(&(SNP_CERT_TABLE_ENTRY_BYTES as u32).to_le_bytes());
+        table[20..24].copy_from_slice(&1u32.to_le_bytes());
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("header overlap must fail");
+        assert!(error.contains("overlaps the header"), "{error}");
+    }
+
+    #[test]
+    fn rejects_overlapping_amd_snp_certificate_ranges() {
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * 3;
+        let mut table = vec![0u8; header_len + 3];
+        for (index, guid) in [SNP_CERT_TABLE_ARK_GUID, SNP_CERT_TABLE_ASK_GUID]
+            .iter()
+            .enumerate()
+        {
+            let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
+            table[entry_offset..entry_offset + 16].copy_from_slice(guid);
+            table[entry_offset + 16..entry_offset + 20]
+                .copy_from_slice(&((header_len + index) as u32).to_le_bytes());
+            table[entry_offset + 20..entry_offset + 24].copy_from_slice(&2u32.to_le_bytes());
+        }
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("overlapping ranges must fail");
+        assert!(error.contains("certificate ranges overlap"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_amd_snp_certificate_types() {
+        let table = fake_amd_snp_cert_table(&[
+            (SNP_CERT_TABLE_ARK_GUID, b"first"),
+            (SNP_CERT_TABLE_ARK_GUID, b"second"),
+        ]);
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("duplicate ARK must fail");
+        assert!(error.contains("duplicate ARK entries"), "{error}");
+    }
+
+    #[test]
+    fn accepts_unknown_amd_snp_certificate_type_without_selecting_it() {
+        let table = fake_amd_snp_cert_table(&[
+            ([0x42; 16], b"future certificate"),
+            (SNP_CERT_TABLE_ARK_GUID, b"ark"),
+            (SNP_CERT_TABLE_ASK_GUID, b"ask"),
+            (SNP_CERT_TABLE_VCEK_GUID, b"vcek"),
+        ]);
+
+        let parsed = parse_amd_snp_cert_table(&table).expect("unknown entry type is extensible");
+        assert_eq!(parsed.ark.as_deref(), Some(b"ark".as_slice()));
+        assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
+        assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
     }
 
     fn expected_gcp_tdx_pcr15_for_uuid(uuid: &[u8; 16]) -> [u8; 32] {
@@ -5987,6 +6095,18 @@ mod tests {
         let parsed = verification_core::parse_amd_snp_cert_table(&table).unwrap();
         assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
         assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
+    }
+
+    #[test]
+    fn amd_snp_vcek_cert_table_builder_enforces_parser_limits() {
+        assert!(amd_snp_vcek_cert_table(b"", b"ask", b"vcek")
+            .unwrap_err()
+            .contains("ARK certificate is empty"));
+
+        let oversized_ark = vec![0u8; MAX_SNP_CERT_TABLE_BYTES];
+        assert!(amd_snp_vcek_cert_table(&oversized_ark, b"ask", b"vcek")
+            .unwrap_err()
+            .contains("1048576-byte limit"));
     }
 
     #[test]

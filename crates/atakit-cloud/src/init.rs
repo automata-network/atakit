@@ -88,8 +88,8 @@ pub enum IntelTdxDcapCollateralSource {
     /// defaults to Automata on-chain PCCS.
     #[default]
     None,
-    /// Load an Automata `dcap_rs::types::collateral::Collateral` JSON
-    /// document from disk.
+    /// Load an `atakit.intel-tdx-dcap-collateral` version 1 JSON document
+    /// from disk.
     File(PathBuf),
     /// Fetch Intel TDX DCAP collateral from a direct HTTP PCCS/PCS endpoint.
     HttpPccs { url: String },

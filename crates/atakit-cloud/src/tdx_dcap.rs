@@ -317,13 +317,16 @@ fn parse_address(address: &str, label: &str) -> Result<Address, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atakit_attestation::IntelTdxPckCa;
+    use atakit_attestation::{IntelTdxDcapCollateralError, IntelTdxPckCa};
     use rcgen::{
         date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams,
         DistinguishedName, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, SerialNumber,
     };
 
-    fn synthetic_collateral_for_quote(quote: &[u8]) -> IntelTdxDcapCollateral {
+    fn synthetic_collateral_for_quote_with_selection(
+        quote: &[u8],
+        selection: IntelTdxCollateralSelection,
+    ) -> Result<IntelTdxDcapCollateral, IntelTdxDcapCollateralError> {
         let identity =
             intel_tdx_quote_collateral_identity(quote).expect("extract quote collateral identity");
         let pck_ca_common_name = match identity.pck_ca {
@@ -394,14 +397,18 @@ mod tests {
 
         IntelTdxDcapCollateral::from_source_material(
             quote,
-            IntelTdxCollateralSelection::Standard,
+            selection,
             crl.der().to_vec(),
             crl.der().to_vec(),
             certificate.pem(),
             tcb_info,
             qe_identity,
         )
-        .expect("parse synthetic collateral")
+    }
+
+    fn synthetic_collateral_for_quote(quote: &[u8]) -> IntelTdxDcapCollateral {
+        synthetic_collateral_for_quote_with_selection(quote, IntelTdxCollateralSelection::Standard)
+            .expect("parse synthetic collateral")
     }
 
     #[test]
@@ -470,6 +477,33 @@ mod tests {
                 .to_file_json()
                 .expect("encode decoded version 1 collateral file"),
             document
+        );
+    }
+
+    #[test]
+    fn exact_evaluation_number_must_match_signed_tcb_info() {
+        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+            .expect("decode TDX quote");
+        let collateral = synthetic_collateral_for_quote_with_selection(
+            &quote,
+            IntelTdxCollateralSelection::EvaluationDataNumber(7),
+        )
+        .expect("matching exact evaluation data number");
+        assert_eq!(
+            collateral.key().selection,
+            IntelTdxCollateralSelection::EvaluationDataNumber(7)
+        );
+
+        let error = synthetic_collateral_for_quote_with_selection(
+            &quote,
+            IntelTdxCollateralSelection::EvaluationDataNumber(999),
+        )
+        .expect_err("mislabeled exact evaluation data number must fail");
+        assert!(
+            error.to_string().contains(
+                "requested TCB evaluation data number 999, but signed TCB Info contains 7"
+            ),
+            "{error}"
         );
     }
 

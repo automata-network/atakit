@@ -136,13 +136,22 @@ impl IntelTdxDcapCollateral {
                 "parse certificates, revocation lists, TCB Info, and QE Identity: {error:#}"
             ))
         })?;
-        Self::from_parsed(
+        let parsed = Self::from_parsed(
             IntelTdxCollateralKey {
                 identity,
                 selection,
             },
             collateral,
-        )
+        )?;
+        if let IntelTdxCollateralSelection::EvaluationDataNumber(requested) = selection {
+            if parsed.tcb_evaluation_data_number != requested {
+                return Err(IntelTdxDcapCollateralError::SourceMaterial(format!(
+                    "requested TCB evaluation data number {requested}, but signed TCB Info contains {}",
+                    parsed.tcb_evaluation_data_number
+                )));
+            }
+        }
+        Ok(parsed)
     }
 
     pub fn from_file_json(
