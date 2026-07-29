@@ -1654,32 +1654,30 @@ fn verify_measurement_attributes(
     if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::IntelTdx) {
         if let Some(actual_bit) = verified_tdx_tcb_status_bit {
             let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
-            let base_mask = effective_attributes
-                .get(&key)
-                .and_then(bytes32_to_u16)
-                .unwrap_or(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
+            let base_matches =
+                tdx_tcb_status_policy_matches(effective_attributes.get(&key), actual_bit);
             check(
                 report,
                 errors,
                 "tee-attribute-base-image-intel-tdx-tcb-status",
-                base_mask & actual_bit != 0,
+                base_matches,
                 format!(
-                    "base-image Intel TDX TCB status mask 0x{base_mask:x} does not permit verified status bit 0x{actual_bit:x}"
+                    "base-image Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
                 ),
             );
             if workload_attributes.is_some() {
-                let workload_mask = encoded_requirements
-                    .get(&key)
-                    .and_then(|values| values.first())
-                    .and_then(bytes32_to_u16)
-                    .unwrap_or(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
+                let workload_matches = match encoded_requirements.get(&key).map(Vec::as_slice) {
+                    Some([value]) => tdx_tcb_status_policy_matches(Some(value), actual_bit),
+                    Some(_) => false,
+                    None => tdx_tcb_status_policy_matches(None, actual_bit),
+                };
                 check(
                     report,
                     errors,
                     "tee-attribute-workload-intel-tdx-tcb-status",
-                    workload_mask & actual_bit != 0,
+                    workload_matches,
                     format!(
-                        "workload Intel TDX TCB status mask 0x{workload_mask:x} does not permit verified status bit 0x{actual_bit:x}"
+                        "workload Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
                     ),
                 );
             }
@@ -1950,6 +1948,16 @@ fn bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
         .iter()
         .all(|byte| *byte == 0)
         .then(|| u16::from_be_bytes([value[30], value[31]]))
+}
+
+fn tdx_tcb_status_policy_matches(value: Option<&[u8; 32]>, actual_bit: u16) -> bool {
+    let mask = match value {
+        Some(value) => bytes32_to_u16(value),
+        None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
+    };
+    mask.is_some_and(|mask| {
+        atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some() && mask & actual_bit != 0
+    })
 }
 
 fn effective_measurement_attributes(
@@ -4964,6 +4972,36 @@ mod tests {
             &[],
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn tdx_tcb_status_policy_rejects_malformed_present_masks() {
+        let ok =
+            atakit_core::tee_attributes::u16_value(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
+        let configuration_needed = atakit_core::tee_attributes::u16_value(0x9);
+        let missing_ok = atakit_core::tee_attributes::u16_value(0x8);
+        let unsupported_bit = atakit_core::tee_attributes::u16_value(0x401);
+        let mut exceeds_u16 = ok;
+        exceeds_u16[0] = 1;
+
+        assert!(tdx_tcb_status_policy_matches(
+            None,
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
+        assert!(!tdx_tcb_status_policy_matches(None, 0x8));
+        assert!(tdx_tcb_status_policy_matches(
+            Some(&configuration_needed),
+            0x8
+        ));
+        assert!(!tdx_tcb_status_policy_matches(Some(&missing_ok), 0x8));
+        assert!(!tdx_tcb_status_policy_matches(
+            Some(&unsupported_bit),
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
+        assert!(!tdx_tcb_status_policy_matches(
+            Some(&exceeds_u16),
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
     }
 
     #[test]

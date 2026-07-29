@@ -1819,18 +1819,12 @@ fn verify_attribute_policy(
         if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::IntelTdx) {
             if let Some(actual_bit) = verified_tdx_tcb_status_bit {
                 let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
-                let base_mask = match trusted
+                let base_value = trusted
                     .effective_attributes
                     .iter()
                     .find(|item| item.key == key)
-                {
-                    Some(item) => session_bytes32_to_u16(&item.value),
-                    None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
-                };
-                let base_matches = base_mask.is_some_and(|mask| {
-                    atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some()
-                        && mask & actual_bit != 0
-                });
+                    .map(|item| &item.value);
+                let base_matches = super::tdx_tcb_status_policy_matches(base_value, actual_bit);
                 record(
                     checks,
                     errors,
@@ -1840,21 +1834,16 @@ fn verify_attribute_policy(
                         "base-image Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
                     ),
                 );
-                let workload_mask = match trusted
+                let workload_matches = match trusted
                     .attribute_requirements
                     .iter()
                     .find(|item| item.key == key)
+                    .map(|item| item.allowed_values.as_slice())
                 {
-                    Some(item) if item.allowed_values.len() == 1 => {
-                        session_bytes32_to_u16(&item.allowed_values[0])
-                    }
-                    Some(_) => None,
-                    None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
+                    Some([value]) => super::tdx_tcb_status_policy_matches(Some(value), actual_bit),
+                    Some(_) => false,
+                    None => super::tdx_tcb_status_policy_matches(None, actual_bit),
                 };
-                let workload_matches = workload_mask.is_some_and(|mask| {
-                    atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some()
-                        && mask & actual_bit != 0
-                });
                 record(
                     checks,
                     errors,
@@ -2076,13 +2065,6 @@ fn resolve_packed_session_requirement(
         ));
     }
     Ok(requirement.allowed_values[0])
-}
-
-fn session_bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
-    value[..30]
-        .iter()
-        .all(|byte| *byte == 0)
-        .then(|| u16::from_be_bytes([value[30], value[31]]))
 }
 
 fn verified_amd_snp_security_state(
