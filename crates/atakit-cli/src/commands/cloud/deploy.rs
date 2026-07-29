@@ -953,6 +953,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         &args.azure_maa_key,
                         &args.amd_ark_root_cert,
                         &args.amd_snp_crl,
+                        args.amd_snp_security_policy.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(

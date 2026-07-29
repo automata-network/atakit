@@ -181,6 +181,7 @@ pub(crate) async fn resolve_verified_portal_access(
         &verification.azure_maa_key,
         &verification.amd_ark_root_cert,
         &verification.amd_snp_crl,
+        verification.amd_snp_security_policy.as_deref(),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(

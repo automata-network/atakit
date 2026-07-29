@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use atakit_attestation::{
     amd_snp_kds_product, amd_snp_security_state, amd_snp_signing_key_type, amd_snp_vcek_request,
-    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation,
+    parse_amd_snp_security_policy_file_json, select_azure_maa_manual_trust_key,
+    verify_measurement_pack, verify_tls_attestation,
     verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpSigningKeyType,
     AmdSnpVerificationCollateral, AzureMaaTrustKey, CheckResult, EvidenceSummary,
     IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse, TrustAnchors,
@@ -630,12 +631,28 @@ pub fn load_tls_verification_trust(
     azure_maa_keys: &[String],
     amd_ark_root_certs: &[String],
     amd_snp_crls: &[String],
+    amd_snp_security_policy: Option<&Path>,
 ) -> Result<TlsVerificationTrust, CloudError> {
+    let amd_snp_security_policies = match amd_snp_security_policy {
+        Some(path) => {
+            let document = std::fs::read(path).map_err(|source| CloudError::IoPath {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            parse_amd_snp_security_policy_file_json(&document).map_err(|error| {
+                CloudError::Config {
+                    message: format!("{}: {error}", path.display()),
+                }
+            })?
+        }
+        None => Vec::new(),
+    };
     Ok(TlsVerificationTrust {
         trust_anchors: TrustAnchors {
             gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
             azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
             amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+            amd_snp_security_policies,
             ..TrustAnchors::default()
         },
         amd_snp_crls: parse_hex_blobs(amd_snp_crls, "--amd-snp-crl")?,
@@ -1387,14 +1404,17 @@ async fn resolve_chain_trust_anchors(
             .decode(&evidence.report)
             .map_err(|error| format!("decode SNP report for registry default lookup: {error}"))?;
         let state = amd_snp_security_state(&report)?;
-        let policy = client
-            .resolve_amd_snp_security_policy(state.cpuid)
-            .await
-            .map_err(|error| error.to_string())?;
-        trust_anchors
+        if !trust_anchors
             .amd_snp_security_policies
-            .retain(|existing| existing.cpuid != state.cpuid);
-        trust_anchors.amd_snp_security_policies.push(policy);
+            .iter()
+            .any(|policy| policy.cpuid == state.cpuid)
+        {
+            let policy = client
+                .resolve_amd_snp_security_policy(state.cpuid)
+                .await
+                .map_err(|error| error.to_string())?;
+            trust_anchors.amd_snp_security_policies.push(policy);
+        }
     }
 
     Ok(())
@@ -2363,12 +2383,47 @@ mod tests {
 
     #[test]
     fn tls_verification_trust_keeps_amd_crls_separate_from_trust_anchors() {
-        let trust =
-            load_tls_verification_trust(&[], &[], &["aabb".to_string()], &["ccdd".to_string()])
-                .expect("TLS verification trust");
+        let trust = load_tls_verification_trust(
+            &[],
+            &[],
+            &["aabb".to_string()],
+            &["ccdd".to_string()],
+            None,
+        )
+        .expect("TLS verification trust");
 
         assert_eq!(trust.trust_anchors.amd_ark_roots, vec![vec![0xaa, 0xbb]]);
         assert_eq!(trust.amd_snp_crls, vec![vec![0xcc, 0xdd]]);
+    }
+
+    #[test]
+    fn tls_verification_trust_loads_explicit_amd_snp_security_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("amd-snp-security-policy.json");
+        std::fs::write(
+            &policy_path,
+            br#"{
+                "schema": "atakit.amd-sev-snp-security-policy",
+                "version": 1,
+                "policies": [{
+                    "cpuid": "0x191101",
+                    "minimumTcb": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+                    "platformInfoPolicy": "0x0000000000000000000000000000000000000000000000000000000000000020",
+                    "requiredLaunchMitigationVector": "0x0000000000000000",
+                    "requiredCurrentMitigationVector": "0x0000000000000000"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let trust = load_tls_verification_trust(&[], &[], &[], &[], Some(&policy_path))
+            .expect("explicit AMD SEV-SNP security policy");
+
+        assert_eq!(trust.trust_anchors.amd_snp_security_policies.len(), 1);
+        assert_eq!(
+            trust.trust_anchors.amd_snp_security_policies[0].cpuid,
+            0x191101
+        );
     }
 
     #[test]

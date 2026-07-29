@@ -353,6 +353,10 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
+    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
     /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,

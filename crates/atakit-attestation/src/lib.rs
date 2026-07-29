@@ -20,9 +20,11 @@ use x509_parser::parse_x509_crl;
 use x509_parser::prelude::{FromDer, X509Certificate, X509Version};
 use x509_parser::time::ASN1Time;
 
+mod amd_snp_policy;
 mod session;
 mod tdx_dcap;
 mod verification_core;
+pub use amd_snp_policy::*;
 pub use session::*;
 pub use tdx_dcap::*;
 
@@ -1768,6 +1770,24 @@ fn select_amd_snp_security_policy(
     Ok(policy)
 }
 
+fn resolve_packed_workload_requirement(
+    encoded_requirements: &BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    key: [u8; 32],
+    default_value: [u8; 32],
+) -> std::result::Result<[u8; 32], String> {
+    let Some(values) = encoded_requirements.get(&key) else {
+        return Ok(default_value);
+    };
+    if values.len() != 1 {
+        return Err(format!(
+            "workload requirement for reserved packed attribute 0x{} must contain exactly one value, got {}",
+            hex::encode(key),
+            values.len()
+        ));
+    }
+    Ok(values[0])
+}
+
 fn verify_amd_snp_measurement_policy(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
@@ -1816,19 +1836,27 @@ fn verify_amd_snp_measurement_policy(
     );
 
     if has_workload {
-        let workload_tcb = encoded_requirements
-            .get(&AMD_SEV_SNP_TCB_MINIMUM_KEY)
-            .and_then(|values| (values.len() == 1).then_some(values[0]))
-            .unwrap_or(registry_default.minimum_tcb);
+        let workload_tcb = resolve_packed_workload_requirement(
+            encoded_requirements,
+            AMD_SEV_SNP_TCB_MINIMUM_KEY,
+            registry_default.minimum_tcb,
+        );
+        let (matches, detail) = match workload_tcb {
+            Ok(workload_tcb) => (
+                amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb),
+                format!(
+                    "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
+                    hex::encode(state.tcb_values)
+                ),
+            ),
+            Err(detail) => (false, detail),
+        };
         check(
             report,
             errors,
             "tee-attribute-workload-amd-sev-snp-tcb-minimum",
-            amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb),
-            format!(
-                "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
-                hex::encode(state.tcb_values)
-            ),
+            matches,
+            detail,
         );
     }
 
@@ -1850,24 +1878,35 @@ fn verify_amd_snp_measurement_policy(
     );
 
     if has_workload {
-        let workload_platform_info = encoded_requirements
-            .get(&AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
-            .and_then(|values| (values.len() == 1).then_some(values[0]))
-            .unwrap_or(registry_default.platform_info_policy);
-        let effective_platform_info =
-            merge_amd_sev_snp_platform_info_policies(&base_platform_info, &workload_platform_info);
-        let workload_platform_info_matches = effective_platform_info
-            .as_ref()
-            .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
+        let workload_platform_info = resolve_packed_workload_requirement(
+            encoded_requirements,
+            AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+            registry_default.platform_info_policy,
+        );
+        let (workload_platform_info_matches, detail) = match workload_platform_info {
+            Ok(workload_platform_info) => {
+                let effective_platform_info = merge_amd_sev_snp_platform_info_policies(
+                    &base_platform_info,
+                    &workload_platform_info,
+                );
+                (
+                    effective_platform_info.as_ref().is_some_and(|policy| {
+                        amd_sev_snp_platform_info_matches(state.platform_info, policy)
+                    }),
+                    format!(
+                        "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
+                        state.platform_info
+                    ),
+                )
+            }
+            Err(detail) => (false, detail),
+        };
         check(
             report,
             errors,
             "tee-attribute-workload-amd-sev-snp-platform-info-policy",
             workload_platform_info_matches,
-            format!(
-                "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
-                state.platform_info
-            ),
+            detail,
         );
     }
 }
@@ -3465,7 +3504,7 @@ mod tests {
     fn vendor_policy_permits_gcp_snp_debug_for_measurement_policy_evaluation() {
         let mut report = vec![0u8; SNP_REPORT_SIZE];
         report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
+            .copy_from_slice(&3u32.to_le_bytes());
         let policy = (1u64 << 17) | SNP_POLICY_DEBUG;
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
             .copy_from_slice(&policy.to_le_bytes());
@@ -3478,7 +3517,7 @@ mod tests {
     fn vendor_policy_permits_gcp_snp_migrate_ma_for_measurement_policy_evaluation() {
         let mut report = vec![0u8; SNP_REPORT_SIZE];
         report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
+            .copy_from_slice(&3u32.to_le_bytes());
         let policy = (1u64 << 17) | SNP_POLICY_MIGRATE_MA;
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
             .copy_from_slice(&policy.to_le_bytes());
@@ -3522,6 +3561,21 @@ mod tests {
         .unwrap_err();
         assert!(
             error.contains("unsupported SNP report version 6"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_version_two() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&(1u64 << 17).to_le_bytes());
+
+        let error = verify_snp_report_policy(&report).unwrap_err();
+        assert!(
+            error.contains("unsupported SNP report version 2"),
             "{error}"
         );
     }
@@ -4913,6 +4967,36 @@ mod tests {
     }
 
     #[test]
+    fn packed_workload_requirement_rejects_malformed_value_counts() {
+        let key = [0x11; 32];
+        let default_value = [0x22; 32];
+        let explicit_value = [0x33; 32];
+
+        assert_eq!(
+            resolve_packed_workload_requirement(&BTreeMap::new(), key, default_value).unwrap(),
+            default_value
+        );
+        assert_eq!(
+            resolve_packed_workload_requirement(
+                &BTreeMap::from([(key, vec![explicit_value])]),
+                key,
+                default_value,
+            )
+            .unwrap(),
+            explicit_value
+        );
+        for values in [Vec::new(), vec![explicit_value, explicit_value]] {
+            let error = resolve_packed_workload_requirement(
+                &BTreeMap::from([(key, values)]),
+                key,
+                default_value,
+            )
+            .unwrap_err();
+            assert!(error.contains("must contain exactly one value"), "{error}");
+        }
+    }
+
+    #[test]
     fn tls_policy_uses_amd_snp_registry_defaults() {
         let mut snp_report = synthetic_snp_security_report(1u64 << 17);
         let raw_tcb = [4, 0, 0, 0, 0, 0, 29, 222];
@@ -5528,7 +5612,7 @@ mod tests {
             .sign_prehash_recoverable(&delegation_digest)
             .expect("session-key possession signature");
         let mut possession_signature = possession_signature.to_bytes().to_vec();
-        possession_signature.push(possession_recovery_id.to_byte());
+        possession_signature.push(possession_recovery_id.to_byte() + 27);
 
         let pcr4_policy = SessionPcrPolicy {
             pcr_index: 4,
@@ -5634,7 +5718,7 @@ mod tests {
             .sign_prehash_recoverable(&binding_digest)
             .expect("request-binding signature");
         let mut binding_signature = binding_signature.to_bytes().to_vec();
-        binding_signature.push(recovery_id.to_byte());
+        binding_signature.push(recovery_id.to_byte() + 27);
 
         let inputs = SessionVerificationInputs {
             bundle: serde_json::to_value(&bundle).unwrap(),
@@ -6147,6 +6231,25 @@ mod tests {
         assert!(verification_core::verified_snp_attribute_states(&report)
             .unwrap_err()
             .contains("reserved"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_LAUNCH_TCB_OFFSET] = 1;
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("launch_tcb"));
+    }
+
+    #[test]
+    fn der_tlv_rejects_content_length_past_buffer() {
+        let short = [0x30, 0x02, 0x00];
+        assert!(verification_core::der_tlv(&short, 0x30, "test")
+            .unwrap_err()
+            .contains("exceeds buffer"));
+
+        let long = [0x30, 0x82, 0x01, 0x00, 0x00];
+        assert!(verification_core::der_tlv(&long, 0x30, "test")
+            .unwrap_err()
+            .contains("exceeds buffer"));
     }
 
     #[test]

@@ -955,9 +955,9 @@ pub(super) fn snp_signing_key_type(
 
 pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(), String> {
     let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP report version")?;
-    if !(2..=5).contains(&version) {
+    if !(3..=5).contains(&version) {
         return Err(format!(
-            "unsupported SNP report version {version}; expected a version from 2 through 5"
+            "unsupported SNP report version {version}; expected a version from 3 through 5"
         ));
     }
     let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
@@ -1399,7 +1399,11 @@ pub(super) fn der_tlv(
         .get(1)
         .ok_or_else(|| format!("{label} DER is missing length"))?;
     if first_len & 0x80 == 0 {
-        return Ok((2, usize::from(first_len)));
+        let len = usize::from(first_len);
+        if 2 + len > data.len() {
+            return Err(format!("{label} DER length exceeds buffer"));
+        }
+        return Ok((2, len));
     }
     let len_len = usize::from(first_len & 0x7f);
     if len_len == 0 || len_len > 4 {
@@ -1414,7 +1418,14 @@ pub(super) fn der_tlv(
     for byte in len_bytes {
         len = (len << 8) | usize::from(*byte);
     }
-    Ok((2 + len_len, len))
+    let content_offset = 2 + len_len;
+    let content_end = content_offset
+        .checked_add(len)
+        .ok_or_else(|| format!("{label} DER length overflows usize"))?;
+    if content_end > data.len() {
+        return Err(format!("{label} DER length exceeds buffer"));
+    }
+    Ok((content_offset, len))
 }
 
 pub(super) fn verify_snp_vek_extensions(
@@ -1735,6 +1746,11 @@ pub(super) fn verified_snp_security_state(
     if !snp_tcb_lane_meets(current, committed) {
         return Err(format!(
             "SNP committed_tcb 0x{committed:08x} exceeds current_tcb 0x{current:08x}"
+        ));
+    }
+    if !snp_tcb_lane_meets(committed, launch) {
+        return Err(format!(
+            "SNP launch_tcb 0x{launch:08x} exceeds committed_tcb 0x{committed:08x}"
         ));
     }
     let mut tcb_values = [0u8; 32];

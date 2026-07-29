@@ -1978,22 +1978,27 @@ fn verify_amd_snp_session_policy(
         ),
     );
 
-    let workload_tcb = trusted
-        .attribute_requirements
-        .iter()
-        .find(|item| item.key == AMD_SEV_SNP_TCB_MINIMUM_KEY)
-        .and_then(|item| (item.allowed_values.len() == 1).then_some(item.allowed_values[0]))
-        .unwrap_or(registry_default.minimum_tcb);
-    let workload_tcb_matches = amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb);
+    let workload_tcb = resolve_packed_session_requirement(
+        &trusted.attribute_requirements,
+        AMD_SEV_SNP_TCB_MINIMUM_KEY,
+        registry_default.minimum_tcb,
+    );
+    let (workload_tcb_matches, workload_tcb_detail) = match workload_tcb {
+        Ok(workload_tcb) => (
+            amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb),
+            format!(
+                "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
+                hex::encode(state.tcb_values)
+            ),
+        ),
+        Err(detail) => (false, detail),
+    };
     record(
         checks,
         errors,
         "tee-attribute-workload-amd-sev-snp-tcb-minimum",
         workload_tcb_matches,
-        &format!(
-            "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
-            hex::encode(state.tcb_values)
-        ),
+        &workload_tcb_detail,
     );
 
     let base_platform_info = trusted
@@ -2015,27 +2020,62 @@ fn verify_amd_snp_session_policy(
         ),
     );
 
-    let workload_platform_info = trusted
-        .attribute_requirements
-        .iter()
-        .find(|item| item.key == AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
-        .and_then(|item| (item.allowed_values.len() == 1).then_some(item.allowed_values[0]))
-        .unwrap_or(registry_default.platform_info_policy);
-    let effective_workload_platform_info =
-        merge_amd_sev_snp_platform_info_policies(&base_platform_info, &workload_platform_info);
-    let workload_platform_info_matches = effective_workload_platform_info
-        .as_ref()
-        .is_some_and(|policy| amd_sev_snp_platform_info_matches(state.platform_info, policy));
+    let workload_platform_info = resolve_packed_session_requirement(
+        &trusted.attribute_requirements,
+        AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+        registry_default.platform_info_policy,
+    );
+    let (workload_platform_info_matches, workload_platform_info_detail) =
+        match workload_platform_info {
+            Ok(workload_platform_info) => {
+                let effective = merge_amd_sev_snp_platform_info_policies(
+                    &base_platform_info,
+                    &workload_platform_info,
+                );
+                (
+                    effective.as_ref().is_some_and(|policy| {
+                        amd_sev_snp_platform_info_matches(state.platform_info, policy)
+                    }),
+                    format!(
+                        "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
+                        state.platform_info
+                    ),
+                )
+            }
+            Err(detail) => (false, detail),
+        };
     record(
         checks,
         errors,
         "tee-attribute-workload-amd-sev-snp-platform-info-policy",
         workload_platform_info_matches,
-        &format!(
-            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
-            state.platform_info
-        ),
+        &workload_platform_info_detail,
     );
+}
+
+/// Resolve a workload's explicit value for a reserved packed attribute.
+///
+/// Mirrors `resolve_packed_workload_requirement` on the TLS path and
+/// `AmdSnpSecurityPolicyRegistry._requirementOrDefault` on chain: omitting the
+/// requirement defers to the registry default, but a requirement that is
+/// present must name exactly one value. Substituting the default for a
+/// malformed requirement would hand the session a policy it never selected.
+fn resolve_packed_session_requirement(
+    requirements: &[SessionAttributeRequirement],
+    key: [u8; 32],
+    default_value: [u8; 32],
+) -> std::result::Result<[u8; 32], String> {
+    let Some(requirement) = requirements.iter().find(|item| item.key == key) else {
+        return Ok(default_value);
+    };
+    if requirement.allowed_values.len() != 1 {
+        return Err(format!(
+            "workload requirement for reserved packed attribute 0x{} must contain exactly one value, got {}",
+            hex::encode(key),
+            requirement.allowed_values.len()
+        ));
+    }
+    Ok(requirement.allowed_values[0])
 }
 
 fn session_bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
@@ -2184,23 +2224,27 @@ pub fn compute_session_qualifying_data(
     keccak(&encoded)
 }
 
-/// Verify a 65-byte recoverable ES256K signature against a SEC1 public key.
+/// Verify a 65-byte recoverable ES256K signature against a 65-byte
+/// uncompressed SEC1 public key.
 ///
-/// The signature is `r || s || v`. The recovery byte may use either `0/1`
-/// or Ethereum's legacy `27/28` form.
+/// The signature is the canonical Ethereum legacy `r || s || v` form. The
+/// recovery byte must be `27` or `28`, and `s` must be in the lower half of
+/// the secp256k1 group order, matching `SignatureVerifier._verifySecp256k1`.
 pub fn recoverable_es256k_signature_matches(
     public_key: &[u8],
     digest: [u8; 32],
     bytes: &[u8],
 ) -> bool {
-    if bytes.len() != 65 {
+    if public_key.len() != 65 || public_key[0] != 0x04 || bytes.len() != 65 {
         return false;
     }
     let Ok(signature) = Signature::from_slice(&bytes[..64]) else {
         return false;
     };
+    if signature.normalize_s().is_some() {
+        return false;
+    }
     let recovery = match bytes[64] {
-        0 | 1 => bytes[64],
         27 | 28 => bytes[64] - 27,
         _ => return false,
     };
@@ -2290,6 +2334,8 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::SigningKey;
 
     #[test]
     fn successful_checks_omit_failure_detail() {
@@ -2317,6 +2363,67 @@ mod tests {
         assert!(!checks[1].valid);
         assert_eq!(checks[1].detail.as_deref(), Some("the check failed"));
         assert_eq!(errors, ["failed-check: the check failed"]);
+    }
+
+    #[test]
+    fn es256k_verification_matches_contract_canonical_signature_rules() {
+        const SECP256K1_ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+
+        let signing_key = SigningKey::from_slice(&[7u8; 32]).expect("valid test key");
+        let digest = [0x42; 32];
+        let (signature, recovery_id): (Signature, RecoveryId) = signing_key
+            .sign_prehash(&digest)
+            .expect("recoverable ES256K signature");
+        let public_key = signing_key.verifying_key().to_encoded_point(false);
+        let mut encoded = [0u8; 65];
+        encoded[..64].copy_from_slice(&signature.to_bytes());
+        encoded[64] = recovery_id.to_byte() + 27;
+
+        assert!(recoverable_es256k_signature_matches(
+            public_key.as_bytes(),
+            digest,
+            &encoded
+        ));
+
+        let compressed_public_key = signing_key.verifying_key().to_encoded_point(true);
+        assert!(!recoverable_es256k_signature_matches(
+            compressed_public_key.as_bytes(),
+            digest,
+            &encoded
+        ));
+
+        let mut raw_recovery = encoded;
+        raw_recovery[64] -= 27;
+        assert!(!recoverable_es256k_signature_matches(
+            public_key.as_bytes(),
+            digest,
+            &raw_recovery
+        ));
+
+        let mut high_s = encoded;
+        let low_s = signature.s().to_bytes();
+        let mut borrow = 0u16;
+        for index in (0..32).rev() {
+            let order = u16::from(SECP256K1_ORDER[index]);
+            let subtrahend = u16::from(low_s[index]) + borrow;
+            if order >= subtrahend {
+                high_s[32 + index] = (order - subtrahend) as u8;
+                borrow = 0;
+            } else {
+                high_s[32 + index] = (order + 256 - subtrahend) as u8;
+                borrow = 1;
+            }
+        }
+        high_s[64] = if encoded[64] == 27 { 28 } else { 27 };
+        assert!(!recoverable_es256k_signature_matches(
+            public_key.as_bytes(),
+            digest,
+            &high_s
+        ));
     }
 
     #[test]
@@ -3458,5 +3565,44 @@ mod tests {
         attest.extend_from_slice(&0xff54_4347u32.to_be_bytes());
         attest.extend_from_slice(&0x8018u16.to_be_bytes());
         assert!(parse_certified_name(&attest).is_err());
+    }
+
+    #[test]
+    fn packed_session_requirement_rejects_malformed_value_counts() {
+        let key = [0x11; 32];
+        let default_value = [0x22; 32];
+        let explicit_value = [0x33; 32];
+        let requirement = |allowed_values: Vec<[u8; 32]>| {
+            vec![SessionAttributeRequirement {
+                key,
+                allowed_values,
+            }]
+        };
+
+        // An absent requirement defers to the registry default.
+        assert_eq!(
+            resolve_packed_session_requirement(&[], key, default_value).unwrap(),
+            default_value
+        );
+        assert_eq!(
+            resolve_packed_session_requirement(
+                &requirement(vec![explicit_value]),
+                key,
+                default_value,
+            )
+            .unwrap(),
+            explicit_value
+        );
+        // A present-but-malformed requirement must fail rather than silently
+        // resolving to the registry default the workload never selected.
+        for allowed_values in [Vec::new(), vec![explicit_value, explicit_value]] {
+            let error = resolve_packed_session_requirement(
+                &requirement(allowed_values),
+                key,
+                default_value,
+            )
+            .unwrap_err();
+            assert!(error.contains("must contain exactly one value"), "{error}");
+        }
     }
 }
