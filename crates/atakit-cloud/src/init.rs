@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atakit_attestation::{
-    amd_snp_kds_product, amd_snp_security_state, amd_snp_vcek_request,
+    amd_snp_kds_product, amd_snp_security_state, amd_snp_signing_key_type, amd_snp_vcek_request,
     select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation,
-    verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpVerificationCollateral,
-    AzureMaaTrustKey, CheckResult, EvidenceSummary, IntelTdxDcapCollateral, MeasurementPolicy,
-    TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
-    VerificationReport, VerifiedTlsIdentity,
+    verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpSigningKeyType,
+    AmdSnpVerificationCollateral, AzureMaaTrustKey, CheckResult, EvidenceSummary,
+    IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse, TrustAnchors,
+    VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -1267,7 +1267,8 @@ async fn resolve_amd_snp_crls(
         .decode(&evidence.report)
         .map_err(|error| format!("decode SNP report for AMD CRL lookup: {error}"))?;
     let product = amd_snp_kds_product(&report)?;
-    let url = format!("https://kdsintf.amd.com/vcek/v1/{product}/crl");
+    let signing_key_type = amd_snp_signing_key_type(&report)?;
+    let (url, signing_key_name) = amd_snp_crl_endpoint(product, signing_key_type);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1276,16 +1277,34 @@ async fn resolve_amd_snp_crls(
         .get(&url)
         .send()
         .await
-        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?
+        .map_err(|error| {
+            format!("fetch AMD {product} {signing_key_name} certificate revocation list: {error}")
+        })?
         .error_for_status()
-        .map_err(|error| format!("fetch AMD {product} certificate revocation list: {error}"))?;
+        .map_err(|error| {
+            format!("fetch AMD {product} {signing_key_name} certificate revocation list: {error}")
+        })?;
     let crl = read_response_bytes_limited(
         crl_response,
         MAX_AMD_COLLATERAL_BYTES,
-        &format!("AMD {product} certificate revocation list"),
+        &format!("AMD {product} {signing_key_name} certificate revocation list"),
     )
     .await?;
     Ok(vec![crl])
+}
+
+fn amd_snp_crl_endpoint(
+    product: &str,
+    signing_key_type: AmdSnpSigningKeyType,
+) -> (String, &'static str) {
+    let (path, signing_key_name) = match signing_key_type {
+        AmdSnpSigningKeyType::Vcek => ("vcek", "VCEK"),
+        AmdSnpSigningKeyType::Vlek => ("vlek", "VLEK"),
+    };
+    (
+        format!("https://kdsintf.amd.com/{path}/v1/{product}/crl"),
+        signing_key_name,
+    )
 }
 
 fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -2841,6 +2860,24 @@ mod tests {
         assert_eq!(amd_snp_kds_product(&report).unwrap(), "Genoa");
         report[0x188] = 0x1a;
         assert!(amd_snp_kds_product(&report).is_err());
+    }
+
+    #[test]
+    fn selects_amd_kds_crl_endpoint_for_report_signing_key() {
+        assert_eq!(
+            amd_snp_crl_endpoint("Milan", AmdSnpSigningKeyType::Vcek),
+            (
+                "https://kdsintf.amd.com/vcek/v1/Milan/crl".to_string(),
+                "VCEK"
+            )
+        );
+        assert_eq!(
+            amd_snp_crl_endpoint("Genoa", AmdSnpSigningKeyType::Vlek),
+            (
+                "https://kdsintf.amd.com/vlek/v1/Genoa/crl".to_string(),
+                "VLEK"
+            )
+        );
     }
 
     #[test]

@@ -210,8 +210,11 @@ pub struct TrustedSessionBinding {
 pub struct CertificateTrust {
     /// Exact trusted DER certificates.
     pub certificates: Vec<Vec<u8>>,
-    /// Keccak-256 hashes of trusted DER certificates.
-    pub keccak256_hashes: Vec<[u8; 32]>,
+    /// Trusted 32-byte hashes of DER certificates.
+    ///
+    /// Each verifier defines the required algorithm. GCP AK roots use
+    /// Keccak-256. AMD ARK roots use SHA-256.
+    pub hashes: Vec<[u8; 32]>,
 }
 
 /// Provider-specific trust input. The caller resolves and supplies these
@@ -674,7 +677,7 @@ fn verify_gcp_platform(
         &chain,
         &ak_public,
         &gcp_ak_roots.certificates,
-        &gcp_ak_roots.keccak256_hashes,
+        &gcp_ak_roots.hashes,
         current_time,
     );
     super::verification_core::verify_tpm_quote_signature(
@@ -715,7 +718,7 @@ fn verify_gcp_platform(
                 Some(collateral),
                 super::verification_core::AmdSnpTrust {
                     ark_roots: &amd.certificates,
-                    ark_root_hashes: &amd.keccak256_hashes,
+                    ark_root_hashes: &amd.hashes,
                 },
                 current_time,
             );
@@ -811,7 +814,7 @@ fn verify_azure_platform(
                 Some(snp_trust.amd_snp_collateral),
                 super::verification_core::AmdSnpTrust {
                     ark_roots: &snp_trust.amd_ark_roots.certificates,
-                    ark_root_hashes: &snp_trust.amd_ark_roots.keccak256_hashes,
+                    ark_root_hashes: &snp_trust.amd_ark_roots.hashes,
                 },
                 current_time,
             );

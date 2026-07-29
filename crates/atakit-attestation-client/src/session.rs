@@ -621,7 +621,7 @@ fn parse_attributes(
 fn certificate_trust(certificates: &[Vec<u8>], hashes: &[[u8; 32]]) -> CertificateTrust {
     CertificateTrust {
         certificates: certificates.to_vec(),
-        keccak256_hashes: hashes.to_vec(),
+        hashes: hashes.to_vec(),
     }
 }
 

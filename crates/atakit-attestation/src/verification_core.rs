@@ -919,11 +919,11 @@ pub(super) fn verify_snp_report_with_collateral(
 
     let signer = snp_signing_key_type(report)?;
     let vek = match signer {
-        SnpSigningKeyType::Vcek => collateral
+        AmdSnpSigningKeyType::Vcek => collateral
             .vcek_der
             .as_deref()
             .ok_or_else(|| "SNP report is VCEK-signed but collateral lacks VCEK".to_string())?,
-        SnpSigningKeyType::Vlek => collateral
+        AmdSnpSigningKeyType::Vlek => collateral
             .vlek_der
             .as_deref()
             .ok_or_else(|| "SNP report is VLEK-signed but collateral lacks VLEK".to_string())?,
@@ -942,19 +942,13 @@ pub(super) fn verify_snp_report_with_collateral(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SnpSigningKeyType {
-    Vcek,
-    Vlek,
-}
-
 pub(super) fn snp_signing_key_type(
     report: &[u8],
-) -> std::result::Result<SnpSigningKeyType, String> {
+) -> std::result::Result<AmdSnpSigningKeyType, String> {
     let key_settings = read_le_u32(report, SNP_REPORT_KEY_SETTINGS_OFFSET, "SNP key_settings")?;
     match key_settings & 0b11100 {
-        0b000 => Ok(SnpSigningKeyType::Vcek),
-        0b100 => Ok(SnpSigningKeyType::Vlek),
+        0b000 => Ok(AmdSnpSigningKeyType::Vcek),
+        0b100 => Ok(AmdSnpSigningKeyType::Vlek),
         value => Err(format!("unknown SNP signing key type bits 0x{value:x}")),
     }
 }
@@ -1104,12 +1098,13 @@ pub(super) fn verify_amd_snp_cert_chain(
     current_time: SystemTime,
     collateral: &AmdSnpVerificationCollateral,
     vek_der: &[u8],
-    signer: SnpSigningKeyType,
+    signer: AmdSnpSigningKeyType,
     expected_product: &str,
     trust: AmdSnpTrust<'_>,
 ) -> std::result::Result<(), String> {
     let ark_der = &collateral.ark_der;
-    let ask_der = &collateral.ask_der;
+    let intermediate_ca_der = &collateral.intermediate_ca_der;
+    let intermediate_ca_label = snp_intermediate_ca_label(signer);
     let ark_hash: [u8; 32] = Sha256::digest(ark_der).into();
     if !trust
         .ark_roots
@@ -1125,12 +1120,16 @@ pub(super) fn verify_amd_snp_cert_chain(
 
     let (_, ark) = X509Certificate::from_der(ark_der)
         .map_err(|e| format!("SNP ARK certificate did not parse: {e}"))?;
-    let (_, ask) = X509Certificate::from_der(ask_der)
-        .map_err(|e| format!("SNP ASK certificate did not parse: {e}"))?;
+    let (_, intermediate_ca) = X509Certificate::from_der(intermediate_ca_der)
+        .map_err(|e| format!("{intermediate_ca_label} certificate did not parse: {e}"))?;
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
     let validation_time = asn1_time(current_time)?;
-    for (label, cert) in [("SNP ARK", &ark), ("SNP ASK", &ask), ("SNP VEK", &vek)] {
+    for (label, cert) in [
+        ("SNP ARK", &ark),
+        (intermediate_ca_label, &intermediate_ca),
+        ("SNP VEK", &vek),
+    ] {
         if cert.version() != X509Version::V3 {
             return Err(format!("{label} certificate is not X.509 version 3"));
         }
@@ -1160,26 +1159,46 @@ pub(super) fn verify_amd_snp_cert_chain(
         return Err("SNP ARK Key Usage does not permit CRL signing".to_string());
     }
     verify_amd_snp_cert_signature(ark_der, &ark, &ark, "SNP ARK self-signature")?;
-    if ask.issuer() != ark.subject() {
-        return Err("SNP ASK issuer does not match ARK subject".to_string());
-    }
-    let ask_common_name = certificate_common_name(&ask, "SNP ASK")?;
-    let expected_ask_common_name = format!("SEV-{expected_product}");
-    if ask_common_name != expected_ask_common_name {
+    if intermediate_ca.issuer() != ark.subject() {
         return Err(format!(
-            "SNP ASK common name is {ask_common_name:?}, expected {expected_ask_common_name:?}"
+            "{intermediate_ca_label} issuer does not match ARK subject"
         ));
     }
-    verify_ca_certificate_role(&ask, "SNP ASK", 0)?;
-    verify_amd_snp_cert_signature(ask_der, &ask, &ark, "SNP ASK signature")?;
-    verify_amd_snp_crls(&ark, &ask, collateral.crls_der(), validation_time)?;
-    if vek.issuer() != ask.subject() {
-        return Err("SNP VEK issuer does not match ASK subject".to_string());
+    let intermediate_ca_common_name =
+        certificate_common_name(&intermediate_ca, intermediate_ca_label)?;
+    let expected_intermediate_ca_common_names =
+        snp_intermediate_ca_common_names(signer, expected_product);
+    if !expected_intermediate_ca_common_names
+        .iter()
+        .any(|expected| intermediate_ca_common_name == expected)
+    {
+        return Err(format!(
+            "{intermediate_ca_label} common name is {intermediate_ca_common_name:?}, expected one of {expected_intermediate_ca_common_names:?}"
+        ));
+    }
+    verify_ca_certificate_role(&intermediate_ca, intermediate_ca_label, 0)?;
+    verify_amd_snp_cert_signature(
+        intermediate_ca_der,
+        &intermediate_ca,
+        &ark,
+        &format!("{intermediate_ca_label} signature"),
+    )?;
+    verify_amd_snp_crls(
+        &ark,
+        &intermediate_ca,
+        intermediate_ca_label,
+        collateral.crls_der(),
+        validation_time,
+    )?;
+    if vek.issuer() != intermediate_ca.subject() {
+        return Err(format!(
+            "SNP VEK issuer does not match {intermediate_ca_label} subject"
+        ));
     }
     verify_end_entity_certificate_role(&vek, "SNP VEK")?;
     let expected_common_name = match signer {
-        SnpSigningKeyType::Vcek => "SEV-VCEK",
-        SnpSigningKeyType::Vlek => "SEV-VLEK",
+        AmdSnpSigningKeyType::Vcek => "SEV-VCEK",
+        AmdSnpSigningKeyType::Vlek => "SEV-VLEK",
     };
     let actual_common_name = certificate_common_name(&vek, "SNP VEK")?;
     if actual_common_name != expected_common_name {
@@ -1187,8 +1206,28 @@ pub(super) fn verify_amd_snp_cert_chain(
             "SNP VEK common name is {actual_common_name:?}, expected {expected_common_name:?}"
         ));
     }
-    verify_amd_snp_cert_signature(vek_der, &vek, &ask, "SNP VEK signature")?;
+    verify_amd_snp_cert_signature(vek_der, &vek, &intermediate_ca, "SNP VEK signature")?;
     Ok(())
+}
+
+pub(super) fn snp_intermediate_ca_label(signer: AmdSnpSigningKeyType) -> &'static str {
+    match signer {
+        AmdSnpSigningKeyType::Vcek => "SNP ASK",
+        AmdSnpSigningKeyType::Vlek => "SNP ASVK",
+    }
+}
+
+pub(super) fn snp_intermediate_ca_common_names(
+    signer: AmdSnpSigningKeyType,
+    expected_product: &str,
+) -> Vec<String> {
+    match signer {
+        AmdSnpSigningKeyType::Vcek => vec![format!("SEV-{expected_product}")],
+        AmdSnpSigningKeyType::Vlek => vec![
+            "SEV-VLEK".to_string(),
+            format!("SEV-VLEK-{expected_product}"),
+        ],
+    }
 }
 
 fn asn1_time(time: SystemTime) -> std::result::Result<ASN1Time, String> {
@@ -1220,7 +1259,8 @@ fn certificate_common_name<'a>(
 
 fn verify_amd_snp_crls(
     ark: &X509Certificate<'_>,
-    ask: &X509Certificate<'_>,
+    intermediate_ca: &X509Certificate<'_>,
+    intermediate_ca_label: &str,
     crl_der_values: &[Vec<u8>],
     current_time: ASN1Time,
 ) -> std::result::Result<(), String> {
@@ -1277,11 +1317,11 @@ fn verify_amd_snp_crls(
         }
         if crl
             .iter_revoked_certificates()
-            .any(|revoked| revoked.serial() == &ask.tbs_certificate.serial)
+            .any(|revoked| revoked.serial() == &intermediate_ca.tbs_certificate.serial)
         {
             return Err(format!(
-                "SNP ASK certificate serial {} is revoked",
-                ask.raw_serial_as_string()
+                "{intermediate_ca_label} certificate serial {} is revoked",
+                intermediate_ca.raw_serial_as_string()
             ));
         }
         return Ok(());
@@ -1380,7 +1420,7 @@ pub(super) fn der_tlv(
 pub(super) fn verify_snp_vek_extensions(
     vek_der: &[u8],
     report: &[u8],
-    signer: SnpSigningKeyType,
+    signer: AmdSnpSigningKeyType,
 ) -> std::result::Result<(), String> {
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
@@ -1392,7 +1432,7 @@ pub(super) fn verify_snp_vek_extensions(
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.3", tcb.snp, "snp")?;
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.8", tcb.microcode, "microcode")?;
 
-    if signer == SnpSigningKeyType::Vcek {
+    if signer == AmdSnpSigningKeyType::Vcek {
         let chip_id = read_exact_at(report, SNP_REPORT_CHIP_ID_OFFSET, 64, "SNP chip_id")?;
         check_snp_octet_extension(&vek, "1.3.6.1.4.1.3704.1.4", chip_id, "chip_id")?;
     }

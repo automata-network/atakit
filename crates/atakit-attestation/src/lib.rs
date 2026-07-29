@@ -104,6 +104,26 @@ const SNP_CERT_TABLE_VLEK_GUID: [u8; 16] = [
     0xa8, 0x07, 0x4b, 0xc2, 0xa2, 0x5a, 0x48, 0x3e, 0xaa, 0xe6, 0x39, 0xc0, 0x45, 0xa0, 0xb8, 0xa1,
 ];
 
+/// The endorsement key that signed an AMD SEV-SNP attestation report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmdSnpSigningKeyType {
+    Vcek,
+    Vlek,
+}
+
+/// Return the endorsement-key type selected by an AMD SEV-SNP report.
+pub fn amd_snp_signing_key_type(
+    report: &[u8],
+) -> std::result::Result<AmdSnpSigningKeyType, String> {
+    if report.len() != SNP_REPORT_SIZE {
+        return Err(format!(
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
+            report.len()
+        ));
+    }
+    verification_core::snp_signing_key_type(report)
+}
+
 /// Fields needed to request the report's VCEK from AMD KDS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmdSnpVcekRequest {
@@ -124,9 +144,7 @@ pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequ
             report.len()
         ));
     }
-    if verification_core::snp_signing_key_type(report)?
-        != verification_core::SnpSigningKeyType::Vcek
-    {
+    if amd_snp_signing_key_type(report)? != AmdSnpSigningKeyType::Vcek {
         return Err("AMD KDS VCEK lookup cannot resolve a VLEK-signed SNP report".to_string());
     }
     let tcb = &report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8];
@@ -221,7 +239,7 @@ pub enum AmdSnpVerificationCollateralError {
 #[derive(Debug, Clone)]
 pub struct AmdSnpVerificationCollateral {
     pub(crate) ark_der: Vec<u8>,
-    pub(crate) ask_der: Vec<u8>,
+    pub(crate) intermediate_ca_der: Vec<u8>,
     pub(crate) vcek_der: Option<Vec<u8>>,
     pub(crate) vlek_der: Option<Vec<u8>>,
     pub(crate) crls_der: Vec<Vec<u8>>,
@@ -236,7 +254,7 @@ impl AmdSnpVerificationCollateral {
     ) -> Self {
         Self {
             ark_der,
-            ask_der,
+            intermediate_ca_der: ask_der,
             vcek_der: Some(vcek_der),
             vlek_der: None,
             crls_der,
@@ -252,9 +270,12 @@ impl AmdSnpVerificationCollateral {
         let ark_der = parsed
             .ark
             .ok_or(AmdSnpVerificationCollateralError::MissingCertificate("ARK"))?;
-        let ask_der = parsed
-            .ask
-            .ok_or(AmdSnpVerificationCollateralError::MissingCertificate("ASK"))?;
+        let intermediate_ca_der =
+            parsed
+                .ask
+                .ok_or(AmdSnpVerificationCollateralError::MissingCertificate(
+                    "ASK or ASVK intermediate CA",
+                ))?;
         if parsed.vcek.is_none() && parsed.vlek.is_none() {
             return Err(AmdSnpVerificationCollateralError::MissingCertificate(
                 "VCEK or VLEK",
@@ -262,7 +283,7 @@ impl AmdSnpVerificationCollateral {
         }
         Ok(Self {
             ark_der,
-            ask_der,
+            intermediate_ca_der,
             vcek_der: parsed.vcek,
             vlek_der: parsed.vlek,
             crls_der,
@@ -5626,11 +5647,11 @@ mod tests {
                 platform: SessionPlatformTrust::GcpSnp {
                     gcp_ak_roots: CertificateTrust {
                         certificates: ak_roots,
-                        keccak256_hashes: Vec::new(),
+                        hashes: Vec::new(),
                     },
                     amd_ark_roots: CertificateTrust {
                         certificates: vec![amd_ark],
-                        keccak256_hashes: Vec::new(),
+                        hashes: Vec::new(),
                     },
                     amd_snp_collateral: AmdSnpVerificationCollateral::from_certificate_table(
                         &snp_cert_table,
@@ -5972,6 +5993,47 @@ mod tests {
         assert_eq!(request.microcode, 219);
         assert_eq!(request.cpuid_family, 0x19);
         assert_eq!(request.cpuid_model, 0x01);
+    }
+
+    #[test]
+    fn selects_vcek_and_vlek_certificate_chains_from_report_key_settings() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        assert_eq!(
+            amd_snp_signing_key_type(&report).unwrap(),
+            AmdSnpSigningKeyType::Vcek
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_label(AmdSnpSigningKeyType::Vcek),
+            "SNP ASK"
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_common_names(
+                AmdSnpSigningKeyType::Vcek,
+                "Milan"
+            ),
+            ["SEV-Milan"]
+        );
+
+        report[SNP_REPORT_KEY_SETTINGS_OFFSET..SNP_REPORT_KEY_SETTINGS_OFFSET + 4]
+            .copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            amd_snp_signing_key_type(&report).unwrap(),
+            AmdSnpSigningKeyType::Vlek
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_label(AmdSnpSigningKeyType::Vlek),
+            "SNP ASVK"
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_common_names(
+                AmdSnpSigningKeyType::Vlek,
+                "Genoa"
+            ),
+            ["SEV-VLEK", "SEV-VLEK-Genoa"]
+        );
+        assert!(amd_snp_vcek_request(&report)
+            .unwrap_err()
+            .contains("cannot resolve a VLEK-signed SNP report"));
     }
 
     #[test]
