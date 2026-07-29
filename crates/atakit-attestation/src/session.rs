@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use signature::{hazmat::PrehashVerifier, Verifier};
 
+use crate::IntelTdxDcapCollateral;
+
 const SESSION_DOMAIN: &str = "CVM_SESSION_V1";
 const KEY_DOMAIN: &str = "KEY_RESOLVER_V1";
 const SESSION_NONCE_DOMAIN: &str = "CVM_SESSION_REG_NONCE_V1";
@@ -218,7 +220,7 @@ pub struct CertificateTrust {
 pub enum SessionPlatformTrust {
     GcpTdx {
         gcp_ak_roots: CertificateTrust,
-        dcap_collateral: serde_json::Value,
+        dcap_collateral: IntelTdxDcapCollateral,
     },
     GcpSnp {
         gcp_ak_roots: CertificateTrust,
@@ -227,7 +229,7 @@ pub enum SessionPlatformTrust {
     },
     AzureTdx {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
-        dcap_collateral: serde_json::Value,
+        dcap_collateral: IntelTdxDcapCollateral,
     },
     AzureSnp {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
@@ -617,7 +619,7 @@ fn verify_gcp_platform(
     bundle: &SessionEvidenceBundle,
     gcp_ak_roots: &CertificateTrust,
     amd_snp_trust: Option<(&CertificateTrust, &[Vec<u8>])>,
-    dcap_collateral: Option<&serde_json::Value>,
+    dcap_collateral: Option<&IntelTdxDcapCollateral>,
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
@@ -725,7 +727,7 @@ fn verify_gcp_platform(
             &mut report,
             &mut core_errors,
             Some(&tee_evidence),
-            dcap,
+            Some(dcap),
             current_time,
         ),
         _ => {
@@ -753,7 +755,7 @@ fn verify_azure_platform(
     bundle: &SessionEvidenceBundle,
     maa_signing_keys: &[AzureMaaTrustKey],
     snp_trust: Option<AzureSnpTrust<'_>>,
-    dcap_collateral: Option<&serde_json::Value>,
+    dcap_collateral: Option<&IntelTdxDcapCollateral>,
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
@@ -826,7 +828,7 @@ fn verify_azure_platform(
             &mut report,
             &mut core_errors,
             Some(&tee_evidence),
-            dcap,
+            Some(dcap),
             current_time,
         ),
         _ => {

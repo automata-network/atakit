@@ -3,14 +3,14 @@ use std::time::Duration;
 
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use atakit_attestation::TdxDcapCollateral;
+use atakit_attestation::IntelTdxDcapCollateral;
 use automata_dcap_network_registry::Network;
+use dcap_rs::types::collateral::Collateral;
 use dcap_rs::types::quote::Quote;
 use futures_util::StreamExt;
 use pccs_reader_rs::tcb_pem::generate_tcb_issuer_chain_pem;
 use pccs_reader_rs::{Collaterals, PccsReadStrategy, PccsReader};
-use serde_json::value::RawValue;
-use x509_cert::der::Encode;
+use x509_cert::der::{Encode, EncodePem};
 
 use crate::init::TdxDcapAutomataReadStrategy;
 
@@ -33,7 +33,8 @@ pub(crate) async fn fetch_automata_collateral(
     overrides: AutomataPccsOverrides<'_>,
     read_strategy: &TdxDcapAutomataReadStrategy,
     quote: &[u8],
-) -> Result<TdxDcapCollateral, String> {
+) -> Result<IntelTdxDcapCollateral, String> {
+    quote_material(quote)?;
     let rpc_url = rpc_url
         .parse()
         .map_err(|error| format!("parse Automata PCCS RPC URL {rpc_url}: {error}"))?;
@@ -105,13 +106,13 @@ pub(crate) async fn fetch_automata_collateral(
         .await
         .map_err(|error| format!("read Automata PCCS collateral: {error}"))?;
 
-    collateral_from_automata_reads(quote, collaterals)
+    collateral_from_automata_reads(collaterals)
 }
 
 pub(crate) async fn fetch_http_collateral(
     base_url: &str,
     quote: &[u8],
-) -> Result<TdxDcapCollateral, String> {
+) -> Result<IntelTdxDcapCollateral, String> {
     let material = quote_material(quote)?;
     let base_url = normalized_pcs_base_url(base_url);
     let client = reqwest::Client::builder()
@@ -124,7 +125,6 @@ pub(crate) async fn fetch_http_collateral(
         material.pck_ca
     );
     let pck_crl_response = checked_get(&client, &pck_crl_url).await?;
-    let pck_crl_issuer_chain = decoded_header(&pck_crl_response, "SGX-PCK-CRL-Issuer-Chain")?;
     let pck_crl = read_limited_body(pck_crl_response, &pck_crl_url).await?;
 
     let tcb_info_url = format!(
@@ -137,64 +137,50 @@ pub(crate) async fn fetch_http_collateral(
         &["SGX-TCB-Info-Issuer-Chain", "TCB-Info-Issuer-Chain"],
     )?;
     let raw_tcb_info = read_limited_text(tcb_info_response, &tcb_info_url).await?;
-    let (tcb_info, tcb_info_signature) = split_signed_document(&raw_tcb_info, "tcbInfo")?;
 
     let qe_identity_url = format!("{base_url}/tdx/certification/v4/qe/identity?update=standard");
     let qe_identity_response = checked_get(&client, &qe_identity_url).await?;
     let qe_identity_issuer_chain =
         decoded_header(&qe_identity_response, "SGX-Enclave-Identity-Issuer-Chain")?;
     let raw_qe_identity = read_limited_text(qe_identity_response, &qe_identity_url).await?;
-    let (qe_identity, qe_identity_signature) =
-        split_signed_document(&raw_qe_identity, "enclaveIdentity")?;
+    if !issuer_chains_match(&tcb_info_issuer_chain, &qe_identity_issuer_chain) {
+        return Err(
+            "TCB info and QE identity issuer chains differ; Automata dcap-rs requires one shared issuer chain"
+                .to_string(),
+        );
+    }
 
     let root_ca_crl = fetch_root_ca_crl(&client, &base_url).await?;
 
-    Ok(TdxDcapCollateral {
-        pck_crl_issuer_chain,
+    IntelTdxDcapCollateral::new(
         root_ca_crl,
         pck_crl,
         tcb_info_issuer_chain,
-        tcb_info,
-        tcb_info_signature,
-        qe_identity_issuer_chain,
-        qe_identity,
-        qe_identity_signature,
-        pck_certificate_chain: Some(material.pck_certificate_chain),
-    })
+        raw_tcb_info,
+        raw_qe_identity,
+    )
 }
 
 fn collateral_from_automata_reads(
-    quote: &[u8],
     collaterals: Collaterals,
-) -> Result<TdxDcapCollateral, String> {
-    let material = quote_material(quote)?;
+) -> Result<IntelTdxDcapCollateral, String> {
     let issuer_chain =
         generate_tcb_issuer_chain_pem(&collaterals.tcb_signing_ca, &collaterals.root_ca)
             .map_err(|error| format!("encode Automata TCB issuer chain: {error:#}"))?;
-    let (tcb_info, tcb_info_signature) = split_signed_document(&collaterals.tcb_info, "tcbInfo")?;
-    let (qe_identity, qe_identity_signature) =
-        split_signed_document(&collaterals.qe_identity, "enclaveIdentity")?;
 
-    Ok(TdxDcapCollateral {
-        pck_crl_issuer_chain: material.pck_crl_issuer_chain,
-        root_ca_crl: collaterals.root_ca_crl,
-        pck_crl: collaterals.pck_crl,
-        tcb_info_issuer_chain: issuer_chain.clone(),
-        tcb_info,
-        tcb_info_signature,
-        qe_identity_issuer_chain: issuer_chain,
-        qe_identity,
-        qe_identity_signature,
-        pck_certificate_chain: Some(material.pck_certificate_chain),
-    })
+    IntelTdxDcapCollateral::new(
+        collaterals.root_ca_crl,
+        collaterals.pck_crl,
+        issuer_chain,
+        collaterals.tcb_info,
+        collaterals.qe_identity,
+    )
 }
 
 #[derive(Debug)]
 struct QuoteMaterial {
     fmspc: String,
     pck_ca: &'static str,
-    pck_crl_issuer_chain: String,
-    pck_certificate_chain: String,
 }
 
 fn quote_material(raw_quote: &[u8]) -> Result<QuoteMaterial, String> {
@@ -242,21 +228,9 @@ fn quote_material(raw_quote: &[u8]) -> Result<QuoteMaterial, String> {
             return Err(format!("unrecognized PCK certificate issuer: {issuer}"));
         }
     };
-    let certificate_der = pck_data
-        .pck_cert_chain
-        .iter()
-        .map(|certificate| {
-            certificate
-                .to_der()
-                .map_err(|error| format!("encode PCK certificate as DER: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
     Ok(QuoteMaterial {
         fmspc: hex::encode_upper(pck_data.pck_extension.fmspc),
         pck_ca,
-        pck_crl_issuer_chain: pem_chain_from_der(&certificate_der[1..])?,
-        pck_certificate_chain: pem_chain_from_der(&certificate_der)?,
     })
 }
 
@@ -334,24 +308,58 @@ async fn fetch_root_ca_crl(client: &reqwest::Client, base_url: &str) -> Result<V
     read_limited_body(response, INTEL_ROOT_CA_CRL_URL).await
 }
 
-fn split_signed_document(
-    document: &str,
-    body_field: &'static str,
-) -> Result<(String, Vec<u8>), String> {
-    let value: std::collections::BTreeMap<String, &RawValue> = serde_json::from_str(document)
-        .map_err(|error| format!("{body_field} response is not valid JSON: {error}"))?;
-    let body = value
-        .get(body_field)
-        .ok_or_else(|| format!("{body_field} response is missing {body_field}"))?;
-    let signature = value
-        .get("signature")
-        .ok_or_else(|| format!("{body_field} response is missing signature"))?;
-    let signature: String = serde_json::from_str(signature.get())
-        .map_err(|error| format!("{body_field} signature is not a JSON string: {error}"))?;
-    let signature = signature.strip_prefix("0x").unwrap_or(&signature);
-    let signature = hex::decode(signature)
-        .map_err(|error| format!("{body_field} signature is not valid hex: {error}"))?;
-    Ok((body.get().to_string(), signature))
+pub(crate) fn parse_dcap_collateral_json(document: &str) -> Result<IntelTdxDcapCollateral, String> {
+    let collateral: Collateral = serde_json::from_str(document)
+        .map_err(|error| format!("parse Automata dcap-rs Collateral JSON: {error}"))?;
+    let root_ca_crl_der = collateral
+        .root_ca_crl
+        .to_der()
+        .map_err(|error| format!("encode Intel root CA CRL as DER: {error}"))?;
+    let pck_crl_der = collateral
+        .pck_crl
+        .to_der()
+        .map_err(|error| format!("encode Intel PCK CRL as DER: {error}"))?;
+    let issuer_chain = collateral
+        .tcb_info_and_qe_identity_issuer_chain
+        .iter()
+        .map(|certificate| {
+            certificate
+                .to_pem(x509_cert::der::pem::LineEnding::LF)
+                .map_err(|error| format!("encode Intel collateral issuer certificate: {error}"))
+        })
+        .collect::<Result<String, String>>()?;
+    let tcb_info_json = serde_json::to_string(&collateral.tcb_info)
+        .map_err(|error| format!("encode Intel TCB info JSON: {error}"))?;
+    let qe_identity_json = serde_json::to_string(&collateral.qe_identity)
+        .map_err(|error| format!("encode Intel QE identity JSON: {error}"))?;
+
+    IntelTdxDcapCollateral::new(
+        root_ca_crl_der,
+        pck_crl_der,
+        issuer_chain,
+        tcb_info_json,
+        qe_identity_json,
+    )
+}
+
+fn issuer_chains_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+
+    let Ok(left_certificates) = pem::parse_many(left) else {
+        return false;
+    };
+    let Ok(right_certificates) = pem::parse_many(right) else {
+        return false;
+    };
+
+    !left_certificates.is_empty()
+        && left_certificates.len() == right_certificates.len()
+        && left_certificates
+            .iter()
+            .zip(&right_certificates)
+            .all(|(left, right)| left.contents() == right.contents())
 }
 
 fn normalized_pcs_base_url(url: &str) -> String {
@@ -363,21 +371,6 @@ fn normalized_pcs_base_url(url: &str) -> String {
 
 fn parse_address(address: &str, label: &str) -> Result<Address, String> {
     Address::from_str(address).map_err(|error| format!("parse {label} address {address}: {error}"))
-}
-
-fn pem_chain_from_der(certificates: &[Vec<u8>]) -> Result<String, String> {
-    if certificates.is_empty() {
-        return Err("cannot build a PEM chain from no certificates".to_string());
-    }
-    Ok(certificates
-        .iter()
-        .map(|certificate| {
-            pem::encode(&pem::Pem::new(
-                "CERTIFICATE".to_string(),
-                certificate.clone(),
-            ))
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -397,14 +390,22 @@ mod tests {
     }
 
     #[test]
-    fn splits_signed_intel_document() {
-        let (body, signature) = split_signed_document(
-            r#"{"tcbInfo":{"version":3,"id":"TDX"},"signature":"0x0102"}"#,
-            "tcbInfo",
-        )
-        .expect("split signed document");
-        assert_eq!(body, r#"{"version":3,"id":"TDX"}"#);
-        assert_eq!(signature, vec![1, 2]);
+    fn rejects_the_former_quote_collateral_v3_json_shape() {
+        let legacy = serde_json::json!({
+            "pck_crl_issuer_chain": "pck",
+            "root_ca_crl": [1, 2],
+            "pck_crl": [3, 4],
+            "tcb_info_issuer_chain": "issuer",
+            "tcb_info": "{}",
+            "tcb_info_signature": [5, 6],
+            "qe_identity_issuer_chain": "issuer",
+            "qe_identity": "{}",
+            "qe_identity_signature": [7, 8]
+        });
+
+        let error = parse_dcap_collateral_json(&legacy.to_string())
+            .expect_err("the former QuoteCollateralV3 JSON shape must not parse");
+        assert!(error.contains("Automata dcap-rs Collateral JSON"));
     }
 
     #[test]
@@ -414,12 +415,6 @@ mod tests {
         let material = quote_material(&quote).expect("extract quote material");
         assert_eq!(material.fmspc.len(), 12);
         assert!(matches!(material.pck_ca, "processor" | "platform"));
-        assert!(material
-            .pck_crl_issuer_chain
-            .contains("-----BEGIN CERTIFICATE-----"));
-        assert!(material
-            .pck_certificate_chain
-            .contains("-----BEGIN CERTIFICATE-----"));
     }
 
     #[test]
@@ -459,7 +454,7 @@ mod tests {
         .await
         .expect("fetch Automata collateral");
         let collateral = collateral
-            .to_automata_collateral()
+            .to_dcap_collateral()
             .expect("convert Automata collateral");
         let mut quote_bytes = quote.as_slice();
         let quote = Quote::read(&mut quote_bytes).expect("parse quote");

@@ -394,6 +394,9 @@ pub struct VerificationInputs {
     pub nonce: [u8; 32],
     pub live_peer_cert_der: Vec<u8>,
     pub response: TlsAttestationResponse,
+    /// Verifier-resolved Intel TDX DCAP collateral. This is separate from the
+    /// portal response because the portal returns local evidence only.
+    pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
     pub measurement_policy: Option<MeasurementPolicy>,
     pub trust_anchors: TrustAnchors,
 }
@@ -1080,7 +1083,7 @@ fn verify_tls_attestation_internal(
             &mut errors,
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
-            &inputs.response.collateral,
+            inputs.intel_tdx_dcap_collateral.as_ref(),
             verification_core::AmdSnpTrust {
                 ark_roots: &inputs.trust_anchors.amd_ark_roots,
                 ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
@@ -1108,7 +1111,7 @@ fn verify_tls_attestation_internal(
                                 &mut report,
                                 &mut errors,
                                 Some(evidence),
-                                &inputs.response.collateral,
+                                inputs.intel_tdx_dcap_collateral.as_ref(),
                                 current_time,
                             );
                     }
@@ -3154,6 +3157,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3405,6 +3409,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response,
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(measurement_policy_for_platform(
                     &pcr,
                     "gcp",
@@ -3477,6 +3482,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         })
@@ -3500,6 +3506,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_root_hashes: vec![gcp_root_hash],
@@ -3531,6 +3538,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3557,6 +3565,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3576,6 +3585,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3602,6 +3612,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3626,6 +3637,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response,
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(policy),
                 trust_anchors: TrustAnchors {
                     gcp_roots,
@@ -3661,6 +3673,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_platform(
                 &pcr,
                 "gcp",
@@ -3697,6 +3710,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3718,6 +3732,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3756,6 +3771,7 @@ mod tests {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response,
+                intel_tdx_dcap_collateral: None,
                 measurement_policy: Some(policy),
                 trust_anchors: TrustAnchors {
                     gcp_roots,
@@ -3793,6 +3809,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3833,6 +3850,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3913,6 +3931,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3953,6 +3972,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -3981,6 +4001,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4004,6 +4025,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4027,6 +4049,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4050,6 +4073,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4074,6 +4098,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4096,6 +4121,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4119,6 +4145,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4141,6 +4168,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4163,6 +4191,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(48)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4276,6 +4305,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4303,6 +4333,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4328,6 +4359,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4355,6 +4387,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4399,6 +4432,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4434,6 +4468,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4469,6 +4504,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4520,6 +4556,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(&pcr, "azure")),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key.clone()],
@@ -4542,6 +4579,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key],
@@ -4897,6 +4935,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_platform(
                 &pcr,
                 "azure",
@@ -4934,6 +4973,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key],
@@ -5449,6 +5489,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -5492,6 +5533,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -5521,6 +5563,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -5539,6 +5582,7 @@ mod tests {
             nonce: [2u8; 32],
             live_peer_cert_der: b"cert-b".to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -5556,6 +5600,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -5575,6 +5620,7 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });

@@ -1,92 +1,49 @@
 use dcap_rs::types::collateral::Collateral;
-use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 
-/// Stable JSON form used in `collateral.gcpTdxDcap`.
+/// Parsed source material for Intel TDX DCAP quote verification.
 ///
-/// This keeps the field names and byte-array encoding used by
-/// `dcap_qvl::QuoteCollateralV3`. Existing collateral files therefore remain
-/// valid after the verifier moves to Automata's `dcap-rs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TdxDcapCollateral {
-    pub pck_crl_issuer_chain: String,
-    #[serde(with = "serde_bytes")]
-    pub root_ca_crl: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub pck_crl: Vec<u8>,
-    pub tcb_info_issuer_chain: String,
-    pub tcb_info: String,
-    #[serde(with = "serde_bytes")]
-    pub tcb_info_signature: Vec<u8>,
-    pub qe_identity_issuer_chain: String,
-    pub qe_identity: String,
-    #[serde(with = "serde_bytes")]
-    pub qe_identity_signature: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pck_certificate_chain: Option<String>,
+/// This type is an in-process verifier input. It is not part of the portal
+/// response wire format. The portal returns only the raw Intel TDQUOTE.
+#[derive(Debug, Clone)]
+pub struct IntelTdxDcapCollateral {
+    root_ca_crl_der: Vec<u8>,
+    pck_crl_der: Vec<u8>,
+    tcb_info_and_qe_identity_issuer_chain_pem: String,
+    tcb_info_json: String,
+    qe_identity_json: String,
 }
 
-impl TdxDcapCollateral {
-    /// Convert the stable transport form into Automata's verifier input.
-    pub fn to_automata_collateral(&self) -> Result<Collateral, String> {
-        if !issuer_chains_match(&self.tcb_info_issuer_chain, &self.qe_identity_issuer_chain) {
-            return Err(
-                "TCB info and QE identity issuer chains differ; Automata dcap-rs requires one shared issuer chain"
-                    .to_string(),
-            );
-        }
+impl IntelTdxDcapCollateral {
+    /// Validate and retain the five inputs required by Automata `dcap-rs`.
+    pub fn new(
+        root_ca_crl_der: Vec<u8>,
+        pck_crl_der: Vec<u8>,
+        tcb_info_and_qe_identity_issuer_chain_pem: String,
+        tcb_info_json: String,
+        qe_identity_json: String,
+    ) -> Result<Self, String> {
+        let collateral = Self {
+            root_ca_crl_der,
+            pck_crl_der,
+            tcb_info_and_qe_identity_issuer_chain_pem,
+            tcb_info_json,
+            qe_identity_json,
+        };
+        collateral.to_dcap_collateral()?;
+        Ok(collateral)
+    }
 
-        let tcb_info = signed_collateral_json("tcbInfo", &self.tcb_info, &self.tcb_info_signature)?;
-        let qe_identity = signed_collateral_json(
-            "enclaveIdentity",
-            &self.qe_identity,
-            &self.qe_identity_signature,
-        )?;
-
+    /// Build the owned value consumed by Automata `dcap-rs`.
+    pub fn to_dcap_collateral(&self) -> Result<Collateral, String> {
         Collateral::new(
-            &self.root_ca_crl,
-            &self.pck_crl,
-            self.tcb_info_issuer_chain.as_bytes(),
-            &tcb_info,
-            &qe_identity,
+            &self.root_ca_crl_der,
+            &self.pck_crl_der,
+            self.tcb_info_and_qe_identity_issuer_chain_pem.as_bytes(),
+            &self.tcb_info_json,
+            &self.qe_identity_json,
         )
-        .map_err(|error| format!("build Automata DCAP collateral: {error:#}"))
+        .map_err(|error| format!("build Intel TDX DCAP collateral: {error:#}"))
     }
-}
-
-fn signed_collateral_json(
-    body_field: &'static str,
-    body: &str,
-    signature: &[u8],
-) -> Result<String, String> {
-    let _: &RawValue = serde_json::from_str(body)
-        .map_err(|error| format!("{body_field} is not valid JSON: {error}"))?;
-    let body_field = serde_json::to_string(body_field)
-        .map_err(|error| format!("serialize {body_field} field name: {error}"))?;
-    Ok(format!(
-        "{{{body_field}:{body},\"signature\":\"{}\"}}",
-        hex::encode(signature)
-    ))
-}
-
-fn issuer_chains_match(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
-    }
-
-    let Ok(left_certificates) = pem::parse_many(left) else {
-        return false;
-    };
-    let Ok(right_certificates) = pem::parse_many(right) else {
-        return false;
-    };
-
-    !left_certificates.is_empty()
-        && left_certificates.len() == right_certificates.len()
-        && left_certificates
-            .iter()
-            .zip(&right_certificates)
-            .all(|(left, right)| left.contents() == right.contents())
 }
 
 #[cfg(test)]
@@ -94,65 +51,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_quote_collateral_v3_json_shape() {
-        let collateral = TdxDcapCollateral {
-            pck_crl_issuer_chain: "pck".to_string(),
-            root_ca_crl: vec![1, 2],
-            pck_crl: vec![3, 4],
-            tcb_info_issuer_chain: "issuer".to_string(),
-            tcb_info: "{}".to_string(),
-            tcb_info_signature: vec![5, 6],
-            qe_identity_issuer_chain: "issuer".to_string(),
-            qe_identity: "{}".to_string(),
-            qe_identity_signature: vec![7, 8],
-            pck_certificate_chain: Some("pck-chain".to_string()),
-        };
+    fn rejects_invalid_dcap_source_material() {
+        let error = IntelTdxDcapCollateral::new(
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            "{}".to_string(),
+            "{}".to_string(),
+        )
+        .expect_err("empty DCAP source material must fail");
 
-        let value = serde_json::to_value(collateral).expect("serialize collateral");
-        assert_eq!(value["root_ca_crl"], serde_json::json!([1, 2]));
-        assert_eq!(value["pck_crl"], serde_json::json!([3, 4]));
-        assert_eq!(value["tcb_info_signature"], serde_json::json!([5, 6]));
-        assert_eq!(value["qe_identity_signature"], serde_json::json!([7, 8]));
-        assert_eq!(value["pck_certificate_chain"], "pck-chain");
-    }
-
-    #[test]
-    fn rejects_different_signed_collateral_issuer_chains() {
-        let collateral = TdxDcapCollateral {
-            pck_crl_issuer_chain: String::new(),
-            root_ca_crl: Vec::new(),
-            pck_crl: Vec::new(),
-            tcb_info_issuer_chain: "tcb".to_string(),
-            tcb_info: "{}".to_string(),
-            tcb_info_signature: Vec::new(),
-            qe_identity_issuer_chain: "qe".to_string(),
-            qe_identity: "{}".to_string(),
-            qe_identity_signature: Vec::new(),
-            pck_certificate_chain: None,
-        };
-
-        assert!(collateral.to_automata_collateral().is_err());
-    }
-
-    #[test]
-    fn accepts_equivalent_issuer_chain_text() {
-        let certificate = pem::encode(&pem::Pem::new("CERTIFICATE", vec![1, 2, 3]));
-        let windows_line_endings = certificate.replace('\n', "\r\n");
-
-        assert!(issuer_chains_match(&certificate, &windows_line_endings));
-    }
-
-    #[test]
-    fn preserves_signed_collateral_body_bytes() {
-        let body = r#"{"version":3,"id":"TDX","issueDate":"2026-07-02T03:30:39Z"}"#;
-        let signed =
-            signed_collateral_json("tcbInfo", body, &[1, 2]).expect("build signed collateral");
-        assert_eq!(
-            signed,
-            concat!(
-                r#"{"tcbInfo":{"version":3,"id":"TDX","issueDate":"2026-07-02T03:30:39Z"},"#,
-                r#""signature":"0102"}"#
-            )
-        );
+        assert!(error.contains("build Intel TDX DCAP collateral"));
     }
 }

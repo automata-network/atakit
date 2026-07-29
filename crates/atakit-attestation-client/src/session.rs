@@ -5,10 +5,11 @@ use std::path::PathBuf;
 pub use crate::TrustedWorkloadSessionPolicy;
 use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
-    verify_session_bundle, AzureMaaTrustKey, BindingMode, CertificateTrust, SessionAttribute,
-    SessionEvidenceBundle, SessionPcrPolicy, SessionPcrVerifyType, SessionPlatformTrust,
-    SessionRequestBinding, SessionTrust, SessionVerificationInputs, TrustedSessionBinding,
-    TrustedSessionPolicy, VerificationReport, VerifiedSession, VerifiedTlsIdentity,
+    verify_session_bundle, AzureMaaTrustKey, BindingMode, CertificateTrust, IntelTdxDcapCollateral,
+    SessionAttribute, SessionEvidenceBundle, SessionPcrPolicy, SessionPcrVerifyType,
+    SessionPlatformTrust, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
+    TrustedSessionBinding, TrustedSessionPolicy, VerificationReport, VerifiedSession,
+    VerifiedTlsIdentity,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -29,7 +30,7 @@ pub struct PortalSessionVerificationContext {
     pub chain_client: Option<AttestationClient>,
     pub manual_azure_maa_keys: Vec<Vec<u8>>,
     pub azure_snp_cert_table: Option<Vec<u8>>,
-    pub tdx_dcap_collateral: Option<serde_json::Value>,
+    pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
 }
 
 /// Portal TLS connection and the independently verified identity bound to it.
@@ -206,7 +207,7 @@ fn build_session_trust(
                 &context.trust_anchors.gcp_roots,
                 &context.trust_anchors.gcp_root_hashes,
             ),
-            dcap_collateral: context.tdx_dcap_collateral.clone().ok_or_else(|| {
+            dcap_collateral: context.intel_tdx_dcap_collateral.clone().ok_or_else(|| {
                 session_error("verified TLS context has no GCP TDX DCAP collateral")
             })?,
         },
@@ -223,7 +224,7 @@ fn build_session_trust(
         },
         ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
             maa_signing_keys: committed_maa_keys,
-            dcap_collateral: context.tdx_dcap_collateral.clone().ok_or_else(|| {
+            dcap_collateral: context.intel_tdx_dcap_collateral.clone().ok_or_else(|| {
                 session_error("verified TLS context has no Azure TDX DCAP collateral")
             })?,
         },

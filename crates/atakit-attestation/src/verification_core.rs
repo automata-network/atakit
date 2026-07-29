@@ -558,7 +558,7 @@ pub(super) fn verify_gcp_tee_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     tee: &str,
-    collateral: &serde_json::Value,
+    tdx_dcap_collateral: Option<&IntelTdxDcapCollateral>,
     amd_snp_trust: AmdSnpTrust<'_>,
     current_time: SystemTime,
 ) -> Option<u16> {
@@ -575,7 +575,13 @@ pub(super) fn verify_gcp_tee_vendor_report(
             );
             None
         }
-        "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral, current_time),
+        "tdx" => verify_gcp_tdx_vendor_report(
+            report,
+            errors,
+            evidence,
+            tdx_dcap_collateral,
+            current_time,
+        ),
         other => {
             fail(
                 report,
@@ -592,7 +598,7 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    collateral: &serde_json::Value,
+    collateral: Option<&IntelTdxDcapCollateral>,
     verification_time: SystemTime,
 ) -> Option<u16> {
     verify_tdx_vendor_report(
@@ -610,7 +616,7 @@ pub(super) fn verify_azure_tdx_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    collateral: &serde_json::Value,
+    collateral: Option<&IntelTdxDcapCollateral>,
     verification_time: SystemTime,
 ) -> Option<u16> {
     verify_tdx_vendor_report(
@@ -628,7 +634,7 @@ fn verify_tdx_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    collateral: &serde_json::Value,
+    collateral: Option<&IntelTdxDcapCollateral>,
     check_name: &str,
     provider_name: &str,
     verification_time: SystemTime,
@@ -668,12 +674,14 @@ fn verify_tdx_vendor_report(
         );
         return None;
     }
-    let collateral = match parse_tdx_dcap_collateral(collateral) {
-        Ok(collateral) => collateral,
-        Err(detail) => {
-            fail(report, errors, check_name, detail);
-            return None;
-        }
+    let Some(collateral) = collateral else {
+        fail(
+            report,
+            errors,
+            check_name,
+            format!("{provider_name} TDX DCAP collateral is missing"),
+        );
+        return None;
     };
     let mut quote_bytes = raw_quote.as_slice();
     let quote = match dcap_rs::types::quote::Quote::read(&mut quote_bytes) {
@@ -713,7 +721,7 @@ fn verify_tdx_vendor_report(
         );
         return None;
     }
-    let collateral = match collateral.to_automata_collateral() {
+    let collateral = match collateral.to_dcap_collateral() {
         Ok(collateral) => collateral,
         Err(error) => {
             fail(report, errors, check_name, error);
@@ -760,17 +768,6 @@ fn tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
     policy.with_tdx_tcb_revocation_policy(
         dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,
     )
-}
-
-pub(super) fn parse_tdx_dcap_collateral(
-    collateral: &serde_json::Value,
-) -> std::result::Result<TdxDcapCollateral, String> {
-    let value = collateral.get("gcpTdxDcap").unwrap_or(collateral);
-    if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
-        return Err("TDX DCAP collateral is missing; expected collateral.gcpTdxDcap".to_string());
-    }
-    serde_json::from_value(value.clone())
-        .map_err(|e| format!("TDX DCAP collateral did not parse: {e}"))
 }
 
 pub(super) fn verify_gcp_snp_vendor_report(

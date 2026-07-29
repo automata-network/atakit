@@ -9,8 +9,8 @@ use atakit_attestation::{
     amd_snp_vcek_cert_table, amd_snp_vcek_request, select_azure_maa_manual_trust_key,
     verify_measurement_pack, verify_tls_attestation,
     verify_tls_attestation_with_workload_attributes, AkBinding, AzureMaaTrustKey, CheckResult,
-    EvidenceSummary, MeasurementPolicy, TdxDcapCollateral, TlsAttestationResponse, TrustAnchors,
-    VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    EvidenceSummary, IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse,
+    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -24,7 +24,10 @@ use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::error::CloudError;
-use crate::tdx_dcap::{fetch_automata_collateral, fetch_http_collateral, AutomataPccsOverrides};
+use crate::tdx_dcap::{
+    fetch_automata_collateral, fetch_http_collateral, parse_dcap_collateral_json,
+    AutomataPccsOverrides,
+};
 
 pub const INIT_SCHEMA_VERSION: u32 = 2;
 pub const PORTAL_READINESS_TIMEOUT_SECONDS: u64 = 300;
@@ -74,21 +77,21 @@ pub struct InitConfig {
 
 /// Verifier-side source for Intel TDX DCAP collateral.
 #[derive(Debug, Clone, Default)]
-pub struct TdxDcapCollateralConfig {
-    pub source: TdxDcapCollateralSource,
+pub struct IntelTdxDcapCollateralConfig {
+    pub source: IntelTdxDcapCollateralSource,
 }
 
 #[derive(Debug, Clone, Default)]
-pub enum TdxDcapCollateralSource {
-    /// Do not fetch collateral before verification. If the endpoint response
-    /// does not already carry collateral, GCP TDX verification fails closed.
-    /// This is retained for internal callers; the CLI defaults to Automata
-    /// on-chain PCCS for GCP TDX.
+pub enum IntelTdxDcapCollateralSource {
+    /// Do not resolve collateral before verification. Intel TDX verification
+    /// then fails closed. This is retained for internal callers; the CLI
+    /// defaults to Automata on-chain PCCS.
     #[default]
     None,
-    /// Load a `TdxDcapCollateral` JSON document from disk.
+    /// Load an Automata `dcap_rs::types::collateral::Collateral` JSON
+    /// document from disk.
     File(PathBuf),
-    /// Fetch `TdxDcapCollateral` from a direct HTTP PCCS/PCS endpoint.
+    /// Fetch Intel TDX DCAP collateral from a direct HTTP PCCS/PCS endpoint.
     HttpPccs { url: String },
     /// Read collateral through Automata's on-chain PCCS contracts.
     ///
@@ -148,7 +151,7 @@ pub fn tdx_dcap_collateral_config(
     pccs_url: Option<String>,
     automata_collateral_rpc_url: Option<String>,
     automata_pcs_dao: Option<String>,
-) -> Result<TdxDcapCollateralConfig, CloudError> {
+) -> Result<IntelTdxDcapCollateralConfig, CloudError> {
     tdx_dcap_collateral_config_with_read_strategy(
         collateral_file,
         pccs_url,
@@ -166,7 +169,7 @@ pub fn tdx_dcap_collateral_config_with_read_strategy(
     automata_collateral_rpc_url: Option<String>,
     automata_pcs_dao: Option<String>,
     automata_read_strategy: TdxDcapAutomataReadStrategy,
-) -> Result<TdxDcapCollateralConfig, CloudError> {
+) -> Result<IntelTdxDcapCollateralConfig, CloudError> {
     let non_default_automata_strategy =
         automata_read_strategy != TdxDcapAutomataReadStrategy::DirectConcurrent;
     let selected = usize::from(collateral_file.is_some())
@@ -182,11 +185,11 @@ pub fn tdx_dcap_collateral_config_with_read_strategy(
         });
     }
     let source = if let Some(path) = collateral_file {
-        TdxDcapCollateralSource::File(path)
+        IntelTdxDcapCollateralSource::File(path)
     } else if let Some(url) = pccs_url {
-        TdxDcapCollateralSource::HttpPccs { url }
+        IntelTdxDcapCollateralSource::HttpPccs { url }
     } else if automata_collateral_rpc_url.is_some() || automata_pcs_dao.is_some() {
-        TdxDcapCollateralSource::AutomataOnchainPccs {
+        IntelTdxDcapCollateralSource::AutomataOnchainPccs {
             chain: Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN.to_string()),
             rpc_url: automata_collateral_rpc_url,
             pcs_dao: automata_pcs_dao,
@@ -196,7 +199,7 @@ pub fn tdx_dcap_collateral_config_with_read_strategy(
             read_strategy: automata_read_strategy,
         }
     } else {
-        TdxDcapCollateralSource::AutomataOnchainPccs {
+        IntelTdxDcapCollateralSource::AutomataOnchainPccs {
             chain: Some(DEFAULT_TDX_DCAP_AUTOMATA_CHAIN.to_string()),
             rpc_url: Some(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL.to_string()),
             pcs_dao: None,
@@ -206,7 +209,7 @@ pub fn tdx_dcap_collateral_config_with_read_strategy(
             read_strategy: automata_read_strategy,
         }
     };
-    Ok(TdxDcapCollateralConfig { source })
+    Ok(IntelTdxDcapCollateralConfig { source })
 }
 
 /// Parse the CLI values for the Automata on-chain read strategy.
@@ -783,7 +786,7 @@ pub async fn bootstrap_portal_tls(
     status_port: u16,
     measurement_policy: Option<MeasurementPolicy>,
     trust_anchors: TrustAnchors,
-    tdx_dcap_collateral: TdxDcapCollateralConfig,
+    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, CloudError> {
@@ -812,7 +815,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
     mut trust_anchors: TrustAnchors,
     azure_maa_trust: AzureMaaTrustConfig,
-    tdx_dcap_collateral: TdxDcapCollateralConfig,
+    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, CloudError> {
@@ -904,22 +907,26 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     // key that signed the retained session MAA JWT.
     let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
 
-    if let Err(detail) = resolve_tdx_dcap_collateral(&mut response, &tdx_dcap_collateral).await {
-        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-        let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report = tls_preverification_failure_report(
-            &response,
-            &live_hash,
-            "tdx-dcap-collateral",
-            detail,
-        );
-        return handle_tls_attestation_failure(
-            report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-        );
-    }
+    let intel_tdx_dcap_collateral =
+        match resolve_tdx_dcap_collateral(&response, &tdx_dcap_collateral).await {
+            Ok(collateral) => collateral,
+            Err(detail) => {
+                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+                let live_hash = format!("0x{}", hex::encode(live_sha));
+                let report = tls_preverification_failure_report(
+                    &response,
+                    &live_hash,
+                    "tdx-dcap-collateral",
+                    detail,
+                );
+                return handle_tls_attestation_failure(
+                    report,
+                    live_peer_cert_der,
+                    trust_tls_cert_sha256,
+                    report_path,
+                );
+            }
+        };
 
     if let Err(detail) =
         resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await
@@ -1013,12 +1020,13 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 chain_client: session_chain_client.clone(),
                 manual_azure_maa_keys: manual_azure_maa_keys.clone(),
                 azure_snp_cert_table: azure_snp_cert_table.clone(),
-                tdx_dcap_collateral: response.collateral.get("gcpTdxDcap").cloned(),
+                intel_tdx_dcap_collateral: intel_tdx_dcap_collateral.clone(),
             });
     let verification_inputs = VerificationInputs {
         nonce,
         live_peer_cert_der: live_peer_cert_der.clone(),
         response,
+        intel_tdx_dcap_collateral,
         measurement_policy,
         trust_anchors,
     };
@@ -1048,34 +1056,22 @@ pub async fn bootstrap_portal_tls_with_trust_config(
 }
 
 async fn resolve_tdx_dcap_collateral(
-    response: &mut TlsAttestationResponse,
-    config: &TdxDcapCollateralConfig,
-) -> Result<(), String> {
-    if !is_tdx(response) || has_tdx_dcap_collateral(&response.collateral) {
-        return Ok(());
+    response: &TlsAttestationResponse,
+    config: &IntelTdxDcapCollateralConfig,
+) -> Result<Option<IntelTdxDcapCollateral>, String> {
+    if !is_tdx(response) {
+        return Ok(None);
     }
     let collateral = match &config.source {
-        TdxDcapCollateralSource::None => return Ok(()),
-        TdxDcapCollateralSource::File(path) => {
+        IntelTdxDcapCollateralSource::None => return Ok(None),
+        IntelTdxDcapCollateralSource::File(path) => {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| format!("read TDX DCAP collateral file {}: {e}", path.display()))?;
-            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-                format!(
-                    "parse TDX DCAP collateral file {} as JSON: {e}",
-                    path.display()
-                )
-            })?;
-            let collateral_value = value.get("gcpTdxDcap").unwrap_or(&value).clone();
-            let _: TdxDcapCollateral =
-                serde_json::from_value(collateral_value.clone()).map_err(|e| {
-                    format!(
-                        "parse TDX DCAP collateral file {} as TdxDcapCollateral: {e}",
-                        path.display()
-                    )
-                })?;
-            collateral_value
+            parse_dcap_collateral_json(&raw).map_err(|error| {
+                format!("parse TDX DCAP collateral file {}: {error}", path.display())
+            })?
         }
-        TdxDcapCollateralSource::HttpPccs { url } => {
+        IntelTdxDcapCollateralSource::HttpPccs { url } => {
             let evidence = response
                 .tee_evidence
                 .as_ref()
@@ -1083,14 +1079,11 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for DCAP collateral fetch: {e}"))?;
-            serde_json::to_value(
-                fetch_http_collateral(url, &quote)
-                    .await
-                    .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?,
-            )
-            .map_err(|e| format!("serialize TDX DCAP collateral from {url}: {e}"))?
+            fetch_http_collateral(url, &quote)
+                .await
+                .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?
         }
-        TdxDcapCollateralSource::AutomataOnchainPccs {
+        IntelTdxDcapCollateralSource::AutomataOnchainPccs {
             chain,
             rpc_url,
             pcs_dao,
@@ -1110,7 +1103,7 @@ async fn resolve_tdx_dcap_collateral(
             let quote = URL_SAFE_NO_PAD
                 .decode(&evidence.report)
                 .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
-            let collateral = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_secs(180),
                 fetch_automata_collateral(
                     rpc_url,
@@ -1131,15 +1124,10 @@ async fn resolve_tdx_dcap_collateral(
                     "fetch TDX DCAP collateral from Automata {chain}: timed out after 180 seconds"
                 )
             })?
-            .map_err(|e| format!("fetch TDX DCAP collateral from Automata {chain}: {e}"))?;
-            serde_json::to_value(collateral)
-                .map_err(|e| format!("serialize Automata {chain} DCAP collateral: {e}"))?
+            .map_err(|e| format!("fetch TDX DCAP collateral from Automata {chain}: {e}"))?
         }
     };
-    let mut object = response.collateral.as_object().cloned().unwrap_or_default();
-    object.insert("gcpTdxDcap".to_string(), collateral);
-    response.collateral = serde_json::Value::Object(object);
-    Ok(())
+    Ok(Some(collateral))
 }
 
 async fn resolve_azure_maa_trust(
@@ -1576,12 +1564,6 @@ fn is_azure_maa_response(response: &TlsAttestationResponse) -> bool {
 fn is_zero_eth_address(value: &str) -> bool {
     let raw = value.trim().strip_prefix("0x").unwrap_or(value.trim());
     raw.len() == 40 && raw.bytes().all(|byte| byte == b'0')
-}
-
-fn has_tdx_dcap_collateral(collateral: &serde_json::Value) -> bool {
-    collateral
-        .get("gcpTdxDcap")
-        .is_some_and(|value| !value.is_null() && !value.as_object().is_some_and(|o| o.is_empty()))
 }
 
 fn tls_preverification_failure_report(
@@ -2218,7 +2200,7 @@ mod tests {
     fn automata_pccs_default_config_defers_versioned_daos_to_tcb_eval() {
         let cfg = tdx_dcap_collateral_config(None, None, None, None).expect("collateral config");
         match cfg.source {
-            TdxDcapCollateralSource::AutomataOnchainPccs {
+            IntelTdxDcapCollateralSource::AutomataOnchainPccs {
                 chain,
                 rpc_url,
                 pcs_dao,
