@@ -1266,6 +1266,7 @@ dependencies = [
  "sha3",
  "signature",
  "thiserror 2.0.18",
+ "x509-cert",
  "x509-parser 0.16.0",
 ]
 
@@ -1348,6 +1349,7 @@ dependencies = [
  "k256",
  "pccs-reader-rs",
  "pem",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
