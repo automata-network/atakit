@@ -204,7 +204,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &init_config.chain,
         )
         .await?;
-        let tls_trust_anchors = init::load_tls_trust_anchors(
+        let tls_verification_trust = init::load_tls_verification_trust(
             &args.gcp_ak_root_cert,
             &args.azure_maa_key,
             &args.amd_ark_root_cert,
@@ -229,7 +229,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             status_port,
             measurement_policy,
             Some(workload_attributes),
-            tls_trust_anchors,
+            tls_verification_trust,
             init::azure_maa_trust_config_from_init_chain(&init_config.chain),
             tdx_dcap_collateral,
             args.trust_tls_cert_sha256.as_deref(),

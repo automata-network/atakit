@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use signature::{hazmat::PrehashVerifier, Verifier};
 
-use crate::IntelTdxDcapCollateral;
+use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral};
 
 const SESSION_DOMAIN: &str = "CVM_SESSION_V1";
 const KEY_DOMAIN: &str = "KEY_RESOLVER_V1";
@@ -225,7 +225,7 @@ pub enum SessionPlatformTrust {
     GcpSnp {
         gcp_ak_roots: CertificateTrust,
         amd_ark_roots: CertificateTrust,
-        amd_snp_crls: Vec<Vec<u8>>,
+        amd_snp_collateral: AmdSnpVerificationCollateral,
     },
     AzureTdx {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
@@ -234,9 +234,7 @@ pub enum SessionPlatformTrust {
     AzureSnp {
         maa_signing_keys: Vec<AzureMaaTrustKey>,
         amd_ark_roots: CertificateTrust,
-        amd_snp_crls: Vec<Vec<u8>>,
-        /// AMD SNP ARK/ASK/VCEK or VLEK certificate table for this report.
-        snp_cert_table: Vec<u8>,
+        amd_snp_collateral: AmdSnpVerificationCollateral,
     },
     AwsSnp {
         aws_nitro_roots: CertificateTrust,
@@ -526,7 +524,7 @@ fn verify_platform_attestation(
         SessionPlatformTrust::GcpSnp {
             gcp_ak_roots,
             amd_ark_roots,
-            amd_snp_crls,
+            amd_snp_collateral,
         } => {
             if !require_platform(bundle, "gcp", "sev-snp", checks, errors) {
                 return None;
@@ -534,7 +532,7 @@ fn verify_platform_attestation(
             verify_gcp_platform(
                 bundle,
                 gcp_ak_roots,
-                Some((amd_ark_roots, amd_snp_crls.as_slice())),
+                Some((amd_ark_roots, amd_snp_collateral)),
                 None,
                 current_time,
                 checks,
@@ -561,8 +559,7 @@ fn verify_platform_attestation(
         SessionPlatformTrust::AzureSnp {
             maa_signing_keys,
             amd_ark_roots,
-            amd_snp_crls,
-            snp_cert_table,
+            amd_snp_collateral,
         } => {
             if !require_platform(bundle, "azure", "sev-snp", checks, errors) {
                 return None;
@@ -572,8 +569,7 @@ fn verify_platform_attestation(
                 maa_signing_keys,
                 Some(AzureSnpTrust {
                     amd_ark_roots,
-                    amd_snp_crls,
-                    snp_cert_table,
+                    amd_snp_collateral,
                 }),
                 None,
                 current_time,
@@ -618,7 +614,7 @@ fn require_platform(
 fn verify_gcp_platform(
     bundle: &SessionEvidenceBundle,
     gcp_ak_roots: &CertificateTrust,
-    amd_snp_trust: Option<(&CertificateTrust, &[Vec<u8>])>,
+    amd_snp_trust: Option<(&CertificateTrust, &AmdSnpVerificationCollateral)>,
     dcap_collateral: Option<&IntelTdxDcapCollateral>,
     current_time: SystemTime,
     checks: &mut Vec<SessionVerificationCheck>,
@@ -711,14 +707,16 @@ fn verify_gcp_platform(
         &pcrs,
     );
     let tdx_tcb_status_bit = match (amd_snp_trust, dcap_collateral) {
-        (Some((amd, crls)), None) => {
+        (Some((amd, collateral)), None) => {
             super::verification_core::verify_gcp_snp_vendor_report(
                 &mut report,
                 &mut core_errors,
                 Some(&tee_evidence),
-                &amd.certificates,
-                &amd.keccak256_hashes,
-                crls,
+                Some(collateral),
+                super::verification_core::AmdSnpTrust {
+                    ark_roots: &amd.certificates,
+                    ark_root_hashes: &amd.keccak256_hashes,
+                },
                 current_time,
             );
             None
@@ -747,8 +745,7 @@ fn verify_gcp_platform(
 
 struct AzureSnpTrust<'a> {
     amd_ark_roots: &'a CertificateTrust,
-    amd_snp_crls: &'a [Vec<u8>],
-    snp_cert_table: &'a [u8],
+    amd_snp_collateral: &'a AmdSnpVerificationCollateral,
 }
 
 fn verify_azure_platform(
@@ -807,18 +804,14 @@ fn verify_azure_platform(
     );
     let tdx_tcb_status_bit = match (snp_trust, dcap_collateral) {
         (Some(snp_trust), None) => {
-            let collateral = serde_json::json!({
-                "azureSnpCertTable": URL_SAFE_NO_PAD.encode(snp_trust.snp_cert_table)
-            });
             super::verification_core::verify_azure_snp_vendor_report(
                 &mut report,
                 &mut core_errors,
                 Some(&tee_evidence),
-                &collateral,
+                Some(snp_trust.amd_snp_collateral),
                 super::verification_core::AmdSnpTrust {
                     ark_roots: &snp_trust.amd_ark_roots.certificates,
                     ark_root_hashes: &snp_trust.amd_ark_roots.keccak256_hashes,
-                    crls: snp_trust.amd_snp_crls,
                 },
                 current_time,
             );
@@ -3319,11 +3312,16 @@ mod tests {
         let mut checks = Vec::new();
         let mut errors = Vec::new();
         let amd_roots = CertificateTrust::default();
-        let amd_crls = Vec::new();
+        let amd_snp_collateral = AmdSnpVerificationCollateral::from_vcek_chain(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![],
+        );
         verify_gcp_platform(
             &bundle,
             &CertificateTrust::default(),
-            Some((&amd_roots, &amd_crls)),
+            Some((&amd_roots, &amd_snp_collateral)),
             None,
             SystemTime::now(),
             &mut checks,

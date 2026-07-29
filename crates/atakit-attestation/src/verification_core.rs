@@ -550,7 +550,11 @@ pub(super) fn verify_expected_pcr15(
 pub(super) struct AmdSnpTrust<'a> {
     pub(super) ark_roots: &'a [Vec<u8>],
     pub(super) ark_root_hashes: &'a [[u8; 32]],
-    pub(super) crls: &'a [Vec<u8>],
+}
+
+pub(super) struct AmdSnpVerificationContext<'a> {
+    pub(super) collateral: Option<&'a AmdSnpVerificationCollateral>,
+    pub(super) trust: AmdSnpTrust<'a>,
 }
 
 pub(super) fn verify_gcp_tee_vendor_report(
@@ -559,7 +563,7 @@ pub(super) fn verify_gcp_tee_vendor_report(
     evidence: Option<&TeeEvidence>,
     tee: &str,
     tdx_dcap_collateral: Option<&IntelTdxDcapCollateral>,
-    amd_snp_trust: AmdSnpTrust<'_>,
+    amd_snp: AmdSnpVerificationContext<'_>,
     current_time: SystemTime,
 ) -> Option<u16> {
     match tee {
@@ -568,9 +572,8 @@ pub(super) fn verify_gcp_tee_vendor_report(
                 report,
                 errors,
                 evidence,
-                amd_snp_trust.ark_roots,
-                amd_snp_trust.ark_root_hashes,
-                amd_snp_trust.crls,
+                amd_snp.collateral,
+                amd_snp.trust,
                 current_time,
             );
             None
@@ -683,6 +686,15 @@ fn verify_tdx_vendor_report(
         );
         return None;
     };
+    if let Err(error) = collateral.ensure_quote_matches(&raw_quote) {
+        fail(
+            report,
+            errors,
+            check_name,
+            format!("{provider_name} TDX DCAP collateral selection failed: {error}"),
+        );
+        return None;
+    }
     let mut quote_bytes = raw_quote.as_slice();
     let quote = match dcap_rs::types::quote::Quote::read(&mut quote_bytes) {
         Ok(quote) => quote,
@@ -721,16 +733,9 @@ fn verify_tdx_vendor_report(
         );
         return None;
     }
-    let collateral = match collateral.to_dcap_collateral() {
-        Ok(collateral) => collateral,
-        Err(error) => {
-            fail(report, errors, check_name, error);
-            return None;
-        }
-    };
-    match dcap_rs::verify_dcap_quote_with_policy(
+    match dcap_rs::verify_dcap_quote_with_policy_ref(
         verification_time,
-        collateral,
+        collateral.parsed(),
         quote,
         &tdx_dcap_verification_policy(),
     ) {
@@ -774,20 +779,18 @@ pub(super) fn verify_gcp_snp_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    trusted_amd_ark_roots: &[Vec<u8>],
-    trusted_amd_ark_root_hashes: &[[u8; 32]],
-    trusted_amd_snp_crls: &[Vec<u8>],
+    collateral: Option<&AmdSnpVerificationCollateral>,
+    amd_snp_trust: AmdSnpTrust<'_>,
     current_time: SystemTime,
 ) {
-    let auxiliary = evidence.and_then(|evidence| evidence.auxiliary.as_deref());
     verify_snp_vendor_report(
         report,
         errors,
         evidence,
-        auxiliary,
-        trusted_amd_ark_roots,
-        trusted_amd_ark_root_hashes,
-        trusted_amd_snp_crls,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
         current_time,
         "gcp-tee-vendor-report",
         "GCP",
@@ -798,36 +801,29 @@ pub(super) fn verify_azure_snp_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    collateral: &serde_json::Value,
+    collateral: Option<&AmdSnpVerificationCollateral>,
     amd_snp_trust: AmdSnpTrust<'_>,
     current_time: SystemTime,
 ) {
-    let cert_table = collateral
-        .get("azureSnpCertTable")
-        .and_then(serde_json::Value::as_str);
     verify_snp_vendor_report(
         report,
         errors,
         evidence,
-        cert_table,
-        amd_snp_trust.ark_roots,
-        amd_snp_trust.ark_root_hashes,
-        amd_snp_trust.crls,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
         current_time,
         "azure-tee-vendor-report",
         "Azure",
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn verify_snp_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    encoded_cert_table: Option<&str>,
-    trusted_amd_ark_roots: &[Vec<u8>],
-    trusted_amd_ark_root_hashes: &[[u8; 32]],
-    trusted_amd_snp_crls: &[Vec<u8>],
+    amd_snp: AmdSnpVerificationContext<'_>,
     current_time: SystemTime,
     check_name: &str,
     provider_name: &str,
@@ -848,23 +844,16 @@ fn verify_snp_vendor_report(
             return;
         }
     };
-    let Some(encoded_cert_table) = encoded_cert_table else {
+    let Some(collateral) = amd_snp.collateral else {
         fail(
             report,
             errors,
             check_name,
-            format!("{provider_name} SNP certificate table is missing"),
+            format!("{provider_name} SNP verification collateral is missing"),
         );
         return;
     };
-    let auxblob = match decode_b64("SNP certificate table", encoded_cert_table) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            fail(report, errors, check_name, e.to_string());
-            return;
-        }
-    };
-    if trusted_amd_ark_roots.is_empty() && trusted_amd_ark_root_hashes.is_empty() {
+    if amd_snp.trust.ark_roots.is_empty() && amd_snp.trust.ark_root_hashes.is_empty() {
         fail(
             report,
             errors,
@@ -873,14 +862,7 @@ fn verify_snp_vendor_report(
         );
         return;
     }
-    match verify_snp_report_with_aux_certs(
-        current_time,
-        &snp_report,
-        &auxblob,
-        trusted_amd_ark_roots,
-        trusted_amd_ark_root_hashes,
-        trusted_amd_snp_crls,
-    ) {
+    match verify_snp_report_with_collateral(current_time, &snp_report, collateral, amd_snp.trust) {
         Ok(()) => match verified_snp_attribute_states(&snp_report) {
             Ok(_) => pass(report, check_name),
             Err(detail) => fail(report, errors, check_name, detail),
@@ -889,6 +871,7 @@ fn verify_snp_vendor_report(
     }
 }
 
+#[cfg(test)]
 pub(super) fn verify_snp_report_with_aux_certs(
     current_time: SystemTime,
     report: &[u8],
@@ -897,9 +880,31 @@ pub(super) fn verify_snp_report_with_aux_certs(
     trusted_amd_ark_root_hashes: &[[u8; 32]],
     trusted_amd_snp_crls: &[Vec<u8>],
 ) -> std::result::Result<(), String> {
+    let collateral = AmdSnpVerificationCollateral::from_certificate_table(
+        auxblob,
+        trusted_amd_snp_crls.to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    verify_snp_report_with_collateral(
+        current_time,
+        report,
+        &collateral,
+        AmdSnpTrust {
+            ark_roots: trusted_amd_ark_roots,
+            ark_root_hashes: trusted_amd_ark_root_hashes,
+        },
+    )
+}
+
+pub(super) fn verify_snp_report_with_collateral(
+    current_time: SystemTime,
+    report: &[u8],
+    collateral: &AmdSnpVerificationCollateral,
+    trust: AmdSnpTrust<'_>,
+) -> std::result::Result<(), String> {
     if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "GCP SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -912,38 +917,25 @@ pub(super) fn verify_snp_report_with_aux_certs(
     verify_snp_report_policy(report)?;
     let expected_product = amd_snp_kds_product(report)?;
 
-    let certs = parse_amd_snp_cert_table(auxblob)?;
-    let ark = certs
-        .ark
-        .as_deref()
-        .ok_or_else(|| "GCP SNP auxblob missing ARK certificate".to_string())?;
-    let ask = certs
-        .ask
-        .as_deref()
-        .ok_or_else(|| "GCP SNP auxblob missing ASK certificate".to_string())?;
     let signer = snp_signing_key_type(report)?;
-    let vek =
-        match signer {
-            SnpSigningKeyType::Vcek => certs.vcek.as_deref().ok_or_else(|| {
-                "GCP SNP report is VCEK-signed but auxblob lacks VCEK".to_string()
-            })?,
-            SnpSigningKeyType::Vlek => certs.vlek.as_deref().ok_or_else(|| {
-                "GCP SNP report is VLEK-signed but auxblob lacks VLEK".to_string()
-            })?,
-        };
+    let vek = match signer {
+        SnpSigningKeyType::Vcek => collateral
+            .vcek_der
+            .as_deref()
+            .ok_or_else(|| "SNP report is VCEK-signed but collateral lacks VCEK".to_string())?,
+        SnpSigningKeyType::Vlek => collateral
+            .vlek_der
+            .as_deref()
+            .ok_or_else(|| "SNP report is VLEK-signed but collateral lacks VLEK".to_string())?,
+    };
 
     verify_amd_snp_cert_chain(
         current_time,
-        ark,
-        ask,
+        collateral,
         vek,
         signer,
         expected_product,
-        AmdSnpTrust {
-            ark_roots: trusted_amd_ark_roots,
-            ark_root_hashes: trusted_amd_ark_root_hashes,
-            crls: trusted_amd_snp_crls,
-        },
+        trust,
     )?;
     verify_snp_vek_extensions(vek, report, signer)?;
     verify_snp_report_signature(vek, report)?;
@@ -1041,13 +1033,14 @@ pub(super) fn parse_amd_snp_cert_table(
 
 pub(super) fn verify_amd_snp_cert_chain(
     current_time: SystemTime,
-    ark_der: &[u8],
-    ask_der: &[u8],
+    collateral: &AmdSnpVerificationCollateral,
     vek_der: &[u8],
     signer: SnpSigningKeyType,
     expected_product: &str,
     trust: AmdSnpTrust<'_>,
 ) -> std::result::Result<(), String> {
+    let ark_der = &collateral.ark_der;
+    let ask_der = &collateral.ask_der;
     let ark_hash: [u8; 32] = Sha256::digest(ark_der).into();
     if !trust
         .ark_roots
@@ -1110,7 +1103,7 @@ pub(super) fn verify_amd_snp_cert_chain(
     }
     verify_ca_certificate_role(&ask, "SNP ASK", 0)?;
     verify_amd_snp_cert_signature(ask_der, &ask, &ark, "SNP ASK signature")?;
-    verify_amd_snp_crls(&ark, &ask, trust.crls, validation_time)?;
+    verify_amd_snp_crls(&ark, &ask, collateral.crls_der(), validation_time)?;
     if vek.issuer() != ask.subject() {
         return Err("SNP VEK issuer does not match ASK subject".to_string());
     }

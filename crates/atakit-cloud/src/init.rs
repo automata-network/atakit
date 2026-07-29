@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atakit_attestation::{
-    amd_snp_ark_from_cert_table, amd_snp_kds_product, amd_snp_security_state,
-    amd_snp_vcek_cert_table, amd_snp_vcek_request, select_azure_maa_manual_trust_key,
-    verify_measurement_pack, verify_tls_attestation,
-    verify_tls_attestation_with_workload_attributes, AkBinding, AzureMaaTrustKey, CheckResult,
-    EvidenceSummary, IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse,
-    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    amd_snp_kds_product, amd_snp_security_state, amd_snp_vcek_request,
+    select_azure_maa_manual_trust_key, verify_measurement_pack, verify_tls_attestation,
+    verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpVerificationCollateral,
+    AzureMaaTrustKey, CheckResult, EvidenceSummary, IntelTdxDcapCollateral, MeasurementPolicy,
+    TlsAttestationResponse, TrustAnchors, VerificationCheck, VerificationInputs,
+    VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -625,19 +625,28 @@ fn parse_measurement_publisher_keys(values: &[String]) -> Result<Vec<Vec<u8>>, C
     parse_hex_blobs(values, "--measurement-publisher-key")
 }
 
-pub fn load_tls_trust_anchors(
+pub fn load_tls_verification_trust(
     gcp_ak_root_certs: &[String],
     azure_maa_keys: &[String],
     amd_ark_root_certs: &[String],
     amd_snp_crls: &[String],
-) -> Result<TrustAnchors, CloudError> {
-    Ok(TrustAnchors {
-        gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
-        azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
-        amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+) -> Result<TlsVerificationTrust, CloudError> {
+    Ok(TlsVerificationTrust {
+        trust_anchors: TrustAnchors {
+            gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
+            azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
+            amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+            ..TrustAnchors::default()
+        },
         amd_snp_crls: parse_hex_blobs(amd_snp_crls, "--amd-snp-crl")?,
-        ..TrustAnchors::default()
     })
+}
+
+/// Verifier-approved roots and verifier-resolved AMD SEV-SNP revocation data.
+#[derive(Debug, Clone, Default)]
+pub struct TlsVerificationTrust {
+    pub trust_anchors: TrustAnchors,
+    pub amd_snp_crls: Vec<Vec<u8>>,
 }
 
 fn parse_hex_blobs(values: &[String], flag: &str) -> Result<Vec<Vec<u8>>, CloudError> {
@@ -795,7 +804,10 @@ pub async fn bootstrap_portal_tls(
         status_port,
         measurement_policy,
         None,
-        trust_anchors,
+        TlsVerificationTrust {
+            trust_anchors,
+            amd_snp_crls: Vec::new(),
+        },
         AzureMaaTrustConfig::default(),
         tdx_dcap_collateral,
         trust_tls_cert_sha256,
@@ -813,12 +825,16 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     status_port: u16,
     measurement_policy: Option<MeasurementPolicy>,
     workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
-    mut trust_anchors: TrustAnchors,
+    tls_verification_trust: TlsVerificationTrust,
     azure_maa_trust: AzureMaaTrustConfig,
     tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, CloudError> {
+    let TlsVerificationTrust {
+        mut trust_anchors,
+        amd_snp_crls,
+    } = tls_verification_trust;
     let nonce = random_nonce()?;
     let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
     let url = format!("https://{host}:{status_port}/tls-attestation?nonce={nonce_b64}");
@@ -896,7 +912,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
     )
     .await
     .map_err(|message| CloudError::PortalTlsAttestationFailed { message })?;
-    let mut response =
+    let response =
         serde_json::from_slice::<TlsAttestationResponse>(&response_body).map_err(|e| {
             CloudError::PortalTlsAttestationFailed {
                 message: format!("invalid response JSON: {e}"),
@@ -943,53 +959,31 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         );
     }
 
-    let azure_snp_cert_table = if response.platform.cloud.eq_ignore_ascii_case("azure")
-        && response.platform.tee.eq_ignore_ascii_case("sev-snp")
-    {
-        match fetch_azure_snp_cert_table(&response).await {
-            Ok(table) => Some(table),
-            Err(detail) => {
-                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-                let live_hash = format!("0x{}", hex::encode(live_sha));
-                let report = tls_preverification_failure_report(
-                    &response,
-                    &live_hash,
-                    "azure-snp-amd-collateral",
-                    detail,
-                );
-                return handle_tls_attestation_failure(
-                    report,
-                    live_peer_cert_der,
-                    trust_tls_cert_sha256,
-                    report_path,
-                );
-            }
+    let amd_snp_collateral = match resolve_amd_snp_collateral(&response, amd_snp_crls).await {
+        Ok(collateral) => collateral,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "amd-snp-collateral",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+            );
         }
-    } else {
-        None
     };
-    if let Some(cert_table) = azure_snp_cert_table.as_deref() {
-        attach_azure_snp_cert_table(&mut response, cert_table);
-    }
-
-    if let Err(detail) = resolve_amd_snp_crl(&response, &mut trust_anchors).await {
-        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-        let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report =
-            tls_preverification_failure_report(&response, &live_hash, "amd-snp-crl", detail);
-        return handle_tls_attestation_failure(
-            report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-        );
-    }
 
     if let Err(detail) = resolve_chain_trust_anchors(
         &response,
         &azure_maa_trust,
         &mut trust_anchors,
-        azure_snp_cert_table.as_deref(),
+        amd_snp_collateral.as_ref(),
     )
     .await
     {
@@ -1019,7 +1013,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 trust_anchors: trust_anchors.clone(),
                 chain_client: session_chain_client.clone(),
                 manual_azure_maa_keys: manual_azure_maa_keys.clone(),
-                azure_snp_cert_table: azure_snp_cert_table.clone(),
+                amd_snp_collateral: amd_snp_collateral.clone(),
                 intel_tdx_dcap_collateral: intel_tdx_dcap_collateral.clone(),
             });
     let verification_inputs = VerificationInputs {
@@ -1027,6 +1021,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         live_peer_cert_der: live_peer_cert_der.clone(),
         response,
         intel_tdx_dcap_collateral,
+        amd_snp_collateral,
         measurement_policy,
         trust_anchors,
     };
@@ -1062,27 +1057,25 @@ async fn resolve_tdx_dcap_collateral(
     if !is_tdx(response) {
         return Ok(None);
     }
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
+    let quote = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|e| format!("decode teeEvidence.report for DCAP collateral lookup: {e}"))?;
     let collateral = match &config.source {
         IntelTdxDcapCollateralSource::None => return Ok(None),
         IntelTdxDcapCollateralSource::File(path) => {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| format!("read TDX DCAP collateral file {}: {e}", path.display()))?;
-            parse_dcap_collateral_json(&raw).map_err(|error| {
+            parse_dcap_collateral_json(&raw, &quote).map_err(|error| {
                 format!("parse TDX DCAP collateral file {}: {error}", path.display())
             })?
         }
-        IntelTdxDcapCollateralSource::HttpPccs { url } => {
-            let evidence = response
-                .tee_evidence
-                .as_ref()
-                .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
-            let quote = URL_SAFE_NO_PAD
-                .decode(&evidence.report)
-                .map_err(|e| format!("decode teeEvidence.report for DCAP collateral fetch: {e}"))?;
-            fetch_http_collateral(url, &quote)
-                .await
-                .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?
-        }
+        IntelTdxDcapCollateralSource::HttpPccs { url } => fetch_http_collateral(url, &quote)
+            .await
+            .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?,
         IntelTdxDcapCollateralSource::AutomataOnchainPccs {
             chain,
             rpc_url,
@@ -1096,13 +1089,6 @@ async fn resolve_tdx_dcap_collateral(
             let rpc_url = rpc_url
                 .as_deref()
                 .unwrap_or(DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL);
-            let evidence = response
-                .tee_evidence
-                .as_ref()
-                .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
-            let quote = URL_SAFE_NO_PAD
-                .decode(&evidence.report)
-                .map_err(|e| format!("decode teeEvidence.report for Automata PCCS lookup: {e}"))?;
             tokio::time::timeout(
                 Duration::from_secs(180),
                 fetch_automata_collateral(
@@ -1164,7 +1150,45 @@ async fn resolve_azure_maa_trust(
     Ok(vec![key])
 }
 
-async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
+async fn resolve_amd_snp_collateral(
+    response: &TlsAttestationResponse,
+    configured_crls: Vec<Vec<u8>>,
+) -> Result<Option<AmdSnpVerificationCollateral>, String> {
+    if !response.platform.tee.eq_ignore_ascii_case("sev-snp") {
+        return Ok(None);
+    }
+    let is_azure = response.platform.cloud.eq_ignore_ascii_case("azure");
+    let is_gcp = response.platform.cloud.eq_ignore_ascii_case("gcp");
+    if !is_azure && !is_gcp {
+        return Ok(None);
+    }
+    let crls = resolve_amd_snp_crls(response, configured_crls).await?;
+    if is_azure {
+        return fetch_azure_snp_collateral(response, crls).await.map(Some);
+    }
+    if is_gcp {
+        let evidence = response
+            .tee_evidence
+            .as_ref()
+            .ok_or_else(|| "GCP SNP response is missing teeEvidence".to_string())?;
+        let auxiliary = evidence
+            .auxiliary
+            .as_ref()
+            .ok_or_else(|| "GCP SNP response is missing teeEvidence.auxiliary".to_string())?;
+        let certificate_table = URL_SAFE_NO_PAD
+            .decode(auxiliary)
+            .map_err(|error| format!("decode GCP SNP auxiliary certificate table: {error}"))?;
+        return AmdSnpVerificationCollateral::from_certificate_table(&certificate_table, crls)
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+    unreachable!("supported AMD SEV-SNP cloud checked above")
+}
+
+async fn fetch_azure_snp_collateral(
+    response: &TlsAttestationResponse,
+    crls: Vec<Vec<u8>>,
+) -> Result<AmdSnpVerificationCollateral, String> {
     let evidence = response
         .tee_evidence
         .as_ref()
@@ -1220,26 +1244,20 @@ async fn fetch_azure_snp_cert_table(response: &TlsAttestationResponse) -> Result
             certs.len()
         ));
     };
-    amd_snp_vcek_cert_table(ark, ask, &vcek)
+    Ok(AmdSnpVerificationCollateral::from_vcek_chain(
+        ark.clone(),
+        ask.clone(),
+        vcek,
+        crls,
+    ))
 }
 
-fn attach_azure_snp_cert_table(response: &mut TlsAttestationResponse, cert_table: &[u8]) {
-    let mut collateral = response.collateral.as_object().cloned().unwrap_or_default();
-    collateral.insert(
-        "azureSnpCertTable".to_string(),
-        serde_json::Value::String(URL_SAFE_NO_PAD.encode(cert_table)),
-    );
-    response.collateral = serde_json::Value::Object(collateral);
-}
-
-async fn resolve_amd_snp_crl(
+async fn resolve_amd_snp_crls(
     response: &TlsAttestationResponse,
-    trust_anchors: &mut TrustAnchors,
-) -> Result<(), String> {
-    if !response.platform.tee.eq_ignore_ascii_case("sev-snp")
-        || !trust_anchors.amd_snp_crls.is_empty()
-    {
-        return Ok(());
+    configured_crls: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, String> {
+    if !configured_crls.is_empty() {
+        return Ok(configured_crls);
     }
     let evidence = response
         .tee_evidence
@@ -1267,8 +1285,7 @@ async fn resolve_amd_snp_crl(
         &format!("AMD {product} certificate revocation list"),
     )
     .await?;
-    trust_anchors.amd_snp_crls.push(crl);
-    Ok(())
+    Ok(vec![crl])
 }
 
 fn parse_pem_certificates(input: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -1300,7 +1317,7 @@ async fn resolve_chain_trust_anchors(
     response: &TlsAttestationResponse,
     config: &AzureMaaTrustConfig,
     trust_anchors: &mut TrustAnchors,
-    azure_snp_cert_table: Option<&[u8]>,
+    amd_snp_collateral: Option<&AmdSnpVerificationCollateral>,
 ) -> Result<(), String> {
     let AzureMaaTrustSource::OnchainRegistry {
         rpc_url,
@@ -1327,17 +1344,16 @@ async fn resolve_chain_trust_anchors(
         && trust_anchors.amd_ark_roots.is_empty()
         && trust_anchors.amd_ark_root_hashes.is_empty()
     {
-        let ark = if response.platform.cloud.eq_ignore_ascii_case("gcp") {
-            extract_snp_ark_cert(response)?
-        } else if response.platform.cloud.eq_ignore_ascii_case("azure") {
-            amd_snp_ark_from_cert_table(azure_snp_cert_table.ok_or_else(|| {
-                "Azure SNP response is missing resolved AMD certificate table".to_string()
-            })?)?
-        } else {
+        if !response.platform.cloud.eq_ignore_ascii_case("gcp")
+            && !response.platform.cloud.eq_ignore_ascii_case("azure")
+        {
             return Ok(());
-        };
+        }
+        let ark = amd_snp_collateral
+            .ok_or_else(|| "SNP response is missing resolved AMD collateral".to_string())?
+            .ark_der();
         let ark_hash = client
-            .resolve_amd_ark_root(&ark)
+            .resolve_amd_ark_root(ark)
             .await
             .map_err(|error| error.to_string())?;
         trust_anchors.amd_ark_root_hashes.push(ark_hash);
@@ -1490,56 +1506,6 @@ fn extract_gcp_ak_root_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>
     chain
         .pop()
         .ok_or_else(|| "GCP AK cert-chain binding is empty".to_string())
-}
-
-fn extract_snp_ark_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>, String> {
-    const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
-        0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0,
-        0xae,
-    ];
-
-    let evidence = response
-        .tee_evidence
-        .as_ref()
-        .ok_or_else(|| "GCP SNP response is missing teeEvidence".to_string())?;
-    let auxiliary = evidence
-        .auxiliary
-        .as_ref()
-        .ok_or_else(|| "GCP SNP response is missing teeEvidence.auxiliary".to_string())?;
-    let auxblob = URL_SAFE_NO_PAD
-        .decode(auxiliary)
-        .map_err(|e| format!("decode GCP SNP auxiliary cert table: {e}"))?;
-    let mut offset = 0usize;
-    while offset + 24 <= auxblob.len() {
-        let guid_bytes = &auxblob[offset..offset + 16];
-        if guid_bytes.iter().all(|byte| *byte == 0) {
-            break;
-        }
-        let cert_offset = u32::from_le_bytes(
-            auxblob[offset + 16..offset + 20]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
-        let cert_len = u32::from_le_bytes(
-            auxblob[offset + 20..offset + 24]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
-        let cert_end = cert_offset
-            .checked_add(cert_len)
-            .ok_or_else(|| "SNP cert table entry overflows usize".to_string())?;
-        if cert_end > auxblob.len() {
-            return Err(format!(
-                "SNP cert table entry extends past auxblob: offset={cert_offset} len={cert_len} auxblob={}",
-                auxblob.len()
-            ));
-        }
-        if guid_bytes == SNP_CERT_TABLE_ARK_GUID {
-            return Ok(auxblob[cert_offset..cert_end].to_vec());
-        }
-        offset += 24;
-    }
-    Err("GCP SNP auxiliary cert table is missing ARK certificate".to_string())
 }
 
 fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, String> {
@@ -2337,8 +2303,8 @@ mod tests {
     }
 
     #[test]
-    fn azure_snp_cert_table_is_added_to_client_collateral() {
-        let mut response = TlsAttestationResponse {
+    fn azure_snp_verification_collateral_stays_separate_from_portal_collateral() {
+        let response = TlsAttestationResponse {
             format: 1,
             nonce: String::new(),
             tls_cert_der: String::new(),
@@ -2363,13 +2329,27 @@ mod tests {
             }),
         };
 
-        attach_azure_snp_cert_table(&mut response, b"certificate table");
+        let collateral = AmdSnpVerificationCollateral::from_vcek_chain(
+            b"ark".to_vec(),
+            b"ask".to_vec(),
+            b"vcek".to_vec(),
+            vec![b"crl".to_vec()],
+        );
 
         assert_eq!(response.collateral["existing"], true);
-        assert_eq!(
-            response.collateral["azureSnpCertTable"],
-            URL_SAFE_NO_PAD.encode(b"certificate table")
-        );
+        assert!(response.collateral.get("azureSnpCertTable").is_none());
+        assert_eq!(collateral.ark_der(), b"ark");
+        assert_eq!(collateral.crls_der(), &[b"crl".to_vec()]);
+    }
+
+    #[test]
+    fn tls_verification_trust_keeps_amd_crls_separate_from_trust_anchors() {
+        let trust =
+            load_tls_verification_trust(&[], &[], &["aabb".to_string()], &["ccdd".to_string()])
+                .expect("TLS verification trust");
+
+        assert_eq!(trust.trust_anchors.amd_ark_roots, vec![vec![0xaa, 0xbb]]);
+        assert_eq!(trust.amd_snp_crls, vec![vec![0xcc, 0xdd]]);
     }
 
     #[test]

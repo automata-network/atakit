@@ -353,7 +353,7 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// Automata dcap-rs collateral JSON file for offline Intel TDX verification.
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
 

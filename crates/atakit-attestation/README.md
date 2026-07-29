@@ -5,6 +5,14 @@ from explicit typed inputs. It performs no network access. The caller chooses
 the measurement policy, workload policy, platform trust roots, Azure MAA keys,
 AMD SEV-SNP registry defaults, expected chain binding, and current time.
 
+Intel TDX collateral enters as `IntelTdxDcapCollateral`. The type keeps one
+parsed `dcap_rs::Collateral` behind `Arc` and rejects reuse for a quote with a
+different FMSPC, PCE ID, or PCK CA type. AMD SEV-SNP certificates and
+certificate revocation lists enter as `AmdSnpVerificationCollateral`. The AMD
+ARK inside that value is a candidate chain root; `TrustAnchors` must separately
+approve the exact ARK certificate or its hash. Neither typed collateral value
+is read from a client-added `TlsAttestationResponse.collateral` field.
+
 The production entry points sample `SystemTime::now()` once. The corresponding
 `*_at` entry points accept a caller-selected verification time. Intel TDX DCAP,
 AMD SEV-SNP certificates and revocation lists, GCP AK certificates, Azure MAA

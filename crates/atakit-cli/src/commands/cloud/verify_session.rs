@@ -61,7 +61,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         chain_client.as_ref(),
     )
     .await?;
-    let trust_anchors = init::load_tls_trust_anchors(
+    let tls_verification_trust = init::load_tls_verification_trust(
         &args.verification.gcp_ak_root_cert,
         &args.verification.azure_maa_key,
         &args.verification.amd_ark_root_cert,
@@ -92,7 +92,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         subject.status_port,
         Some(measurement_policy),
         None,
-        trust_anchors,
+        tls_verification_trust,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,
         None,

@@ -176,7 +176,7 @@ pub(crate) async fn resolve_verified_portal_access(
         &init_chain,
     )
     .await?;
-    let trust_anchors = init::load_tls_trust_anchors(
+    let tls_verification_trust = init::load_tls_verification_trust(
         &verification.gcp_ak_root_cert,
         &verification.azure_maa_key,
         &verification.amd_ark_root_cert,
@@ -202,7 +202,7 @@ pub(crate) async fn resolve_verified_portal_access(
         status_port,
         measurement_policy,
         None,
-        trust_anchors,
+        tls_verification_trust,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,
         None,

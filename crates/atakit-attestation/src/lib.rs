@@ -195,6 +195,78 @@ pub fn amd_snp_vcek_cert_table(
     Ok(output)
 }
 
+#[derive(Debug, Error)]
+pub enum AmdSnpVerificationCollateralError {
+    #[error("invalid AMD SEV-SNP certificate table: {0}")]
+    CertificateTable(String),
+    #[error("AMD SEV-SNP certificate collateral is missing {0}")]
+    MissingCertificate(&'static str),
+}
+
+/// Verifier-resolved AMD SEV-SNP certificate and revocation collateral.
+///
+/// The ARK certificate is a candidate chain root. The verifier must still
+/// approve that exact ARK certificate or its hash through [`TrustAnchors`].
+#[derive(Debug, Clone)]
+pub struct AmdSnpVerificationCollateral {
+    pub(crate) ark_der: Vec<u8>,
+    pub(crate) ask_der: Vec<u8>,
+    pub(crate) vcek_der: Option<Vec<u8>>,
+    pub(crate) vlek_der: Option<Vec<u8>>,
+    pub(crate) crls_der: Vec<Vec<u8>>,
+}
+
+impl AmdSnpVerificationCollateral {
+    pub fn from_vcek_chain(
+        ark_der: Vec<u8>,
+        ask_der: Vec<u8>,
+        vcek_der: Vec<u8>,
+        crls_der: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            ark_der,
+            ask_der,
+            vcek_der: Some(vcek_der),
+            vlek_der: None,
+            crls_der,
+        }
+    }
+
+    pub fn from_certificate_table(
+        table: &[u8],
+        crls_der: Vec<Vec<u8>>,
+    ) -> std::result::Result<Self, AmdSnpVerificationCollateralError> {
+        let parsed = verification_core::parse_amd_snp_cert_table(table)
+            .map_err(AmdSnpVerificationCollateralError::CertificateTable)?;
+        let ark_der = parsed
+            .ark
+            .ok_or(AmdSnpVerificationCollateralError::MissingCertificate("ARK"))?;
+        let ask_der = parsed
+            .ask
+            .ok_or(AmdSnpVerificationCollateralError::MissingCertificate("ASK"))?;
+        if parsed.vcek.is_none() && parsed.vlek.is_none() {
+            return Err(AmdSnpVerificationCollateralError::MissingCertificate(
+                "VCEK or VLEK",
+            ));
+        }
+        Ok(Self {
+            ark_der,
+            ask_der,
+            vcek_der: parsed.vcek,
+            vlek_der: parsed.vlek,
+            crls_der,
+        })
+    }
+
+    pub fn ark_der(&self) -> &[u8] {
+        &self.ark_der
+    }
+
+    pub fn crls_der(&self) -> &[Vec<u8>] {
+        &self.crls_der
+    }
+}
+
 /// Return the ARK DER certificate from a standard SNP certificate table.
 pub fn amd_snp_ark_from_cert_table(table: &[u8]) -> std::result::Result<Vec<u8>, String> {
     verification_core::parse_amd_snp_cert_table(table)?
@@ -397,6 +469,9 @@ pub struct VerificationInputs {
     /// Verifier-resolved Intel TDX DCAP collateral. This is separate from the
     /// portal response because the portal returns local evidence only.
     pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
+    /// Verifier-resolved AMD SEV-SNP certificate and revocation collateral.
+    /// The approved ARK roots remain separate in `trust_anchors`.
+    pub amd_snp_collateral: Option<AmdSnpVerificationCollateral>,
     pub measurement_policy: Option<MeasurementPolicy>,
     pub trust_anchors: TrustAnchors,
 }
@@ -414,8 +489,6 @@ pub struct TrustAnchors {
     pub azure_maa_keys: Vec<Vec<u8>>,
     pub amd_ark_roots: Vec<Vec<u8>>,
     pub amd_ark_root_hashes: Vec<[u8; 32]>,
-    /// AMD-signed DER certificate revocation lists for the trusted ARK roots.
-    pub amd_snp_crls: Vec<Vec<u8>>,
     /// AMD SEV-SNP registry defaults supplied by the verifier or read from
     /// AmdSnpSecurityPolicyRegistry.
     pub amd_snp_security_policies: Vec<AmdSnpSecurityPolicy>,
@@ -1084,10 +1157,12 @@ fn verify_tls_attestation_internal(
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
             inputs.intel_tdx_dcap_collateral.as_ref(),
-            verification_core::AmdSnpTrust {
-                ark_roots: &inputs.trust_anchors.amd_ark_roots,
-                ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
-                crls: &inputs.trust_anchors.amd_snp_crls,
+            verification_core::AmdSnpVerificationContext {
+                collateral: inputs.amd_snp_collateral.as_ref(),
+                trust: verification_core::AmdSnpTrust {
+                    ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                    ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                },
             },
             current_time,
         );
@@ -1119,11 +1194,10 @@ fn verify_tls_attestation_internal(
                         &mut report,
                         &mut errors,
                         Some(evidence),
-                        &inputs.response.collateral,
+                        inputs.amd_snp_collateral.as_ref(),
                         verification_core::AmdSnpTrust {
                             ark_roots: &inputs.trust_anchors.amd_ark_roots,
                             ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
-                            crls: &inputs.trust_anchors.amd_snp_crls,
                         },
                         current_time,
                     ),
@@ -3158,6 +3232,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3228,9 +3303,11 @@ mod tests {
             report: URL_SAFE_NO_PAD.encode(snp_report),
             auxiliary: Some(URL_SAFE_NO_PAD.encode(b"HCL var_data")),
         };
-        let collateral = serde_json::json!({
-            "azureSnpCertTable": URL_SAFE_NO_PAD.encode(cert_table)
-        });
+        let collateral = AmdSnpVerificationCollateral::from_certificate_table(
+            &cert_table,
+            vec![fixture_amd_milan_crl()],
+        )
+        .expect("AMD SNP verification collateral");
         let mut report = VerificationReport {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
@@ -3241,11 +3318,10 @@ mod tests {
             &mut report,
             &mut errors,
             Some(&evidence),
-            &collateral,
+            Some(&collateral),
             AmdSnpTrust {
                 ark_roots: &[ark],
                 ark_root_hashes: &[],
-                crls: &[fixture_amd_milan_crl()],
             },
             snp_fixture_time(),
         );
@@ -3403,6 +3479,20 @@ mod tests {
         let cert = b"cert";
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots, amd_ark) = gcp_snp_response_roots_and_ark(nonce, cert);
+        let certificate_table = URL_SAFE_NO_PAD
+            .decode(
+                response
+                    .tee_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.auxiliary.as_deref())
+                    .expect("GCP SNP auxiliary certificate table"),
+            )
+            .expect("base64url certificate table");
+        let amd_snp_collateral = AmdSnpVerificationCollateral::from_certificate_table(
+            &certificate_table,
+            vec![fixture_amd_milan_crl()],
+        )
+        .expect("AMD SNP verification collateral");
 
         verify_tls_attestation_at(
             VerificationInputs {
@@ -3410,6 +3500,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response,
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: Some(amd_snp_collateral),
                 measurement_policy: Some(measurement_policy_for_platform(
                     &pcr,
                     "gcp",
@@ -3419,7 +3510,6 @@ mod tests {
                 trust_anchors: TrustAnchors {
                     gcp_roots,
                     amd_ark_roots: vec![amd_ark],
-                    amd_snp_crls: vec![fixture_amd_milan_crl()],
                     amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
                         cpuid: 0x190101,
                         minimum_tcb: [0; 32],
@@ -3483,6 +3573,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         })
@@ -3507,6 +3598,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_root_hashes: vec![gcp_root_hash],
@@ -3539,6 +3631,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3566,6 +3659,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3586,6 +3680,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3613,6 +3708,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3638,6 +3734,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response,
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
                 measurement_policy: Some(policy),
                 trust_anchors: TrustAnchors {
                     gcp_roots,
@@ -3674,6 +3771,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_platform(
                 &pcr,
                 "gcp",
@@ -3711,6 +3809,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy.clone()),
             trust_anchors: TrustAnchors {
                 gcp_roots: gcp_roots.clone(),
@@ -3733,6 +3832,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response: response.clone(),
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
                 measurement_policy: Some(policy.clone()),
                 trust_anchors: TrustAnchors {
                     gcp_roots: gcp_roots.clone(),
@@ -3772,6 +3872,7 @@ mod tests {
                 live_peer_cert_der: cert.to_vec(),
                 response,
                 intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
                 measurement_policy: Some(policy),
                 trust_anchors: TrustAnchors {
                     gcp_roots,
@@ -3810,6 +3911,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3851,6 +3953,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3932,6 +4035,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -3973,6 +4077,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4002,6 +4107,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4026,6 +4132,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4050,6 +4157,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4074,6 +4182,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4099,6 +4208,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4122,6 +4232,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4146,6 +4257,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4169,6 +4281,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4192,6 +4305,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(48)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4306,6 +4420,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4334,6 +4449,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4360,6 +4476,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -4388,6 +4505,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4433,6 +4551,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4469,6 +4588,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4505,6 +4625,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -4526,7 +4647,9 @@ mod tests {
         }
         assert!(failure.errors.iter().any(|error| {
             error.check == "azure-tee-vendor-report"
-                && error.detail.contains("certificate table is missing")
+                && error
+                    .detail
+                    .contains("Azure SNP verification collateral is missing")
         }));
     }
 
@@ -4557,6 +4680,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(&pcr, "azure")),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key.clone()],
@@ -4580,6 +4704,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key],
@@ -4936,6 +5061,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response: response.clone(),
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_platform(
                 &pcr,
                 "azure",
@@ -4974,6 +5100,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 azure_maa_keys: vec![trusted_maa_key],
@@ -5397,7 +5524,11 @@ mod tests {
                         certificates: vec![amd_ark],
                         keccak256_hashes: Vec::new(),
                     },
-                    amd_snp_crls: vec![fixture_amd_milan_crl()],
+                    amd_snp_collateral: AmdSnpVerificationCollateral::from_certificate_table(
+                        &snp_cert_table,
+                        vec![fixture_amd_milan_crl()],
+                    )
+                    .expect("AMD SNP verification collateral"),
                 },
                 policy: TrustedSessionPolicy {
                     workload_id,
@@ -5490,6 +5621,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -5534,6 +5666,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -5564,6 +5697,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -5583,6 +5717,7 @@ mod tests {
             live_peer_cert_der: b"cert-b".to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -5601,6 +5736,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -5621,6 +5757,7 @@ mod tests {
             live_peer_cert_der: cert.to_vec(),
             response,
             intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });

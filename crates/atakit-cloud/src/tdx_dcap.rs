@@ -3,14 +3,13 @@ use std::time::Duration;
 
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use atakit_attestation::IntelTdxDcapCollateral;
+use atakit_attestation::{
+    intel_tdx_quote_collateral_identity, IntelTdxCollateralSelection, IntelTdxDcapCollateral,
+};
 use automata_dcap_network_registry::Network;
-use dcap_rs::types::collateral::Collateral;
-use dcap_rs::types::quote::Quote;
 use futures_util::StreamExt;
 use pccs_reader_rs::tcb_pem::generate_tcb_issuer_chain_pem;
 use pccs_reader_rs::{Collaterals, PccsReadStrategy, PccsReader};
-use x509_cert::der::{Encode, EncodePem};
 
 use crate::init::TdxDcapAutomataReadStrategy;
 
@@ -18,7 +17,6 @@ const INTEL_PCS_URL: &str = "https://api.trustedservices.intel.com";
 const INTEL_ROOT_CA_CRL_URL: &str =
     "https://certificates.trustedservices.intel.com/IntelSGXRootCA.der";
 const MAX_DCAP_COLLATERAL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
 
 pub(crate) struct AutomataPccsOverrides<'a> {
     pub(crate) pcs_dao: Option<&'a str>,
@@ -106,7 +104,11 @@ pub(crate) async fn fetch_automata_collateral(
         .await
         .map_err(|error| format!("read Automata PCCS collateral: {error}"))?;
 
-    collateral_from_automata_reads(collaterals)
+    let selection = tcb_eval_num.map_or(
+        IntelTdxCollateralSelection::Standard,
+        IntelTdxCollateralSelection::EvaluationDataNumber,
+    );
+    collateral_from_automata_reads(collaterals, quote, selection)
 }
 
 pub(crate) async fn fetch_http_collateral(
@@ -152,29 +154,37 @@ pub(crate) async fn fetch_http_collateral(
 
     let root_ca_crl = fetch_root_ca_crl(&client, &base_url).await?;
 
-    IntelTdxDcapCollateral::new(
+    IntelTdxDcapCollateral::from_source_material(
+        quote,
+        IntelTdxCollateralSelection::Standard,
         root_ca_crl,
         pck_crl,
         tcb_info_issuer_chain,
         raw_tcb_info,
         raw_qe_identity,
     )
+    .map_err(|error| error.to_string())
 }
 
 fn collateral_from_automata_reads(
     collaterals: Collaterals,
+    quote: &[u8],
+    selection: IntelTdxCollateralSelection,
 ) -> Result<IntelTdxDcapCollateral, String> {
     let issuer_chain =
         generate_tcb_issuer_chain_pem(&collaterals.tcb_signing_ca, &collaterals.root_ca)
             .map_err(|error| format!("encode Automata TCB issuer chain: {error:#}"))?;
 
-    IntelTdxDcapCollateral::new(
+    IntelTdxDcapCollateral::from_source_material(
+        quote,
+        selection,
         collaterals.root_ca_crl,
         collaterals.pck_crl,
         issuer_chain,
         collaterals.tcb_info,
         collaterals.qe_identity,
     )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -184,53 +194,11 @@ struct QuoteMaterial {
 }
 
 fn quote_material(raw_quote: &[u8]) -> Result<QuoteMaterial, String> {
-    if raw_quote.len() > MAX_TDX_QUOTE_BYTES {
-        return Err(format!("TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"));
-    }
-    let mut quote_bytes = raw_quote;
-    let quote =
-        Quote::read(&mut quote_bytes).map_err(|error| format!("parse TDX quote: {error:#}"))?;
-    if quote.header.tee_type != dcap_rs::types::quote::TDX_TEE_TYPE
-        || !matches!(quote.header.version.get(), 4 | 5)
-    {
-        return Err(format!(
-            "expected a TDX quote with version 4 or 5, got tee_type 0x{:x} and version {}",
-            quote.header.tee_type,
-            quote.header.version.get()
-        ));
-    }
-    if quote_bytes.iter().any(|byte| *byte != 0) {
-        return Err(format!(
-            "TDX quote has {} non-zero trailing bytes",
-            quote_bytes.len()
-        ));
-    }
-    let pck_data = quote
-        .signature
-        .get_pck_cert_chain()
-        .map_err(|error| format!("extract PCK certificate chain from quote: {error:#}"))?;
-    if pck_data.pck_cert_chain.len() < 2 {
-        return Err(
-            "PCK certificate chain in quote must contain the leaf and its issuer".to_string(),
-        );
-    }
-
-    let pck_ca = {
-        let issuer = pck_data.pck_cert_chain[0]
-            .tbs_certificate
-            .issuer
-            .to_string();
-        if issuer.contains(pccs_reader_rs::constants::INTEL_PCK_PLATFORM_CA_CN) {
-            "platform"
-        } else if issuer.contains(pccs_reader_rs::constants::INTEL_PCK_PROCESSOR_CA_CN) {
-            "processor"
-        } else {
-            return Err(format!("unrecognized PCK certificate issuer: {issuer}"));
-        }
-    };
+    let identity =
+        intel_tdx_quote_collateral_identity(raw_quote).map_err(|error| error.to_string())?;
     Ok(QuoteMaterial {
-        fmspc: hex::encode_upper(pck_data.pck_extension.fmspc),
-        pck_ca,
+        fmspc: hex::encode_upper(identity.fmspc),
+        pck_ca: identity.pck_ca.pcs_query_value(),
     })
 }
 
@@ -308,38 +276,11 @@ async fn fetch_root_ca_crl(client: &reqwest::Client, base_url: &str) -> Result<V
     read_limited_body(response, INTEL_ROOT_CA_CRL_URL).await
 }
 
-pub(crate) fn parse_dcap_collateral_json(document: &str) -> Result<IntelTdxDcapCollateral, String> {
-    let collateral: Collateral = serde_json::from_str(document)
-        .map_err(|error| format!("parse Automata dcap-rs Collateral JSON: {error}"))?;
-    let root_ca_crl_der = collateral
-        .root_ca_crl
-        .to_der()
-        .map_err(|error| format!("encode Intel root CA CRL as DER: {error}"))?;
-    let pck_crl_der = collateral
-        .pck_crl
-        .to_der()
-        .map_err(|error| format!("encode Intel PCK CRL as DER: {error}"))?;
-    let issuer_chain = collateral
-        .tcb_info_and_qe_identity_issuer_chain
-        .iter()
-        .map(|certificate| {
-            certificate
-                .to_pem(x509_cert::der::pem::LineEnding::LF)
-                .map_err(|error| format!("encode Intel collateral issuer certificate: {error}"))
-        })
-        .collect::<Result<String, String>>()?;
-    let tcb_info_json = serde_json::to_string(&collateral.tcb_info)
-        .map_err(|error| format!("encode Intel TCB info JSON: {error}"))?;
-    let qe_identity_json = serde_json::to_string(&collateral.qe_identity)
-        .map_err(|error| format!("encode Intel QE identity JSON: {error}"))?;
-
-    IntelTdxDcapCollateral::new(
-        root_ca_crl_der,
-        pck_crl_der,
-        issuer_chain,
-        tcb_info_json,
-        qe_identity_json,
-    )
+pub(crate) fn parse_dcap_collateral_json(
+    document: &str,
+    quote: &[u8],
+) -> Result<IntelTdxDcapCollateral, String> {
+    IntelTdxDcapCollateral::from_file_json(document, quote).map_err(|error| error.to_string())
 }
 
 fn issuer_chains_match(left: &str, right: &str) -> bool {
@@ -376,6 +317,92 @@ fn parse_address(address: &str, label: &str) -> Result<Address, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atakit_attestation::IntelTdxPckCa;
+    use rcgen::{
+        date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams,
+        DistinguishedName, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, SerialNumber,
+    };
+
+    fn synthetic_collateral_for_quote(quote: &[u8]) -> IntelTdxDcapCollateral {
+        let identity =
+            intel_tdx_quote_collateral_identity(quote).expect("extract quote collateral identity");
+        let pck_ca_common_name = match identity.pck_ca {
+            IntelTdxPckCa::Processor => "Intel SGX PCK Processor CA",
+            IntelTdxPckCa::Platform => "Intel SGX PCK Platform CA",
+        };
+
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, pck_ca_common_name);
+        let mut certificate_params =
+            CertificateParams::new(Vec::<String>::new()).expect("certificate parameters");
+        certificate_params.distinguished_name = distinguished_name;
+        certificate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        certificate_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let key_pair = KeyPair::generate().expect("generate certificate key");
+        let certificate = certificate_params
+            .self_signed(&key_pair)
+            .expect("generate issuer certificate");
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&certificate, &key_pair)
+        .expect("generate certificate revocation list");
+
+        let evaluation_data_number = 7;
+        let tcb_info = serde_json::json!({
+            "tcbInfo": {
+                "id": "TDX",
+                "version": 3,
+                "issueDate": "2026-01-01T00:00:00Z",
+                "nextUpdate": "2027-01-01T00:00:00Z",
+                "fmspc": hex::encode_upper(identity.fmspc),
+                "pceId": hex::encode_upper(identity.pce_id),
+                "tcbType": 0,
+                "tcbEvaluationDataNumber": evaluation_data_number,
+                "tcbLevels": []
+            },
+            "signature": ""
+        })
+        .to_string();
+        let qe_identity = serde_json::json!({
+            "enclaveIdentity": {
+                "id": "TD_QE",
+                "version": 2,
+                "issueDate": "2026-01-01T00:00:00Z",
+                "nextUpdate": "2027-01-01T00:00:00Z",
+                "tcbEvaluationDataNumber": evaluation_data_number,
+                "miscselect": "00000000",
+                "miscselectMask": "FFFFFFFF",
+                "attributes": "00000000000000000000000000000000",
+                "attributesMask": "00000000000000000000000000000000",
+                "mrsigner": "0000000000000000000000000000000000000000000000000000000000000000",
+                "isvprodid": 0,
+                "tcbLevels": []
+            },
+            "signature": ""
+        })
+        .to_string();
+
+        IntelTdxDcapCollateral::from_source_material(
+            quote,
+            IntelTdxCollateralSelection::Standard,
+            crl.der().to_vec(),
+            crl.der().to_vec(),
+            certificate.pem(),
+            tcb_info,
+            qe_identity,
+        )
+        .expect("parse synthetic collateral")
+    }
 
     #[test]
     fn normalizes_pccs_and_pcs_base_urls() {
@@ -403,9 +430,9 @@ mod tests {
             "qe_identity_signature": [7, 8]
         });
 
-        let error = parse_dcap_collateral_json(&legacy.to_string())
+        let error = parse_dcap_collateral_json(&legacy.to_string(), &[])
             .expect_err("the former QuoteCollateralV3 JSON shape must not parse");
-        assert!(error.contains("Automata dcap-rs Collateral JSON"));
+        assert!(error.contains("invalid Intel TDX collateral file"));
     }
 
     #[test]
@@ -415,6 +442,35 @@ mod tests {
         let material = quote_material(&quote).expect("extract quote material");
         assert_eq!(material.fmspc.len(), 12);
         assert!(matches!(material.pck_ca, "processor" | "platform"));
+    }
+
+    #[test]
+    fn version_one_file_round_trip_preserves_collateral_and_exact_selector() {
+        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+            .expect("decode TDX quote");
+        let collateral = synthetic_collateral_for_quote(&quote);
+        let clone = collateral.clone();
+        assert!(std::ptr::eq(collateral.parsed(), clone.parsed()));
+
+        let document = collateral
+            .to_file_json()
+            .expect("encode version 1 collateral file");
+        let decoded =
+            parse_dcap_collateral_json(&document, &quote).expect("parse version 1 collateral file");
+
+        assert_eq!(decoded.key().identity, collateral.key().identity);
+        assert_eq!(
+            decoded.key().selection,
+            IntelTdxCollateralSelection::EvaluationDataNumber(7)
+        );
+        assert_eq!(decoded.tcb_evaluation_data_number(), 7);
+        assert_eq!(decoded.qe_identity_evaluation_data_number(), 7);
+        assert_eq!(
+            decoded
+                .to_file_json()
+                .expect("encode decoded version 1 collateral file"),
+            document
+        );
     }
 
     #[test]
@@ -428,7 +484,7 @@ mod tests {
         let mut padded_tdx_quote =
             hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
                 .expect("decode TDX quote");
-        *padded_tdx_quote.last_mut().expect("sample quote") = 1;
+        padded_tdx_quote.push(1);
         assert!(quote_material(&padded_tdx_quote)
             .expect_err("non-zero trailing bytes must be rejected")
             .contains("non-zero trailing bytes"));
@@ -453,14 +509,11 @@ mod tests {
         )
         .await
         .expect("fetch Automata collateral");
-        let collateral = collateral
-            .to_dcap_collateral()
-            .expect("convert Automata collateral");
         let mut quote_bytes = quote.as_slice();
-        let quote = Quote::read(&mut quote_bytes).expect("parse quote");
-        dcap_rs::verify_dcap_quote_with_policy(
+        let quote = dcap_rs::types::quote::Quote::read(&mut quote_bytes).expect("parse quote");
+        dcap_rs::verify_dcap_quote_with_policy_ref(
             std::time::SystemTime::now(),
-            collateral,
+            collateral.parsed(),
             quote,
             &dcap_rs::DcapVerificationPolicy::production().with_tdx_tcb_revocation_policy(
                 dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,

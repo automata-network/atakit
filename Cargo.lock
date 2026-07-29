@@ -1469,7 +1469,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "automata-dcap-evm-bindings"
 version = "1.2.0"
-source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=e370572e5c6fa267005c6eb466965a37034f7266#e370572e5c6fa267005c6eb466965a37034f7266"
+source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=3dfe43038c868a62337f83e20f8fd38bba9e351a#3dfe43038c868a62337f83e20f8fd38bba9e351a"
 dependencies = [
  "alloy",
  "serde",
@@ -1478,7 +1478,7 @@ dependencies = [
 [[package]]
 name = "automata-dcap-network-registry"
 version = "1.2.0"
-source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=e370572e5c6fa267005c6eb466965a37034f7266#e370572e5c6fa267005c6eb466965a37034f7266"
+source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=3dfe43038c868a62337f83e20f8fd38bba9e351a#3dfe43038c868a62337f83e20f8fd38bba9e351a"
 dependencies = [
  "alloy",
  "anyhow",
@@ -1493,7 +1493,7 @@ dependencies = [
 [[package]]
 name = "automata-dcap-utils"
 version = "1.2.0"
-source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=e370572e5c6fa267005c6eb466965a37034f7266#e370572e5c6fa267005c6eb466965a37034f7266"
+source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=3dfe43038c868a62337f83e20f8fd38bba9e351a#3dfe43038c868a62337f83e20f8fd38bba9e351a"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2061,7 +2061,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "dcap-rs"
 version = "1.2.0"
-source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=e370572e5c6fa267005c6eb466965a37034f7266#e370572e5c6fa267005c6eb466965a37034f7266"
+source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=3dfe43038c868a62337f83e20f8fd38bba9e351a#3dfe43038c868a62337f83e20f8fd38bba9e351a"
 dependencies = [
  "alloy-sol-types",
  "anyhow",
@@ -3635,7 +3635,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "pccs-reader-rs"
 version = "1.2.0"
-source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=e370572e5c6fa267005c6eb466965a37034f7266#e370572e5c6fa267005c6eb466965a37034f7266"
+source = "git+https://github.com/automata-network/automata-dcap-attestation?rev=3dfe43038c868a62337f83e20f8fd38bba9e351a#3dfe43038c868a62337f83e20f8fd38bba9e351a"
 dependencies = [
  "alloy",
  "anyhow",

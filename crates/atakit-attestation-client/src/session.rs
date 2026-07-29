@@ -5,11 +5,11 @@ use std::path::PathBuf;
 pub use crate::TrustedWorkloadSessionPolicy;
 use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
-    verify_session_bundle, AzureMaaTrustKey, BindingMode, CertificateTrust, IntelTdxDcapCollateral,
-    SessionAttribute, SessionEvidenceBundle, SessionPcrPolicy, SessionPcrVerifyType,
-    SessionPlatformTrust, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
-    TrustedSessionBinding, TrustedSessionPolicy, VerificationReport, VerifiedSession,
-    VerifiedTlsIdentity,
+    verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustKey, BindingMode,
+    CertificateTrust, IntelTdxDcapCollateral, SessionAttribute, SessionEvidenceBundle,
+    SessionPcrPolicy, SessionPcrVerifyType, SessionPlatformTrust, SessionRequestBinding,
+    SessionTrust, SessionVerificationInputs, TrustedSessionBinding, TrustedSessionPolicy,
+    VerificationReport, VerifiedSession, VerifiedTlsIdentity,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -29,7 +29,10 @@ pub struct PortalSessionVerificationContext {
     /// This is optional only when manual platform trust is supplied.
     pub chain_client: Option<AttestationClient>,
     pub manual_azure_maa_keys: Vec<Vec<u8>>,
-    pub azure_snp_cert_table: Option<Vec<u8>>,
+    /// Collateral resolved during this portal TLS bootstrap. Session
+    /// verification rechecks its certificate and revocation validity against
+    /// the session verification time. No process-wide cache stores this value.
+    pub amd_snp_collateral: Option<AmdSnpVerificationCollateral>,
     pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
 }
 
@@ -220,7 +223,9 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
-            amd_snp_crls: context.trust_anchors.amd_snp_crls.clone(),
+            amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
+                session_error("verified TLS context has no GCP SNP verification collateral")
+            })?,
         },
         ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
             maa_signing_keys: committed_maa_keys,
@@ -234,9 +239,8 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_roots,
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
-            amd_snp_crls: context.trust_anchors.amd_snp_crls.clone(),
-            snp_cert_table: context.azure_snp_cert_table.clone().ok_or_else(|| {
-                session_error("verified TLS context has no Azure SNP certificate table")
+            amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
+                session_error("verified TLS context has no Azure SNP verification collateral")
             })?,
         },
         (cloud, tee) => {
