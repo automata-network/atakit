@@ -144,6 +144,30 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if !m.config.base_image.is_empty() {
         print_multi("Base Images:", &m.config.base_image);
     }
+    if m.config.attributes.is_empty() {
+        println!("  {:<18}none", "Attributes:");
+    } else {
+        for (index, (name, values)) in m.config.attributes.iter().enumerate() {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    atakit_core::tee_attributes::AttributeValue::Boolean(value) => {
+                        value.to_string()
+                    }
+                    atakit_core::tee_attributes::AttributeValue::String(value) => {
+                        format!("{value:?}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  {:<18}{} = [{}]",
+                if index == 0 { "Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     // --- Runtime ---

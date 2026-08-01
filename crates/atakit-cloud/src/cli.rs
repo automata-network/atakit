@@ -219,19 +219,23 @@ pub struct DeployArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// TDX DCAP collateral JSON file for offline GCP TDX TLS verification.
+    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
 
-    /// Direct HTTP PCCS/PCS URL for verifier-side GCP TDX DCAP collateral fetch.
+    /// Direct HTTP PCCS/PCS URL for verifier-side Intel TDX DCAP collateral fetch.
     #[arg(long, value_name = "URL")]
     pub tdx_dcap_pccs_url: Option<String>,
 
-    /// Automata on-chain collateral RPC URL for verifier-side GCP TDX DCAP lookup.
+    /// Automata on-chain collateral RPC URL for verifier-side Intel TDX DCAP lookup.
     #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
     pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
 
-    /// Automata PCS DAO address override for verifier-side GCP TDX DCAP collateral lookup.
+    /// Automata PCS DAO address override for verifier-side Intel TDX DCAP collateral lookup.
     #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
     pub tdx_dcap_automata_pcs_dao: Option<String>,
 
@@ -463,19 +467,23 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// TDX DCAP collateral JSON file for offline GCP TDX TLS verification.
+    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
     #[arg(long, value_name = "PATH")]
     pub tdx_dcap_collateral: Option<PathBuf>,
 
-    /// Direct HTTP PCCS/PCS URL for verifier-side GCP TDX DCAP collateral fetch.
+    /// Direct HTTP PCCS/PCS URL for verifier-side Intel TDX DCAP collateral fetch.
     #[arg(long, value_name = "URL")]
     pub tdx_dcap_pccs_url: Option<String>,
 
-    /// Automata on-chain collateral RPC URL for verifier-side GCP TDX DCAP lookup.
+    /// Automata on-chain collateral RPC URL for verifier-side Intel TDX DCAP lookup.
     #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
     pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
 
-    /// Automata PCS DAO address override for verifier-side GCP TDX DCAP collateral lookup.
+    /// Automata PCS DAO address override for verifier-side Intel TDX DCAP collateral lookup.
     #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
     pub tdx_dcap_automata_pcs_dao: Option<String>,
 
@@ -570,6 +578,10 @@ pub struct SessionVerificationArgs {
     /// AMD SEV-SNP certificate revocation list, as hex DER.
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
+
+    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
 
     /// TDX DCAP collateral JSON file.
     #[arg(long, value_name = "PATH")]

@@ -125,8 +125,40 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         other => bail!("unknown base-image-mode: {other}"),
     };
 
+    // WorkloadRegistry rejects this on-chain (EmptyBaseImageWhitelist). Catch it here so the
+    // operator sees the reason instead of a decoded revert, and does not burn the name/version
+    // pair: workload specs are immutable and the identifier stays claimed after deactivation.
+    if base_image_mode == 2 && base_image_ids.is_empty() {
+        bail!(
+            "base-image-mode is \"whitelist\" but no base images are listed; \
+             an empty whitelist denies every base image and the workload could never \
+             register a session. Add entries to `base-image` in the workload manifest, \
+             pass --base-image-id, or use base-image-mode \"any\"."
+        );
+    }
+
     // Build WorkloadSpec using the contract's generated types
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
+    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
+        AttributeRequirement, PcrSpec, WorkloadSpec,
+    };
+
+    let requirements = manifest
+        .config
+        .attributes
+        .iter()
+        .map(|(name, allowed_values)| {
+            let (key, allowed_values) =
+                atakit_core::tee_attributes::encode_requirement(name, allowed_values)
+                    .map_err(anyhow::Error::msg)?;
+            Ok(AttributeRequirement {
+                key: alloy_ext::core::primitives::B256::from(key),
+                allowedValues: allowed_values
+                    .into_iter()
+                    .map(alloy_ext::core::primitives::B256::from)
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let spec = WorkloadSpec {
         name: manifest.meta.name.clone(),
@@ -134,7 +166,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         ttl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
         baseImageMode: base_image_mode,
         baseImageIds: base_image_ids,
-        requirements: vec![],
+        requirements,
         pcrs: vec![PcrSpec {
             pcrIndex: 23,
             verifyType: 0, // STATIC
@@ -224,6 +256,65 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
         }
     );
+    if spec.requirements.is_empty() {
+        println!("  {:<20}{}", "Attributes:".dimmed(), "none".dimmed());
+    } else {
+        for (index, requirement) in spec.requirements.iter().enumerate() {
+            let key: [u8; 32] = requirement.key.into();
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key);
+            let name = attribute
+                .map(|attribute| attribute.name())
+                .or_else(|| {
+                    manifest
+                        .config
+                        .attributes
+                        .keys()
+                        .find(|name| atakit_core::tee_attributes::attribute_key(name) == key)
+                        .map(String::as_str)
+                })
+                .unwrap_or("unknown");
+            let values = if attribute.is_none() {
+                manifest
+                    .config
+                    .attributes
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|value| match value {
+                        atakit_core::tee_attributes::AttributeValue::String(value) => {
+                            format!("{value:?}")
+                        }
+                        atakit_core::tee_attributes::AttributeValue::Boolean(value) => {
+                            value.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                requirement
+                    .allowedValues
+                    .iter()
+                    .map(|value| {
+                        let value: [u8; 32] = (*value).into();
+                        attribute
+                            .and_then(|attribute| {
+                                atakit_core::tee_attributes::readable_reserved_value(
+                                    attribute, &value,
+                                )
+                            })
+                            .unwrap_or_else(|| format!("0x{}", hex::encode(value)))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "  {:<20}{} = [{}]",
+                if index == 0 { "Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {

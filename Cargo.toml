@@ -24,7 +24,6 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-serde_bytes = "0.11"
 base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
@@ -62,9 +61,9 @@ pem = "3"
 rcgen = "0.13"
 
 # Pin all Automata DCAP crates to the same reviewed upstream commit.
-dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
-automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
-pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "e370572e5c6fa267005c6eb466965a37034f7266" }
+dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
+automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
+pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
 
 # Async
 async-trait = "0.1"

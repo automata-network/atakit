@@ -202,6 +202,7 @@ pub fn convert_to_current(v1: ManifestV1) -> Manifest {
             image: v1.config.image,
             base_image_mode: v1.config.base_image_mode,
             base_image: v1.config.base_image,
+            attributes: BTreeMap::new(),
             ports: v1.config.ports,
             restart: v1.config.restart,
             command: v1.config.command,

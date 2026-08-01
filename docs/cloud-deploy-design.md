@@ -236,6 +236,28 @@ both policies constrain the same PCR. Deployment-management verification with
 `WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
 collateral.
 
+TLS bootstrap applies the same verified TEE attribute policy before any
+`POST /init` data is sent. The verifier extracts the Intel TDX debug state and
+DCAP TCB status, or the AMD SEV-SNP debug, `MIGRATE_MA`, TCB,
+`PLATFORM_INFO`, CPUID, report-version, `LAUNCH_MIT_VECTOR`, and
+`CURRENT_MIT_VECTOR` state, from the signed report. It compares that
+state with the effective signed platform profile and measurement variant. When
+a workload manifest is selected, it also applies
+`manifest.config.attributes`. When no workload is selected, missing workload
+requirements do not create a workload-side AMD SEV-SNP policy; TLS verification
+applies only the resolved base-image policy. Missing Boolean base-image values
+mean disabled, and a missing Intel TDX base-image TCB status means `ok` only.
+For AMD SEV-SNP, the verifier either receives the exact-CPUID registry default
+as an explicit trust input or reads it
+from the `AmdSnpSecurityPolicyRegistry` derived from the selected
+`SessionRegistry`. Custom attributes and all six reserved TEE attributes use
+measurement-variant-first lookup. The variant value replaces the matching
+profile value. With a workload, an explicit workload packed value replaces its
+registry default; without a workload, the resolved base-image value applies by
+itself. The registry mitigation-vector masks always apply. A nonzero mask
+requires a version-5 report and every required bit in the matching signed
+vector.
+
 `atakit cloud session status` resolves only the deployment and verified portal
 TLS connection before reading portal request state. It displays `idle`,
 `waiting`, `running`, and `failed` without loading `WorkloadRegistry` policy.
@@ -252,7 +274,10 @@ session verification resolves that bundle's exact MAA key and verifies its JWT
 with that key. A fresh TLS MAA key is not a fallback for the committed session
 MAA key. Every manual `--azure-maa-key` value remains available until both JWTs
 have been checked, so valid key rotation between session creation and a later
-command does not make the committed session unverifiable.
+command does not make the committed session unverifiable. Both verifications
+also require numeric `iat`, `nbf`, and `exp` claims and enforce
+`nbf <= verification_time < exp` using the same caller-selected time as the
+other certificate and collateral checks.
 
 Portal status and init ports default to `2024` and `1024` and can be overridden
 per invocation with `--status-port` and `--init-port`. The selected ports are

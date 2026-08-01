@@ -8,11 +8,14 @@ value.
 The client:
 
 - checks the RPC-reported chain ID;
-- derives `BaseImageRegistry` and `WorkloadRegistry` from `SessionRegistry`;
+- derives `BaseImageRegistry`, `WorkloadRegistry`, and
+  `AmdSnpSecurityPolicyRegistry` from `SessionRegistry`;
 - checks optional expected registry addresses;
 - loads the registered base-image measurement policy;
 - loads and validates the registered `WorkloadSpec`;
 - checks GCP vTPM AK and AMD ARK roots against the verifier contracts;
+- resolves the active AMD SEV-SNP registry default for the exact CPUID
+  in a verified report;
 - resolves Azure MAA signing keys, including revocation, issuer, and expiry;
 - produces `TrustedSessionBinding`; and
 - fetches and verifies a fresh current-session evidence bundle after portal
@@ -52,6 +55,21 @@ let binding = client.trusted_session_binding();
 
 The selected base-image ID passed to `resolve_workload_policy` must come from
 verified portal TLS identity. Do not take it from the evidence bundle.
+
+For AMD SEV-SNP, call `resolve_amd_snp_security_policy` with the exact
+family-model-stepping value extracted from the signed report. The result is an
+input to `atakit-attestation`; it is not selected by portal evidence. A missing
+or inactive exact-CPUID record fails verification.
+
+The base-image measurement policy preserves custom attributes and all six
+reserved TEE attributes from both `PlatformProfile.attributes` and
+`MeasurementVariant.attributes`. When the selected variant and profile contain
+the same key, the variant value is effective. Missing reserved values use the
+same safe defaults as on-chain registration: `false` for Boolean states and
+`ok` only for Intel TDX TCB status. A missing AMD SEV-SNP packed value resolves
+to the active exact-CPUID registry default. An explicit value replaces the
+default on its policy side; the registry value is not an independent mandatory
+floor.
 
 ## Verify a current session
 

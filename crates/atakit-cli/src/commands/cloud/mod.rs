@@ -42,6 +42,7 @@ use automata_tee_workload_measurement::base_image_registry::{
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::types::AppRef;
 use owo_colors::OwoColorize;
+use sha2::{Digest, Sha256};
 
 use crate::config::{ChainConfig, Config, KeyMode, KeySpec, ProverSpec};
 
@@ -834,6 +835,8 @@ fn resolve_store_image(
 /// Resolved workload source: archive path + name/version + declared ports + disks.
 pub(crate) struct ResolvedWorkload {
     pub archive_path: PathBuf,
+    /// SHA-256 of the same immutable archive bytes used to parse the manifest.
+    pub archive_sha256: [u8; 32],
     pub name: String,
     pub version: String,
     pub ports: Vec<String>,
@@ -847,6 +850,8 @@ pub(crate) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
+    /// Verified TEE attribute requirements from the measured manifest.
+    pub attributes: atakit_core::tee_attributes::AttributeRequirements,
     /// Declared unmeasured-data allowlist paths from the manifest, as
     /// deploy-relative paths (the `unmeasured-data/` prefix stripped). The
     /// operator may supply any subset of this set at `/init`.
@@ -874,19 +879,8 @@ pub(crate) fn resolve_workload(
             if !blob.exists() {
                 bail!("no archive blob for {name}:{version} in store");
             }
-            let inspect_opts = atakit_workload::InspectOptions {
-                archive: Some(blob.clone()),
-                workload_dir: None,
-                engine: None,
-                verbose: false,
-                measured_data_root: None,
-                unmeasured_data_root: None,
-            };
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(atakit_workload::inspect_workload(&inspect_opts))
-            })
-            .context("failed to inspect store archive")?;
+            let (result, archive_sha256) = inspect_workload_archive_snapshot(&blob)
+                .context("failed to inspect store archive")?;
             let disks = result
                 .manifest
                 .disks
@@ -902,6 +896,7 @@ pub(crate) fn resolve_workload(
             let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
+                archive_sha256,
                 name,
                 version,
                 ports,
@@ -909,6 +904,7 @@ pub(crate) fn resolve_workload(
                 boot_disk_size: result.manifest.config.boot_disk_size,
                 base_image_mode: result.manifest.config.base_image_mode,
                 base_image: result.manifest.config.base_image,
+                attributes: result.manifest.config.attributes,
                 unmeasured_data_paths: unmeasured_paths,
                 workload_dir: None,
             });
@@ -919,18 +915,8 @@ pub(crate) fn resolve_workload(
         if !path.exists() {
             bail!("archive not found: {src}");
         }
-        let opts = atakit_workload::InspectOptions {
-            archive: Some(path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-            measured_data_root: None,
-            unmeasured_data_root: None,
-        };
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
-        })
-        .context("failed to inspect archive")?;
+        let (result, archive_sha256) =
+            inspect_workload_archive_snapshot(&path).context("failed to inspect archive")?;
         let disks = result
             .manifest
             .disks
@@ -946,6 +932,7 @@ pub(crate) fn resolve_workload(
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
         return Ok(ResolvedWorkload {
             archive_path: path,
+            archive_sha256,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
             ports,
@@ -953,6 +940,7 @@ pub(crate) fn resolve_workload(
             boot_disk_size: result.manifest.config.boot_disk_size,
             base_image_mode: result.manifest.config.base_image_mode,
             base_image: result.manifest.config.base_image,
+            attributes: result.manifest.config.attributes,
             unmeasured_data_paths: unmeasured_paths,
             workload_dir: None,
         });
@@ -985,18 +973,8 @@ pub(crate) fn resolve_workload(
         }
     }
 
-    let inspect_opts = atakit_workload::InspectOptions {
-        archive: Some(archive_path.clone()),
-        workload_dir: None,
-        engine: None,
-        verbose: false,
-        measured_data_root: None,
-        unmeasured_data_root: None,
-    };
-    let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-    })
-    .context("failed to inspect archive")?;
+    let (result, archive_sha256) =
+        inspect_workload_archive_snapshot(&archive_path).context("failed to inspect archive")?;
     let ports = collect_firewall_ports(&result.manifest);
     let disks = result
         .manifest
@@ -1014,6 +992,7 @@ pub(crate) fn resolve_workload(
     let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
     Ok(ResolvedWorkload {
         archive_path,
+        archive_sha256,
         name: result.manifest.meta.name,
         version: result.manifest.meta.version,
         ports,
@@ -1021,9 +1000,20 @@ pub(crate) fn resolve_workload(
         boot_disk_size: result.manifest.config.boot_disk_size,
         base_image_mode: result.manifest.config.base_image_mode,
         base_image: result.manifest.config.base_image,
+        attributes: result.manifest.config.attributes,
         unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
     })
+}
+
+fn inspect_workload_archive_snapshot(
+    archive_path: &Path,
+) -> Result<(atakit_workload::InspectResult, [u8; 32])> {
+    let bytes = std::fs::read(archive_path)
+        .with_context(|| format!("failed to read archive {}", archive_path.display()))?;
+    let archive_sha256 = Sha256::digest(&bytes).into();
+    let inspection = atakit_workload::inspect_workload_archive_bytes(&bytes)?;
+    Ok((inspection, archive_sha256))
 }
 
 /// The declared unmeasured-data file paths from the manifest, as deploy-relative

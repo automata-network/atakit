@@ -20,9 +20,11 @@ use x509_parser::parse_x509_crl;
 use x509_parser::prelude::{FromDer, X509Certificate, X509Version};
 use x509_parser::time::ASN1Time;
 
+mod amd_snp_policy;
 mod session;
 mod tdx_dcap;
 mod verification_core;
+pub use amd_snp_policy::*;
 pub use session::*;
 pub use tdx_dcap::*;
 
@@ -43,6 +45,7 @@ pub type Result<T> = std::result::Result<T, AttestationError>;
 const TPM_GENERATED_VALUE: u32 = 0xff54_4347;
 const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
 const TPM_ALG_SHA256: u16 = 0x000b;
+const TPM_ALG_SHA384: u16 = 0x000c;
 const TPM_ALG_NULL: u16 = 0x0010;
 const TPM_ALG_RSASSA: u16 = 0x0014;
 const TPM_ALG_ECDSA: u16 = 0x0018;
@@ -52,24 +55,44 @@ const TDX_QUOTE_V5_BODY_HEADER_LEN: usize = 6;
 const TDX_TEE_TYPE: u32 = 0x0000_0081;
 const TDX_BODY_TD_REPORT10_TYPE: u16 = 2;
 const TDX_BODY_TD_REPORT15_TYPE: u16 = 3;
+const TDX_REPORT_ATTRIBUTES_OFFSET: usize = 120;
 const TDX_REPORT_RTMR3_OFFSET: usize = 472;
 const TDX_REPORT_REPORT_DATA_OFFSET: usize = 520;
+const TDX_REPORT15_MR_SERVICETD_OFFSET: usize = 600;
 const GCP_TDX_UUID_LEN: usize = 16;
 const SNP_REPORT_REPORT_ID_OFFSET: usize = 0x140;
 const SNP_REPORT_REPORT_ID_LEN: usize = 32;
 const SNP_REPORT_SIGNATURE_OFFSET: usize = 0x2a0;
 const SNP_REPORT_SIGNED_LEN: usize = 0x2a0;
-const SNP_REPORT_MIN_LEN: usize = 0x4a0;
-const SNP_REPORT_VERSION_OFFSET: usize = 0x00;
-const SNP_REPORT_POLICY_OFFSET: usize = 0x08;
+const SNP_REPORT_SIZE: usize = 0x4a0;
+const SNP_REPORT_VERSION_OFFSET: usize = 0;
+const SNP_REPORT_POLICY_OFFSET: usize = 8;
 const SNP_REPORT_VMPL_OFFSET: usize = 0x30;
+const SNP_REPORT_ID_MA_OFFSET: usize = 0x160;
+const SNP_REPORT_ID_MA_LEN: usize = 32;
 const SNP_REPORT_SIG_ALGO_OFFSET: usize = 0x34;
+const SNP_REPORT_CURRENT_TCB_OFFSET: usize = 0x38;
+const SNP_REPORT_PLATFORM_INFO_OFFSET: usize = 0x40;
 const SNP_REPORT_KEY_SETTINGS_OFFSET: usize = 0x48;
+const SNP_REPORT_RESERVED_1_OFFSET: usize = 0x4c;
 const SNP_REPORT_REPORTED_TCB_OFFSET: usize = 0x180;
+const SNP_REPORT_CPUID_OFFSET: usize = 0x188;
+const SNP_REPORT_CPUID_RESERVED_OFFSET: usize = 0x18b;
+const SNP_REPORT_CPUID_RESERVED_LEN: usize = 21;
 const SNP_REPORT_CHIP_ID_OFFSET: usize = 0x1a0;
+const SNP_REPORT_COMMITTED_TCB_OFFSET: usize = 0x1e0;
+const SNP_REPORT_CURRENT_VERSION_RESERVED_OFFSET: usize = 0x1eb;
+const SNP_REPORT_COMMITTED_VERSION_RESERVED_OFFSET: usize = 0x1ef;
+const SNP_REPORT_LAUNCH_TCB_OFFSET: usize = 0x1f0;
+const SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET: usize = 0x1f8;
+const SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET: usize = 0x200;
+const SNP_REPORT_CURRENT_MITIGATION_VECTOR_END: usize = 0x208;
 const SNP_POLICY_MIGRATE_MA: u64 = 1 << 18;
 const SNP_POLICY_DEBUG: u64 = 1 << 19;
 const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
+const SNP_CERT_TABLE_ENTRY_BYTES: usize = 24;
+const MAX_SNP_CERT_TABLE_BYTES: usize = 1024 * 1024;
+const MAX_SNP_CERT_TABLE_ENTRIES: usize = 64;
 const SNP_CERT_TABLE_ARK_GUID: [u8; 16] = [
     0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0, 0xae,
 ];
@@ -82,6 +105,26 @@ const SNP_CERT_TABLE_VCEK_GUID: [u8; 16] = [
 const SNP_CERT_TABLE_VLEK_GUID: [u8; 16] = [
     0xa8, 0x07, 0x4b, 0xc2, 0xa2, 0x5a, 0x48, 0x3e, 0xaa, 0xe6, 0x39, 0xc0, 0x45, 0xa0, 0xb8, 0xa1,
 ];
+
+/// The endorsement key that signed an AMD SEV-SNP attestation report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmdSnpSigningKeyType {
+    Vcek,
+    Vlek,
+}
+
+/// Return the endorsement-key type selected by an AMD SEV-SNP report.
+pub fn amd_snp_signing_key_type(
+    report: &[u8],
+) -> std::result::Result<AmdSnpSigningKeyType, String> {
+    if report.len() != SNP_REPORT_SIZE {
+        return Err(format!(
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
+            report.len()
+        ));
+    }
+    verification_core::snp_signing_key_type(report)
+}
 
 /// Fields needed to request the report's VCEK from AMD KDS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,15 +140,13 @@ pub struct AmdSnpVcekRequest {
 
 /// Parse the VCEK lookup fields from a raw SEV-SNP attestation report.
 pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequest, String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
-    if verification_core::snp_signing_key_type(report)?
-        != verification_core::SnpSigningKeyType::Vcek
-    {
+    if amd_snp_signing_key_type(report)? != AmdSnpSigningKeyType::Vcek {
         return Err("AMD KDS VCEK lookup cannot resolve a VLEK-signed SNP report".to_string());
     }
     let tcb = &report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8];
@@ -125,9 +166,9 @@ pub fn amd_snp_vcek_request(report: &[u8]) -> std::result::Result<AmdSnpVcekRequ
 
 /// Return the AMD Key Distribution Service product name for an SNP report.
 pub fn amd_snp_kds_product(report: &[u8]) -> std::result::Result<&'static str, String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -149,17 +190,20 @@ pub fn amd_snp_vcek_cert_table(
     vcek: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
     let entries = [
-        (SNP_CERT_TABLE_ARK_GUID, ark),
-        (SNP_CERT_TABLE_ASK_GUID, ask),
-        (SNP_CERT_TABLE_VCEK_GUID, vcek),
+        ("ARK", SNP_CERT_TABLE_ARK_GUID, ark),
+        ("ASK", SNP_CERT_TABLE_ASK_GUID, ask),
+        ("VCEK", SNP_CERT_TABLE_VCEK_GUID, vcek),
     ];
-    let table_len = 24usize
+    if let Some((label, _, _)) = entries.iter().find(|(_, _, cert)| cert.is_empty()) {
+        return Err(format!("SNP {label} certificate is empty"));
+    }
+    let table_len = SNP_CERT_TABLE_ENTRY_BYTES
         .checked_mul(entries.len() + 1)
         .ok_or_else(|| "SNP certificate-table header length overflow".to_string())?;
     let mut output = vec![0u8; table_len];
     let mut cert_offset = table_len;
-    for (index, (guid, cert)) in entries.iter().enumerate() {
-        let entry_offset = index * 24;
+    for (index, (_, guid, cert)) in entries.iter().enumerate() {
+        let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
         let offset = u32::try_from(cert_offset)
             .map_err(|_| "SNP certificate-table offset exceeds u32".to_string())?;
         let length = u32::try_from(cert.len())
@@ -170,11 +214,91 @@ pub fn amd_snp_vcek_cert_table(
         cert_offset = cert_offset
             .checked_add(cert.len())
             .ok_or_else(|| "SNP certificate-table length overflow".to_string())?;
+        if cert_offset > MAX_SNP_CERT_TABLE_BYTES {
+            return Err(format!(
+                "SNP certificate table exceeds the {MAX_SNP_CERT_TABLE_BYTES}-byte limit"
+            ));
+        }
     }
-    for (_, cert) in entries {
+    for (_, _, cert) in entries {
         output.extend_from_slice(cert);
     }
     Ok(output)
+}
+
+#[derive(Debug, Error)]
+pub enum AmdSnpVerificationCollateralError {
+    #[error("invalid AMD SEV-SNP certificate table: {0}")]
+    CertificateTable(String),
+    #[error("AMD SEV-SNP certificate collateral is missing {0}")]
+    MissingCertificate(&'static str),
+}
+
+/// Verifier-resolved AMD SEV-SNP certificate and revocation collateral.
+///
+/// The ARK certificate is a candidate chain root. The verifier must still
+/// approve that exact ARK certificate or its hash through [`TrustAnchors`].
+#[derive(Debug, Clone)]
+pub struct AmdSnpVerificationCollateral {
+    pub(crate) ark_der: Vec<u8>,
+    pub(crate) intermediate_ca_der: Vec<u8>,
+    pub(crate) vcek_der: Option<Vec<u8>>,
+    pub(crate) vlek_der: Option<Vec<u8>>,
+    pub(crate) crls_der: Vec<Vec<u8>>,
+}
+
+impl AmdSnpVerificationCollateral {
+    pub fn from_vcek_chain(
+        ark_der: Vec<u8>,
+        ask_der: Vec<u8>,
+        vcek_der: Vec<u8>,
+        crls_der: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            ark_der,
+            intermediate_ca_der: ask_der,
+            vcek_der: Some(vcek_der),
+            vlek_der: None,
+            crls_der,
+        }
+    }
+
+    pub fn from_certificate_table(
+        table: &[u8],
+        crls_der: Vec<Vec<u8>>,
+    ) -> std::result::Result<Self, AmdSnpVerificationCollateralError> {
+        let parsed = verification_core::parse_amd_snp_cert_table(table)
+            .map_err(AmdSnpVerificationCollateralError::CertificateTable)?;
+        let ark_der = parsed
+            .ark
+            .ok_or(AmdSnpVerificationCollateralError::MissingCertificate("ARK"))?;
+        let intermediate_ca_der =
+            parsed
+                .ask
+                .ok_or(AmdSnpVerificationCollateralError::MissingCertificate(
+                    "ASK or ASVK intermediate CA",
+                ))?;
+        if parsed.vcek.is_none() && parsed.vlek.is_none() {
+            return Err(AmdSnpVerificationCollateralError::MissingCertificate(
+                "VCEK or VLEK",
+            ));
+        }
+        Ok(Self {
+            ark_der,
+            intermediate_ca_der,
+            vcek_der: parsed.vcek,
+            vlek_der: parsed.vlek,
+            crls_der,
+        })
+    }
+
+    pub fn ark_der(&self) -> &[u8] {
+        &self.ark_der
+    }
+
+    pub fn crls_der(&self) -> &[Vec<u8>] {
+        &self.crls_der
+    }
 }
 
 /// Return the ARK DER certificate from a standard SNP certificate table.
@@ -376,6 +500,12 @@ pub struct VerificationInputs {
     pub nonce: [u8; 32],
     pub live_peer_cert_der: Vec<u8>,
     pub response: TlsAttestationResponse,
+    /// Verifier-resolved Intel TDX DCAP collateral. This is separate from the
+    /// portal response because the portal returns local evidence only.
+    pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
+    /// Verifier-resolved AMD SEV-SNP certificate and revocation collateral.
+    /// The approved ARK roots remain separate in `trust_anchors`.
+    pub amd_snp_collateral: Option<AmdSnpVerificationCollateral>,
     pub measurement_policy: Option<MeasurementPolicy>,
     pub trust_anchors: TrustAnchors,
 }
@@ -393,9 +523,60 @@ pub struct TrustAnchors {
     pub azure_maa_keys: Vec<Vec<u8>>,
     pub amd_ark_roots: Vec<Vec<u8>>,
     pub amd_ark_root_hashes: Vec<[u8; 32]>,
-    /// AMD-signed DER certificate revocation lists for the trusted ARK roots.
-    pub amd_snp_crls: Vec<Vec<u8>>,
+    /// AMD SEV-SNP registry defaults supplied by the verifier or read from
+    /// AmdSnpSecurityPolicyRegistry.
+    pub amd_snp_security_policies: Vec<AmdSnpSecurityPolicy>,
     pub aws_nitro_roots: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmdSnpSecurityPolicy {
+    /// Exact family || model || stepping value from the signed report.
+    pub cpuid: u32,
+    /// Packed CURRENT, REPORTED, COMMITTED, and LAUNCH minimum TCB values.
+    pub minimum_tcb: [u8; 32],
+    /// Packed PLATFORM_INFO required-clear and required-set masks.
+    pub platform_info_policy: [u8; 32],
+    /// Required bits in a version-5 report's LAUNCH_MIT_VECTOR.
+    #[serde(default)]
+    pub required_launch_mitigation_vector: u64,
+    /// Required bits in a version-5 report's CURRENT_MIT_VECTOR.
+    #[serde(default)]
+    pub required_current_mitigation_vector: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmdSnpSecurityState {
+    pub debug: bool,
+    pub migrate_ma: bool,
+    pub tcb_values: [u8; 32],
+    pub platform_info: u64,
+    pub cpuid: u32,
+    #[serde(default)]
+    pub report_version: u32,
+    #[serde(default)]
+    pub launch_mitigation_vector: u64,
+    #[serde(default)]
+    pub current_mitigation_vector: u64,
+}
+
+/// Extract and validate the security fields that drive AMD SEV-SNP policy.
+///
+/// Callers must also verify the report signature and certificate chain.
+pub fn amd_snp_security_state(report: &[u8]) -> std::result::Result<AmdSnpSecurityState, String> {
+    let state = verification_core::verified_snp_security_state(report)?;
+    Ok(AmdSnpSecurityState {
+        debug: state.debug,
+        migrate_ma: state.migrate_ma,
+        tcb_values: state.tcb_values,
+        platform_info: state.platform_info,
+        cpuid: state.cpuid,
+        report_version: state.report_version,
+        launch_mitigation_vector: state.launch_mitigation_vector,
+        current_mitigation_vector: state.current_mitigation_vector,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,6 +684,9 @@ struct AzureMaaJwtHeader {
 #[derive(Debug, Deserialize)]
 struct AzureMaaJwtClaims {
     iss: String,
+    exp: u64,
+    nbf: u64,
+    iat: u64,
     #[serde(rename = "x-ms-attestation-type")]
     attestation_type: String,
     #[serde(rename = "x-ms-compliance-status")]
@@ -600,13 +784,48 @@ pub fn verify_tls_attestation(
     verify_tls_attestation_at(inputs, SystemTime::now())
 }
 
-fn verify_tls_attestation_at(
+/// Verifies TLS evidence and applies the selected workload manifest's verified
+/// TEE attribute requirements before returning the trusted TLS identity.
+pub fn verify_tls_attestation_with_workload_attributes(
     inputs: VerificationInputs,
+    workload_attributes: &atakit_core::tee_attributes::AttributeRequirements,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_with_workload_attributes_at(
+        inputs,
+        workload_attributes,
+        SystemTime::now(),
+    )
+}
+
+/// Verifies TLS evidence at a caller-selected time. Every certificate,
+/// collateral, and token time check uses this same value.
+pub fn verify_tls_attestation_at(
+    inputs: VerificationInputs,
+    verification_time: SystemTime,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_internal(inputs, None, verification_time)
+}
+
+/// Verifies TLS evidence and workload attributes at a caller-selected time.
+/// Every certificate, collateral, and token time check uses this same value.
+pub fn verify_tls_attestation_with_workload_attributes_at(
+    inputs: VerificationInputs,
+    workload_attributes: &atakit_core::tee_attributes::AttributeRequirements,
+    verification_time: SystemTime,
+) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    verify_tls_attestation_internal(inputs, Some(workload_attributes), verification_time)
+}
+
+fn verify_tls_attestation_internal(
+    inputs: VerificationInputs,
+    workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
     current_time: SystemTime,
 ) -> std::result::Result<VerifiedTlsIdentity, VerificationFailure> {
+    let mut authenticated_pcrs = None;
     let mut verified_base_image_id = None;
     let mut verified_platform_profile_id = None;
     let mut verified_variant_id = None;
+    let mut verified_tdx_tcb_status_bit = None;
     let mut report = VerificationReport {
         checks: Vec::new(),
         evidence: EvidenceSummary {
@@ -775,7 +994,7 @@ fn verify_tls_attestation_at(
                     "qualifyingData does not match nonce and TLS cert hash".to_string(),
                 );
                 if let Some(tpm_quote_bytes) = &tpm_quote_bytes {
-                    verification_core::verify_tpm_quote(
+                    authenticated_pcrs = verification_core::verify_tpm_quote(
                         &mut report,
                         &mut errors,
                         tpm_quote_bytes,
@@ -876,6 +1095,7 @@ fn verify_tls_attestation_at(
                 binding,
                 &inputs.trust_anchors.azure_maa_keys,
                 &inputs.response.platform.tee,
+                current_time,
             );
             verification_core::verify_azure_hclak_quote_signature(
                 &mut report,
@@ -899,6 +1119,7 @@ fn verify_tls_attestation_at(
                 ak_public,
                 &inputs.trust_anchors.gcp_roots,
                 &inputs.trust_anchors.gcp_root_hashes,
+                current_time,
             );
             verification_core::verify_tpm_quote_signature(
                 &mut report,
@@ -962,21 +1183,73 @@ fn verify_tls_attestation_at(
             &mut errors,
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
-            &inputs.response.tpm.pcrs,
+            authenticated_pcrs.as_deref().unwrap_or(&[]),
         );
-        verification_core::verify_gcp_tee_vendor_report(
+        verified_tdx_tcb_status_bit = verification_core::verify_gcp_tee_vendor_report(
             &mut report,
             &mut errors,
             inputs.response.tee_evidence.as_ref(),
             &inputs.response.platform.tee,
-            &inputs.response.collateral,
-            verification_core::AmdSnpTrust {
-                ark_roots: &inputs.trust_anchors.amd_ark_roots,
-                ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
-                crls: &inputs.trust_anchors.amd_snp_crls,
+            inputs.intel_tdx_dcap_collateral.as_ref(),
+            verification_core::AmdSnpVerificationContext {
+                collateral: inputs.amd_snp_collateral.as_ref(),
+                trust: verification_core::AmdSnpTrust {
+                    ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                    ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                },
             },
             current_time,
         );
+    } else if inputs.response.platform.cloud == "azure" {
+        match (
+            inputs.response.tee_evidence.as_ref(),
+            inputs.response.ak_binding.as_ref(),
+        ) {
+            (Some(evidence), Some(binding)) => {
+                verification_core::verify_azure_tee_ak_binding(
+                    &mut report,
+                    &mut errors,
+                    evidence,
+                    binding,
+                    &inputs.response.platform.tee,
+                );
+                match inputs.response.platform.tee.as_str() {
+                    "tdx" => {
+                        verified_tdx_tcb_status_bit =
+                            verification_core::verify_azure_tdx_vendor_report(
+                                &mut report,
+                                &mut errors,
+                                Some(evidence),
+                                inputs.intel_tdx_dcap_collateral.as_ref(),
+                                current_time,
+                            );
+                    }
+                    "sev-snp" => verification_core::verify_azure_snp_vendor_report(
+                        &mut report,
+                        &mut errors,
+                        Some(evidence),
+                        inputs.amd_snp_collateral.as_ref(),
+                        verification_core::AmdSnpTrust {
+                            ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                            ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                        },
+                        current_time,
+                    ),
+                    other => fail(
+                        &mut report,
+                        &mut errors,
+                        "azure-tee-vendor-report",
+                        format!("Azure raw TEE vendor verification is unsupported for tee={other}"),
+                    ),
+                }
+            }
+            _ => fail(
+                &mut report,
+                &mut errors,
+                "azure-tee-ak-binding",
+                "Azure TEE evidence or AK binding is missing".to_string(),
+            ),
+        }
     }
 
     match &inputs.response.ak_binding {
@@ -1179,6 +1452,18 @@ fn verify_tls_attestation_at(
             Err(e) => fail(&mut report, &mut errors, "variant-id", e.to_string()),
         }
 
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            profile,
+            variant,
+            &inputs.response.platform.tee,
+            inputs.response.tee_evidence.as_ref(),
+            verified_tdx_tcb_status_bit,
+            workload_attributes,
+            &inputs.trust_anchors.amd_snp_security_policies,
+        );
+
         match effective_pcr_specs(profile, variant) {
             Ok(pcr_specs) if pcr_specs.is_empty() => fail(
                 &mut report,
@@ -1192,7 +1477,7 @@ fn verify_tls_attestation_at(
                         &mut report,
                         &mut errors,
                         spec,
-                        &inputs.response.tpm.pcrs,
+                        authenticated_pcrs.as_deref().unwrap_or(&[]),
                         &inputs.response.tpm.event_log_hashes,
                     );
                 }
@@ -1246,10 +1531,610 @@ fn effective_pcr_specs<'a>(
                 spec.pcr_index, variant.name
             ));
         }
+        // A profile invariant always holds. `override_pcrs` is a historical field name: its
+        // entries must be disjoint from `profile.invariants` and may only pin indices the
+        // profile leaves unpinned. Overwriting here would silently drop the stricter
+        // platform-level spec and disagree with on-chain evaluation, which rejects the
+        // overlap (SessionRegistry.PcrVariantOverridesInvariant).
+        if specs.contains_key(&spec.pcr_index) {
+            return Err(format!(
+                "variant {} pins PCR index {} that profile {} declares invariant; \
+                 profile invariants always hold and cannot be overridden",
+                variant.name, spec.pcr_index, profile.name
+            ));
+        }
         specs.insert(spec.pcr_index, spec);
     }
 
     Ok(specs.into_values().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_measurement_attributes(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    profile: &MeasurementProfile,
+    variant: &MeasurementVariant,
+    tee: &str,
+    evidence: Option<&TeeEvidence>,
+    verified_tdx_tcb_status_bit: Option<u16>,
+    workload_attributes: Option<&atakit_core::tee_attributes::AttributeRequirements>,
+    amd_snp_security_policies: &[AmdSnpSecurityPolicy],
+) {
+    let Some(evidence) = evidence else {
+        fail(
+            report,
+            errors,
+            "measurement-attributes",
+            "TEE evidence is missing".to_string(),
+        );
+        return;
+    };
+    let report_bytes = match decode_b64("teeEvidence.report", &evidence.report) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            fail(report, errors, "measurement-attributes", error.to_string());
+            return;
+        }
+    };
+    let verified_states = match verification_core::verified_tee_attribute_states(tee, &report_bytes)
+    {
+        Ok(states) => states,
+        Err(detail) => {
+            fail(report, errors, "measurement-attributes", detail);
+            return;
+        }
+    };
+    let effective_attributes = match effective_measurement_attributes(profile, variant) {
+        Ok(attributes) => attributes,
+        Err(detail) => {
+            fail(report, errors, "measurement-attributes", detail);
+            return;
+        }
+    };
+    let tee_platform = match tee {
+        "tdx" => Some(atakit_core::tee_attributes::TeePlatform::IntelTdx),
+        "sev-snp" => Some(atakit_core::tee_attributes::TeePlatform::AmdSevSnp),
+        _ => None,
+    };
+    let mut encoded_requirements = BTreeMap::new();
+    if let Some(requirements) = workload_attributes {
+        for (name, values) in requirements {
+            match atakit_core::tee_attributes::encode_requirement(name, values) {
+                Ok((key, allowed_values)) => {
+                    encoded_requirements.insert(key, allowed_values);
+                }
+                Err(detail) => fail(report, errors, "workload-attributes", detail),
+            }
+        }
+    }
+
+    for (attribute, enabled) in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN
+        .into_iter()
+        .zip(verified_states)
+    {
+        if Some(attribute.platform()) != tee_platform {
+            continue;
+        }
+        let verified_value = atakit_core::tee_attributes::bool_value(enabled);
+        let declared_value = effective_attributes
+            .get(&attribute.key())
+            .copied()
+            .unwrap_or(atakit_core::tee_attributes::ATTRIBUTE_FALSE);
+        check(
+            report,
+            errors,
+            &format!("tee-attribute-base-image-{}", attribute.name()),
+            declared_value == verified_value,
+            format!(
+                "base-image declaration for {} is 0x{}, verified value is 0x{}",
+                attribute.name(),
+                hex::encode(declared_value),
+                hex::encode(verified_value)
+            ),
+        );
+        if workload_attributes.is_some() {
+            let allowed = encoded_requirements
+                .get(&attribute.key())
+                .map_or(!enabled, |values| values.contains(&verified_value));
+            check(
+                report,
+                errors,
+                &format!("tee-attribute-workload-{}", attribute.name()),
+                allowed,
+                format!(
+                    "workload requirement for {} does not permit verified value {}",
+                    attribute.name(),
+                    enabled
+                ),
+            );
+        }
+    }
+
+    if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::IntelTdx) {
+        if let Some(actual_bit) = verified_tdx_tcb_status_bit {
+            let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
+            let base_matches =
+                tdx_tcb_status_policy_matches(effective_attributes.get(&key), actual_bit);
+            check(
+                report,
+                errors,
+                "tee-attribute-base-image-intel-tdx-tcb-status",
+                base_matches,
+                format!(
+                    "base-image Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
+                ),
+            );
+            if workload_attributes.is_some() {
+                let workload_matches = match encoded_requirements.get(&key).map(Vec::as_slice) {
+                    Some([value]) => tdx_tcb_status_policy_matches(Some(value), actual_bit),
+                    Some(_) => false,
+                    None => tdx_tcb_status_policy_matches(None, actual_bit),
+                };
+                check(
+                    report,
+                    errors,
+                    "tee-attribute-workload-intel-tdx-tcb-status",
+                    workload_matches,
+                    format!(
+                        "workload Intel TDX TCB status mask is invalid or does not permit verified status bit 0x{actual_bit:x}"
+                    ),
+                );
+            }
+        }
+    }
+
+    if tee_platform == Some(atakit_core::tee_attributes::TeePlatform::AmdSevSnp) {
+        match verification_core::verified_snp_security_state(&report_bytes) {
+            Ok(state) => {
+                let registry_default =
+                    select_amd_snp_security_policy(amd_snp_security_policies, state.cpuid);
+                match registry_default {
+                    Ok(registry_default) => {
+                        verify_amd_snp_measurement_policy(
+                            report,
+                            errors,
+                            state,
+                            registry_default,
+                            &effective_attributes,
+                            &encoded_requirements,
+                            workload_attributes.is_some(),
+                        );
+                    }
+                    Err(detail) => fail(report, errors, "amd-sev-snp-registry-default", detail),
+                }
+            }
+            Err(detail) => fail(report, errors, "amd-sev-snp-security-state", detail),
+        }
+    }
+
+    for (key, allowed_values) in encoded_requirements {
+        if atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key).is_some() {
+            continue;
+        }
+        let Some(actual) = effective_attributes.get(&key) else {
+            fail(
+                report,
+                errors,
+                "workload-attribute",
+                format!(
+                    "base image does not declare required attribute 0x{}",
+                    hex::encode(key)
+                ),
+            );
+            continue;
+        };
+        check(
+            report,
+            errors,
+            &format!("workload-attribute-{}", hex::encode(key)),
+            allowed_values.is_empty() || allowed_values.contains(actual),
+            format!(
+                "workload requirement for attribute 0x{} does not permit value 0x{}",
+                hex::encode(key),
+                hex::encode(actual)
+            ),
+        );
+    }
+}
+
+fn select_amd_snp_security_policy(
+    policies: &[AmdSnpSecurityPolicy],
+    cpuid: u32,
+) -> std::result::Result<&AmdSnpSecurityPolicy, String> {
+    let mut matching = policies.iter().filter(|policy| policy.cpuid == cpuid);
+    let policy = matching.next().ok_or_else(|| {
+        format!(
+            "no active AmdSnpSecurityPolicyRegistry policy was supplied for CPUID 0x{cpuid:06x}"
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "multiple AMD SEV-SNP security policies were supplied for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&policy.minimum_tcb) {
+        return Err(format!(
+            "AMD SEV-SNP registry default minimum TCB is invalid for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+        &policy.platform_info_policy,
+    ) {
+        return Err(format!(
+            "AMD SEV-SNP registry default PLATFORM_INFO policy is invalid for CPUID 0x{cpuid:06x}"
+        ));
+    }
+    Ok(policy)
+}
+
+fn resolve_packed_workload_requirement(
+    encoded_requirements: &BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    key: [u8; 32],
+    default_value: [u8; 32],
+) -> std::result::Result<[u8; 32], String> {
+    let Some(values) = encoded_requirements.get(&key) else {
+        return Ok(default_value);
+    };
+    if values.len() != 1 {
+        return Err(format!(
+            "workload requirement for reserved packed attribute 0x{} must contain exactly one value, got {}",
+            hex::encode(key),
+            values.len()
+        ));
+    }
+    Ok(values[0])
+}
+
+fn verify_amd_snp_measurement_policy(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    state: verification_core::VerifiedAmdSnpSecurityState,
+    registry_default: &AmdSnpSecurityPolicy,
+    effective_attributes: &BTreeMap<[u8; 32], [u8; 32]>,
+    encoded_requirements: &BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    has_workload: bool,
+) {
+    use atakit_core::tee_attributes::{
+        amd_sev_snp_platform_info_matches, amd_sev_snp_tcb_meets_minimum,
+        merge_amd_sev_snp_platform_info_policies, AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+        AMD_SEV_SNP_TCB_MINIMUM_KEY,
+    };
+
+    let mitigation_policy = validate_amd_snp_mitigation_policy(
+        state.report_version,
+        state.launch_mitigation_vector,
+        state.current_mitigation_vector,
+        registry_default,
+    );
+    check(
+        report,
+        errors,
+        "amd-sev-snp-mitigation-vector-policy",
+        mitigation_policy.is_ok(),
+        mitigation_policy.err().unwrap_or_else(|| {
+            "verified AMD SEV-SNP mitigation vectors satisfy the registry policy".to_string()
+        }),
+    );
+
+    let base_tcb = effective_attributes
+        .get(&AMD_SEV_SNP_TCB_MINIMUM_KEY)
+        .copied()
+        .unwrap_or(registry_default.minimum_tcb);
+    let base_tcb_matches = amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &base_tcb);
+    check(
+        report,
+        errors,
+        "tee-attribute-base-image-amd-sev-snp-tcb-minimum",
+        base_tcb_matches,
+        format!(
+            "verified AMD SEV-SNP TCB 0x{} does not meet the resolved base-image minimum",
+            hex::encode(state.tcb_values)
+        ),
+    );
+
+    if has_workload {
+        let workload_tcb = resolve_packed_workload_requirement(
+            encoded_requirements,
+            AMD_SEV_SNP_TCB_MINIMUM_KEY,
+            registry_default.minimum_tcb,
+        );
+        let (matches, detail) = match workload_tcb {
+            Ok(workload_tcb) => (
+                amd_sev_snp_tcb_meets_minimum(&state.tcb_values, &workload_tcb),
+                format!(
+                    "verified AMD SEV-SNP TCB 0x{} does not meet the resolved workload minimum",
+                    hex::encode(state.tcb_values)
+                ),
+            ),
+            Err(detail) => (false, detail),
+        };
+        check(
+            report,
+            errors,
+            "tee-attribute-workload-amd-sev-snp-tcb-minimum",
+            matches,
+            detail,
+        );
+    }
+
+    let base_platform_info = effective_attributes
+        .get(&AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY)
+        .copied()
+        .unwrap_or(registry_default.platform_info_policy);
+    let base_platform_info_matches =
+        amd_sev_snp_platform_info_matches(state.platform_info, &base_platform_info);
+    check(
+        report,
+        errors,
+        "tee-attribute-base-image-amd-sev-snp-platform-info-policy",
+        base_platform_info_matches,
+        format!(
+            "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} does not meet the resolved base-image policy",
+            state.platform_info
+        ),
+    );
+
+    if has_workload {
+        let workload_platform_info = resolve_packed_workload_requirement(
+            encoded_requirements,
+            AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY,
+            registry_default.platform_info_policy,
+        );
+        let (workload_platform_info_matches, detail) = match workload_platform_info {
+            Ok(workload_platform_info) => {
+                let effective_platform_info = merge_amd_sev_snp_platform_info_policies(
+                    &base_platform_info,
+                    &workload_platform_info,
+                );
+                (
+                    effective_platform_info.as_ref().is_some_and(|policy| {
+                        amd_sev_snp_platform_info_matches(state.platform_info, policy)
+                    }),
+                    format!(
+                        "verified AMD SEV-SNP PLATFORM_INFO 0x{:016x} conflicts with or does not meet the resolved base-image and workload policies",
+                        state.platform_info
+                    ),
+                )
+            }
+            Err(detail) => (false, detail),
+        };
+        check(
+            report,
+            errors,
+            "tee-attribute-workload-amd-sev-snp-platform-info-policy",
+            workload_platform_info_matches,
+            detail,
+        );
+    }
+}
+
+fn validate_amd_snp_mitigation_policy(
+    report_version: u32,
+    launch_mitigation_vector: u64,
+    current_mitigation_vector: u64,
+    policy: &AmdSnpSecurityPolicy,
+) -> std::result::Result<(), String> {
+    if (policy.required_launch_mitigation_vector != 0
+        || policy.required_current_mitigation_vector != 0)
+        && report_version != 5
+    {
+        return Err(format!(
+            "AMD SEV-SNP report version {} cannot satisfy a mitigation-vector policy; version 5 is required",
+            report_version
+        ));
+    }
+    if launch_mitigation_vector & policy.required_launch_mitigation_vector
+        != policy.required_launch_mitigation_vector
+    {
+        return Err(format!(
+            "AMD SEV-SNP LAUNCH_MIT_VECTOR 0x{:016x} is missing required mask 0x{:016x}",
+            launch_mitigation_vector, policy.required_launch_mitigation_vector
+        ));
+    }
+    if current_mitigation_vector & policy.required_current_mitigation_vector
+        != policy.required_current_mitigation_vector
+    {
+        return Err(format!(
+            "AMD SEV-SNP CURRENT_MIT_VECTOR 0x{:016x} is missing required mask 0x{:016x}",
+            current_mitigation_vector, policy.required_current_mitigation_vector
+        ));
+    }
+    Ok(())
+}
+
+fn bytes32_to_u16(value: &[u8; 32]) -> Option<u16> {
+    value[..30]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| u16::from_be_bytes([value[30], value[31]]))
+}
+
+fn tdx_tcb_status_policy_matches(value: Option<&[u8; 32]>, actual_bit: u16) -> bool {
+    let mask = match value {
+        Some(value) => bytes32_to_u16(value),
+        None => Some(atakit_core::tee_attributes::TDX_TCB_STATUS_OK),
+    };
+    mask.is_some_and(|mask| {
+        atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_some() && mask & actual_bit != 0
+    })
+}
+
+fn effective_measurement_attributes(
+    profile: &MeasurementProfile,
+    variant: &MeasurementVariant,
+) -> std::result::Result<BTreeMap<[u8; 32], [u8; 32]>, String> {
+    let mut attributes = parse_measurement_attributes(&profile.attributes, "profile")?;
+    for (key, value) in parse_measurement_attributes(&variant.attributes, "variant")? {
+        attributes.insert(key, value);
+    }
+    Ok(attributes)
+}
+
+fn parse_measurement_attributes(
+    values: &[serde_json::Value],
+    owner: &str,
+) -> std::result::Result<BTreeMap<[u8; 32], [u8; 32]>, String> {
+    let mut attributes = BTreeMap::new();
+    for value in values {
+        let (key, value) = if let Some(name) = value.get("name").and_then(serde_json::Value::as_str)
+        {
+            use atakit_core::tee_attributes::{
+                ReservedAttributeValueKind, VerifiedTeeAttribute, TEE_ATTRIBUTE_NAMESPACE,
+            };
+            match VerifiedTeeAttribute::from_name(name) {
+                Some(attribute)
+                    if attribute.value_kind() == ReservedAttributeValueKind::Boolean =>
+                {
+                    let enabled = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} is missing Boolean value"
+                            )
+                        })?;
+                    (
+                        attribute.key(),
+                        atakit_core::tee_attributes::bool_value(enabled),
+                    )
+                }
+                Some(VerifiedTeeAttribute::IntelTdxTcbStatusAllowed) => {
+                    let names = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} value must be a status-name array"
+                            )
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().ok_or_else(|| {
+                                format!(
+                                    "{owner} readable reserved attribute {name} status names must be strings"
+                                )
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let mask = atakit_core::tee_attributes::tdx_tcb_status_mask(names)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} must contain unique supported status names and include ok"
+                            )
+                        })?;
+                    (
+                        atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY,
+                        atakit_core::tee_attributes::u16_value(mask),
+                    )
+                }
+                Some(attribute) => {
+                    let packed = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(atakit_core::tee_attributes::parse_bytes32_hex)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} readable reserved attribute {name} value must be a 0x-prefixed bytes32 string"
+                            )
+                        })?;
+                    let valid = match attribute.value_kind() {
+                        ReservedAttributeValueKind::AmdSevSnpTcb => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&packed)
+                        }
+                        ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                            atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+                                &packed,
+                            )
+                        }
+                        _ => unreachable!("Boolean and Intel TDX TCB values handled above"),
+                    };
+                    if !valid {
+                        return Err(format!(
+                            "{owner} readable reserved attribute {name} value is invalid"
+                        ));
+                    }
+                    (attribute.key(), packed)
+                }
+                None if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) => {
+                    return Err(format!(
+                        "{owner} attribute has unknown reserved name {name}"
+                    ));
+                }
+                None => {
+                    let string_value = value
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            format!(
+                                "{owner} custom readable attribute {name} value must be a string"
+                            )
+                        })?;
+                    (
+                        atakit_core::tee_attributes::attribute_key(name),
+                        atakit_core::tee_attributes::attribute_string_value(string_value),
+                    )
+                }
+            }
+        } else {
+            let key = value
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{owner} attribute is missing string key"))?;
+            let value = value
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{owner} attribute is missing string value"))?;
+            (
+                decode_hex_32("attribute.key", key).map_err(|error| error.to_string())?,
+                decode_hex_32("attribute.value", value).map_err(|error| error.to_string())?,
+            )
+        };
+        if let Some(attribute) = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key) {
+            match attribute.value_kind() {
+                atakit_core::tee_attributes::ReservedAttributeValueKind::Boolean
+                    if value != atakit_core::tee_attributes::ATTRIBUTE_FALSE
+                        && value != atakit_core::tee_attributes::ATTRIBUTE_TRUE =>
+                {
+                    return Err(format!(
+                        "{owner} reserved Boolean attribute 0x{} has invalid value 0x{}",
+                        hex::encode(key),
+                        hex::encode(value)
+                    ));
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                    let mask = bytes32_to_u16(&value).ok_or_else(|| {
+                        format!("{owner} Intel TDX TCB status mask is not a uint16")
+                    })?;
+                    if atakit_core::tee_attributes::tdx_tcb_status_names(mask).is_none() {
+                        return Err(format!(
+                            "{owner} Intel TDX TCB status mask 0x{mask:x} is invalid"
+                        ));
+                    }
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpTcb
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&value) =>
+                {
+                    return Err(format!("{owner} AMD SEV-SNP TCB minimum is invalid"));
+                }
+                atakit_core::tee_attributes::ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy
+                    if !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(&value) =>
+                {
+                    return Err(format!(
+                        "{owner} AMD SEV-SNP PLATFORM_INFO policy is invalid"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if attributes.insert(key, value).is_some() {
+            return Err(format!(
+                "{owner} attributes contain a duplicate key 0x{}",
+                hex::encode(key)
+            ));
+        }
+    }
+    Ok(attributes)
 }
 
 pub fn compute_tls_bootstrap_qualifying_data(
@@ -1339,6 +2224,18 @@ fn verify_pcr_spec(
     event_log_hashes: &[PcrEventHashes],
 ) {
     let check_name = format!("pcr-{}-{}", spec.pcr_index, spec.verify_type);
+    if spec.verify_type.eq_ignore_ascii_case("static") && spec.match_data.len() != 1 {
+        fail(
+            report,
+            errors,
+            &check_name,
+            format!(
+                "STATIC PCR spec requires exactly one matchData entry, got {}",
+                spec.match_data.len()
+            ),
+        );
+        return;
+    }
     if spec.match_data.is_empty() {
         fail(
             report,
@@ -1465,14 +2362,18 @@ fn decode_b64_32(field: &'static str, value: &str) -> Result<[u8; 32]> {
 }
 
 fn decode_hex_32(field: &'static str, value: &str) -> Result<[u8; 32]> {
+    decode_hex_array(field, value)
+}
+
+fn decode_hex_array<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
     let raw = value.strip_prefix("0x").unwrap_or(value);
     let bytes = hex::decode(raw).map_err(|e| AttestationError::Hex {
         field,
         detail: e.to_string(),
     })?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| AttestationError::Hex {
+    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| AttestationError::Hex {
         field,
-        detail: format!("expected 32 bytes, got {}", bytes.len()),
+        detail: format!("expected {N} bytes, got {}", bytes.len()),
     })
 }
 
@@ -1556,6 +2457,18 @@ mod tests {
     use p256::pkcs8::DecodePrivateKey;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
     use signature::{hazmat::PrehashSigner, Signer};
+
+    fn synthetic_snp_security_report(policy: u64) -> Vec<u8> {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&3u32.to_le_bytes());
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+        report[SNP_REPORT_SIG_ALGO_OFFSET..SNP_REPORT_SIG_ALGO_OFFSET + 4]
+            .copy_from_slice(&SNP_SIG_ALGO_ECDSA_P384_SHA384.to_le_bytes());
+        report[SNP_REPORT_CPUID_OFFSET..SNP_REPORT_CPUID_OFFSET + 3].copy_from_slice(&[0x19, 0, 0]);
+        report
+    }
 
     fn response_for(nonce: [u8; 32], cert: &[u8], cloud: &str) -> TlsAttestationResponse {
         let cert_sha: [u8; 32] = Sha256::digest(cert).into();
@@ -1745,6 +2658,7 @@ mod tests {
 
     fn fake_gcp_tdx_quote_body(uuid: &[u8; 16]) -> Vec<u8> {
         let mut quote = vec![0u8; TDX_REPORT_REPORT_DATA_OFFSET + 64];
+        quote[TDX_REPORT_ATTRIBUTES_OFFSET + 3] = 0x10;
         let mut rtmr3_input = Vec::with_capacity(96);
         rtmr3_input.extend_from_slice(&[0u8; 48]);
         rtmr3_input.extend_from_slice(&[0u8; 32]);
@@ -1800,17 +2714,12 @@ mod tests {
         UNIX_EPOCH + std::time::Duration::from_secs(1_784_851_200)
     }
 
-    fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
-        let entries = [
-            (SNP_CERT_TABLE_ARK_GUID, ark),
-            (SNP_CERT_TABLE_ASK_GUID, ask),
-            (SNP_CERT_TABLE_VCEK_GUID, vcek),
-        ];
-        let table_len = 24 * (entries.len() + 1);
+    fn fake_amd_snp_cert_table(entries: &[([u8; 16], &[u8])]) -> Vec<u8> {
+        let table_len = SNP_CERT_TABLE_ENTRY_BYTES * (entries.len() + 1);
         let mut out = vec![0u8; table_len];
         let mut cert_offset = table_len;
         for (idx, (guid, cert)) in entries.iter().enumerate() {
-            let entry_offset = idx * 24;
+            let entry_offset = idx * SNP_CERT_TABLE_ENTRY_BYTES;
             out[entry_offset..entry_offset + 16].copy_from_slice(guid);
             out[entry_offset + 16..entry_offset + 20]
                 .copy_from_slice(&(cert_offset as u32).to_le_bytes());
@@ -1824,6 +2733,14 @@ mod tests {
         out
     }
 
+    fn fake_amd_snp_auxblob(ark: &[u8], ask: &[u8], vcek: &[u8]) -> Vec<u8> {
+        fake_amd_snp_cert_table(&[
+            (SNP_CERT_TABLE_ARK_GUID, ark),
+            (SNP_CERT_TABLE_ASK_GUID, ask),
+            (SNP_CERT_TABLE_VCEK_GUID, vcek),
+        ])
+    }
+
     #[test]
     fn parses_amd_snp_auxblob_raw_cert_table_guids() {
         let ark = b"ark";
@@ -1835,6 +2752,100 @@ mod tests {
         assert_eq!(certs.ark.as_deref(), Some(ark.as_slice()));
         assert_eq!(certs.ask.as_deref(), Some(ask.as_slice()));
         assert_eq!(certs.vcek.as_deref(), Some(vcek.as_slice()));
+    }
+
+    #[test]
+    fn rejects_oversized_amd_snp_certificate_table() {
+        let table = vec![0u8; MAX_SNP_CERT_TABLE_BYTES + 1];
+        let error = parse_amd_snp_cert_table(&table).expect_err("oversized table must fail");
+
+        assert!(error.contains("1048576-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_with_too_many_entries() {
+        let entry_count = MAX_SNP_CERT_TABLE_ENTRIES + 1;
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * (entry_count + 1);
+        let mut table = vec![0u8; header_len + entry_count];
+        for index in 0..entry_count {
+            let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
+            table[entry_offset] = 1;
+            table[entry_offset + 16..entry_offset + 20]
+                .copy_from_slice(&((header_len + index) as u32).to_le_bytes());
+            table[entry_offset + 20..entry_offset + 24].copy_from_slice(&1u32.to_le_bytes());
+        }
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("too many entries must fail");
+        assert!(error.contains("more than 64 entries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_without_terminator() {
+        let mut table = vec![0u8; SNP_CERT_TABLE_ENTRY_BYTES + 1];
+        table[..16].copy_from_slice(&SNP_CERT_TABLE_ARK_GUID);
+        table[16..20].copy_from_slice(&(SNP_CERT_TABLE_ENTRY_BYTES as u32).to_le_bytes());
+        table[20..24].copy_from_slice(&1u32.to_le_bytes());
+        table[SNP_CERT_TABLE_ENTRY_BYTES] = 1;
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("missing terminator must fail");
+        assert!(error.contains("missing its zero terminator"), "{error}");
+    }
+
+    #[test]
+    fn rejects_amd_snp_certificate_table_range_overlapping_header() {
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * 2;
+        let mut table = vec![0u8; header_len + 1];
+        table[..16].copy_from_slice(&SNP_CERT_TABLE_ARK_GUID);
+        table[16..20].copy_from_slice(&(SNP_CERT_TABLE_ENTRY_BYTES as u32).to_le_bytes());
+        table[20..24].copy_from_slice(&1u32.to_le_bytes());
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("header overlap must fail");
+        assert!(error.contains("overlaps the header"), "{error}");
+    }
+
+    #[test]
+    fn rejects_overlapping_amd_snp_certificate_ranges() {
+        let header_len = SNP_CERT_TABLE_ENTRY_BYTES * 3;
+        let mut table = vec![0u8; header_len + 3];
+        for (index, guid) in [SNP_CERT_TABLE_ARK_GUID, SNP_CERT_TABLE_ASK_GUID]
+            .iter()
+            .enumerate()
+        {
+            let entry_offset = index * SNP_CERT_TABLE_ENTRY_BYTES;
+            table[entry_offset..entry_offset + 16].copy_from_slice(guid);
+            table[entry_offset + 16..entry_offset + 20]
+                .copy_from_slice(&((header_len + index) as u32).to_le_bytes());
+            table[entry_offset + 20..entry_offset + 24].copy_from_slice(&2u32.to_le_bytes());
+        }
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("overlapping ranges must fail");
+        assert!(error.contains("certificate ranges overlap"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_amd_snp_certificate_types() {
+        let table = fake_amd_snp_cert_table(&[
+            (SNP_CERT_TABLE_ARK_GUID, b"first"),
+            (SNP_CERT_TABLE_ARK_GUID, b"second"),
+        ]);
+
+        let error = parse_amd_snp_cert_table(&table).expect_err("duplicate ARK must fail");
+        assert!(error.contains("duplicate ARK entries"), "{error}");
+    }
+
+    #[test]
+    fn accepts_unknown_amd_snp_certificate_type_without_selecting_it() {
+        let table = fake_amd_snp_cert_table(&[
+            ([0x42; 16], b"future certificate"),
+            (SNP_CERT_TABLE_ARK_GUID, b"ark"),
+            (SNP_CERT_TABLE_ASK_GUID, b"ask"),
+            (SNP_CERT_TABLE_VCEK_GUID, b"vcek"),
+        ]);
+
+        let parsed = parse_amd_snp_cert_table(&table).expect("unknown entry type is extensible");
+        assert_eq!(parsed.ark.as_deref(), Some(b"ark".as_slice()));
+        assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
+        assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
     }
 
     fn expected_gcp_tdx_pcr15_for_uuid(uuid: &[u8; 16]) -> [u8; 32] {
@@ -1944,6 +2955,7 @@ mod tests {
             &ak_public,
             &[root.der().as_ref().to_vec()],
             &[],
+            SystemTime::now(),
         );
 
         assert!(
@@ -2050,6 +3062,13 @@ mod tests {
     }
 
     fn fake_azure_ak_binding_and_signature(tpm2b_attest: &[u8]) -> (AkBinding, Vec<u8>, Vec<u8>) {
+        fake_azure_ak_binding_and_signature_for_tee(tpm2b_attest, "tdx")
+    }
+
+    fn fake_azure_ak_binding_and_signature_for_tee(
+        tpm2b_attest: &[u8],
+        tee: &str,
+    ) -> (AkBinding, Vec<u8>, Vec<u8>) {
         let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test RSA key");
         let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let signature = sign_rsa_sha256(
@@ -2065,7 +3084,7 @@ mod tests {
             }]
         });
         let hcl_var_data = serde_json::to_vec(&hcl_var_data).expect("hcl var data JSON");
-        let (jwt, trusted_maa_key) = fake_azure_maa_jwt(&hcl_var_data, "tdx");
+        let (jwt, trusted_maa_key) = fake_azure_maa_jwt(&hcl_var_data, tee);
         let binding = serde_json::json!({
             "jwt": jwt,
             "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data)
@@ -2081,7 +3100,56 @@ mod tests {
         )
     }
 
+    fn bind_azure_tdx_evidence_to_ak_binding(response: &mut TlsAttestationResponse) {
+        let binding = response.ak_binding.as_ref().expect("Azure AK binding");
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        let hcl_var_data = URL_SAFE_NO_PAD
+            .decode(binding_json["hclVarData"].as_str().unwrap())
+            .unwrap();
+        let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
+        let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = tdx_quote_report_start(&quote).expect("TDX quote body");
+        let report_data_start = report_start + TDX_REPORT_REPORT_DATA_OFFSET;
+        let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
+        quote[report_data_start..report_data_start + 32].copy_from_slice(&hcl_hash);
+        quote[report_data_start + 32..report_data_start + 64].fill(0);
+        evidence.report = URL_SAFE_NO_PAD.encode(quote);
+        evidence.auxiliary = Some(URL_SAFE_NO_PAD.encode(hcl_var_data));
+    }
+
+    fn bind_azure_snp_evidence_to_ak_binding(response: &mut TlsAttestationResponse) {
+        let binding = response.ak_binding.as_ref().expect("Azure AK binding");
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        let hcl_var_data = URL_SAFE_NO_PAD
+            .decode(binding_json["hclVarData"].as_str().unwrap())
+            .unwrap();
+        let mut snp_report = synthetic_snp_security_report(1u64 << 17);
+        let hcl_hash: [u8; 32] = Sha256::digest(&hcl_var_data).into();
+        snp_report[0x50..0x70].copy_from_slice(&hcl_hash);
+        let evidence = response.tee_evidence.as_mut().expect("Azure TEE evidence");
+        evidence.report = URL_SAFE_NO_PAD.encode(snp_report);
+        evidence.auxiliary = Some(URL_SAFE_NO_PAD.encode(hcl_var_data));
+    }
+
     fn fake_azure_maa_jwt(hcl_var_data: &[u8], tee: &str) -> (String, Vec<u8>) {
+        fake_azure_maa_jwt_with_times(
+            hcl_var_data,
+            tee,
+            1_700_000_000,
+            1_700_000_000,
+            4_102_444_800,
+        )
+    }
+
+    fn fake_azure_maa_jwt_with_times(
+        hcl_var_data: &[u8],
+        tee: &str,
+        iat: u64,
+        nbf: u64,
+        exp: u64,
+    ) -> (String, Vec<u8>) {
         let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test MAA RSA key");
         let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let trusted_key = serde_json::to_vec(&serde_json::json!({
@@ -2109,6 +3177,10 @@ mod tests {
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
                 "iss": "https://sharedeus.eus.attest.azure.net",
+                "iat": iat,
+                "nbf": nbf,
+                "exp": exp,
+                "x-ms-runtime": {"exp": 4_102_444_800u64},
                 "x-ms-attestation-type": attestation_type,
                 "x-ms-compliance-status": "azure-compliant-cvm",
                 report_data_claim: hex::encode(report_data)
@@ -2158,6 +3230,14 @@ mod tests {
     }
 
     fn fake_tpm_quote(qualifying_data: &[u8; 32], pcrs: &[(u8, [u8; 32])]) -> Vec<u8> {
+        fake_tpm_quote_banks(qualifying_data, pcrs, &[])
+    }
+
+    fn fake_tpm_quote_banks(
+        qualifying_data: &[u8; 32],
+        sha256_pcrs: &[(u8, [u8; 32])],
+        sha384_pcrs: &[(u8, [u8; 48])],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&TPM_GENERATED_VALUE.to_be_bytes());
         body.extend_from_slice(&TPM_ST_ATTEST_QUOTE.to_be_bytes());
@@ -2166,16 +3246,41 @@ mod tests {
         body.extend_from_slice(qualifying_data);
         body.extend_from_slice(&[0u8; 17]); // clockInfo
         body.extend_from_slice(&[0u8; 8]); // firmwareVersion
-        body.extend_from_slice(&1u32.to_be_bytes()); // PCR selection count
-        body.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
-        body.push(3); // sizeofSelect for PCRs 0..=23
-        let mut select = [0u8; 3];
-        for (index, _) in pcrs {
-            select[usize::from(index / 8)] |= 1 << (index % 8);
+        let selection_count =
+            u32::from(!sha256_pcrs.is_empty()) + u32::from(!sha384_pcrs.is_empty());
+        body.extend_from_slice(&selection_count.to_be_bytes());
+        for (hash_alg, indices) in [
+            (
+                TPM_ALG_SHA256,
+                sha256_pcrs
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                TPM_ALG_SHA384,
+                sha384_pcrs
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            if indices.is_empty() {
+                continue;
+            }
+            body.extend_from_slice(&hash_alg.to_be_bytes());
+            body.push(3); // sizeofSelect for PCRs 0..=23
+            let mut select = [0u8; 3];
+            for index in indices {
+                select[usize::from(index / 8)] |= 1 << (index % 8);
+            }
+            body.extend_from_slice(&select);
         }
-        body.extend_from_slice(&select);
-        let mut pcr_concat = Vec::with_capacity(pcrs.len() * 32);
-        for (_, value) in pcrs {
+        let mut pcr_concat = Vec::with_capacity(sha256_pcrs.len() * 32 + sha384_pcrs.len() * 48);
+        for (_, value) in sha256_pcrs {
+            pcr_concat.extend_from_slice(value);
+        }
+        for (_, value) in sha384_pcrs {
             pcr_concat.extend_from_slice(value);
         }
         let digest: [u8; 32] = Sha256::digest(&pcr_concat).into();
@@ -2262,29 +3367,34 @@ mod tests {
     }
 
     #[test]
-    fn gcp_tdx_pcr15_binding_parses_full_quote_and_body_fixture() {
+    fn gcp_tdx_pcr15_binding_requires_full_quote() {
         let uuid = [0x42u8; 16];
         let expected = expected_gcp_tdx_pcr15_for_uuid(&uuid);
-        for quote in [
-            fake_gcp_tdx_full_quote_v4(&uuid),
-            fake_gcp_tdx_quote_body(&uuid),
-        ] {
-            let mut report = VerificationReport {
-                checks: Vec::new(),
-                evidence: EvidenceSummary::default(),
-            };
-            let mut errors = Vec::new();
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        let got =
+            expected_gcp_tdx_pcr15(&mut report, &mut errors, &fake_gcp_tdx_full_quote_v4(&uuid))
+                .expect("GCP TDX PCR15 should derive from a full quote");
+        assert_eq!(got, expected);
+        assert!(errors.is_empty(), "{errors:?}");
 
-            let got = expected_gcp_tdx_pcr15(&mut report, &mut errors, &quote)
-                .expect("GCP TDX PCR15 should derive from quote");
-
-            assert_eq!(got, expected);
-            assert!(
-                errors.is_empty(),
-                "unexpected binding errors for quote len {}: {errors:?}",
-                quote.len()
-            );
-        }
+        let mut body_report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut body_errors = Vec::new();
+        assert!(expected_gcp_tdx_pcr15(
+            &mut body_report,
+            &mut body_errors,
+            &fake_gcp_tdx_quote_body(&uuid),
+        )
+        .is_none());
+        assert!(body_errors
+            .iter()
+            .any(|error| error.detail.contains("unsupported version")));
     }
 
     #[test]
@@ -2297,6 +3407,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -2351,51 +3463,75 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gcp_snp_report_that_permits_debugging() {
-        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
-        let mut policy = u64::from_le_bytes(
-            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-        policy |= SNP_POLICY_DEBUG;
-        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-            .copy_from_slice(&policy.to_le_bytes());
-
-        let error = verify_snp_report_with_aux_certs(
+    fn azure_snp_vendor_wrapper_accepts_ff_report_id_ma_absence_sentinel() {
+        let (snp_report, ark, cert_table) = fixture_gcp_snp_report_and_certs();
+        verify_snp_report_with_aux_certs(
             snp_fixture_time(),
-            &report,
-            &auxblob,
-            &[ark],
+            &snp_report,
+            &cert_table,
+            std::slice::from_ref(&ark),
             &[],
             &[fixture_amd_milan_crl()],
         )
-        .unwrap_err();
-        assert!(error.contains("debugging"), "{error}");
+        .expect("fixture report signature and certificate chain should verify");
+        let evidence = TeeEvidence {
+            kind: "azure-hcl-report".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: Some(URL_SAFE_NO_PAD.encode(b"HCL var_data")),
+        };
+        let collateral = AmdSnpVerificationCollateral::from_certificate_table(
+            &cert_table,
+            vec![fixture_amd_milan_crl()],
+        )
+        .expect("AMD SNP verification collateral");
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        verify_azure_snp_vendor_report(
+            &mut report,
+            &mut errors,
+            Some(&evidence),
+            Some(&collateral),
+            AmdSnpTrust {
+                ark_roots: &[ark],
+                ark_root_hashes: &[],
+            },
+            snp_fixture_time(),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(report.checks.iter().any(|check| {
+            check.name == "azure-tee-vendor-report" && check.result == CheckResult::Pass
+        }));
     }
 
     #[test]
-    fn rejects_gcp_snp_report_that_permits_migration_agent() {
-        let (mut report, ark, auxblob) = fixture_gcp_snp_report_and_certs();
-        let mut policy = u64::from_le_bytes(
-            report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-        policy |= SNP_POLICY_MIGRATE_MA;
+    fn vendor_policy_permits_gcp_snp_debug_for_measurement_policy_evaluation() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&3u32.to_le_bytes());
+        let policy = (1u64 << 17) | SNP_POLICY_DEBUG;
         report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
             .copy_from_slice(&policy.to_le_bytes());
 
-        let error = verify_snp_report_with_aux_certs(
-            snp_fixture_time(),
-            &report,
-            &auxblob,
-            &[ark],
-            &[],
-            &[fixture_amd_milan_crl()],
-        )
-        .unwrap_err();
-        assert!(error.contains("migration agent"), "{error}");
+        verify_snp_report_policy(&report)
+            .expect("SNP DEBUG must reach verified TEE attribute policy evaluation");
+    }
+
+    #[test]
+    fn vendor_policy_permits_gcp_snp_migrate_ma_for_measurement_policy_evaluation() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&3u32.to_le_bytes());
+        let policy = (1u64 << 17) | SNP_POLICY_MIGRATE_MA;
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&policy.to_le_bytes());
+
+        verify_snp_report_policy(&report)
+            .expect("SNP MIGRATE_MA must reach verified TEE attribute policy evaluation");
     }
 
     #[test]
@@ -2433,6 +3569,21 @@ mod tests {
         .unwrap_err();
         assert!(
             error.contains("unsupported SNP report version 6"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_gcp_snp_report_version_two() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&(1u64 << 17).to_le_bytes());
+
+        let error = verify_snp_report_policy(&report).unwrap_err();
+        assert!(
+            error.contains("unsupported SNP report version 2"),
             "{error}"
         );
     }
@@ -2514,17 +3665,33 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_gcp_snp_tls_attestation_fixture() {
+    fn verifier_accepts_gcp_snp_fixture_with_ff_report_id_ma_absence_sentinel() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let pcr = format!("0x{}", "aa".repeat(32));
         let (response, gcp_roots, amd_ark) = gcp_snp_response_roots_and_ark(nonce, cert);
+        let certificate_table = URL_SAFE_NO_PAD
+            .decode(
+                response
+                    .tee_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.auxiliary.as_deref())
+                    .expect("GCP SNP auxiliary certificate table"),
+            )
+            .expect("base64url certificate table");
+        let amd_snp_collateral = AmdSnpVerificationCollateral::from_certificate_table(
+            &certificate_table,
+            vec![fixture_amd_milan_crl()],
+        )
+        .expect("AMD SNP verification collateral");
 
-        let identity = verify_tls_attestation_at(
+        verify_tls_attestation_at(
             VerificationInputs {
                 nonce,
                 live_peer_cert_der: cert.to_vec(),
                 response,
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: Some(amd_snp_collateral),
                 measurement_policy: Some(measurement_policy_for_platform(
                     &pcr,
                     "gcp",
@@ -2534,18 +3701,19 @@ mod tests {
                 trust_anchors: TrustAnchors {
                     gcp_roots,
                     amd_ark_roots: vec![amd_ark],
-                    amd_snp_crls: vec![fixture_amd_milan_crl()],
+                    amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
+                        cpuid: 0x190101,
+                        minimum_tcb: [0; 32],
+                        platform_info_policy: [0; 32],
+                        required_launch_mitigation_vector: 0,
+                        required_current_mitigation_vector: 0,
+                    }],
                     ..TrustAnchors::default()
                 },
             },
             snp_fixture_time(),
         )
-        .expect("GCP SEV-SNP TLS attestation should verify with trusted roots");
-
-        assert_eq!(identity.cert_der, cert);
-        assert!(identity.base_image_id.is_some());
-        assert!(identity.platform_profile_id.is_some());
-        assert!(identity.variant_id.is_some());
+        .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
     }
 
     #[test]
@@ -2595,6 +3763,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         })
@@ -2618,6 +3788,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_root_hashes: vec![gcp_root_hash],
@@ -2631,6 +3803,284 @@ mod tests {
         assert_check_passed(&failure, "platform-profile-id");
         assert_check_passed(&failure, "variant-id");
         assert_check_passed(&failure, "pcr-4-static");
+    }
+
+    #[test]
+    fn verifier_enforces_tdx_debug_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        let evidence = response.tee_evidence.as_mut().expect("TEE evidence");
+        let mut quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = tdx_quote_report_start(&quote).unwrap();
+        quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] = 1;
+        evidence.report = URL_SAFE_NO_PAD.encode(quote);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy(&pcr)),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Intel TDX debug declaration must fail");
+        let check_name = format!(
+            "tee-attribute-base-image-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+        assert!(failure.errors.iter().any(|error| error.check == check_name));
+
+        let mut policy = measurement_policy(&pcr);
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": false,
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": true,
+        })];
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(policy.clone()),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("fixture still lacks TDX DCAP collateral");
+        assert!(!failure.errors.iter().any(|error| error.check == check_name));
+        assert_check_passed(&failure, &check_name);
+
+        let workload_check_name = format!(
+            "tee-attribute-workload-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+        let failure = verify_tls_attestation_with_workload_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect_err("missing workload requirement must reject Intel TDX debug");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == workload_check_name));
+
+        let allowed = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
+            vec![
+                atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                atakit_core::tee_attributes::AttributeValue::Boolean(true),
+            ],
+        )]);
+        let failure = verify_tls_attestation_with_workload_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &allowed,
+        )
+        .expect_err("fixture still lacks TDX DCAP collateral");
+        assert!(!failure
+            .errors
+            .iter()
+            .any(|error| error.check == workload_check_name));
+        assert_check_passed(&failure, &workload_check_name);
+
+        let malformed = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME.to_string(),
+            vec![atakit_core::tee_attributes::AttributeValue::Boolean(true)],
+        )]);
+        let failure = verify_tls_attestation_with_workload_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response,
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
+                measurement_policy: Some(policy),
+                trust_anchors: TrustAnchors {
+                    gcp_roots,
+                    ..TrustAnchors::default()
+                },
+            },
+            &malformed,
+        )
+        .expect_err("malformed workload requirement must fail");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "workload-attributes"));
+    }
+
+    #[test]
+    fn verifier_enforces_snp_states_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let (mut response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        response.platform.tee = "sev-snp".to_string();
+        response.platform.machine_type = "n2d-standard-4".to_string();
+        let snp_report =
+            synthetic_snp_security_report((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA);
+        response.tee_evidence = Some(TeeEvidence {
+            kind: "configfs-tsm".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: None,
+        });
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_platform(
+                &pcr,
+                "gcp",
+                "sev-snp",
+                "n2d-standard-4",
+            )),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing AMD SEV-SNP declarations must fail");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let mut policy = measurement_policy_for_platform(&pcr, "gcp", "sev-snp", "n2d-standard-4");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            policy.pack.profiles[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": false}));
+            policy.pack.profiles[0].variants[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": true}));
+        }
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(policy.clone()),
+            trust_anchors: TrustAnchors {
+                gcp_roots: gcp_roots.clone(),
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
+
+        let failure = verify_tls_attestation_with_workload_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response: response.clone(),
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
+                measurement_policy: Some(policy.clone()),
+                trust_anchors: TrustAnchors {
+                    gcp_roots: gcp_roots.clone(),
+                    ..TrustAnchors::default()
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect_err("missing workload requirements must reject enabled AMD SEV-SNP states");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-workload-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let allowed = BTreeMap::from([
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME.to_string(),
+                vec![
+                    atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                    atakit_core::tee_attributes::AttributeValue::Boolean(true),
+                ],
+            ),
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME.to_string(),
+                vec![
+                    atakit_core::tee_attributes::AttributeValue::Boolean(false),
+                    atakit_core::tee_attributes::AttributeValue::Boolean(true),
+                ],
+            ),
+        ]);
+        let failure = verify_tls_attestation_with_workload_attributes(
+            VerificationInputs {
+                nonce,
+                live_peer_cert_der: cert.to_vec(),
+                response,
+                intel_tdx_dcap_collateral: None,
+                amd_snp_collateral: None,
+                measurement_policy: Some(policy),
+                trust_anchors: TrustAnchors {
+                    gcp_roots,
+                    ..TrustAnchors::default()
+                },
+            },
+            &allowed,
+        )
+        .expect_err("synthetic AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-workload-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
     }
 
     #[test]
@@ -2651,6 +4101,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&pcr)),
             trust_anchors: TrustAnchors {
                 gcp_roots,
@@ -2666,10 +4118,16 @@ mod tests {
     }
 
     #[test]
-    fn verifier_applies_variant_pcr_override() {
+    /// A profile invariant always holds. A variant that pins an index the profile already
+    /// declares invariant must be rejected, not resolved in the variant's favour — on-chain
+    /// registration rejects the same overlap, so accepting it here would let offline TLS
+    /// verification and `registerSession` disagree about the same measurement pack.
+    fn verifier_rejects_variant_pcr_that_pins_an_invariant() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        // Invariant PCR4 is deliberately wrong; the variant tries to relax it to the value the
+        // machine actually reports. Previously the override won and `pcr-4-static` passed.
         let mut policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
         policy.pack.profiles[0].variants[0]
             .override_pcrs
@@ -2685,16 +4143,110 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
                 gcp_roots,
                 ..TrustAnchors::default()
             },
         })
-        .expect_err("GCP TDX must fail closed without DCAP collateral");
+        .expect_err("variant pinning an invariant PCR must fail closed");
 
-        assert_only_gcp_vendor_gap(&failure);
-        assert_check_passed(&failure, "pcr-4-static");
+        let overlap = failure
+            .errors
+            .iter()
+            .find(|error| error.check == "measurement-pcrs")
+            .expect("expected a measurement-pcrs failure");
+        assert!(
+            overlap.detail.contains("declares invariant"),
+            "unexpected detail: {}",
+            overlap.detail
+        );
+        // The relaxed spec must never have been evaluated.
+        assert!(
+            !failure
+                .report
+                .checks
+                .iter()
+                .any(|check| check.name == "pcr-4-static"),
+            "the overriding spec was evaluated: {:?}",
+            failure.report.checks
+        );
+    }
+
+    #[test]
+    fn effective_pcr_specs_rejects_variant_pinning_an_invariant() {
+        let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
+        let profile = &policy.pack.profiles[0];
+        let mut variant = profile.variants[0].clone();
+        variant.override_pcrs.push(PcrSpec {
+            pcr_index: 4,
+            verify_type: "static".to_string(),
+            match_data: vec![format!("0x{}", "aa".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        });
+
+        let error = effective_pcr_specs(profile, &variant)
+            .expect_err("overlap with a profile invariant must be rejected");
+        assert!(error.contains("declares invariant"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn effective_pcr_specs_allows_disjoint_variant() {
+        let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
+        let profile = &policy.pack.profiles[0];
+        let mut variant = profile.variants[0].clone();
+        variant.override_pcrs.push(PcrSpec {
+            pcr_index: 10,
+            verify_type: "static".to_string(),
+            match_data: vec![format!("0x{}", "cc".repeat(32))],
+            event_indices: Vec::new(),
+            total_events: None,
+        });
+
+        let specs = effective_pcr_specs(profile, &variant).expect("disjoint variant is allowed");
+        let indices: Vec<u8> = specs.iter().map(|spec| spec.pcr_index).collect();
+        assert_eq!(indices, vec![4, 10]);
+    }
+
+    #[test]
+    fn verifier_rejects_static_without_exactly_one_match_data_entry() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
+        let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
+        policy.pack.profiles[0].invariants[0]
+            .match_data
+            .push(format!("0x{}", "bb".repeat(32)));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                gcp_roots,
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("STATIC with two matchData entries must fail closed");
+
+        let check = failure
+            .errors
+            .iter()
+            .find(|error| error.check == "pcr-4-static")
+            .expect("expected pcr-4-static failure");
+        assert!(
+            check
+                .detail
+                .contains("requires exactly one matchData entry, got 2"),
+            "unexpected detail: {}",
+            check.detail
+        );
     }
 
     #[test]
@@ -2715,6 +4267,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2743,6 +4297,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2766,6 +4322,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2789,6 +4347,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2812,6 +4372,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2836,6 +4398,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2858,6 +4422,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2881,6 +4447,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2903,6 +4471,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2912,6 +4482,117 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.check == "tpm-quote-pcr-digest"));
+    }
+
+    #[test]
+    fn verifier_does_not_use_unselected_sha384_for_static_policy() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "gcp");
+        response.tpm.pcrs[0].sha384 = Some(format!("0x{}", "bb".repeat(48)));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy(&format!("0x{}", "bb".repeat(48)))),
+            trust_anchors: TrustAnchors::default(),
+        })
+        .expect_err("an unquoted SHA-384 PCR value must not satisfy static policy");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "pcr-4-static"));
+        assert_check_passed(&failure, "tpm-quote-pcr-digest");
+    }
+
+    #[test]
+    fn verifier_authenticates_sha384_only_quote_selection() {
+        let qualifying_data = [0x11; 32];
+        let sha384 = [0x44; 48];
+        let quote = fake_tpm_quote_banks(&qualifying_data, &[], &[(4, sha384)]);
+        let evidence = vec![PcrEvidence {
+            index: 4,
+            sha256: Some(format!("0x{}", "aa".repeat(32))),
+            sha384: Some(hex0x(&sha384)),
+        }];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        let authenticated = verify_tpm_quote(
+            &mut report,
+            &mut errors,
+            &quote,
+            &qualifying_data,
+            &evidence,
+        )
+        .expect("SHA-384 selection should authenticate");
+        assert!(errors.is_empty(), "{errors:?}");
+        let expected_sha384 = hex0x(&sha384);
+        assert_eq!(authenticated[0].sha256, None);
+        assert_eq!(
+            authenticated[0].sha384.as_deref(),
+            Some(expected_sha384.as_str())
+        );
+
+        verify_pcr_spec(
+            &mut report,
+            &mut errors,
+            &PcrSpec {
+                pcr_index: 4,
+                verify_type: "static".into(),
+                match_data: vec![hex0x(&sha384)],
+                event_indices: vec![],
+                total_events: None,
+            },
+            &authenticated,
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn verifier_authenticates_sha256_and_sha384_quote_selections_together() {
+        let qualifying_data = [0x22; 32];
+        let sha256 = [0x33; 32];
+        let sha384 = [0x44; 48];
+        let quote = fake_tpm_quote_banks(&qualifying_data, &[(4, sha256)], &[(4, sha384)]);
+        let evidence = vec![PcrEvidence {
+            index: 4,
+            sha256: Some(hex0x(&sha256)),
+            sha384: Some(hex0x(&sha384)),
+        }];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        let authenticated = verify_tpm_quote(
+            &mut report,
+            &mut errors,
+            &quote,
+            &qualifying_data,
+            &evidence,
+        )
+        .expect("both selected banks should authenticate");
+        assert!(errors.is_empty(), "{errors:?}");
+        let expected_sha256 = hex0x(&sha256);
+        let expected_sha384 = hex0x(&sha384);
+        assert_eq!(
+            authenticated[0].sha256.as_deref(),
+            Some(expected_sha256.as_str())
+        );
+        assert_eq!(
+            authenticated[0].sha384.as_deref(),
+            Some(expected_sha384.as_str())
+        );
     }
 
     #[test]
@@ -2929,6 +4610,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2956,6 +4639,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2981,6 +4666,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -2993,7 +4680,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_azure_hclak_rsa_quote_signature() {
+    fn verifier_authenticates_azure_hclak_before_rejecting_unverified_tdx_report() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let mut response = response_for(nonce, cert, "azure");
@@ -3002,11 +4689,14 @@ mod tests {
         response.tpm.ak_public = String::new();
         response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
         response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
 
-        let result = verify_tls_attestation(VerificationInputs {
+        let failure = verify_tls_attestation(VerificationInputs {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -3015,9 +4705,668 @@ mod tests {
                 azure_maa_keys: vec![trusted_maa_key],
                 ..TrustAnchors::default()
             },
-        });
+        })
+        .expect_err("Azure TDX report without DCAP collateral must fail");
 
-        assert!(result.is_ok());
+        for check in [
+            "azure-maa-jwt",
+            "tpm-quote-signature",
+            "azure-tee-ak-binding",
+            "azure-tee-var-data-binding",
+        ] {
+            assert_check_passed(&failure, check);
+        }
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-vendor-report"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_tdx_report_not_bound_to_hcl_data() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        let binding_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&binding.data).unwrap()).unwrap();
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.tee_evidence.as_mut().unwrap().auxiliary =
+            Some(binding_json["hclVarData"].as_str().unwrap().to_string());
+        response.ak_binding = Some(binding);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure TDX report_data that does not bind HCL var_data must fail");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-var-data-binding"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_tee_auxiliary_different_from_ak_binding() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
+        response.tee_evidence.as_mut().unwrap().auxiliary =
+            Some(URL_SAFE_NO_PAD.encode(b"different HCL var_data"));
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure TEE auxiliary data that differs from the MAA binding must fail");
+
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.check == "azure-tee-ak-binding"));
+    }
+
+    #[test]
+    fn verifier_rejects_azure_snp_report_without_vendor_certificates() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let mut response = response_for(nonce, cert, "azure");
+        response.platform.tee = "sev-snp".to_string();
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) =
+            fake_azure_ak_binding_and_signature_for_tee(&quote, "sev-snp");
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_snp_evidence_to_ak_binding(&mut response);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_cloud(
+                &format!("0x{}", "aa".repeat(32)),
+                "azure",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("Azure SNP report without a certificate table must fail");
+
+        for check in [
+            "azure-maa-jwt",
+            "tpm-quote-signature",
+            "azure-tee-ak-binding",
+            "azure-tee-var-data-binding",
+        ] {
+            assert_check_passed(&failure, check);
+        }
+        assert!(failure.errors.iter().any(|error| {
+            error.check == "azure-tee-vendor-report"
+                && error
+                    .detail
+                    .contains("Azure SNP verification collateral is missing")
+        }));
+    }
+
+    #[test]
+    fn verifier_enforces_azure_tdx_debug_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let mut response = response_for(nonce, cert, "azure");
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) = fake_azure_ak_binding_and_signature(&quote);
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_tdx_evidence_to_ak_binding(&mut response);
+        let evidence = response.tee_evidence.as_mut().expect("Azure TDX evidence");
+        let mut tee_quote = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        let report_start = tdx_quote_report_start(&tee_quote).expect("TDX quote body");
+        tee_quote[report_start + TDX_REPORT_ATTRIBUTES_OFFSET] |= 1;
+        evidence.report = URL_SAFE_NO_PAD.encode(tee_quote);
+        let check_name = format!(
+            "tee-attribute-base-image-{}",
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME
+        );
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_cloud(&pcr, "azure")),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key.clone()],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Azure Intel TDX debug declaration must fail");
+        assert!(failure.errors.iter().any(|error| error.check == check_name));
+
+        let mut policy = measurement_policy_for_cloud(&pcr, "azure");
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": false,
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
+            "value": true,
+        })];
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic Azure Intel TDX evidence lacks DCAP collateral");
+        assert!(!failure.errors.iter().any(|error| error.check == check_name));
+        assert_check_passed(&failure, &check_name);
+    }
+
+    #[test]
+    fn tls_policy_enforces_verified_tdx_tcb_status_masks() {
+        let nonce = [1u8; 32];
+        let response = response_for(nonce, b"cert", "gcp");
+        let evidence = response.tee_evidence.as_ref().expect("GCP TDX evidence");
+        let mut policy = measurement_policy_for_cloud(&format!("0x{}", "aa".repeat(32)), "gcp");
+        let profile = &policy.pack.profiles[0];
+        let variant = &profile.variants[0];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            profile,
+            variant,
+            "tdx",
+            Some(evidence),
+            Some(0x8),
+            None,
+            &[],
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-base-image-intel-tdx-tcb-status" }));
+        assert!(!errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-workload-intel-tdx-tcb-status" }));
+
+        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+            "value": ["ok"],
+        })];
+        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+            "value": ["ok", "configuration-needed"],
+        })];
+        let requirements = BTreeMap::from([(
+            atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME.to_string(),
+            vec![
+                atakit_core::tee_attributes::AttributeValue::String("ok".to_string()),
+                atakit_core::tee_attributes::AttributeValue::String(
+                    "configuration-needed".to_string(),
+                ),
+            ],
+        )]);
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "tdx",
+            Some(evidence),
+            Some(0x8),
+            Some(&requirements),
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn tdx_tcb_status_policy_rejects_malformed_present_masks() {
+        let ok =
+            atakit_core::tee_attributes::u16_value(atakit_core::tee_attributes::TDX_TCB_STATUS_OK);
+        let configuration_needed = atakit_core::tee_attributes::u16_value(0x9);
+        let missing_ok = atakit_core::tee_attributes::u16_value(0x8);
+        let unsupported_bit = atakit_core::tee_attributes::u16_value(0x401);
+        let mut exceeds_u16 = ok;
+        exceeds_u16[0] = 1;
+
+        assert!(tdx_tcb_status_policy_matches(
+            None,
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
+        assert!(!tdx_tcb_status_policy_matches(None, 0x8));
+        assert!(tdx_tcb_status_policy_matches(
+            Some(&configuration_needed),
+            0x8
+        ));
+        assert!(!tdx_tcb_status_policy_matches(Some(&missing_ok), 0x8));
+        assert!(!tdx_tcb_status_policy_matches(
+            Some(&unsupported_bit),
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
+        assert!(!tdx_tcb_status_policy_matches(
+            Some(&exceeds_u16),
+            atakit_core::tee_attributes::TDX_TCB_STATUS_OK
+        ));
+    }
+
+    #[test]
+    fn packed_workload_requirement_rejects_malformed_value_counts() {
+        let key = [0x11; 32];
+        let default_value = [0x22; 32];
+        let explicit_value = [0x33; 32];
+
+        assert_eq!(
+            resolve_packed_workload_requirement(&BTreeMap::new(), key, default_value).unwrap(),
+            default_value
+        );
+        assert_eq!(
+            resolve_packed_workload_requirement(
+                &BTreeMap::from([(key, vec![explicit_value])]),
+                key,
+                default_value,
+            )
+            .unwrap(),
+            explicit_value
+        );
+        for values in [Vec::new(), vec![explicit_value, explicit_value]] {
+            let error = resolve_packed_workload_requirement(
+                &BTreeMap::from([(key, values)]),
+                key,
+                default_value,
+            )
+            .unwrap_err();
+            assert!(error.contains("must contain exactly one value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tls_policy_uses_amd_snp_registry_defaults() {
+        let mut snp_report = synthetic_snp_security_report(1u64 << 17);
+        let raw_tcb = [4, 0, 0, 0, 0, 0, 29, 222];
+        for offset in [
+            SNP_REPORT_CURRENT_TCB_OFFSET,
+            SNP_REPORT_REPORTED_TCB_OFFSET,
+            SNP_REPORT_COMMITTED_TCB_OFFSET,
+            SNP_REPORT_LAUNCH_TCB_OFFSET,
+        ] {
+            snp_report[offset..offset + 8].copy_from_slice(&raw_tcb);
+        }
+        snp_report[SNP_REPORT_PLATFORM_INFO_OFFSET..SNP_REPORT_PLATFORM_INFO_OFFSET + 8]
+            .copy_from_slice(&0x20u64.to_le_bytes());
+        let evidence = TeeEvidence {
+            kind: "configfs-tsm".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: None,
+        };
+        let mut policy = measurement_policy_for_platform(
+            &format!("0x{}", "aa".repeat(32)),
+            "gcp",
+            "sev-snp",
+            "n2d-standard-4",
+        );
+        let minimum_tcb = atakit_core::tee_attributes::parse_bytes32_hex(
+            "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+        )
+        .unwrap();
+        let platform_info_policy = atakit_core::tee_attributes::parse_bytes32_hex(
+            "0x0000000000000000000000000000000000000000000000000000000000000020",
+        )
+        .unwrap();
+        let registry_default = AmdSnpSecurityPolicy {
+            cpuid: 0x190000,
+            minimum_tcb,
+            platform_info_policy,
+            required_launch_mitigation_vector: 0,
+            required_current_mitigation_vector: 0,
+        };
+        policy.pack.profiles[0].attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": "0x00000000df1e000500000000de1d000400000000de1d000400000000de1d0004",
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": "0x0000000000000000000000000000000000000000000000200000000000000000",
+            }),
+        ];
+        policy.pack.profiles[0].variants[0].attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": "0x0000000000000000000000000000000000000000000000000000000000000020",
+            }),
+        ];
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            None,
+            &[registry_default],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            None,
+            &[],
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.check == "amd-sev-snp-registry-default"));
+    }
+
+    #[test]
+    fn tls_policy_allows_amd_snp_base_only_and_coordinated_relaxation() {
+        let mut snp_report = synthetic_snp_security_report(1u64 << 17);
+        let lower_raw_tcb = [3, 0, 0, 0, 0, 0, 29, 222];
+        for offset in [
+            SNP_REPORT_CURRENT_TCB_OFFSET,
+            SNP_REPORT_REPORTED_TCB_OFFSET,
+            SNP_REPORT_COMMITTED_TCB_OFFSET,
+            SNP_REPORT_LAUNCH_TCB_OFFSET,
+        ] {
+            snp_report[offset..offset + 8].copy_from_slice(&lower_raw_tcb);
+        }
+        snp_report[SNP_REPORT_PLATFORM_INFO_OFFSET..SNP_REPORT_PLATFORM_INFO_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let evidence = TeeEvidence {
+            kind: "configfs-tsm".to_string(),
+            report: URL_SAFE_NO_PAD.encode(snp_report),
+            auxiliary: None,
+        };
+
+        let lower_tcb = "0x00000000de1d000300000000de1d000300000000de1d000300000000de1d0003";
+        let lower_platform = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let mut policy = measurement_policy_for_platform(
+            &format!("0x{}", "aa".repeat(32)),
+            "gcp",
+            "sev-snp",
+            "n2d-standard-4",
+        );
+        policy.pack.profiles[0].variants[0].attributes = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": lower_tcb,
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": lower_platform,
+            }),
+        ];
+        let registry_default = AmdSnpSecurityPolicy {
+            cpuid: 0x190000,
+            minimum_tcb: atakit_core::tee_attributes::parse_bytes32_hex(
+                "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+            )
+            .unwrap(),
+            platform_info_policy: atakit_core::tee_attributes::parse_bytes32_hex(
+                "0x0000000000000000000000000000000000000000000000000000000000000020",
+            )
+            .unwrap(),
+            required_launch_mitigation_vector: 0,
+            required_current_mitigation_vector: 0,
+        };
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            None,
+            std::slice::from_ref(&registry_default),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        let empty_workload = BTreeMap::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            Some(&empty_workload),
+            std::slice::from_ref(&registry_default),
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-workload-amd-sev-snp-tcb-minimum" }));
+        assert!(errors.iter().any(|error| {
+            error.check == "tee-attribute-workload-amd-sev-snp-platform-info-policy"
+        }));
+
+        let lower_workload = BTreeMap::from([
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME.to_string(),
+                vec![atakit_core::tee_attributes::AttributeValue::String(
+                    lower_tcb.to_string(),
+                )],
+            ),
+            (
+                atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME.to_string(),
+                vec![atakit_core::tee_attributes::AttributeValue::String(
+                    lower_platform.to_string(),
+                )],
+            ),
+        ]);
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            Some(&lower_workload),
+            std::slice::from_ref(&registry_default),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        policy.pack.profiles[0].variants[0].attributes.clear();
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verify_measurement_attributes(
+            &mut report,
+            &mut errors,
+            &policy.pack.profiles[0],
+            &policy.pack.profiles[0].variants[0],
+            "sev-snp",
+            Some(&evidence),
+            None,
+            Some(&lower_workload),
+            &[registry_default],
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.check == "tee-attribute-base-image-amd-sev-snp-tcb-minimum" }));
+        assert!(errors.iter().any(|error| {
+            error.check == "tee-attribute-base-image-amd-sev-snp-platform-info-policy"
+        }));
+    }
+
+    #[test]
+    fn verifier_enforces_azure_snp_states_against_effective_measurement_attributes() {
+        let nonce = [1u8; 32];
+        let cert = b"cert";
+        let pcr = format!("0x{}", "aa".repeat(32));
+        let mut response = response_for(nonce, cert, "azure");
+        response.platform.tee = "sev-snp".to_string();
+        response.platform.machine_type = "n2d-standard-4".to_string();
+        let quote = URL_SAFE_NO_PAD.decode(&response.tpm.quote).unwrap();
+        let (binding, signature, trusted_maa_key) =
+            fake_azure_ak_binding_and_signature_for_tee(&quote, "sev-snp");
+        response.tpm.ak_public = String::new();
+        response.tpm.signature = URL_SAFE_NO_PAD.encode(signature);
+        response.ak_binding = Some(binding);
+        bind_azure_snp_evidence_to_ak_binding(&mut response);
+        let evidence = response.tee_evidence.as_mut().expect("Azure SNP evidence");
+        let mut snp_report = URL_SAFE_NO_PAD.decode(&evidence.report).unwrap();
+        snp_report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8].copy_from_slice(
+            &((1u64 << 17) | SNP_POLICY_DEBUG | SNP_POLICY_MIGRATE_MA).to_le_bytes(),
+        );
+        evidence.report = URL_SAFE_NO_PAD.encode(snp_report);
+
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response: response.clone(),
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(measurement_policy_for_platform(
+                &pcr,
+                "azure",
+                "sev-snp",
+                "n2d-standard-4",
+            )),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key.clone()],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("missing Azure AMD SEV-SNP declarations must fail");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(failure.errors.iter().any(|error| error.check == check_name));
+        }
+
+        let mut policy =
+            measurement_policy_for_platform(&pcr, "azure", "sev-snp", "n2d-standard-4");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            policy.pack.profiles[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": false}));
+            policy.pack.profiles[0].variants[0]
+                .attributes
+                .push(serde_json::json!({"name": name, "value": true}));
+        }
+        let failure = verify_tls_attestation(VerificationInputs {
+            nonce,
+            live_peer_cert_der: cert.to_vec(),
+            response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
+            measurement_policy: Some(policy),
+            trust_anchors: TrustAnchors {
+                azure_maa_keys: vec![trusted_maa_key],
+                ..TrustAnchors::default()
+            },
+        })
+        .expect_err("synthetic Azure AMD SEV-SNP evidence lacks vendor certificates");
+        for name in [
+            atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
+            atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
+        ] {
+            let check_name = format!("tee-attribute-base-image-{name}");
+            assert!(!failure.errors.iter().any(|error| error.check == check_name));
+            assert_check_passed(&failure, &check_name);
+        }
     }
 
     #[test]
@@ -3052,7 +5401,7 @@ mod tests {
             .unwrap_err()
             .contains("2 HCLAkPub entries"));
         let mut raw_tdx_quote = fake_gcp_tdx_full_quote_v4(&[0u8; 16]);
-        let report_start = gcp_tdx_report_start(&raw_tdx_quote).expect("TDX report start");
+        let report_start = tdx_quote_report_start(&raw_tdx_quote).expect("TDX report start");
         let report_data_start = report_start + TDX_REPORT_REPORT_DATA_OFFSET;
         raw_tdx_quote[report_data_start..report_data_start + 32]
             .copy_from_slice(&Sha256::digest(&hcl_var_data));
@@ -3079,6 +5428,7 @@ mod tests {
             &binding,
             std::slice::from_ref(&trust),
             "tdx",
+            SystemTime::now(),
         );
         verify_azure_tee_var_data_binding(&mut report, &mut errors, &evidence, "tdx");
         assert!(errors.is_empty(), "{errors:?}");
@@ -3094,6 +5444,7 @@ mod tests {
             &binding,
             &[trust.clone(), trust.clone()],
             "tdx",
+            SystemTime::now(),
         );
         assert!(duplicate_errors
             .iter()
@@ -3113,6 +5464,7 @@ mod tests {
                 ..trust
             }],
             "tdx",
+            SystemTime::now(),
         );
         assert!(expired_errors
             .iter()
@@ -3141,7 +5493,94 @@ mod tests {
     }
 
     #[test]
-    fn public_session_verifier_accepts_complete_local_bound_gcp_snp_evidence() {
+    fn azure_maa_jwt_uses_verifier_selected_time() {
+        let hcl_var_data = b"{\"keys\":[]}";
+        let (jwt, trusted_key) = fake_azure_maa_jwt_with_times(hcl_var_data, "tdx", 100, 100, 200);
+        let binding = AkBinding {
+            kind: "azure-maa-jwt".into(),
+            data: URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "jwt": jwt,
+                    "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data),
+                }))
+                .unwrap(),
+            ),
+        };
+
+        for timestamp in [100, 199] {
+            let mut report = VerificationReport {
+                checks: Vec::new(),
+                evidence: EvidenceSummary::default(),
+            };
+            let mut errors = Vec::new();
+            verify_azure_maa_jwt_binding(
+                &mut report,
+                &mut errors,
+                &binding,
+                std::slice::from_ref(&trusted_key),
+                "tdx",
+                UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            );
+            assert!(errors.is_empty(), "timestamp {timestamp}: {errors:?}");
+        }
+
+        for (timestamp, expected) in [(99, "not valid before"), (200, "expired")] {
+            let mut report = VerificationReport {
+                checks: Vec::new(),
+                evidence: EvidenceSummary::default(),
+            };
+            let mut errors = Vec::new();
+            verify_azure_maa_jwt_binding(
+                &mut report,
+                &mut errors,
+                &binding,
+                std::slice::from_ref(&trusted_key),
+                "tdx",
+                UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            );
+            assert!(
+                errors.iter().any(|error| error.detail.contains(expected)),
+                "timestamp {timestamp}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_maa_jwt_rejects_future_issued_at_time() {
+        let hcl_var_data = b"{\"keys\":[]}";
+        let (jwt, trusted_key) = fake_azure_maa_jwt_with_times(hcl_var_data, "tdx", 151, 100, 200);
+        let binding = AkBinding {
+            kind: "azure-maa-jwt".into(),
+            data: URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "jwt": jwt,
+                    "hclVarData": URL_SAFE_NO_PAD.encode(hcl_var_data),
+                }))
+                .unwrap(),
+            ),
+        };
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        verify_azure_maa_jwt_binding(
+            &mut report,
+            &mut errors,
+            &binding,
+            std::slice::from_ref(&trusted_key),
+            "tdx",
+            UNIX_EPOCH + std::time::Duration::from_secs(150),
+        );
+
+        assert!(errors
+            .iter()
+            .any(|error| error.detail.contains("issued in the future")));
+    }
+
+    #[test]
+    fn public_session_verifier_accepts_ff_report_id_ma_absence_sentinel() {
         use crate::session::{
             compute_key_fingerprint, compute_session_id, compute_session_qualifying_data,
             request_binding_digest, AkEvidence, BindingMode, CertificateTrust, RawEvidence,
@@ -3207,14 +5646,19 @@ mod tests {
         let delegation_signature: P256Signature = tpm_signing_key
             .sign_prehash(&delegation_digest)
             .expect("delegation signature");
+        let (possession_signature, possession_recovery_id) = session_signing_key
+            .sign_prehash_recoverable(&delegation_digest)
+            .expect("session-key possession signature");
+        let mut possession_signature = possession_signature.to_bytes().to_vec();
+        possession_signature.push(possession_recovery_id.to_byte() + 27);
 
         let pcr4_policy = SessionPcrPolicy {
             pcr_index: 4,
             verify_type: SessionPcrVerifyType::Static,
             match_data: vec![hex0x(&pcr4)],
         };
-        let mut bundle = SessionEvidenceBundle {
-            format: 1,
+        let bundle = SessionEvidenceBundle {
+            format: 2,
             binding: SessionBinding {
                 mode: BindingMode::Local,
                 chain_id: 0,
@@ -3285,6 +5729,7 @@ mod tests {
                 },
                 digest: hex0x(&delegation_digest),
                 signature: hex0x(delegation_signature.to_der().as_bytes()),
+                session_key_possession_signature: hex0x(&possession_signature),
             },
             session_id: hex0x(&session_id),
             policy: SessionPolicy {
@@ -3311,7 +5756,7 @@ mod tests {
             .sign_prehash_recoverable(&binding_digest)
             .expect("request-binding signature");
         let mut binding_signature = binding_signature.to_bytes().to_vec();
-        binding_signature.push(recovery_id.to_byte());
+        binding_signature.push(recovery_id.to_byte() + 27);
 
         let inputs = SessionVerificationInputs {
             bundle: serde_json::to_value(&bundle).unwrap(),
@@ -3324,13 +5769,17 @@ mod tests {
                 platform: SessionPlatformTrust::GcpSnp {
                     gcp_ak_roots: CertificateTrust {
                         certificates: ak_roots,
-                        keccak256_hashes: Vec::new(),
+                        hashes: Vec::new(),
                     },
                     amd_ark_roots: CertificateTrust {
                         certificates: vec![amd_ark],
-                        keccak256_hashes: Vec::new(),
+                        hashes: Vec::new(),
                     },
-                    amd_snp_crls: vec![fixture_amd_milan_crl()],
+                    amd_snp_collateral: AmdSnpVerificationCollateral::from_certificate_table(
+                        &snp_cert_table,
+                        vec![fixture_amd_milan_crl()],
+                    )
+                    .expect("AMD SNP verification collateral"),
                 },
                 policy: TrustedSessionPolicy {
                     workload_id,
@@ -3340,19 +5789,29 @@ mod tests {
                     pcr_specs: vec![pcr4_policy],
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
+                    amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
+                        cpuid: 0x190101,
+                        minimum_tcb: [0; 32],
+                        platform_info_policy: [0; 32],
+                        required_launch_mitigation_vector: 0,
+                        required_current_mitigation_vector: 0,
+                    }],
                 },
                 binding: None,
             },
         };
-        let verified = crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
-            .expect("complete local-bound GCP SNP evidence must verify");
+        crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
+            .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
 
-        assert_eq!(verified.session_id, session_id);
-        assert_eq!(verified.binding_mode, BindingMode::Local);
-        assert_eq!(verified.binding_chain_id, 0);
-        assert_eq!(verified.binding_registry, [0; 20]);
-        assert_eq!(verified.attestation_mode, SessionAttestationMode::Hardware);
-        assert!(bundle.owner.contract_authorization.take().is_none());
+        let mut no_possession = inputs.clone();
+        no_possession.bundle["session_key_delegation"]["session_key_possession_signature"] =
+            serde_json::json!("0x");
+        let failure = crate::session::verify_session_bundle_at(no_possession, snp_fixture_time())
+            .expect_err("the session key must prove possession of its private key");
+        assert!(failure
+            .errors
+            .iter()
+            .any(|error| error.contains("session-key-possession-signature")));
 
         let mut replayed = inputs.clone();
         replayed.expected_challenge = [0x56; 32];
@@ -3412,6 +5871,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -3455,6 +5916,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(
                 &format!("0x{}", "aa".repeat(32)),
                 "azure",
@@ -3484,6 +5947,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy(&format!("0x{}", "aa".repeat(32)))),
             trust_anchors: TrustAnchors::default(),
         })
@@ -3502,6 +5967,8 @@ mod tests {
             nonce: [2u8; 32],
             live_peer_cert_der: b"cert-b".to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -3519,6 +5986,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -3538,6 +6007,8 @@ mod tests {
             nonce,
             live_peer_cert_der: cert.to_vec(),
             response,
+            intel_tdx_dcap_collateral: None,
+            amd_snp_collateral: None,
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
@@ -3628,7 +6099,7 @@ mod tests {
 
     #[test]
     fn extracts_amd_snp_vcek_request_fields() {
-        let mut report = vec![0u8; SNP_REPORT_MIN_LEN];
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
         report[SNP_REPORT_REPORTED_TCB_OFFSET..SNP_REPORT_REPORTED_TCB_OFFSET + 8]
             .copy_from_slice(&[4, 0, 0, 0, 0, 0, 24, 219]);
         report[SNP_REPORT_REPORTED_TCB_OFFSET + 8] = 0x19;
@@ -3647,6 +6118,179 @@ mod tests {
     }
 
     #[test]
+    fn selects_vcek_and_vlek_certificate_chains_from_report_key_settings() {
+        let mut report = vec![0u8; SNP_REPORT_SIZE];
+        assert_eq!(
+            amd_snp_signing_key_type(&report).unwrap(),
+            AmdSnpSigningKeyType::Vcek
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_label(AmdSnpSigningKeyType::Vcek),
+            "SNP ASK"
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_common_names(
+                AmdSnpSigningKeyType::Vcek,
+                "Milan"
+            ),
+            ["SEV-Milan"]
+        );
+
+        report[SNP_REPORT_KEY_SETTINGS_OFFSET..SNP_REPORT_KEY_SETTINGS_OFFSET + 4]
+            .copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            amd_snp_signing_key_type(&report).unwrap(),
+            AmdSnpSigningKeyType::Vlek
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_label(AmdSnpSigningKeyType::Vlek),
+            "SNP ASVK"
+        );
+        assert_eq!(
+            verification_core::snp_intermediate_ca_common_names(
+                AmdSnpSigningKeyType::Vlek,
+                "Genoa"
+            ),
+            ["SEV-VLEK", "SEV-VLEK-Genoa"]
+        );
+        assert!(amd_snp_vcek_request(&report)
+            .unwrap_err()
+            .contains("cannot resolve a VLEK-signed SNP report"));
+    }
+
+    #[test]
+    fn extracts_verified_snp_debug_and_migrate_ma_states() {
+        let policy = (1u64 << 17) | (1u64 << 18) | (1u64 << 19);
+        let report = synthetic_snp_security_report(policy);
+
+        assert_eq!(
+            verification_core::verified_snp_attribute_states(&report).unwrap(),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn extracts_verified_snp_version_five_mitigation_vectors() {
+        let mut report = synthetic_snp_security_report(1u64 << 17);
+        report[SNP_REPORT_VERSION_OFFSET..SNP_REPORT_VERSION_OFFSET + 4]
+            .copy_from_slice(&5u32.to_le_bytes());
+        report[SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET
+            ..SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        report[SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET
+            ..SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET + 8]
+            .copy_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+
+        let state = amd_snp_security_state(&report).expect("version-5 security state");
+        assert_eq!(state.report_version, 5);
+        assert_eq!(state.launch_mitigation_vector, 0x0102_0304_0506_0708);
+        assert_eq!(state.current_mitigation_vector, 0x1112_1314_1516_1718);
+
+        let version_three = amd_snp_security_state(&synthetic_snp_security_report(1u64 << 17))
+            .expect("version-3 security state");
+        assert_eq!(version_three.report_version, 3);
+        assert_eq!(version_three.launch_mitigation_vector, 0);
+        assert_eq!(version_three.current_mitigation_vector, 0);
+    }
+
+    #[test]
+    fn amd_snp_mitigation_policy_requires_version_five_and_required_bits() {
+        let policy = AmdSnpSecurityPolicy {
+            cpuid: 0x190000,
+            minimum_tcb: [0; 32],
+            platform_info_policy: [0; 32],
+            required_launch_mitigation_vector: 0b0011,
+            required_current_mitigation_vector: 0b1100,
+        };
+
+        let version_error = validate_amd_snp_mitigation_policy(3, 0b0011, 0b1100, &policy)
+            .expect_err("a nonzero mitigation policy requires a version-5 report");
+        assert!(
+            version_error.contains("version 5 is required"),
+            "{version_error}"
+        );
+
+        let future_version_error = validate_amd_snp_mitigation_policy(6, 0b0011, 0b1100, &policy)
+            .expect_err("version-5 vector semantics must not apply to a future report version");
+        assert!(
+            future_version_error.contains("version 5 is required"),
+            "{future_version_error}"
+        );
+
+        validate_amd_snp_mitigation_policy(5, 0b1011, 0b1110, &policy)
+            .expect("required masks use bit inclusion");
+
+        let launch_error = validate_amd_snp_mitigation_policy(5, 0b0010, 0b1100, &policy)
+            .expect_err("the launch vector is missing a required bit");
+        assert!(launch_error.contains("LAUNCH_MIT_VECTOR"), "{launch_error}");
+
+        let current_error = validate_amd_snp_mitigation_policy(5, 0b0011, 0b1000, &policy)
+            .expect_err("the current vector is missing a required bit");
+        assert!(
+            current_error.contains("CURRENT_MIT_VECTOR"),
+            "{current_error}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_verified_snp_report_fields() {
+        let valid_report = || synthetic_snp_security_report(1u64 << 17);
+
+        assert!(verification_core::verified_snp_attribute_states(&valid_report()[..1183]).is_err());
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(0xff);
+        verification_core::verified_snp_attribute_states(&report)
+            .expect("all-0xff REPORT_ID_MA must mean no migration-agent association");
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(1);
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("REPORT_ID_MA"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_ID_MA_OFFSET..SNP_REPORT_ID_MA_OFFSET + SNP_REPORT_ID_MA_LEN].fill(0xff);
+        report[SNP_REPORT_ID_MA_OFFSET] = 0;
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("REPORT_ID_MA"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_VMPL_OFFSET..SNP_REPORT_VMPL_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("VMPL"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_POLICY_OFFSET..SNP_REPORT_POLICY_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("reserved"));
+
+        let mut report = valid_report();
+        report[SNP_REPORT_LAUNCH_TCB_OFFSET] = 1;
+        assert!(verification_core::verified_snp_attribute_states(&report)
+            .unwrap_err()
+            .contains("launch_tcb"));
+    }
+
+    #[test]
+    fn der_tlv_rejects_content_length_past_buffer() {
+        let short = [0x30, 0x02, 0x00];
+        assert!(verification_core::der_tlv(&short, 0x30, "test")
+            .unwrap_err()
+            .contains("exceeds buffer"));
+
+        let long = [0x30, 0x82, 0x01, 0x00, 0x00];
+        assert!(verification_core::der_tlv(&long, 0x30, "test")
+            .unwrap_err()
+            .contains("exceeds buffer"));
+    }
+
+    #[test]
     fn builds_amd_snp_vcek_cert_table() {
         let table = amd_snp_vcek_cert_table(b"ark", b"ask", b"vcek").expect("cert table");
 
@@ -3654,6 +6298,69 @@ mod tests {
         let parsed = verification_core::parse_amd_snp_cert_table(&table).unwrap();
         assert_eq!(parsed.ask.as_deref(), Some(b"ask".as_slice()));
         assert_eq!(parsed.vcek.as_deref(), Some(b"vcek".as_slice()));
+    }
+
+    #[test]
+    fn amd_snp_vcek_cert_table_builder_enforces_parser_limits() {
+        assert!(amd_snp_vcek_cert_table(b"", b"ask", b"vcek")
+            .unwrap_err()
+            .contains("ARK certificate is empty"));
+
+        let oversized_ark = vec![0u8; MAX_SNP_CERT_TABLE_BYTES];
+        assert!(amd_snp_vcek_cert_table(&oversized_ark, b"ask", b"vcek")
+            .unwrap_err()
+            .contains("1048576-byte limit"));
+    }
+
+    #[test]
+    fn measurement_attributes_accept_all_reserved_variant_policy_encodings() {
+        let tcb = "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004";
+        let platform_info = "0x0000000000000000000000000000000000000000000000010000000000000020";
+        let readable = vec![
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+                "value": ["ok", "configuration-needed"],
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
+                "value": tcb,
+            }),
+            serde_json::json!({
+                "name": atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_NAME,
+                "value": platform_info,
+            }),
+        ];
+        let parsed = parse_measurement_attributes(&readable, "variant").unwrap();
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY],
+            atakit_core::tee_attributes::u16_value(0x9)
+        );
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY],
+            atakit_core::tee_attributes::parse_bytes32_hex(tcb).unwrap()
+        );
+        assert_eq!(
+            parsed[&atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_POLICY_KEY],
+            atakit_core::tee_attributes::parse_bytes32_hex(platform_info).unwrap()
+        );
+
+        let hexadecimal = readable
+            .iter()
+            .map(|attribute| {
+                let name = attribute["name"].as_str().unwrap();
+                let reserved =
+                    atakit_core::tee_attributes::VerifiedTeeAttribute::from_name(name).unwrap();
+                let value = parsed[&reserved.key()];
+                serde_json::json!({
+                    "key": format!("0x{}", hex::encode(reserved.key())),
+                    "value": format!("0x{}", hex::encode(value)),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_measurement_attributes(&hexadecimal, "variant").unwrap(),
+            parsed
+        );
     }
 
     #[test]

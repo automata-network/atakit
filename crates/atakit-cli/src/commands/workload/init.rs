@@ -5,7 +5,6 @@ use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_core::Env;
 use atakit_workload::cli::InitArgs;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
@@ -25,8 +24,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 2. Resolve workload.
     let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
     let archive_path = resolved.archive_path;
+    let archive_sha256 = resolved.archive_sha256;
     let workload_name = resolved.name;
     let workload_version = resolved.version;
+    let workload_attributes = resolved.attributes;
 
     // Collect unmeasured-data files. Explicit root flags take precedence over
     // the default <workload-dir>/unmeasured-data root.
@@ -38,10 +39,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let unmeasured_tar =
         resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
 
-    // 3. Compute archive hash (display-only).
-    let bytes = std::fs::read(&archive_path)
-        .map_err(|e| anyhow::anyhow!("failed to read archive {}: {e}", archive_path.display()))?;
-    let archive_hash = format!("{:x}", Sha256::digest(&bytes));
+    // 3. Display the hash of the exact archive snapshot inspected above.
+    let archive_hash = hex::encode(archive_sha256);
 
     // 4. Resolve init env. No target available, so fall back to [cloud.defaults] only.
     let defaults = &config.cloud.defaults;
@@ -205,11 +204,12 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &init_config.chain,
         )
         .await?;
-        let tls_trust_anchors = init::load_tls_trust_anchors(
+        let tls_verification_trust = init::load_tls_verification_trust(
             &args.gcp_ak_root_cert,
             &args.azure_maa_key,
             &args.amd_ark_root_cert,
             &args.amd_snp_crl,
+            args.amd_snp_security_policy.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
@@ -229,7 +229,8 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &host,
             status_port,
             measurement_policy,
-            tls_trust_anchors,
+            Some(workload_attributes),
+            tls_verification_trust,
             init::azure_maa_trust_config_from_init_chain(&init_config.chain),
             tdx_dcap_collateral,
             args.trust_tls_cert_sha256.as_deref(),
@@ -258,6 +259,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         status_port,
         init_port,
         &archive_path.display().to_string(),
+        &archive_sha256,
         unmeasured_tar.as_deref(),
         &init_config,
         std::time::Duration::from_secs(args.init_upload_timeout),

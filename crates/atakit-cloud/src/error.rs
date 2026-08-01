@@ -79,6 +79,16 @@ pub enum CloudError {
     #[error("archive not found: {path}")]
     ArchiveNotFound { path: String },
 
+    #[error(
+        "workload archive changed after policy validation: {path} \
+         (expected SHA-256 {expected}, got {actual}); restart initialization"
+    )]
+    WorkloadArchiveChanged {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+
     #[error("workload error: {message}")]
     WorkloadError { message: String },
 

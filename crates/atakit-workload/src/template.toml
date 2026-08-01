@@ -5,8 +5,8 @@
 # `atakit workload build` compiles it into a deterministic .atawl archive
 # containing manifest.json + images + measured-data.
 
-# Schema version. Current: 4.
-format = 5
+# Schema version. Current: 6.
+format = 6
 
 # ── package data ────────────────────────────────────────────────
 #
@@ -174,6 +174,21 @@ image = "{{name}}:latest"
 # base-path = "/app"
 # mount-path = "/data"
 # read-only = false
+
+# ── attributes ───────────────────────────────────────────────────
+#
+# Custom attribute values are strings. Reserved verified TEE attributes use
+# the types and rules shown below. A missing Boolean requirement permits only
+# false. A missing Intel TDX TCB status requirement permits only "ok". An empty
+# custom array requires the attribute to exist and accepts any declared value.
+[workload.attributes]
+# "example.operator.attribute" = ["production"]
+# "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+# "atakit.attestation.v1.tee.intel-tdx.tcb.status.allowed" = ["ok"]
+# "atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false]
+# "atakit.attestation.v1.tee.amd-sev-snp.migrate-ma.enabled" = [false, true]
+# "atakit.attestation.v1.tee.amd-sev-snp.tcb.minimum" = ["0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004"]
+# "atakit.attestation.v1.tee.amd-sev-snp.platform-info.policy" = ["0x0000000000000000000000000000000000000000000000010000000000000020"]
 
 # ── dependencies ──────────────────────────────────────────────────
 #

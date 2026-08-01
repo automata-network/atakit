@@ -1,7 +1,9 @@
 use std::io::Read;
 
 use atakit_core::{ArchiveCompression, NullReporter};
-use atakit_workload::{build_workload, inspect_workload, BuildOptions, InspectOptions};
+use atakit_workload::{
+    build_workload, inspect_workload, inspect_workload_archive_bytes, BuildOptions, InspectOptions,
+};
 use sha2::{Digest, Sha256};
 
 /// Build a minimal but valid docker-archive tar containing a single image
@@ -198,10 +200,9 @@ async fn build_produces_valid_archive() {
         .to_string_lossy()
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
-    assert_eq!(
-        read_manifest_json(&result.archive_path)["meta"]["format"],
-        5
-    );
+    let manifest = read_manifest_json(&result.archive_path);
+    assert_eq!(manifest["meta"]["format"], 6);
+    assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
     // Verify archive contents
     let file = std::fs::File::open(&result.archive_path).unwrap();
@@ -411,7 +412,7 @@ async fn inspect_archive_matches_build() {
     .unwrap();
 
     let inspect_result = inspect_workload(&InspectOptions {
-        archive: Some(build_result.archive_path),
+        archive: Some(build_result.archive_path.clone()),
         workload_dir: None,
         engine: None,
         verbose: false,
@@ -420,6 +421,8 @@ async fn inspect_archive_matches_build() {
     })
     .await
     .unwrap();
+    let archive_bytes = std::fs::read(build_result.archive_path).unwrap();
+    let byte_snapshot_result = inspect_workload_archive_bytes(&archive_bytes).unwrap();
 
     assert_eq!(inspect_result.manifest.meta.name, "my-workload");
     assert_eq!(inspect_result.manifest.meta.version, "v0.1.0");
@@ -430,6 +433,11 @@ async fn inspect_archive_matches_build() {
     assert!(inspect_result
         .manifest_raw
         .contains("\"name\":\"my-workload\""));
+    assert_eq!(byte_snapshot_result.sha256, inspect_result.sha256);
+    assert_eq!(
+        byte_snapshot_result.manifest.config.attributes,
+        inspect_result.manifest.config.attributes
+    );
 }
 
 #[tokio::test]

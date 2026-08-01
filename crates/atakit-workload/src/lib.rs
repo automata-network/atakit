@@ -19,7 +19,9 @@ pub mod validate;
 pub use build::{build_workload, BuildOptions, BuildResult};
 pub use error::WorkloadError;
 pub use image::ContainerEngine;
-pub use inspect::{inspect_workload, InspectOptions, InspectResult};
+pub use inspect::{
+    inspect_workload, inspect_workload_archive_bytes, InspectOptions, InspectResult,
+};
 pub use repository::{
     hex_equal, GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta,
     RepositoryFilters, UploadContext, WorkloadCoords, WorkloadRepository,
@@ -28,4 +30,4 @@ pub use scaffold::create_workload;
 pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
 
 /// Current format version for `atakit-workload.toml` and `manifest.json`.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;

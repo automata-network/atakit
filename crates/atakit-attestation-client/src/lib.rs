@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use atakit_attestation::{
-    AzureMaaTrustKey, BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile,
-    MeasurementVariant, PcrSpec, SessionAttributeRequirement, SessionPcrPolicy,
+    AmdSnpSecurityPolicy, AzureMaaTrustKey, BaseImage, MeasurementPack, MeasurementPolicy,
+    MeasurementProfile, MeasurementVariant, PcrSpec, SessionAttributeRequirement, SessionPcrPolicy,
     SessionPcrVerifyType, TrustedSessionBinding,
 };
 use automata_tee_workload_measurement::base_image_registry::{
@@ -61,6 +61,7 @@ pub struct ChainVerificationContext {
     pub session_registry: String,
     pub base_image_registry: String,
     pub workload_registry: String,
+    pub amd_snp_security_policy_registry: String,
 }
 
 /// Trusted workload policy resolved from `WorkloadRegistry`.
@@ -135,6 +136,16 @@ impl AttestationClient {
                 "call SessionRegistry.baseImageRegistry(): {error}"
             ))
         })?;
+        let amd_snp_security_policy_registry = {
+            let result = raw_eth_call(
+                &config.rpc_url,
+                &session_registry.to_string(),
+                encode_no_arg_call("amdSnpSecurityPolicyRegistry()"),
+                "SessionRegistry.amdSnpSecurityPolicyRegistry",
+            )
+            .await?;
+            decode_address_return(&result, "SessionRegistry.amdSnpSecurityPolicyRegistry")?
+        };
 
         validate_expected_address(
             "expected_workload_registry",
@@ -152,6 +163,7 @@ impl AttestationClient {
             session_registry: session_registry.to_string(),
             base_image_registry: base_image_registry.to_string(),
             workload_registry: workload_registry.to_string(),
+            amd_snp_security_policy_registry,
         };
         Ok(Self { config, context })
     }
@@ -338,6 +350,27 @@ impl AttestationClient {
         )))
     }
 
+    /// Read the active AMD SEV-SNP policy defaults for the report's exact
+    /// family, model, and stepping value.
+    pub async fn resolve_amd_snp_security_policy(
+        &self,
+        cpuid: u32,
+    ) -> Result<AmdSnpSecurityPolicy, AttestationClientError> {
+        if cpuid > 0x00ff_ffff {
+            return Err(AttestationClientError::Config(format!(
+                "AMD SEV-SNP CPUID 0x{cpuid:x} does not fit uint24"
+            )));
+        }
+        let result = self
+            .eth_call(
+                &self.context.amd_snp_security_policy_registry,
+                encode_uint_arg_call("getActivePolicy(uint24)", u64::from(cpuid)),
+                "AmdSnpSecurityPolicyRegistry.getActivePolicy",
+            )
+            .await?;
+        decode_amd_snp_security_policy_return(&result, cpuid)
+    }
+
     /// Resolve and validate the exact Azure MAA signing key selected by the
     /// JWT `kid` and `iss` claims.
     pub async fn resolve_azure_maa_signing_key(
@@ -448,49 +481,107 @@ impl AttestationClient {
         calldata: Vec<u8>,
         label: &str,
     ) -> Result<Vec<u8>, AttestationClientError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": contract,
-                    "data": hex0x(calldata),
-                    "value": "0x0"
-                },
-                "latest"
-            ]
-        });
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|error| AttestationClientError::Connect(error.to_string()))?;
-        let response: serde_json::Value = client
-            .post(&self.config.rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| AttestationClientError::Rpc(format!("call {label}: {error}")))?
-            .json()
-            .await
-            .map_err(|error| {
-                AttestationClientError::Rpc(format!("decode {label} response: {error}"))
-            })?;
-        if let Some(error) = response.get("error") {
-            return Err(AttestationClientError::Rpc(format!(
-                "{label} returned JSON-RPC error: {error}"
-            )));
-        }
-        let result = response
-            .get("result")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                AttestationClientError::Rpc(format!("{label} response is missing result"))
-            })?;
-        hex::decode(result.strip_prefix("0x").unwrap_or(result)).map_err(|error| {
-            AttestationClientError::Rpc(format!("decode {label} result as hex: {error}"))
-        })
+        raw_eth_call(&self.config.rpc_url, contract, calldata, label).await
     }
+}
+
+async fn raw_eth_call(
+    rpc_url: &str,
+    contract: &str,
+    calldata: Vec<u8>,
+    label: &str,
+) -> Result<Vec<u8>, AttestationClientError> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [
+            {
+                "to": contract,
+                "data": hex0x(calldata),
+                "value": "0x0"
+            },
+            "latest"
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| AttestationClientError::Connect(error.to_string()))?;
+    let response: serde_json::Value = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| AttestationClientError::Rpc(format!("call {label}: {error}")))?
+        .json()
+        .await
+        .map_err(|error| {
+            AttestationClientError::Rpc(format!("decode {label} response: {error}"))
+        })?;
+    if let Some(error) = response.get("error") {
+        return Err(AttestationClientError::Rpc(format!(
+            "{label} returned JSON-RPC error: {error}"
+        )));
+    }
+    let result = response
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AttestationClientError::Rpc(format!("{label} response is missing result"))
+        })?;
+    hex::decode(result.strip_prefix("0x").unwrap_or(result)).map_err(|error| {
+        AttestationClientError::Rpc(format!("decode {label} result as hex: {error}"))
+    })
+}
+
+fn decode_amd_snp_security_policy_return(
+    bytes: &[u8],
+    cpuid: u32,
+) -> Result<AmdSnpSecurityPolicy, AttestationClientError> {
+    if bytes.len() != 160 && bytes.len() != 224 {
+        return Err(AttestationClientError::Rpc(format!(
+            "AmdSnpSecurityPolicyRegistry.getActivePolicy returned {} bytes; expected 160 or 224",
+            bytes.len()
+        )));
+    }
+    let mut minimum_tcb = [0u8; 32];
+    minimum_tcb.copy_from_slice(&bytes[..32]);
+    let mut platform_info_policy = [0u8; 32];
+    platform_info_policy.copy_from_slice(&bytes[32..64]);
+    let revision = abi_word_to_u64(&bytes[96..128])?;
+    let active = abi_word_bool(&bytes[128..160]).map_err(AttestationClientError::Rpc)?;
+    let required_launch_mitigation_vector = if bytes.len() == 224 {
+        abi_word_to_u64(&bytes[160..192])?
+    } else {
+        0
+    };
+    let required_current_mitigation_vector = if bytes.len() == 224 {
+        abi_word_to_u64(&bytes[192..224])?
+    } else {
+        0
+    };
+    if revision == 0 || !active {
+        return Err(AttestationClientError::Rpc(format!(
+            "AmdSnpSecurityPolicyRegistry returned inactive or revision-zero policy for CPUID 0x{cpuid:06x}"
+        )));
+    }
+    if !atakit_core::tee_attributes::valid_amd_sev_snp_tcb(&minimum_tcb)
+        || !atakit_core::tee_attributes::valid_amd_sev_snp_platform_info_policy(
+            &platform_info_policy,
+        )
+    {
+        return Err(AttestationClientError::Rpc(format!(
+            "AmdSnpSecurityPolicyRegistry returned malformed policy for CPUID 0x{cpuid:06x}"
+        )));
+    }
+    Ok(AmdSnpSecurityPolicy {
+        cpuid,
+        minimum_tcb,
+        platform_info_policy,
+        required_launch_mitigation_vector,
+        required_current_mitigation_vector,
+    })
 }
 
 #[derive(Debug)]
@@ -1018,6 +1109,36 @@ mod tests {
         assert_eq!(decoded.issuer_hash, issuer_hash);
         assert_eq!(decoded.not_after, 1_811_611_165);
         assert!(!decoded.revoked);
+    }
+
+    #[test]
+    fn amd_snp_security_policy_return_decodes_static_struct() {
+        let minimum_tcb = [0x11u8; 32];
+        let platform_info_policy = [0x22u8; 32];
+        let mut returned = Vec::new();
+        returned.extend_from_slice(&minimum_tcb);
+        returned.extend_from_slice(&platform_info_policy);
+        returned.extend_from_slice(&[0x33; 32]);
+        returned.extend_from_slice(&abi_word_u64(7));
+        returned.extend_from_slice(&abi_word_u64(1));
+
+        let error = decode_amd_snp_security_policy_return(&returned, 0x190100).unwrap_err();
+        assert!(error.to_string().contains("malformed policy"));
+
+        returned[..32].fill(0);
+        returned[32..64].fill(0);
+        let decoded = decode_amd_snp_security_policy_return(&returned, 0x190100).unwrap();
+        assert_eq!(decoded.cpuid, 0x190100);
+        assert_eq!(decoded.minimum_tcb, [0; 32]);
+        assert_eq!(decoded.platform_info_policy, [0; 32]);
+        assert_eq!(decoded.required_launch_mitigation_vector, 0);
+        assert_eq!(decoded.required_current_mitigation_vector, 0);
+
+        returned.extend_from_slice(&abi_word_u64(0x1234));
+        returned.extend_from_slice(&abi_word_u64(0x5678));
+        let decoded = decode_amd_snp_security_policy_return(&returned, 0x190100).unwrap();
+        assert_eq!(decoded.required_launch_mitigation_vector, 0x1234);
+        assert_eq!(decoded.required_current_mitigation_vector, 0x5678);
     }
 
     #[test]

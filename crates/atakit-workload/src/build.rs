@@ -241,7 +241,7 @@ pub async fn build_workload(
         unmeasured_data,
         unmeasured_env_files,
         images,
-    );
+    )?;
     let manifest_json = manifest::serialize_canonical_json(&m)?;
     staging.write_manifest(&manifest_json)?;
     handle.finish();

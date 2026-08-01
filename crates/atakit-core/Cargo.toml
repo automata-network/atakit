@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+serde.workspace = true
+sha3.workspace = true
+hex.workspace = true

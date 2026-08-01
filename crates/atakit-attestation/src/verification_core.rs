@@ -9,6 +9,7 @@ pub(super) fn verify_gcp_ak_cert_chain(
     ak_public: &[u8],
     trusted_roots: &[Vec<u8>],
     trusted_root_hashes: &[[u8; 32]],
+    verification_time: SystemTime,
 ) {
     if binding.kind != "gcp-cert-chain" {
         fail(
@@ -36,6 +37,7 @@ pub(super) fn verify_gcp_ak_cert_chain(
         ak_public,
         trusted_roots,
         trusted_root_hashes,
+        verification_time,
     );
 }
 
@@ -46,7 +48,15 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
     ak_public: &[u8],
     trusted_roots: &[Vec<u8>],
     trusted_root_hashes: &[[u8; 32]],
+    verification_time: SystemTime,
 ) {
+    let validation_time = match asn1_time(verification_time) {
+        Ok(time) => time,
+        Err(detail) => {
+            fail(report, errors, "gcp-ak-cert-chain", detail);
+            return;
+        }
+    };
     if trusted_roots.is_empty() && trusted_root_hashes.is_empty() {
         fail(
             report,
@@ -78,12 +88,12 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
             return;
         }
     };
-    if !leaf.validity().is_valid() {
+    if !leaf.validity().is_valid_at(validation_time) {
         fail(
             report,
             errors,
             "gcp-ak-cert-chain",
-            "GCP AK leaf certificate is not currently valid".to_string(),
+            "GCP AK leaf certificate is not valid at the verification time".to_string(),
         );
         return;
     }
@@ -150,12 +160,16 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
             );
             return;
         }
-        if !child.validity().is_valid() || !parent.validity().is_valid() {
+        if !child.validity().is_valid_at(validation_time)
+            || !parent.validity().is_valid_at(validation_time)
+        {
             fail(
                 report,
                 errors,
                 "gcp-ak-cert-chain",
-                format!("GCP AK chain certificate {idx} or its issuer is not currently valid"),
+                format!(
+                    "GCP AK chain certificate {idx} or its issuer is not valid at the verification time"
+                ),
             );
             return;
         }
@@ -384,7 +398,7 @@ pub(super) fn expected_gcp_tdx_pcr15(
     errors: &mut Vec<VerificationError>,
     quote: &[u8],
 ) -> Option<[u8; 32]> {
-    let report_start = match gcp_tdx_report_start(quote) {
+    let report_start = match tdx_quote_report_start(quote) {
         Ok(start) => start,
         Err(detail) => {
             fail(report, errors, "gcp-tee-vtpm-binding", detail);
@@ -445,13 +459,11 @@ pub(super) fn expected_gcp_tdx_pcr15(
     Some(Sha256::digest(&pcr_input).into())
 }
 
-pub(super) fn gcp_tdx_report_start(quote: &[u8]) -> std::result::Result<usize, String> {
-    let Some(version) = read_le_u16_opt(quote, 0) else {
-        return Ok(0);
-    };
-    let Some(tee_type) = read_le_u32_opt(quote, 4) else {
-        return Ok(0);
-    };
+pub(super) fn tdx_quote_report_start(quote: &[u8]) -> std::result::Result<usize, String> {
+    let version = read_le_u16_opt(quote, 0)
+        .ok_or_else(|| "TDX quote is too short for its version".to_string())?;
+    let tee_type = read_le_u32_opt(quote, 4)
+        .ok_or_else(|| "TDX quote is too short for its tee_type".to_string())?;
     match version {
         4 if tee_type == TDX_TEE_TYPE => Ok(TDX_QUOTE_HEADER_LEN),
         5 if tee_type == TDX_TEE_TYPE => {
@@ -466,11 +478,8 @@ pub(super) fn gcp_tdx_report_start(quote: &[u8]) -> std::result::Result<usize, S
                 )),
             }
         }
-        4 | 5 => Err(format!("GCP TDX quote has non-TDX tee_type 0x{tee_type:x}")),
-        // Unit fixtures and some low-level callers pass only the TDREPORT
-        // body. Real endpoint evidence is a full TDQUOTE and takes the
-        // branches above.
-        _ => Ok(0),
+        4 | 5 => Err(format!("TDX quote has non-TDX tee_type 0x{tee_type:x}")),
+        other => Err(format!("TDX quote has unsupported version {other}")),
     }
 }
 
@@ -541,7 +550,11 @@ pub(super) fn verify_expected_pcr15(
 pub(super) struct AmdSnpTrust<'a> {
     pub(super) ark_roots: &'a [Vec<u8>],
     pub(super) ark_root_hashes: &'a [[u8; 32]],
-    pub(super) crls: &'a [Vec<u8>],
+}
+
+pub(super) struct AmdSnpVerificationContext<'a> {
+    pub(super) collateral: Option<&'a AmdSnpVerificationCollateral>,
+    pub(super) trust: AmdSnpTrust<'a>,
 }
 
 pub(super) fn verify_gcp_tee_vendor_report(
@@ -549,27 +562,38 @@ pub(super) fn verify_gcp_tee_vendor_report(
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
     tee: &str,
-    collateral: &serde_json::Value,
-    amd_snp_trust: AmdSnpTrust<'_>,
+    tdx_dcap_collateral: Option<&IntelTdxDcapCollateral>,
+    amd_snp: AmdSnpVerificationContext<'_>,
     current_time: SystemTime,
-) {
+) -> Option<u16> {
     match tee {
-        "sev-snp" => verify_gcp_snp_vendor_report(
+        "sev-snp" => {
+            verify_gcp_snp_vendor_report(
+                report,
+                errors,
+                evidence,
+                amd_snp.collateral,
+                amd_snp.trust,
+                current_time,
+            );
+            None
+        }
+        "tdx" => verify_gcp_tdx_vendor_report(
             report,
             errors,
             evidence,
-            amd_snp_trust.ark_roots,
-            amd_snp_trust.ark_root_hashes,
-            amd_snp_trust.crls,
+            tdx_dcap_collateral,
             current_time,
         ),
-        "tdx" => verify_gcp_tdx_vendor_report(report, errors, evidence, collateral),
-        other => fail(
-            report,
-            errors,
-            "gcp-tee-vendor-report",
-            format!("GCP raw TEE vendor verification is unsupported for tee={other}"),
-        ),
+        other => {
+            fail(
+                report,
+                errors,
+                "gcp-tee-vendor-report",
+                format!("GCP raw TEE vendor verification is unsupported for tee={other}"),
+            );
+            None
+        }
     }
 }
 
@@ -577,16 +601,55 @@ pub(super) fn verify_gcp_tdx_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    collateral: &serde_json::Value,
-) {
+    collateral: Option<&IntelTdxDcapCollateral>,
+    verification_time: SystemTime,
+) -> Option<u16> {
+    verify_tdx_vendor_report(
+        report,
+        errors,
+        evidence,
+        collateral,
+        "gcp-tee-vendor-report",
+        "GCP",
+        verification_time,
+    )
+}
+
+pub(super) fn verify_azure_tdx_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: Option<&IntelTdxDcapCollateral>,
+    verification_time: SystemTime,
+) -> Option<u16> {
+    verify_tdx_vendor_report(
+        report,
+        errors,
+        evidence,
+        collateral,
+        "azure-tee-vendor-report",
+        "Azure",
+        verification_time,
+    )
+}
+
+fn verify_tdx_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: Option<&IntelTdxDcapCollateral>,
+    check_name: &str,
+    provider_name: &str,
+    verification_time: SystemTime,
+) -> Option<u16> {
     let Some(evidence) = evidence else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP TDX TEE evidence is missing".to_string(),
+            check_name,
+            format!("{provider_name} TDX TEE evidence is missing"),
         );
-        return;
+        return None;
     };
     let raw_quote = match decode_b64("teeEvidence.report", &evidence.report) {
         Ok(bytes) if !bytes.is_empty() => bytes,
@@ -594,14 +657,14 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             fail(
                 report,
                 errors,
-                "gcp-tee-vendor-report",
-                "GCP TDX quote is empty".to_string(),
+                check_name,
+                format!("{provider_name} TDX quote is empty"),
             );
-            return;
+            return None;
         }
         Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
-            return;
+            fail(report, errors, check_name, e.to_string());
+            return None;
         }
     };
     const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
@@ -609,18 +672,29 @@ pub(super) fn verify_gcp_tdx_vendor_report(
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            format!("GCP TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
+            check_name,
+            format!("{provider_name} TDX quote exceeds {MAX_TDX_QUOTE_BYTES} bytes"),
         );
-        return;
+        return None;
     }
-    let collateral = match parse_gcp_tdx_dcap_collateral(collateral) {
-        Ok(collateral) => collateral,
-        Err(detail) => {
-            fail(report, errors, "gcp-tee-vendor-report", detail);
-            return;
-        }
+    let Some(collateral) = collateral else {
+        fail(
+            report,
+            errors,
+            check_name,
+            format!("{provider_name} TDX DCAP collateral is missing"),
+        );
+        return None;
     };
+    if let Err(error) = collateral.ensure_quote_matches(&raw_quote) {
+        fail(
+            report,
+            errors,
+            check_name,
+            format!("{provider_name} TDX DCAP collateral selection failed: {error}"),
+        );
+        return None;
+    }
     let mut quote_bytes = raw_quote.as_slice();
     let quote = match dcap_rs::types::quote::Quote::read(&mut quote_bytes) {
         Ok(quote) => quote,
@@ -628,142 +702,176 @@ pub(super) fn verify_gcp_tdx_vendor_report(
             fail(
                 report,
                 errors,
-                "gcp-tee-vendor-report",
-                format!("GCP TDX DCAP quote did not parse: {error:#}"),
+                check_name,
+                format!("{provider_name} TDX DCAP quote did not parse: {error:#}"),
             );
-            return;
+            return None;
         }
     };
     if quote.header.tee_type != TDX_TEE_TYPE || !matches!(quote.header.version.get(), 4 | 5) {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             format!(
-                "GCP TDX evidence must contain a TDX quote with version 4 or 5; got tee_type 0x{:x} and version {}",
+                "{provider_name} TDX evidence must contain a TDX quote with version 4 or 5; got tee_type 0x{:x} and version {}",
                 quote.header.tee_type,
                 quote.header.version.get()
             ),
         );
-        return;
+        return None;
     }
     if quote_bytes.iter().any(|byte| *byte != 0) {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             format!(
-                "GCP TDX DCAP quote has {} non-zero trailing bytes",
+                "{provider_name} TDX DCAP quote has {} non-zero trailing bytes",
                 quote_bytes.len()
             ),
         );
-        return;
+        return None;
     }
-    let collateral = match collateral.to_automata_collateral() {
-        Ok(collateral) => collateral,
-        Err(error) => {
-            fail(report, errors, "gcp-tee-vendor-report", error);
-            return;
-        }
-    };
-    match dcap_rs::verify_dcap_quote_with_policy(
-        SystemTime::now(),
-        collateral,
+    match dcap_rs::verify_dcap_quote_with_policy_ref(
+        verification_time,
+        collateral.parsed(),
         quote,
-        &gcp_tdx_dcap_verification_policy(),
+        &tdx_dcap_verification_policy(),
     ) {
-        Ok(_) => pass(report, "gcp-tee-vendor-report"),
-        Err(e) => fail(
-            report,
-            errors,
-            "gcp-tee-vendor-report",
-            format!("GCP TDX DCAP quote verification failed: {e:#}"),
-        ),
+        Ok(output) if matches!(output.tcb_status, 0..=5 | 8 | 9) => {
+            pass(report, check_name);
+            Some(1u16 << output.tcb_status)
+        }
+        Ok(output) => {
+            fail(
+                report,
+                errors,
+                check_name,
+                format!(
+                    "{provider_name} TDX trusted computing base status {} cannot be configured",
+                    output.tcb_status
+                ),
+            );
+            None
+        }
+        Err(e) => {
+            fail(
+                report,
+                errors,
+                check_name,
+                format!("{provider_name} TDX DCAP quote verification failed: {e:#}"),
+            );
+            None
+        }
     }
 }
 
-fn gcp_tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
-    dcap_rs::DcapVerificationPolicy::production().with_tdx_tcb_revocation_policy(
+fn tdx_dcap_verification_policy() -> dcap_rs::DcapVerificationPolicy {
+    let mut policy = dcap_rs::DcapVerificationPolicy::production();
+    policy.allow_debug = true;
+    policy.with_tdx_tcb_revocation_policy(
         dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch,
     )
-}
-
-pub(super) fn parse_gcp_tdx_dcap_collateral(
-    collateral: &serde_json::Value,
-) -> std::result::Result<TdxDcapCollateral, String> {
-    let value = collateral.get("gcpTdxDcap").unwrap_or(collateral);
-    if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
-        return Err(
-            "GCP TDX DCAP collateral is missing; expected collateral.gcpTdxDcap".to_string(),
-        );
-    }
-    serde_json::from_value(value.clone())
-        .map_err(|e| format!("GCP TDX DCAP collateral did not parse: {e}"))
 }
 
 pub(super) fn verify_gcp_snp_vendor_report(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     evidence: Option<&TeeEvidence>,
-    trusted_amd_ark_roots: &[Vec<u8>],
-    trusted_amd_ark_root_hashes: &[[u8; 32]],
-    trusted_amd_snp_crls: &[Vec<u8>],
+    collateral: Option<&AmdSnpVerificationCollateral>,
+    amd_snp_trust: AmdSnpTrust<'_>,
     current_time: SystemTime,
+) {
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
+        current_time,
+        "gcp-tee-vendor-report",
+        "GCP",
+    );
+}
+
+pub(super) fn verify_azure_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: Option<&AmdSnpVerificationCollateral>,
+    amd_snp_trust: AmdSnpTrust<'_>,
+    current_time: SystemTime,
+) {
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
+        current_time,
+        "azure-tee-vendor-report",
+        "Azure",
+    );
+}
+
+fn verify_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    amd_snp: AmdSnpVerificationContext<'_>,
+    current_time: SystemTime,
+    check_name: &str,
+    provider_name: &str,
 ) {
     let Some(evidence) = evidence else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP SNP TEE evidence is missing".to_string(),
+            check_name,
+            format!("{provider_name} SNP TEE evidence is missing"),
         );
         return;
     };
     let snp_report = match decode_b64("teeEvidence.report", &evidence.report) {
         Ok(bytes) => bytes,
         Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
+            fail(report, errors, check_name, e.to_string());
             return;
         }
     };
-    let Some(auxiliary) = &evidence.auxiliary else {
+    let Some(collateral) = amd_snp.collateral else {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
-            "GCP SNP auxiliary cert table is missing".to_string(),
+            check_name,
+            format!("{provider_name} SNP verification collateral is missing"),
         );
         return;
     };
-    let auxblob = match decode_b64("teeEvidence.auxiliary", auxiliary) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            fail(report, errors, "gcp-tee-vendor-report", e.to_string());
-            return;
-        }
-    };
-    if trusted_amd_ark_roots.is_empty() && trusted_amd_ark_root_hashes.is_empty() {
+    if amd_snp.trust.ark_roots.is_empty() && amd_snp.trust.ark_root_hashes.is_empty() {
         fail(
             report,
             errors,
-            "gcp-tee-vendor-report",
+            check_name,
             "no trusted AMD SEV-SNP ARK root certificates or root hashes configured".to_string(),
         );
         return;
     }
-    match verify_snp_report_with_aux_certs(
-        current_time,
-        &snp_report,
-        &auxblob,
-        trusted_amd_ark_roots,
-        trusted_amd_ark_root_hashes,
-        trusted_amd_snp_crls,
-    ) {
-        Ok(()) => pass(report, "gcp-tee-vendor-report"),
-        Err(detail) => fail(report, errors, "gcp-tee-vendor-report", detail),
+    match verify_snp_report_with_collateral(current_time, &snp_report, collateral, amd_snp.trust) {
+        Ok(()) => match verified_snp_attribute_states(&snp_report) {
+            Ok(_) => pass(report, check_name),
+            Err(detail) => fail(report, errors, check_name, detail),
+        },
+        Err(detail) => fail(report, errors, check_name, detail),
     }
 }
 
+#[cfg(test)]
 pub(super) fn verify_snp_report_with_aux_certs(
     current_time: SystemTime,
     report: &[u8],
@@ -772,9 +880,31 @@ pub(super) fn verify_snp_report_with_aux_certs(
     trusted_amd_ark_root_hashes: &[[u8; 32]],
     trusted_amd_snp_crls: &[Vec<u8>],
 ) -> std::result::Result<(), String> {
-    if report.len() < SNP_REPORT_MIN_LEN {
+    let collateral = AmdSnpVerificationCollateral::from_certificate_table(
+        auxblob,
+        trusted_amd_snp_crls.to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    verify_snp_report_with_collateral(
+        current_time,
+        report,
+        &collateral,
+        AmdSnpTrust {
+            ark_roots: trusted_amd_ark_roots,
+            ark_root_hashes: trusted_amd_ark_root_hashes,
+        },
+    )
+}
+
+pub(super) fn verify_snp_report_with_collateral(
+    current_time: SystemTime,
+    report: &[u8],
+    collateral: &AmdSnpVerificationCollateral,
+    trust: AmdSnpTrust<'_>,
+) -> std::result::Result<(), String> {
+    if report.len() != SNP_REPORT_SIZE {
         return Err(format!(
-            "GCP SNP report is too short: got {}, need at least {SNP_REPORT_MIN_LEN}",
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
             report.len()
         ));
     }
@@ -787,79 +917,54 @@ pub(super) fn verify_snp_report_with_aux_certs(
     verify_snp_report_policy(report)?;
     let expected_product = amd_snp_kds_product(report)?;
 
-    let certs = parse_amd_snp_cert_table(auxblob)?;
-    let ark = certs
-        .ark
-        .as_deref()
-        .ok_or_else(|| "GCP SNP auxblob missing ARK certificate".to_string())?;
-    let ask = certs
-        .ask
-        .as_deref()
-        .ok_or_else(|| "GCP SNP auxblob missing ASK certificate".to_string())?;
     let signer = snp_signing_key_type(report)?;
-    let vek =
-        match signer {
-            SnpSigningKeyType::Vcek => certs.vcek.as_deref().ok_or_else(|| {
-                "GCP SNP report is VCEK-signed but auxblob lacks VCEK".to_string()
-            })?,
-            SnpSigningKeyType::Vlek => certs.vlek.as_deref().ok_or_else(|| {
-                "GCP SNP report is VLEK-signed but auxblob lacks VLEK".to_string()
-            })?,
-        };
+    let vek = match signer {
+        AmdSnpSigningKeyType::Vcek => collateral
+            .vcek_der
+            .as_deref()
+            .ok_or_else(|| "SNP report is VCEK-signed but collateral lacks VCEK".to_string())?,
+        AmdSnpSigningKeyType::Vlek => collateral
+            .vlek_der
+            .as_deref()
+            .ok_or_else(|| "SNP report is VLEK-signed but collateral lacks VLEK".to_string())?,
+    };
 
     verify_amd_snp_cert_chain(
         current_time,
-        ark,
-        ask,
+        collateral,
         vek,
         signer,
         expected_product,
-        AmdSnpTrust {
-            ark_roots: trusted_amd_ark_roots,
-            ark_root_hashes: trusted_amd_ark_root_hashes,
-            crls: trusted_amd_snp_crls,
-        },
+        trust,
     )?;
     verify_snp_vek_extensions(vek, report, signer)?;
     verify_snp_report_signature(vek, report)?;
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SnpSigningKeyType {
-    Vcek,
-    Vlek,
-}
-
 pub(super) fn snp_signing_key_type(
     report: &[u8],
-) -> std::result::Result<SnpSigningKeyType, String> {
+) -> std::result::Result<AmdSnpSigningKeyType, String> {
     let key_settings = read_le_u32(report, SNP_REPORT_KEY_SETTINGS_OFFSET, "SNP key_settings")?;
     match key_settings & 0b11100 {
-        0b000 => Ok(SnpSigningKeyType::Vcek),
-        0b100 => Ok(SnpSigningKeyType::Vlek),
+        0b000 => Ok(AmdSnpSigningKeyType::Vcek),
+        0b100 => Ok(AmdSnpSigningKeyType::Vlek),
         value => Err(format!("unknown SNP signing key type bits 0x{value:x}")),
     }
 }
 
 pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(), String> {
     let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP report version")?;
-    if !(2..=5).contains(&version) {
+    if !(3..=5).contains(&version) {
         return Err(format!(
-            "unsupported SNP report version {version}; expected a version from 2 through 5"
+            "unsupported SNP report version {version}; expected a version from 3 through 5"
         ));
     }
-    let policy_bytes = read_exact_at(report, SNP_REPORT_POLICY_OFFSET, 8, "SNP policy")?;
-    let policy = u64::from_le_bytes(
-        policy_bytes
-            .try_into()
-            .expect("SNP policy slice has the checked length"),
-    );
-    if policy & SNP_POLICY_DEBUG != 0 {
-        return Err("SNP report policy permits host debugging".to_string());
-    }
-    if policy & SNP_POLICY_MIGRATE_MA != 0 {
-        return Err("SNP report policy permits association with a migration agent".to_string());
+    let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
+    if policy & (1 << 17) == 0 || policy >> 26 != 0 {
+        return Err(format!(
+            "SNP policy reserved bits are invalid: 0x{policy:016x}"
+        ));
     }
     let vmpl = read_le_u32(report, SNP_REPORT_VMPL_OFFSET, "SNP VMPL")?;
     if vmpl != 0 {
@@ -868,7 +973,7 @@ pub(super) fn verify_snp_report_policy(report: &[u8]) -> std::result::Result<(),
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct AmdSnpCertTable {
     pub(super) ark: Option<Vec<u8>>,
     pub(super) ask: Option<Vec<u8>>,
@@ -879,23 +984,50 @@ pub(super) struct AmdSnpCertTable {
 pub(super) fn parse_amd_snp_cert_table(
     auxblob: &[u8],
 ) -> std::result::Result<AmdSnpCertTable, String> {
-    let mut table = AmdSnpCertTable::default();
+    if auxblob.len() > MAX_SNP_CERT_TABLE_BYTES {
+        return Err(format!(
+            "SNP certificate table exceeds the {MAX_SNP_CERT_TABLE_BYTES}-byte limit"
+        ));
+    }
+
+    struct Entry {
+        guid: [u8; 16],
+        cert_offset: usize,
+        cert_end: usize,
+    }
+
+    let mut entries = Vec::new();
     let mut offset = 0usize;
-    while offset + 24 <= auxblob.len() {
-        let guid_bytes = &auxblob[offset..offset + 16];
-        if guid_bytes.iter().all(|&b| b == 0) {
-            break;
+    let header_end = loop {
+        let entry_end = offset
+            .checked_add(SNP_CERT_TABLE_ENTRY_BYTES)
+            .ok_or_else(|| "SNP certificate-table header length overflows usize".to_string())?;
+        if entry_end > auxblob.len() {
+            return Err("SNP certificate table is missing its zero terminator".to_string());
         }
-        let cert_offset = u32::from_le_bytes(
-            auxblob[offset + 16..offset + 20]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
-        let cert_len = u32::from_le_bytes(
-            auxblob[offset + 20..offset + 24]
-                .try_into()
-                .expect("slice length"),
-        ) as usize;
+
+        let entry = &auxblob[offset..entry_end];
+        let guid_bytes = &entry[..16];
+        if guid_bytes.iter().all(|&b| b == 0) {
+            if entry[16..].iter().any(|&b| b != 0) {
+                return Err(
+                    "SNP certificate-table terminator contains a nonzero offset or length"
+                        .to_string(),
+                );
+            }
+            break entry_end;
+        }
+        if entries.len() >= MAX_SNP_CERT_TABLE_ENTRIES {
+            return Err(format!(
+                "SNP certificate table contains more than {MAX_SNP_CERT_TABLE_ENTRIES} entries"
+            ));
+        }
+        let cert_offset =
+            u32::from_le_bytes(entry[16..20].try_into().expect("slice length")) as usize;
+        let cert_len = u32::from_le_bytes(entry[20..24].try_into().expect("slice length")) as usize;
+        if cert_len == 0 {
+            return Err("SNP certificate-table entry has an empty certificate".to_string());
+        }
         let cert_end = cert_offset
             .checked_add(cert_len)
             .ok_or_else(|| "SNP cert table entry overflows usize".to_string())?;
@@ -905,30 +1037,74 @@ pub(super) fn parse_amd_snp_cert_table(
                 auxblob.len()
             ));
         }
-        let cert = auxblob[cert_offset..cert_end].to_vec();
-        if guid_bytes == SNP_CERT_TABLE_ARK_GUID {
-            table.ark = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_ASK_GUID {
-            table.ask = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_VCEK_GUID {
-            table.vcek = Some(cert);
-        } else if guid_bytes == SNP_CERT_TABLE_VLEK_GUID {
-            table.vlek = Some(cert);
+        entries.push(Entry {
+            guid: guid_bytes.try_into().expect("slice length"),
+            cert_offset,
+            cert_end,
+        });
+        offset = entry_end;
+    };
+
+    for entry in &entries {
+        if entry.cert_offset < header_end {
+            return Err(format!(
+                "SNP certificate-table entry overlaps the header: offset={} header={header_end}",
+                entry.cert_offset
+            ));
         }
-        offset += 24;
     }
+
+    let mut ranges = entries
+        .iter()
+        .map(|entry| (entry.cert_offset, entry.cert_end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("SNP certificate-table certificate ranges overlap".to_string());
+    }
+
+    fn set_certificate(
+        slot: &mut Option<Vec<u8>>,
+        label: &str,
+        certificate: &[u8],
+    ) -> std::result::Result<(), String> {
+        if slot.is_some() {
+            return Err(format!(
+                "SNP certificate table contains duplicate {label} entries"
+            ));
+        }
+        *slot = Some(certificate.to_vec());
+        Ok(())
+    }
+
+    let mut table = AmdSnpCertTable::default();
+    for entry in entries {
+        let certificate = &auxblob[entry.cert_offset..entry.cert_end];
+        if entry.guid == SNP_CERT_TABLE_ARK_GUID {
+            set_certificate(&mut table.ark, "ARK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_ASK_GUID {
+            set_certificate(&mut table.ask, "ASK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_VCEK_GUID {
+            set_certificate(&mut table.vcek, "VCEK", certificate)?;
+        } else if entry.guid == SNP_CERT_TABLE_VLEK_GUID {
+            set_certificate(&mut table.vlek, "VLEK", certificate)?;
+        }
+    }
+
     Ok(table)
 }
 
 pub(super) fn verify_amd_snp_cert_chain(
     current_time: SystemTime,
-    ark_der: &[u8],
-    ask_der: &[u8],
+    collateral: &AmdSnpVerificationCollateral,
     vek_der: &[u8],
-    signer: SnpSigningKeyType,
+    signer: AmdSnpSigningKeyType,
     expected_product: &str,
     trust: AmdSnpTrust<'_>,
 ) -> std::result::Result<(), String> {
+    let ark_der = &collateral.ark_der;
+    let intermediate_ca_der = &collateral.intermediate_ca_der;
+    let intermediate_ca_label = snp_intermediate_ca_label(signer);
     let ark_hash: [u8; 32] = Sha256::digest(ark_der).into();
     if !trust
         .ark_roots
@@ -944,12 +1120,16 @@ pub(super) fn verify_amd_snp_cert_chain(
 
     let (_, ark) = X509Certificate::from_der(ark_der)
         .map_err(|e| format!("SNP ARK certificate did not parse: {e}"))?;
-    let (_, ask) = X509Certificate::from_der(ask_der)
-        .map_err(|e| format!("SNP ASK certificate did not parse: {e}"))?;
+    let (_, intermediate_ca) = X509Certificate::from_der(intermediate_ca_der)
+        .map_err(|e| format!("{intermediate_ca_label} certificate did not parse: {e}"))?;
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
     let validation_time = asn1_time(current_time)?;
-    for (label, cert) in [("SNP ARK", &ark), ("SNP ASK", &ask), ("SNP VEK", &vek)] {
+    for (label, cert) in [
+        ("SNP ARK", &ark),
+        (intermediate_ca_label, &intermediate_ca),
+        ("SNP VEK", &vek),
+    ] {
         if cert.version() != X509Version::V3 {
             return Err(format!("{label} certificate is not X.509 version 3"));
         }
@@ -979,26 +1159,46 @@ pub(super) fn verify_amd_snp_cert_chain(
         return Err("SNP ARK Key Usage does not permit CRL signing".to_string());
     }
     verify_amd_snp_cert_signature(ark_der, &ark, &ark, "SNP ARK self-signature")?;
-    if ask.issuer() != ark.subject() {
-        return Err("SNP ASK issuer does not match ARK subject".to_string());
-    }
-    let ask_common_name = certificate_common_name(&ask, "SNP ASK")?;
-    let expected_ask_common_name = format!("SEV-{expected_product}");
-    if ask_common_name != expected_ask_common_name {
+    if intermediate_ca.issuer() != ark.subject() {
         return Err(format!(
-            "SNP ASK common name is {ask_common_name:?}, expected {expected_ask_common_name:?}"
+            "{intermediate_ca_label} issuer does not match ARK subject"
         ));
     }
-    verify_ca_certificate_role(&ask, "SNP ASK", 0)?;
-    verify_amd_snp_cert_signature(ask_der, &ask, &ark, "SNP ASK signature")?;
-    verify_amd_snp_crls(&ark, &ask, trust.crls, validation_time)?;
-    if vek.issuer() != ask.subject() {
-        return Err("SNP VEK issuer does not match ASK subject".to_string());
+    let intermediate_ca_common_name =
+        certificate_common_name(&intermediate_ca, intermediate_ca_label)?;
+    let expected_intermediate_ca_common_names =
+        snp_intermediate_ca_common_names(signer, expected_product);
+    if !expected_intermediate_ca_common_names
+        .iter()
+        .any(|expected| intermediate_ca_common_name == expected)
+    {
+        return Err(format!(
+            "{intermediate_ca_label} common name is {intermediate_ca_common_name:?}, expected one of {expected_intermediate_ca_common_names:?}"
+        ));
+    }
+    verify_ca_certificate_role(&intermediate_ca, intermediate_ca_label, 0)?;
+    verify_amd_snp_cert_signature(
+        intermediate_ca_der,
+        &intermediate_ca,
+        &ark,
+        &format!("{intermediate_ca_label} signature"),
+    )?;
+    verify_amd_snp_crls(
+        &ark,
+        &intermediate_ca,
+        intermediate_ca_label,
+        collateral.crls_der(),
+        validation_time,
+    )?;
+    if vek.issuer() != intermediate_ca.subject() {
+        return Err(format!(
+            "SNP VEK issuer does not match {intermediate_ca_label} subject"
+        ));
     }
     verify_end_entity_certificate_role(&vek, "SNP VEK")?;
     let expected_common_name = match signer {
-        SnpSigningKeyType::Vcek => "SEV-VCEK",
-        SnpSigningKeyType::Vlek => "SEV-VLEK",
+        AmdSnpSigningKeyType::Vcek => "SEV-VCEK",
+        AmdSnpSigningKeyType::Vlek => "SEV-VLEK",
     };
     let actual_common_name = certificate_common_name(&vek, "SNP VEK")?;
     if actual_common_name != expected_common_name {
@@ -1006,8 +1206,28 @@ pub(super) fn verify_amd_snp_cert_chain(
             "SNP VEK common name is {actual_common_name:?}, expected {expected_common_name:?}"
         ));
     }
-    verify_amd_snp_cert_signature(vek_der, &vek, &ask, "SNP VEK signature")?;
+    verify_amd_snp_cert_signature(vek_der, &vek, &intermediate_ca, "SNP VEK signature")?;
     Ok(())
+}
+
+pub(super) fn snp_intermediate_ca_label(signer: AmdSnpSigningKeyType) -> &'static str {
+    match signer {
+        AmdSnpSigningKeyType::Vcek => "SNP ASK",
+        AmdSnpSigningKeyType::Vlek => "SNP ASVK",
+    }
+}
+
+pub(super) fn snp_intermediate_ca_common_names(
+    signer: AmdSnpSigningKeyType,
+    expected_product: &str,
+) -> Vec<String> {
+    match signer {
+        AmdSnpSigningKeyType::Vcek => vec![format!("SEV-{expected_product}")],
+        AmdSnpSigningKeyType::Vlek => vec![
+            "SEV-VLEK".to_string(),
+            format!("SEV-VLEK-{expected_product}"),
+        ],
+    }
 }
 
 fn asn1_time(time: SystemTime) -> std::result::Result<ASN1Time, String> {
@@ -1039,7 +1259,8 @@ fn certificate_common_name<'a>(
 
 fn verify_amd_snp_crls(
     ark: &X509Certificate<'_>,
-    ask: &X509Certificate<'_>,
+    intermediate_ca: &X509Certificate<'_>,
+    intermediate_ca_label: &str,
     crl_der_values: &[Vec<u8>],
     current_time: ASN1Time,
 ) -> std::result::Result<(), String> {
@@ -1096,11 +1317,11 @@ fn verify_amd_snp_crls(
         }
         if crl
             .iter_revoked_certificates()
-            .any(|revoked| revoked.serial() == &ask.tbs_certificate.serial)
+            .any(|revoked| revoked.serial() == &intermediate_ca.tbs_certificate.serial)
         {
             return Err(format!(
-                "SNP ASK certificate serial {} is revoked",
-                ask.raw_serial_as_string()
+                "{intermediate_ca_label} certificate serial {} is revoked",
+                intermediate_ca.raw_serial_as_string()
             ));
         }
         return Ok(());
@@ -1178,7 +1399,11 @@ pub(super) fn der_tlv(
         .get(1)
         .ok_or_else(|| format!("{label} DER is missing length"))?;
     if first_len & 0x80 == 0 {
-        return Ok((2, usize::from(first_len)));
+        let len = usize::from(first_len);
+        if 2 + len > data.len() {
+            return Err(format!("{label} DER length exceeds buffer"));
+        }
+        return Ok((2, len));
     }
     let len_len = usize::from(first_len & 0x7f);
     if len_len == 0 || len_len > 4 {
@@ -1193,13 +1418,20 @@ pub(super) fn der_tlv(
     for byte in len_bytes {
         len = (len << 8) | usize::from(*byte);
     }
-    Ok((2 + len_len, len))
+    let content_offset = 2 + len_len;
+    let content_end = content_offset
+        .checked_add(len)
+        .ok_or_else(|| format!("{label} DER length overflows usize"))?;
+    if content_end > data.len() {
+        return Err(format!("{label} DER length exceeds buffer"));
+    }
+    Ok((content_offset, len))
 }
 
 pub(super) fn verify_snp_vek_extensions(
     vek_der: &[u8],
     report: &[u8],
-    signer: SnpSigningKeyType,
+    signer: AmdSnpSigningKeyType,
 ) -> std::result::Result<(), String> {
     let (_, vek) = X509Certificate::from_der(vek_der)
         .map_err(|e| format!("SNP VEK certificate did not parse: {e}"))?;
@@ -1211,7 +1443,7 @@ pub(super) fn verify_snp_vek_extensions(
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.3", tcb.snp, "snp")?;
     check_snp_tcb_extension(&vek, "1.3.6.1.4.1.3704.1.3.8", tcb.microcode, "microcode")?;
 
-    if signer == SnpSigningKeyType::Vcek {
+    if signer == AmdSnpSigningKeyType::Vcek {
         let chip_id = read_exact_at(report, SNP_REPORT_CHIP_ID_OFFSET, 64, "SNP chip_id")?;
         check_snp_octet_extension(&vek, "1.3.6.1.4.1.3704.1.4", chip_id, "chip_id")?;
     }
@@ -1315,11 +1547,7 @@ fn check_snp_product_extension(
         .find(|ext| ext.oid.to_id_string() == "1.3.6.1.4.1.3704.1.2")
         .ok_or_else(|| "SNP VEK is missing required productName extension".to_string())?;
     let value = match ext.value {
-        [tag @ (0x0c | 0x16), length, value @ ..]
-            if *tag != 0 && usize::from(*length) == value.len() =>
-        {
-            value
-        }
+        [0x0c | 0x16, length, value @ ..] if usize::from(*length) == value.len() => value,
         raw => {
             return Err(format!(
                 "SNP VEK productName extension has unsupported encoding: 0x{}",
@@ -1392,6 +1620,286 @@ pub(super) fn read_le_u32(
     Ok(u32::from_le_bytes(bytes.try_into().expect("slice length")))
 }
 
+pub(super) fn read_le_u64(
+    data: &[u8],
+    offset: usize,
+    field: &str,
+) -> std::result::Result<u64, String> {
+    let bytes = read_exact_at(data, offset, 8, field)?;
+    Ok(u64::from_le_bytes(bytes.try_into().expect("slice length")))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct VerifiedAmdSnpSecurityState {
+    pub(super) debug: bool,
+    pub(super) migrate_ma: bool,
+    pub(super) tcb_values: [u8; 32],
+    pub(super) platform_info: u64,
+    pub(super) cpuid: u32,
+    pub(super) report_version: u32,
+    pub(super) launch_mitigation_vector: u64,
+    pub(super) current_mitigation_vector: u64,
+}
+
+pub(super) fn verified_snp_security_state(
+    report: &[u8],
+) -> std::result::Result<VerifiedAmdSnpSecurityState, String> {
+    if report.len() != SNP_REPORT_SIZE {
+        return Err(format!(
+            "SNP report has invalid size: got {}, expected {SNP_REPORT_SIZE}",
+            report.len()
+        ));
+    }
+    let version = read_le_u32(report, SNP_REPORT_VERSION_OFFSET, "SNP version")?;
+    if !(3..=5).contains(&version) {
+        return Err(format!(
+            "SNP report version {version} is unsupported; expected a version from 3 through 5"
+        ));
+    }
+    let policy = read_le_u64(report, SNP_REPORT_POLICY_OFFSET, "SNP policy")?;
+    if policy & (1 << 17) == 0 || policy >> 26 != 0 {
+        return Err(format!(
+            "SNP policy reserved bits are invalid: 0x{policy:016x}"
+        ));
+    }
+    let vmpl = read_le_u32(report, SNP_REPORT_VMPL_OFFSET, "SNP VMPL")?;
+    if vmpl != 0 {
+        return Err(format!("SNP VMPL {vmpl} is unsupported; expected 0"));
+    }
+    let signature_algorithm = read_le_u32(
+        report,
+        SNP_REPORT_SIG_ALGO_OFFSET,
+        "SNP signature algorithm",
+    )?;
+    if signature_algorithm != SNP_SIG_ALGO_ECDSA_P384_SHA384 {
+        return Err(format!(
+            "SNP signature algorithm is {signature_algorithm}, expected {SNP_SIG_ALGO_ECDSA_P384_SHA384}"
+        ));
+    }
+    let key_settings = read_le_u32(report, SNP_REPORT_KEY_SETTINGS_OFFSET, "SNP key settings")?;
+    let signing_key = (key_settings >> 2) & 7;
+    if key_settings >> 5 != 0 || signing_key > 1 || key_settings & 2 != 0 {
+        return Err(format!(
+            "SNP key settings contain unsupported bits: 0x{key_settings:08x}"
+        ));
+    }
+    require_zero_bytes(report, SNP_REPORT_RESERVED_1_OFFSET, 4, "SNP reserved1")?;
+
+    let report_id_ma = read_exact_at(
+        report,
+        SNP_REPORT_ID_MA_OFFSET,
+        SNP_REPORT_ID_MA_LEN,
+        "SNP report_id_ma",
+    )?;
+    let no_migration_agent =
+        report_id_ma.iter().all(|byte| *byte == 0) || report_id_ma.iter().all(|byte| *byte == 0xff);
+    if !no_migration_agent {
+        return Err(
+            "SNP REPORT_ID_MA is neither the all-zero nor the all-0xff no-association sentinel; migration-agent association is unsupported".into(),
+        );
+    }
+
+    let platform_info = read_le_u64(report, SNP_REPORT_PLATFORM_INFO_OFFSET, "SNP platform_info")?;
+    if platform_info & !atakit_core::tee_attributes::AMD_SEV_SNP_PLATFORM_INFO_SUPPORTED_MASK != 0 {
+        return Err(format!(
+            "SNP PLATFORM_INFO contains unsupported bits: 0x{platform_info:016x}"
+        ));
+    }
+
+    let cpuid_bytes = read_exact_at(report, SNP_REPORT_CPUID_OFFSET, 3, "SNP CPUID")?;
+    let cpuid = (u32::from(cpuid_bytes[0]) << 16)
+        | (u32::from(cpuid_bytes[1]) << 8)
+        | u32::from(cpuid_bytes[2]);
+    if cpuid_bytes[0] != 0x19 || cpuid_bytes[1] > 0x1f {
+        return Err(format!(
+            "SNP CPUID 0x{cpuid:06x} is not a supported Milan or Genoa processor"
+        ));
+    }
+    require_zero_bytes(
+        report,
+        SNP_REPORT_CPUID_RESERVED_OFFSET,
+        SNP_REPORT_CPUID_RESERVED_LEN,
+        "SNP CPUID reserved field",
+    )?;
+    require_zero_bytes(
+        report,
+        SNP_REPORT_CURRENT_VERSION_RESERVED_OFFSET,
+        1,
+        "SNP current version reserved field",
+    )?;
+    require_zero_bytes(
+        report,
+        SNP_REPORT_COMMITTED_VERSION_RESERVED_OFFSET,
+        1,
+        "SNP committed version reserved field",
+    )?;
+
+    let current = normalized_snp_tcb(report, SNP_REPORT_CURRENT_TCB_OFFSET, "current_tcb")?;
+    let reported = normalized_snp_tcb(report, SNP_REPORT_REPORTED_TCB_OFFSET, "reported_tcb")?;
+    let committed = normalized_snp_tcb(report, SNP_REPORT_COMMITTED_TCB_OFFSET, "committed_tcb")?;
+    let launch = normalized_snp_tcb(report, SNP_REPORT_LAUNCH_TCB_OFFSET, "launch_tcb")?;
+    if !snp_tcb_lane_meets(committed, reported) {
+        return Err(format!(
+            "SNP reported_tcb 0x{reported:08x} exceeds committed_tcb 0x{committed:08x}"
+        ));
+    }
+    if !snp_tcb_lane_meets(current, committed) {
+        return Err(format!(
+            "SNP committed_tcb 0x{committed:08x} exceeds current_tcb 0x{current:08x}"
+        ));
+    }
+    if !snp_tcb_lane_meets(committed, launch) {
+        return Err(format!(
+            "SNP launch_tcb 0x{launch:08x} exceeds committed_tcb 0x{committed:08x}"
+        ));
+    }
+    let mut tcb_values = [0u8; 32];
+    for (index, value) in [current, reported, committed, launch]
+        .into_iter()
+        .enumerate()
+    {
+        tcb_values[index * 8..index * 8 + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    let reserved_offset = if version < 5 {
+        SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET
+    } else {
+        SNP_REPORT_CURRENT_MITIGATION_VECTOR_END
+    };
+    require_zero_bytes(
+        report,
+        reserved_offset,
+        SNP_REPORT_SIGNATURE_OFFSET - reserved_offset,
+        "SNP mitigation-vector reserved field",
+    )?;
+    let (launch_mitigation_vector, current_mitigation_vector) = if version == 5 {
+        (
+            read_le_u64(
+                report,
+                SNP_REPORT_LAUNCH_MITIGATION_VECTOR_OFFSET,
+                "SNP launch_mit_vector",
+            )?,
+            read_le_u64(
+                report,
+                SNP_REPORT_CURRENT_MITIGATION_VECTOR_OFFSET,
+                "SNP current_mit_vector",
+            )?,
+        )
+    } else {
+        (0, 0)
+    };
+
+    Ok(VerifiedAmdSnpSecurityState {
+        debug: policy & SNP_POLICY_DEBUG != 0,
+        migrate_ma: policy & SNP_POLICY_MIGRATE_MA != 0,
+        tcb_values,
+        platform_info,
+        cpuid,
+        report_version: version,
+        launch_mitigation_vector,
+        current_mitigation_vector,
+    })
+}
+
+fn normalized_snp_tcb(
+    report: &[u8],
+    offset: usize,
+    field: &str,
+) -> std::result::Result<u64, String> {
+    let raw = read_exact_at(report, offset, 8, field)?;
+    if raw[2..6].iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "SNP {field} contains nonzero reserved or unsupported fields: 0x{}",
+            hex::encode(raw)
+        ));
+    }
+    Ok(u64::from(raw[0])
+        | (u64::from(raw[1]) << 8)
+        | (u64::from(raw[6]) << 16)
+        | (u64::from(raw[7]) << 24))
+}
+
+fn snp_tcb_lane_meets(actual: u64, minimum: u64) -> bool {
+    (0..4).all(|index| ((actual >> (index * 8)) & 0xff) >= ((minimum >> (index * 8)) & 0xff))
+}
+
+fn require_zero_bytes(
+    report: &[u8],
+    offset: usize,
+    len: usize,
+    field: &str,
+) -> std::result::Result<(), String> {
+    let value = read_exact_at(report, offset, len, field)?;
+    if value.iter().any(|byte| *byte != 0) {
+        return Err(format!("{field} contains nonzero bytes"));
+    }
+    Ok(())
+}
+
+pub(super) fn verified_snp_attribute_states(
+    report: &[u8],
+) -> std::result::Result<(bool, bool), String> {
+    let state = verified_snp_security_state(report)?;
+    Ok((state.debug, state.migrate_ma))
+}
+
+pub(super) fn verified_tee_attribute_states(
+    tee: &str,
+    report: &[u8],
+) -> std::result::Result<[bool; 3], String> {
+    match tee {
+        "tdx" => {
+            let report_start = tdx_quote_report_start(report)?;
+            let attributes = read_exact_at(
+                report,
+                report_start + TDX_REPORT_ATTRIBUTES_OFFSET,
+                8,
+                "TDX TD_ATTRIBUTES",
+            )?;
+            if attributes[0] & !0x01 != 0
+                || attributes[1] != 0
+                || attributes[2] != 0
+                || attributes[3] & 0x2f != 0
+                || attributes[4] != 0
+                || attributes[5] != 0
+                || attributes[6] != 0
+                || attributes[7] & 0x7f != 0
+            {
+                return Err("TDX TD_ATTRIBUTES has reserved bits set".into());
+            }
+            if attributes[3] & 0x10 == 0 {
+                return Err("TDX TD_ATTRIBUTES.SEPT_VE_DISABLE is not set".into());
+            }
+            let version = read_le_u16_opt(report, 0);
+            let body_type = read_le_u16_opt(report, TDX_QUOTE_HEADER_LEN);
+            let td15 = matches!(
+                (version, body_type),
+                (Some(5), Some(TDX_BODY_TD_REPORT15_TYPE))
+            ) || (!matches!(version, Some(4 | 5)) && report.len() >= 648);
+            if td15 {
+                let mr_service_td = read_exact_at(
+                    report,
+                    report_start + TDX_REPORT15_MR_SERVICETD_OFFSET,
+                    48,
+                    "TDX MR_SERVICETD",
+                )?;
+                if mr_service_td.iter().any(|byte| *byte != 0) {
+                    return Err("TDX MR_SERVICETD is nonzero; migration is unsupported".into());
+                }
+            }
+            Ok([attributes[0] & 0x01 != 0, false, false])
+        }
+        "sev-snp" => {
+            let (debug, migrate_ma) = verified_snp_attribute_states(report)?;
+            Ok([false, debug, migrate_ma])
+        }
+        "emulation" | "none" => Ok([false; 3]),
+        other => Err(format!(
+            "verified TEE attribute extraction is unsupported for tee={other}"
+        )),
+    }
+}
+
 pub(super) fn read_exact_at<'a>(
     data: &'a [u8],
     offset: usize,
@@ -1411,6 +1919,7 @@ pub(super) fn verify_azure_maa_jwt_binding(
     binding: &AkBinding,
     trusted_maa_keys: &[Vec<u8>],
     tee: &str,
+    verification_time: SystemTime,
 ) {
     let binding = match parse_azure_maa_binding(binding) {
         Ok(binding) => binding,
@@ -1471,6 +1980,10 @@ pub(super) fn verify_azure_maa_jwt_binding(
                 claims.compliance_status
             ),
         );
+        return;
+    }
+    if let Err(detail) = verify_azure_maa_token_time(&claims, verification_time) {
+        fail(report, errors, "azure-maa-jwt", detail);
         return;
     }
 
@@ -1560,6 +2073,7 @@ pub(super) fn verify_azure_maa_session_binding(
     binding: &AkBinding,
     trusted_keys: &[AzureMaaTrustKey],
     tee: &str,
+    verification_time: SystemTime,
 ) {
     let parsed_binding = match parse_azure_maa_binding(binding) {
         Ok(binding) => binding,
@@ -1614,19 +2128,19 @@ pub(super) fn verify_azure_maa_session_binding(
         return;
     }
     let key = matching_keys[0];
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+    let verification_timestamp = match verification_time.duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
         Err(error) => {
             fail(
                 report,
                 errors,
                 "azure-maa-trust-selection",
-                format!("system clock is before Unix epoch: {error}"),
+                format!("verification time is before Unix epoch: {error}"),
             );
             return;
         }
     };
-    if now > key.not_after {
+    if verification_timestamp > key.not_after {
         fail(
             report,
             errors,
@@ -1642,7 +2156,49 @@ pub(super) fn verify_azure_maa_session_binding(
         binding,
         std::slice::from_ref(&key.public_key),
         tee,
+        verification_time,
     );
+}
+
+fn verify_azure_maa_token_time(
+    claims: &AzureMaaJwtClaims,
+    verification_time: SystemTime,
+) -> std::result::Result<(), String> {
+    let verification_timestamp = verification_time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("verification time is before Unix epoch: {error}"))?
+        .as_secs();
+    if claims.nbf >= claims.exp {
+        return Err(format!(
+            "MAA JWT validity window is invalid: nbf={} must be earlier than exp={}",
+            claims.nbf, claims.exp
+        ));
+    }
+    if claims.iat >= claims.exp {
+        return Err(format!(
+            "MAA JWT issued-at time is invalid: iat={} must be earlier than exp={}",
+            claims.iat, claims.exp
+        ));
+    }
+    if verification_timestamp < claims.nbf {
+        return Err(format!(
+            "MAA JWT is not valid before nbf={}; verification time is {verification_timestamp}",
+            claims.nbf
+        ));
+    }
+    if verification_timestamp >= claims.exp {
+        return Err(format!(
+            "MAA JWT expired at exp={}; verification time is {verification_timestamp}",
+            claims.exp
+        ));
+    }
+    if claims.iat > verification_timestamp {
+        return Err(format!(
+            "MAA JWT was issued in the future at iat={}; verification time is {verification_timestamp}",
+            claims.iat
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn verify_azure_tee_var_data_binding(
@@ -1685,7 +2241,7 @@ pub(super) fn verify_azure_tee_var_data_binding(
         }
     };
     let report_data = match tee {
-        "tdx" => gcp_tdx_report_start(&raw_report).and_then(|start| {
+        "tdx" => tdx_quote_report_start(&raw_report).and_then(|start| {
             read_exact_at(
                 &raw_report,
                 start + TDX_REPORT_REPORT_DATA_OFFSET,
@@ -1716,6 +2272,57 @@ pub(super) fn verify_azure_tee_var_data_binding(
         "raw TEE report_data does not equal sha256(HCL var_data) followed by 32 zero bytes"
             .to_string(),
     );
+}
+
+pub(super) fn verify_azure_tee_ak_binding(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: &TeeEvidence,
+    binding: &AkBinding,
+    tee: &str,
+) {
+    let parsed_binding = match parse_azure_maa_binding(binding) {
+        Ok(binding) => binding,
+        Err(detail) => {
+            fail(report, errors, "azure-tee-ak-binding", detail);
+            return;
+        }
+    };
+    let Some(auxiliary) = evidence.auxiliary.as_deref() else {
+        fail(
+            report,
+            errors,
+            "azure-tee-ak-binding",
+            "Azure TEE evidence is missing HCL var_data".to_string(),
+        );
+        return;
+    };
+    let auxiliary = match decode_b64("teeEvidence.auxiliary", auxiliary) {
+        Ok(auxiliary) => auxiliary,
+        Err(error) => {
+            fail(report, errors, "azure-tee-ak-binding", error.to_string());
+            return;
+        }
+    };
+    let binding_hcl_var_data =
+        match decode_b64("akBinding.hclVarData", &parsed_binding.hcl_var_data) {
+            Ok(hcl_var_data) => hcl_var_data,
+            Err(error) => {
+                fail(report, errors, "azure-tee-ak-binding", error.to_string());
+                return;
+            }
+        };
+    if auxiliary != binding_hcl_var_data {
+        fail(
+            report,
+            errors,
+            "azure-tee-ak-binding",
+            "teeEvidence.auxiliary differs from akBinding HCL var_data".to_string(),
+        );
+        return;
+    }
+    pass(report, "azure-tee-ak-binding");
+    verify_azure_tee_var_data_binding(report, errors, evidence, tee);
 }
 
 pub(super) fn parse_azure_maa_binding(
@@ -1950,7 +2557,7 @@ pub(super) fn verify_tpm_quote(
     tpm2b_attest: &[u8],
     expected_qualifying_data: &[u8; 32],
     pcrs: &[PcrEvidence],
-) {
+) -> Option<Vec<PcrEvidence>> {
     let parsed = match parse_tpm_quote(tpm2b_attest) {
         Ok(parsed) => {
             pass(report, "tpm-quote-structure");
@@ -1959,8 +2566,9 @@ pub(super) fn verify_tpm_quote(
         Err(detail) => {
             fail(report, errors, "tpm-quote-structure", detail);
             skipped(report, "tpm-quote-challenge", "TPM quote did not parse");
+            skipped(report, "tpm-quote-pcr-selection", "TPM quote did not parse");
             skipped(report, "tpm-quote-pcr-digest", "TPM quote did not parse");
-            return;
+            return None;
         }
     };
 
@@ -1972,14 +2580,19 @@ pub(super) fn verify_tpm_quote(
         "TPM quote extraData does not match expected qualifyingData".to_string(),
     );
 
-    if parsed.sha256_pcr_indices.is_empty() {
+    if parsed.pcr_selections.is_empty()
+        || parsed
+            .pcr_selections
+            .iter()
+            .all(|selection| selection.indices.is_empty())
+    {
         fail(
             report,
             errors,
             "tpm-quote-pcr-digest",
-            "TPM quote does not select any SHA-256 PCRs".to_string(),
+            "TPM quote does not select any PCRs".to_string(),
         );
-        return;
+        return None;
     }
     if parsed.pcr_digest.len() != 32 {
         fail(
@@ -1987,11 +2600,11 @@ pub(super) fn verify_tpm_quote(
             errors,
             "tpm-quote-pcr-digest",
             format!(
-                "TPM quote SHA-256 PCR digest is {} bytes, expected 32",
+                "TPM quote PCR digest is {} bytes, expected 32 for the supported SHA-256 quote signature schemes",
                 parsed.pcr_digest.len()
             ),
         );
-        return;
+        return None;
     }
 
     let supplied_indices = pcrs.iter().map(|pcr| pcr.index).collect::<Vec<_>>();
@@ -2005,64 +2618,130 @@ pub(super) fn verify_tpm_quote(
             "supplied PCR values must have unique, strictly increasing indices in 0..=23"
                 .to_string(),
         );
-        return;
+        return None;
     }
-    if supplied_indices != parsed.sha256_pcr_indices {
+
+    let mut selected_algorithms = BTreeSet::new();
+    let mut selected_indices = BTreeSet::new();
+    for selection in &parsed.pcr_selections {
+        if !selected_algorithms.insert(selection.hash_alg) {
+            fail(
+                report,
+                errors,
+                "tpm-quote-pcr-selection",
+                format!(
+                    "TPM quote contains more than one PCR selection for hash algorithm 0x{:04x}",
+                    selection.hash_alg
+                ),
+            );
+            return None;
+        }
+        if !matches!(selection.hash_alg, TPM_ALG_SHA256 | TPM_ALG_SHA384) {
+            fail(
+                report,
+                errors,
+                "tpm-quote-pcr-selection",
+                format!(
+                    "TPM quote selects unsupported PCR bank algorithm 0x{:04x}",
+                    selection.hash_alg
+                ),
+            );
+            return None;
+        }
+        selected_indices.extend(selection.indices.iter().copied());
+    }
+    let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
+    if supplied_indices != selected_indices {
         fail(
             report,
             errors,
             "tpm-quote-pcr-selection",
             format!(
-                "supplied PCR indices {supplied_indices:?} differ from Quote SHA-256 selection {:?}",
-                parsed.sha256_pcr_indices
+                "supplied PCR indices {supplied_indices:?} differ from the union of Quote PCR selections {selected_indices:?}"
             ),
         );
-        return;
+        return None;
     }
     pass(report, "tpm-quote-pcr-selection");
 
-    let mut pcr_concat = Vec::with_capacity(parsed.sha256_pcr_indices.len() * 32);
-    for index in &parsed.sha256_pcr_indices {
-        let Some(pcr) = pcrs.iter().find(|pcr| &pcr.index == index) else {
-            fail(
-                report,
-                errors,
-                "tpm-quote-pcr-digest",
-                format!("TPM quote selects PCR {index}, but response.pcrs omits it"),
-            );
-            return;
-        };
-        let Some(value) = &pcr.sha256 else {
-            fail(
-                report,
-                errors,
-                "tpm-quote-pcr-digest",
-                format!("TPM quote selects PCR {index}, but response.pcrs has no sha256 value"),
-            );
-            return;
-        };
-        match decode_hex_32("pcr.sha256", value) {
-            Ok(bytes) => pcr_concat.extend_from_slice(&bytes),
-            Err(e) => {
+    let mut authenticated_pcrs = supplied_indices
+        .iter()
+        .map(|index| PcrEvidence {
+            index: *index,
+            sha256: None,
+            sha384: None,
+        })
+        .collect::<Vec<_>>();
+    let mut pcr_concat = Vec::new();
+    for selection in &parsed.pcr_selections {
+        for index in &selection.indices {
+            let pcr = pcrs
+                .iter()
+                .find(|pcr| pcr.index == *index)
+                .expect("supplied indices equal selected indices");
+            let (field, value, decoded) = match selection.hash_alg {
+                TPM_ALG_SHA256 => (
+                    "pcr.sha256",
+                    pcr.sha256.as_ref(),
+                    pcr.sha256
+                        .as_deref()
+                        .map(|value| decode_hex_array::<32>("pcr.sha256", value).map(Vec::from)),
+                ),
+                TPM_ALG_SHA384 => (
+                    "pcr.sha384",
+                    pcr.sha384.as_ref(),
+                    pcr.sha384
+                        .as_deref()
+                        .map(|value| decode_hex_array::<48>("pcr.sha384", value).map(Vec::from)),
+                ),
+                _ => unreachable!("unsupported algorithms rejected above"),
+            };
+            let Some(decoded) = decoded else {
                 fail(
                     report,
                     errors,
                     "tpm-quote-pcr-digest",
-                    format!("PCR {index}: {e}"),
+                    format!("TPM quote selects PCR {index} in {field}, but response.pcrs omits it"),
                 );
-                return;
+                return None;
+            };
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    fail(
+                        report,
+                        errors,
+                        "tpm-quote-pcr-digest",
+                        format!("PCR {index}: {error}"),
+                    );
+                    return None;
+                }
+            };
+            pcr_concat.extend_from_slice(&decoded);
+            let authenticated = authenticated_pcrs
+                .iter_mut()
+                .find(|pcr| pcr.index == *index)
+                .expect("authenticated projection contains selected index");
+            match selection.hash_alg {
+                TPM_ALG_SHA256 => authenticated.sha256 = value.cloned(),
+                TPM_ALG_SHA384 => authenticated.sha384 = value.cloned(),
+                _ => unreachable!("unsupported algorithms rejected above"),
             }
         }
     }
 
     let expected_digest: [u8; 32] = Sha256::digest(&pcr_concat).into();
-    check(
-        report,
-        errors,
-        "tpm-quote-pcr-digest",
-        parsed.pcr_digest == expected_digest,
-        "TPM quote PCR digest does not match response PCR values".to_string(),
-    );
+    if parsed.pcr_digest != expected_digest {
+        fail(
+            report,
+            errors,
+            "tpm-quote-pcr-digest",
+            "TPM quote PCR digest does not match the selected response PCR-bank values".to_string(),
+        );
+        return None;
+    }
+    pass(report, "tpm-quote-pcr-digest");
+    Some(authenticated_pcrs)
 }
 
 pub(super) fn verify_tpm_quote_signature(
@@ -2258,8 +2937,14 @@ pub(super) fn parse_tpmt_signature_rsassa_sha256(
 #[derive(Debug)]
 pub(super) struct ParsedTpmQuote {
     extra_data: Vec<u8>,
-    sha256_pcr_indices: Vec<u8>,
+    pcr_selections: Vec<ParsedPcrSelection>,
     pcr_digest: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ParsedPcrSelection {
+    hash_alg: u16,
+    indices: Vec<u8>,
 }
 
 pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
@@ -2285,26 +2970,26 @@ pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<Parsed
     reader.read_exact("firmwareVersion", 8)?;
 
     let selection_count = reader.read_u32("attested.quote.pcrSelect.count")?;
-    let mut sha256_pcr_indices = Vec::new();
+    let mut pcr_selections = Vec::new();
     for selection_idx in 0..selection_count {
         let hash_alg = reader.read_u16("attested.quote.pcrSelect.hash")?;
         let select_len = reader.read_u8("attested.quote.pcrSelect.sizeofSelect")? as usize;
         let select = reader.read_exact("attested.quote.pcrSelect.pcrSelect", select_len)?;
-        if hash_alg == TPM_ALG_SHA256 {
-            for (byte_idx, byte) in select.iter().enumerate() {
-                for bit in 0..8 {
-                    if byte & (1 << bit) != 0 {
-                        let index = byte_idx * 8 + bit;
-                        let index = u8::try_from(index).map_err(|_| {
-                            format!(
-                                "SHA-256 PCR selection {selection_idx} contains out-of-range PCR index {index}"
-                            )
-                        })?;
-                        sha256_pcr_indices.push(index);
+        let mut indices = Vec::new();
+        for (byte_idx, byte) in select.iter().enumerate() {
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 {
+                    let index = byte_idx * 8 + bit;
+                    if index > 23 {
+                        return Err(format!(
+                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected 0..=23"
+                        ));
                     }
+                    indices.push(index as u8);
                 }
             }
         }
+        pcr_selections.push(ParsedPcrSelection { hash_alg, indices });
     }
     let pcr_digest = reader.read_tpm2b("attested.quote.pcrDigest")?.to_vec();
     if !reader.is_empty() {
@@ -2316,7 +3001,7 @@ pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<Parsed
 
     Ok(ParsedTpmQuote {
         extra_data,
-        sha256_pcr_indices,
+        pcr_selections,
         pcr_digest,
     })
 }
@@ -2395,9 +3080,13 @@ pub(super) fn evaluate_pcr_policy(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     match policy.verify_type {
         SessionPcrVerifyType::Static => {
-            let Some(value) = expected.first() else {
-                return Err("STATIC policy has no match_data".into());
-            };
+            if expected.len() != 1 {
+                return Err(format!(
+                    "STATIC policy requires exactly one match_data entry, got {}",
+                    expected.len()
+                ));
+            }
+            let value = &expected[0];
             if measured_value != *value {
                 return Err("STATIC PCR value mismatch".into());
             }
@@ -2477,7 +3166,7 @@ mod tests {
     #[test]
     fn gcp_tdx_verification_rejects_revoked_sgx_pce_partial_matches() {
         assert_eq!(
-            gcp_tdx_dcap_verification_policy().tdx_tcb_revocation_policy,
+            tdx_dcap_verification_policy().tdx_tcb_revocation_policy,
             dcap_rs::TdxTcbRevocationPolicy::RejectRevokedSgxPcePartialMatch
         );
     }

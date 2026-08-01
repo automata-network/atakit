@@ -16,7 +16,6 @@ use atakit_cloud::{
 };
 use atakit_core::Env;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use super::{
     effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
@@ -214,6 +213,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // 1. Resolve workload source (unless --image-only).
     // `workload_boot_min` carries the raw workload manifest boot-disk-size string
     // (if any); the effective size is resolved later once the target is known.
+    let workload_attributes: atakit_core::tee_attributes::AttributeRequirements;
+    let archive_sha256: Option<[u8; 32]>;
     let (
         archive_path,
         workload_name,
@@ -246,11 +247,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_name = String::new();
         workload_version = String::new();
         archive_hash = String::new();
+        archive_sha256 = None;
         workload_ports = Vec::new();
         workload_disks = Vec::new();
         workload_boot_min = None;
         base_image_mode = String::new();
         base_image_list = Vec::new();
+        workload_attributes = BTreeMap::new();
         unmeasured_tar = None;
         unmeasured_data_paths = Vec::<String>::new();
         // No workload in image-only mode; reject any stray --disk-passphrase.
@@ -259,6 +262,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
         workload_name = resolved.name;
         workload_version = resolved.version;
+        archive_sha256 = Some(resolved.archive_sha256);
         workload_ports = resolved.ports;
         workload_disks = resolved
             .disks
@@ -281,6 +285,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_boot_min = resolved.boot_disk_size.clone();
         base_image_mode = resolved.base_image_mode;
         base_image_list = resolved.base_image;
+        workload_attributes = resolved.attributes;
         // Collect unmeasured-data files. Explicit root flags take precedence over
         // the default <workload-dir>/unmeasured-data root.
         let unmeasured_root = effective_unmeasured_data_root(
@@ -292,9 +297,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             resolve_unmeasured_tar(&resolved.unmeasured_data_paths, unmeasured_root.as_ref())?;
         unmeasured_data_paths = resolved.unmeasured_data_paths;
         let ap = resolved.archive_path;
-        let bytes = std::fs::read(&ap)
-            .with_context(|| format!("failed to read archive: {}", ap.display()))?;
-        archive_hash = format!("{:x}", Sha256::digest(&bytes));
+        archive_hash = hex::encode(resolved.archive_sha256);
         archive_path = ap.display().to_string();
     }
 
@@ -929,6 +932,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     args.init_timeout,
                     init_config.owner_operations.op_expiry_seconds,
                 );
+                let expected_archive_sha256 = archive_sha256.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("workload initialization is missing its inspected archive hash")
+                })?;
 
                 let verified_tls = if args.unsafe_skip_tls_attestation {
                     super::warn_unsafe_skip_tls_attestation();
@@ -942,11 +948,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         &init_config.chain,
                     )
                     .await?;
-                    let tls_trust_anchors = init::load_tls_trust_anchors(
+                    let tls_verification_trust = init::load_tls_verification_trust(
                         &args.gcp_ak_root_cert,
                         &args.azure_maa_key,
                         &args.amd_ark_root_cert,
                         &args.amd_snp_crl,
+                        args.amd_snp_security_policy.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
@@ -966,7 +973,8 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         &ip,
                         status_port,
                         measurement_policy,
-                        tls_trust_anchors,
+                        Some(workload_attributes.clone()),
+                        tls_verification_trust,
                         init::azure_maa_trust_config_from_init_chain(&init_config.chain),
                         tdx_dcap_collateral,
                         args.trust_tls_cert_sha256.as_deref(),
@@ -997,6 +1005,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     status_port,
                     init_port,
                     ap,
+                    expected_archive_sha256,
                     unmeasured_tar.as_deref(),
                     &init_config,
                     std::time::Duration::from_secs(args.init_upload_timeout),

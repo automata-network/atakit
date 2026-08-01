@@ -61,11 +61,12 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         chain_client.as_ref(),
     )
     .await?;
-    let trust_anchors = init::load_tls_trust_anchors(
+    let tls_verification_trust = init::load_tls_verification_trust(
         &args.verification.gcp_ak_root_cert,
         &args.verification.azure_maa_key,
         &args.verification.amd_ark_root_cert,
         &args.verification.amd_snp_crl,
+        args.verification.amd_snp_security_policy.as_deref(),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
@@ -91,7 +92,8 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         &subject.host,
         subject.status_port,
         Some(measurement_policy),
-        trust_anchors,
+        None,
+        tls_verification_trust,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,
         None,

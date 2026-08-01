@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DataMount, ImageSource, StringOrArray, WorkloadConfig};
+use crate::config::{AttributeRequirements, DataMount, ImageSource, StringOrArray, WorkloadConfig};
 use crate::data::{logical_data_path_rel, namespaced_data_path};
 use crate::WorkloadError;
 
@@ -70,6 +70,8 @@ pub struct ManifestConfig {
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
+    #[serde(default)]
+    pub attributes: AttributeRequirements,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default = "default_restart")]
@@ -640,8 +642,9 @@ pub fn build_manifest(
     unmeasured_data: BTreeSet<String>,
     unmeasured_env_files: BTreeMap<String, Vec<String>>,
     images: BTreeMap<String, ManifestImage>,
-) -> Manifest {
+) -> Result<Manifest, WorkloadError> {
     let w = &config.workload;
+    let attributes = crate::validate::normalize_attributes(&w.attributes)?;
     let measured_data = measured_data_from_hashes(&hashes);
 
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
@@ -852,7 +855,7 @@ pub fn build_manifest(
         })
         .collect();
 
-    Manifest {
+    Ok(Manifest {
         meta: ManifestMeta {
             format: crate::FORMAT_VERSION,
             name: w.name.clone(),
@@ -862,6 +865,7 @@ pub fn build_manifest(
             image: resolved_image.to_string(),
             base_image_mode: w.base_image_mode.clone(),
             base_image: w.base_image.clone(),
+            attributes,
             ports: w.ports.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
@@ -896,7 +900,7 @@ pub fn build_manifest(
         unmeasured_data,
         unmeasured_env_files,
         images,
-    }
+    })
 }
 
 fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
@@ -985,6 +989,30 @@ fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_manifest(
+        config: &WorkloadConfig,
+        resolved_image: &str,
+        environment: BTreeMap<String, String>,
+        dep_environments: BTreeMap<String, BTreeMap<String, String>>,
+        hashes: BTreeMap<String, String>,
+        unmeasured_data: BTreeSet<String>,
+        unmeasured_env_files: BTreeMap<String, Vec<String>>,
+        images: BTreeMap<String, ManifestImage>,
+    ) -> Manifest {
+        super::build_manifest(
+            config,
+            resolved_image,
+            environment,
+            dep_environments,
+            hashes,
+            unmeasured_data,
+            unmeasured_env_files,
+            images,
+        )
+        .expect("valid test manifest")
+    }
 
     #[test]
     fn strip_dot_slash_works() {
@@ -1106,7 +1134,8 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":5"));
+        assert!(output.contains("\"format\":6"));
+        assert!(output.contains("\"attributes\":{}"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
@@ -1123,6 +1152,85 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn attributes_are_canonical_and_change_manifest_measurement_bytes() {
+        let config = |values: &str| {
+            WorkloadConfig::load_from_str(&format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            ))
+            .unwrap()
+        };
+        let build = |config: &WorkloadConfig| {
+            build_manifest(
+                config,
+                "my-app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+
+        let false_only = serialize_canonical_json(&build(&config("[false]"))).unwrap();
+        let false_or_true = serialize_canonical_json(&build(&config("[false, true]"))).unwrap();
+
+        assert!(false_only.contains(
+            "\"attributes\":{\"atakit.attestation.v1.tee.intel-tdx.debug.enabled\":[false]}"
+        ));
+        assert_ne!(false_only, false_or_true);
+        assert_eq!(
+            false_only,
+            serialize_canonical_json(&build(&config("[false]"))).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_manifest_returns_invalid_attribute_error() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [true]
+"#,
+        )
+        .unwrap();
+
+        let error = super::build_manifest(
+            &config,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must be [false] or [false, true]"));
     }
 
     #[test]

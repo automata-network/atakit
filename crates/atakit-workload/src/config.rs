@@ -7,6 +7,8 @@ use crate::WorkloadError;
 
 const CONFIG_FILENAME: &str = "atakit-workload.toml";
 
+pub use atakit_core::tee_attributes::{AttributeRequirements, AttributeValue};
+
 /// Top-level structure of `atakit-workload.toml`.
 #[derive(Debug, Deserialize)]
 pub struct WorkloadConfig {
@@ -165,6 +167,8 @@ pub struct WorkloadSection {
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
+    #[serde(default)]
+    pub attributes: AttributeRequirements,
     pub image: ImageSource,
     #[serde(default)]
     pub ports: Vec<String>,
@@ -844,6 +848,30 @@ image = "my-app:latest"
         assert_eq!(cfg.workload.name, "my-app");
         assert_eq!(cfg.workload.version, "v0.0.1");
         assert!(matches!(cfg.workload.image, ImageSource::Registry(ref s) if s == "my-app:latest"));
+    }
+
+    #[test]
+    fn parses_attributes() {
+        let toml = r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false, true]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workload.attributes["atakit.attestation.v1.tee.amd-sev-snp.debug.enabled"],
+            vec![
+                AttributeValue::Boolean(false),
+                AttributeValue::Boolean(true)
+            ]
+        );
     }
 
     #[test]

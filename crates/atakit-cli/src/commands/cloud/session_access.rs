@@ -176,11 +176,12 @@ pub(crate) async fn resolve_verified_portal_access(
         &init_chain,
     )
     .await?;
-    let trust_anchors = init::load_tls_trust_anchors(
+    let tls_verification_trust = init::load_tls_verification_trust(
         &verification.gcp_ak_root_cert,
         &verification.azure_maa_key,
         &verification.amd_ark_root_cert,
         &verification.amd_snp_crl,
+        verification.amd_snp_security_policy.as_deref(),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
@@ -201,7 +202,8 @@ pub(crate) async fn resolve_verified_portal_access(
         &host,
         status_port,
         measurement_policy,
-        trust_anchors,
+        None,
+        tls_verification_trust,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
         tdx_dcap,
         None,
@@ -551,7 +553,21 @@ async fn load_local_workload_policy(
             &inspection.pcr23,
             "trusted workload archive PCR23",
         )?)],
-        attribute_requirements: Vec::new(),
+        attribute_requirements: inspection
+            .manifest
+            .config
+            .attributes
+            .iter()
+            .map(|(name, values)| {
+                let (key, allowed_values) =
+                    atakit_core::tee_attributes::encode_requirement(name, values)
+                        .map_err(anyhow::Error::msg)?;
+                Ok(SessionAttributeRequirement {
+                    key,
+                    allowed_values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -636,11 +652,14 @@ mod tests {
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
         let manifest = serde_json::json!({
-            "meta": {"format": 5, "name": "test", "version": "v0.0.1"},
+            "meta": {"format": 6, "name": "test", "version": "v0.0.1"},
             "config": {
                 "image": "test:v0.0.1",
                 "base-image-mode": "blacklist",
                 "base-image": [],
+                "attributes": {
+                    "atakit.attestation.v1.tee.intel-tdx.debug.enabled": [false, true]
+                },
                 "ports": [],
                 "restart": "no",
                 "command": null,
@@ -825,7 +844,18 @@ mod tests {
             policy.pcr_specs[0].verify_type,
             SessionPcrVerifyType::Static
         );
-        assert!(policy.attribute_requirements.is_empty());
+        assert_eq!(policy.attribute_requirements.len(), 1);
+        assert_eq!(
+            policy.attribute_requirements[0].key,
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY
+        );
+        assert_eq!(
+            policy.attribute_requirements[0].allowed_values,
+            [
+                atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                atakit_core::tee_attributes::ATTRIBUTE_TRUE
+            ]
+        );
 
         let mut mismatched = state;
         mismatched.archive_hash = "0x00".into();

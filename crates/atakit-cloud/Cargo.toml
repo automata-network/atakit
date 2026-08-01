@@ -40,4 +40,5 @@ async-trait.workspace = true
 clap = { workspace = true, optional = true }
 
 [dev-dependencies]
+rcgen.workspace = true
 toml.workspace = true

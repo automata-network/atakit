@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
 use crate::config::{
-    self, DataMount, DiskSection, ImageSource, ServiceStorageSection, WorkloadConfig,
+    self, AttributeRequirements, AttributeValue, DataMount, DiskSection, ImageSource,
+    ServiceStorageSection, WorkloadConfig,
 };
 use crate::data::{
     logical_data_path_rel, namespaced_data_path, validate_logical_data_path, DataRoots,
@@ -10,6 +11,117 @@ use crate::data::{
 use crate::WorkloadError;
 
 const MIN_DATA_DISK_GB: u64 = 10;
+
+pub fn normalize_attributes(
+    attributes: &AttributeRequirements,
+) -> Result<AttributeRequirements, WorkloadError> {
+    use atakit_core::tee_attributes::{
+        bytes32_hex, parse_bytes32_hex, tdx_tcb_status_mask, tdx_tcb_status_names,
+        valid_amd_sev_snp_platform_info_policy, valid_amd_sev_snp_tcb,
+        validate_boolean_allowed_values, ReservedAttributeValueKind, VerifiedTeeAttribute,
+        TEE_ATTRIBUTE_NAMESPACE,
+    };
+
+    let mut normalized = attributes.clone();
+    for (name, values) in attributes {
+        let Some(reserved) = VerifiedTeeAttribute::from_name(name) else {
+            if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) {
+                return Err(WorkloadError::Validation(format!(
+                    "unknown workload.attributes name `{name}` in the reserved namespace"
+                )));
+            }
+            if !values
+                .iter()
+                .all(|value| matches!(value, AttributeValue::String(_)))
+            {
+                return Err(WorkloadError::Validation(format!(
+                    "workload.attributes `{name}` custom values must be strings"
+                )));
+            }
+            continue;
+        };
+
+        match reserved.value_kind() {
+            ReservedAttributeValueKind::Boolean => {
+                let bools: Option<Vec<bool>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::Boolean(value) => Some(*value),
+                        AttributeValue::String(_) => None,
+                    })
+                    .collect();
+                if !bools
+                    .as_deref()
+                    .is_some_and(validate_boolean_allowed_values)
+                {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must be [false] or [false, true]"
+                    )));
+                }
+            }
+            ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                let names: Option<Vec<&str>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::String(value) => Some(value.as_str()),
+                        AttributeValue::Boolean(_) => None,
+                    })
+                    .collect();
+                let Some(mask) = names
+                    .as_ref()
+                    .and_then(|names| tdx_tcb_status_mask(names.iter().copied()))
+                else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain unique supported Intel TDX TCB status names and include \"ok\""
+                    )));
+                };
+                normalized.insert(
+                    name.clone(),
+                    tdx_tcb_status_names(mask)
+                        .expect("validated mask")
+                        .into_iter()
+                        .map(|value| AttributeValue::String(value.to_string()))
+                        .collect(),
+                );
+            }
+            ReservedAttributeValueKind::AmdSevSnpTcb
+            | ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                if values.len() != 1 {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                }
+                let AttributeValue::String(value) = &values[0] else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let Some(encoded) = parse_bytes32_hex(value) else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let valid = match reserved.value_kind() {
+                    ReservedAttributeValueKind::AmdSevSnpTcb => valid_amd_sev_snp_tcb(&encoded),
+                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                        valid_amd_sev_snp_platform_info_policy(&encoded)
+                    }
+                    _ => unreachable!(),
+                };
+                if !valid {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` contains an invalid packed value"
+                    )));
+                }
+                normalized.insert(
+                    name.clone(),
+                    vec![AttributeValue::String(bytes32_hex(&encoded))],
+                );
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
 fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
@@ -126,6 +238,13 @@ pub fn validate_config_with_roots(
             crate::FORMAT_VERSION
         )));
     }
+
+    if config.format < 6 && !w.attributes.is_empty() {
+        return Err(WorkloadError::Validation(
+            "workload.attributes requires format = 6".into(),
+        ));
+    }
+    normalize_attributes(&w.attributes)?;
 
     // ── gid-group ────────────────────────────────────────
     if let Some(ref gg) = w.gid_group {
@@ -1373,6 +1492,90 @@ image = "my-app:latest"
         let tmp = tempfile::tempdir().unwrap();
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn validates_canonical_tee_attribute_requirements() {
+        for values in ["[false]", "[false, true]"] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            validate_config(&cfg, tmp.path()).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_noncanonical_tee_attribute_requirements() {
+        for (name, values) in [
+            ("atakit.attestation.v1.tee.unknown", "[false]"),
+            ("atakit.attestation.v1.tee.intel-tdx.debug.enabled", "[]"),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[false, false]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true, false]",
+            ),
+        ] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"{name}" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                validate_config(&cfg, tmp.path()).is_err(),
+                "{name} {values}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_attributes_before_format_six() {
+        let toml = r#"
+format = 5
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("requires format = 6"));
     }
 
     #[test]

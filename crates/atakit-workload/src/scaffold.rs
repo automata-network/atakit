@@ -59,7 +59,8 @@ mod tests {
         assert!(dir.join(CONFIG_FILENAME).is_file());
 
         let content = std::fs::read_to_string(dir.join(CONFIG_FILENAME)).unwrap();
-        assert!(content.contains("format = 5"));
+        assert!(content.contains("format = 6"));
+        assert!(content.contains("[workload.attributes]"));
         assert!(content.contains("name = \"my-app\""));
         assert!(content.contains("version = \"v0.0.1\""));
         assert!(content.contains("base-image-mode = \"blacklist\""));
