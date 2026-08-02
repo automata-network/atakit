@@ -217,15 +217,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .collect();
     let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
 
-    let init_config = InitConfig {
+    let mut init_config = InitConfig {
         platform: provider_config.platform.to_string(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
         prover_credential: prover_init,
+        pcr_policy: None,
         disks: disk_passphrases,
     };
+    if !registration_off && args.pcr_policy.is_some() {
+        bail!("--pcr-policy requires effective chain registration = \"off\"");
+    }
     let initialization_timeout_secs = init::initialization_timeout_seconds(
         args.init_timeout,
         init_config.owner_operations.op_expiry_seconds,
@@ -397,6 +401,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         ))
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
+    init_config.pcr_policy = super::resolve_init_pcr_policy(
+        args.pcr_policy.as_deref(),
+        &init_config,
+        registration_off,
+        verified_tls.as_ref(),
+        &workload_name,
+        &workload_version,
+    )
+    .await?;
 
     // Save the workload identity and configuration references before the
     // one-shot POST /init. A process exit after the portal accepts /init must

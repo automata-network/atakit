@@ -84,7 +84,7 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
             format!("0x{}", hex::encode(owner_fp)).dimmed()
         );
     }
-    println!("  {:<20}{}", "TTL:", format_ttl(spec.ttl));
+    println!("  {:<20}{}", "TTL:", format_ttl(spec.sessionTtl));
 
     // Base image mode
     let mode_name = match spec.baseImageMode {
@@ -113,10 +113,10 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
 
     // PCR specs
     println!("  {}", "PCR Specs:".cyan().bold());
-    if spec.pcrs.is_empty() {
+    if spec.workloadPcrs256.is_empty() && spec.workloadPcrs384.is_empty() {
         println!("    {}", "none".dimmed());
     } else {
-        for pcr in &spec.pcrs {
+        for pcr in &spec.workloadPcrs256 {
             let verify_type = match pcr.verifyType {
                 0 => "STATIC",
                 1 => "DYNAMIC_SUBSET",
@@ -159,6 +159,26 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
                         format!("0x{}", hex::encode(pcr_value)).green()
                     );
                 }
+            }
+        }
+        for pcr in &spec.workloadPcrs384 {
+            let verify_type = match pcr.verifyType {
+                0 => "STATIC",
+                1 => "DYNAMIC_SUBSET",
+                2 => "DYNAMIC_SUBSEQUENCE",
+                _ => "UNKNOWN",
+            };
+            println!(
+                "    SHA-384 PCR{:<4} {} ({})",
+                pcr.pcrIndex,
+                verify_type.dimmed(),
+                pcr.verifyType,
+            );
+            for (i, value) in pcr.matchData.iter().enumerate() {
+                let mut bytes = [0u8; 48];
+                bytes[..32].copy_from_slice(value.first.as_slice());
+                bytes[32..].copy_from_slice(value.second.as_slice());
+                println!("      matchData[{i}]: 0x{}", hex::encode(bytes));
             }
         }
     }

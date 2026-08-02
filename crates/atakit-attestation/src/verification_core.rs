@@ -2416,7 +2416,7 @@ pub(super) fn verify_azure_hclak_quote_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
     if binding.kind != "azure-maa-jwt" {
@@ -2431,7 +2431,7 @@ pub(super) fn verify_azure_hclak_quote_signature(
         );
         return;
     }
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-quote-signature", detail);
@@ -2468,10 +2468,10 @@ pub(super) fn verify_azure_hclak_certify_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-certify-signature", detail);
@@ -2554,11 +2554,11 @@ pub(super) fn rsa_public_key_from_jwk(
 pub(super) fn verify_tpm_quote(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     expected_qualifying_data: &[u8; 32],
     pcrs: &[PcrEvidence],
 ) -> Option<Vec<PcrEvidence>> {
-    let parsed = match parse_tpm_quote(tpm2b_attest) {
+    let parsed = match parse_tpm_quote(tpms_attest) {
         Ok(parsed) => {
             pass(report, "tpm-quote-structure");
             parsed
@@ -2748,10 +2748,10 @@ pub(super) fn verify_tpm_quote_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     ak_public: &[u8],
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-quote-signature", detail);
@@ -2784,22 +2784,22 @@ pub(super) fn verify_tpm_quote_signature(
     }
 }
 
-pub(super) fn tpm2b_attest_body(tpm2b_attest: &[u8]) -> std::result::Result<&[u8], String> {
-    if tpm2b_attest.len() >= 4
+pub(super) fn tpms_attest_body(tpms_attest: &[u8]) -> std::result::Result<&[u8], String> {
+    if tpms_attest.len() >= 4
         && u32::from_be_bytes([
-            tpm2b_attest[0],
-            tpm2b_attest[1],
-            tpm2b_attest[2],
-            tpm2b_attest[3],
+            tpms_attest[0],
+            tpms_attest[1],
+            tpms_attest[2],
+            tpms_attest[3],
         ]) == TPM_GENERATED_VALUE
     {
-        return Ok(tpm2b_attest);
+        return Ok(tpms_attest);
     }
-    if tpm2b_attest.len() < 2 {
+    if tpms_attest.len() < 2 {
         return Err("TPM2B_ATTEST is shorter than its size prefix".to_string());
     }
-    let declared = u16::from_be_bytes([tpm2b_attest[0], tpm2b_attest[1]]) as usize;
-    let body = &tpm2b_attest[2..];
+    let declared = u16::from_be_bytes([tpms_attest[0], tpms_attest[1]]) as usize;
+    let body = &tpms_attest[2..];
     if declared != body.len() {
         return Err(format!(
             "TPM2B_ATTEST size prefix declares {declared} bytes, got {}",
@@ -2947,8 +2947,8 @@ struct ParsedPcrSelection {
     indices: Vec<u8>,
 }
 
-pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
-    let body = tpm2b_attest_body(tpm2b_attest)?;
+pub(super) fn parse_tpm_quote(tpms_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
+    let body = tpms_attest_body(tpms_attest)?;
 
     let mut reader = ByteReader::new(body);
     let magic = reader.read_u32("magic")?;

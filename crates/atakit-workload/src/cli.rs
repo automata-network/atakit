@@ -102,6 +102,7 @@ pub struct DeactivateArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
@@ -128,6 +129,7 @@ pub struct PublishArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
@@ -284,6 +286,10 @@ pub struct InitArgs {
     /// Chain config name override (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
 
     /// Owner key name override (references [keys.<name>])
     #[arg(long)]

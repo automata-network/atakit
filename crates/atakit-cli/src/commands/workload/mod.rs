@@ -281,14 +281,14 @@ pub async fn query_chain_data(
         .unwrap_or(false);
 
     let pcr23 = spec
-        .pcrs
+        .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| p.matchData.first())
         .map(|b| format!("0x{}", hex::encode(b)));
 
     let cached = CachedChainSpec {
-        session_ttl: spec.ttl,
+        session_ttl: spec.sessionTtl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
@@ -296,7 +296,7 @@ pub async fn query_chain_data(
             .map(|b| format!("0x{}", hex::encode(b)))
             .collect(),
         pcrs: spec
-            .pcrs
+            .workloadPcrs256
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,

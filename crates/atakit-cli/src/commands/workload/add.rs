@@ -42,7 +42,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
                 result.manifest.meta.name.clone(),
                 result.manifest.meta.version.clone(),
                 Some(result.sha256),
-                Some(result.pcr23),
+                Some(result.pcr23_sha256),
                 Some(size),
             )
         } else {
@@ -132,7 +132,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // On-chain STATIC matchData stores the final PCR23 value
     let chain_pcr23 = spec
-        .pcrs
+        .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| p.matchData.first())
@@ -143,7 +143,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Build cached chain spec
     let chain_spec = CachedChainSpec {
-        session_ttl: spec.ttl,
+        session_ttl: spec.sessionTtl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
@@ -151,7 +151,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             .map(|b| format!("0x{}", hex::encode(b)))
             .collect(),
         pcrs: spec
-            .pcrs
+            .workloadPcrs256
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,

@@ -302,7 +302,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         .await
         .context("failed to inspect downloaded archive")?;
     let sha256 = &inspection.sha256;
-    let pcr23 = &inspection.pcr23;
+    let pcr23 = &inspection.pcr23_sha256;
     let archive_name = &inspection.manifest.meta.name;
     let archive_version = &inspection.manifest.meta.version;
 
@@ -621,7 +621,7 @@ async fn verify_pcr23(
 
     // Find PCR23 in the spec. matchData[0] is the final PCR register value.
     let on_chain_pcr23 = spec
-        .pcrs
+        .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| p.matchData.first())

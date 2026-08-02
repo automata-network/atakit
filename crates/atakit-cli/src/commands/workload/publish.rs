@@ -79,12 +79,23 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let manifest = &result.manifest;
 
     // Final PCR23 register value (computed by inspect).
-    let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
+    let pcr23_hex = result
+        .pcr23_sha256
+        .strip_prefix("0x")
+        .unwrap_or(&result.pcr23_sha256);
     let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
         .context("invalid PCR23 hex")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
     let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
+    let pcr23_sha384_hex = result
+        .pcr23_sha384
+        .strip_prefix("0x")
+        .unwrap_or(&result.pcr23_sha384);
+    let pcr23_sha384: [u8; 48] = hex::decode(pcr23_sha384_hex)
+        .context("invalid SHA-384 PCR23 hex")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("SHA-384 PCR23 must be 48 bytes"))?;
 
     // Derive base image IDs from manifest's base-image list (name:version -> on-chain ID).
     // --base-image-id CLI args override if provided.
@@ -139,7 +150,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     // Build WorkloadSpec using the contract's generated types
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, PcrSpec, WorkloadSpec,
+        AttributeRequirement, Bytes48, PcrSpec256, PcrSpec384, WorkloadSpec,
     };
 
     let requirements = manifest
@@ -163,14 +174,24 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     let spec = WorkloadSpec {
         name: manifest.meta.name.clone(),
         version: manifest.meta.version.clone(),
-        ttl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
+        sessionTtl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
         baseImageMode: base_image_mode,
         baseImageIds: base_image_ids,
         requirements,
-        pcrs: vec![PcrSpec {
+        workloadPcrs256: vec![PcrSpec256 {
             pcrIndex: 23,
             verifyType: 0, // STATIC
             matchData: vec![pcr23_b256],
+        }],
+        workloadPcrs384: vec![PcrSpec384 {
+            pcrIndex: 23,
+            verifyType: 0,
+            matchData: vec![Bytes48 {
+                first: alloy_ext::core::primitives::B256::from_slice(&pcr23_sha384[..32]),
+                second: pcr23_sha384[32..]
+                    .try_into()
+                    .expect("16-byte SHA-384 suffix"),
+            }],
         }],
     };
 
@@ -212,7 +233,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!();
     println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
     println!("  {:<20}{}", "Manifest SHA256:".dimmed(), result.sha256);
-    println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
+    println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23_sha256);
     println!(
         "  {:<20}{} ({})",
         "Base Image Mode:".dimmed(),
@@ -250,10 +271,10 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!(
         "  {:<20}{}",
         "TTL:".dimmed(),
-        if spec.ttl == 0 {
+        if spec.sessionTtl == 0 {
             "contract default (30 days)".to_string()
         } else {
-            format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
+            format!("{}s ({} days)", spec.sessionTtl, spec.sessionTtl / 86400)
         }
     );
     if spec.requirements.is_empty() {
@@ -373,7 +394,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 Some(mut m) => {
                     m.workload_id = workload_id_hex.clone();
                     m.sha256 = Some(result.sha256.clone());
-                    m.pcr23 = Some(result.pcr23.clone());
+                    m.pcr23 = Some(result.pcr23_sha256.clone());
                     apply_chain_data_to_meta(&mut m, &chain_data);
                     m.added_at = now;
                     m
@@ -384,7 +405,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                         name: manifest.meta.name.clone(),
                         version: manifest.meta.version.clone(),
                         sha256: Some(result.sha256.clone()),
-                        pcr23: Some(result.pcr23.clone()),
+                        pcr23: Some(result.pcr23_sha256.clone()),
                         owner: None,
                         archive_size: None,
                         on_chain_spec: None,
@@ -433,7 +454,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             Some(mut m) => {
                 m.workload_id = workload_id_hex.clone();
                 m.sha256 = Some(result.sha256.clone());
-                m.pcr23 = Some(result.pcr23.clone());
+                m.pcr23 = Some(result.pcr23_sha256.clone());
                 apply_chain_data_to_meta(&mut m, &chain_data);
                 m.added_at = now;
                 m
@@ -444,7 +465,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                     name: manifest.meta.name.clone(),
                     version: manifest.meta.version.clone(),
                     sha256: Some(result.sha256.clone()),
-                    pcr23: Some(result.pcr23.clone()),
+                    pcr23: Some(result.pcr23_sha256.clone()),
                     owner: None,
                     archive_size: None,
                     on_chain_spec: None,

@@ -919,15 +919,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     }
                 };
 
-                let init_config = InitConfig {
+                let mut init_config = InitConfig {
                     platform: provider_config.platform.to_string(),
                     chain: init_chain,
                     owner_operations: config.owner_operations.clone(),
                     owner_key: owner_init,
                     gas_wallet: gas_init,
                     prover_credential: prover_init,
+                    pcr_policy: None,
                     disks: disk_passphrases.clone(),
                 };
+                if !registration_off && args.pcr_policy.is_some() {
+                    bail!("--pcr-policy requires effective chain registration = \"off\"");
+                }
                 let initialization_timeout_secs = init::initialization_timeout_seconds(
                     args.init_timeout,
                     init_config.owner_operations.op_expiry_seconds,
@@ -998,6 +1002,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     ))
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
+                init_config.pcr_policy = super::resolve_init_pcr_policy(
+                    args.pcr_policy.as_deref(),
+                    &init_config,
+                    registration_off,
+                    verified_tls.as_ref(),
+                    &workload_name,
+                    &workload_version,
+                )
+                .await?;
 
                 match init::post_portal_init_with_client(
                     &portal_client,

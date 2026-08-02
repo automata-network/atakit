@@ -395,6 +395,7 @@ pub struct TpmEvidence {
     pub ak_public: String,
     pub quote: String,
     pub signature: String,
+    pub pcr0_startup_locality: u8,
     #[serde(default)]
     pub pcrs: Vec<PcrEvidence>,
     #[serde(default)]
@@ -416,6 +417,8 @@ pub struct PcrEventHashes {
     pub pcr_index: u8,
     #[serde(default)]
     pub sha256: Vec<String>,
+    #[serde(default)]
+    pub sha384: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +436,7 @@ pub struct AkBinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementPack {
     pub schema: String,
     pub revision: u64,
@@ -445,6 +449,7 @@ pub struct MeasurementPack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BaseImage {
     pub name: String,
     pub version: String,
@@ -456,13 +461,17 @@ pub struct BaseImage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MeasurementProfile {
     pub name: String,
     pub id: String,
     pub cloud: String,
     pub tee: String,
+    pub pcr_bank_selection: PcrBankSelection,
     #[serde(default)]
-    pub invariants: Vec<PcrSpec>,
+    pub invariants256: Vec<PcrSpec256>,
+    #[serde(default)]
+    pub invariants384: Vec<PcrSpec384>,
     #[serde(default)]
     pub variants: Vec<MeasurementVariant>,
     #[serde(default)]
@@ -470,28 +479,51 @@ pub struct MeasurementProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MeasurementVariant {
     pub name: String,
     pub id: String,
     #[serde(rename = "machineTypes", default)]
     pub machine_types: Vec<String>,
-    #[serde(rename = "overridePcrs", default)]
-    pub override_pcrs: Vec<PcrSpec>,
+    #[serde(default)]
+    pub variant_pcrs256: Vec<PcrSpec256>,
+    #[serde(default)]
+    pub variant_pcrs384: Vec<PcrSpec384>,
     #[serde(default)]
     pub attributes: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PcrBankSelection {
+    Sha256,
+    Sha384,
+    Sha256AndSha384,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PcrSpec {
-    #[serde(rename = "pcrIndex")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PcrSpec256 {
     pub pcr_index: u8,
-    #[serde(rename = "verifyType")]
     pub verify_type: String,
-    #[serde(rename = "matchData", default)]
+    #[serde(default)]
     pub match_data: Vec<String>,
-    #[serde(rename = "eventIndices", default)]
+    #[serde(default)]
     pub event_indices: Vec<u64>,
-    #[serde(rename = "totalEvents", default)]
+    #[serde(default)]
+    pub total_events: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PcrSpec384 {
+    pub pcr_index: u8,
+    pub verify_type: String,
+    #[serde(default)]
+    pub match_data: Vec<String>,
+    #[serde(default)]
+    pub event_indices: Vec<u64>,
+    #[serde(default)]
     pub total_events: Option<u64>,
 }
 
@@ -716,7 +748,15 @@ struct AzureJwk {
 }
 
 pub fn parse_measurement_pack(bytes: &[u8]) -> Result<MeasurementPack> {
-    serde_json::from_slice(bytes).map_err(|e| AttestationError::MeasurementPack(e.to_string()))
+    let pack: MeasurementPack = serde_json::from_slice(bytes)
+        .map_err(|e| AttestationError::MeasurementPack(e.to_string()))?;
+    if pack.schema != "atakit.measurement-pack.v2" {
+        return Err(AttestationError::MeasurementPack(format!(
+            "unsupported schema {}",
+            pack.schema
+        )));
+    }
+    Ok(pack)
 }
 
 pub fn verify_measurement_pack(
@@ -877,8 +917,8 @@ fn verify_tls_attestation_internal(
         &mut report,
         &mut errors,
         "response-format",
-        inputs.response.format == 1,
-        format!("expected 1, got {}", inputs.response.format),
+        inputs.response.format == 2,
+        format!("expected 2, got {}", inputs.response.format),
     );
 
     let response_nonce = decode_b64_32("nonce", &inputs.response.nonce);
@@ -1276,7 +1316,7 @@ fn verify_tls_attestation_internal(
             &mut report,
             &mut errors,
             "measurement-pack-schema",
-            policy.pack.schema == "atakit.measurement-pack.v1",
+            policy.pack.schema == "atakit.measurement-pack.v2",
             format!("unsupported schema {}", policy.pack.schema),
         );
 
@@ -1353,6 +1393,25 @@ fn verify_tls_attestation_internal(
             }
         };
         pass(&mut report, "measurement-profile");
+
+        match (
+            &*inputs.response.platform.cloud,
+            &profile.pcr_bank_selection,
+        ) {
+            ("aws", PcrBankSelection::Sha256) => fail(
+                &mut report,
+                &mut errors,
+                "pcr-bank-selection",
+                "AWS pcrBankSelection must include SHA-384".to_string(),
+            ),
+            ("gcp", PcrBankSelection::Sha384) => fail(
+                &mut report,
+                &mut errors,
+                "pcr-bank-selection",
+                "GCP pcrBankSelection must include SHA-256".to_string(),
+            ),
+            _ => pass(&mut report, "pcr-bank-selection"),
+        }
 
         let expected_profile_id =
             compute_platform_profile_id(&expected_base_image_id, &profile.name);
@@ -1464,25 +1523,70 @@ fn verify_tls_attestation_internal(
             &inputs.trust_anchors.amd_snp_security_policies,
         );
 
-        match effective_pcr_specs(profile, variant) {
-            Ok(pcr_specs) if pcr_specs.is_empty() => fail(
-                &mut report,
-                &mut errors,
-                "measurement-pcrs",
-                "selected profile/variant has no PCR specs".to_string(),
+        check(
+            &mut report,
+            &mut errors,
+            "pcr0-startup-locality",
+            inputs.response.tpm.pcr0_startup_locality == 0xff
+                || inputs.response.tpm.pcr0_startup_locality <= 4,
+            format!(
+                "invalid PCR0 StartupLocality {}",
+                inputs.response.tpm.pcr0_startup_locality
             ),
-            Ok(pcr_specs) => {
-                for spec in pcr_specs {
-                    verify_pcr_spec(
-                        &mut report,
-                        &mut errors,
-                        spec,
-                        authenticated_pcrs.as_deref().unwrap_or(&[]),
-                        &inputs.response.tpm.event_log_hashes,
-                    );
+        );
+
+        let pcrs = authenticated_pcrs.as_deref().unwrap_or(&[]);
+        if matches!(
+            profile.pcr_bank_selection,
+            PcrBankSelection::Sha256 | PcrBankSelection::Sha256AndSha384
+        ) {
+            match effective_pcr_specs256(profile, variant) {
+                Ok(specs) if specs.is_empty() => fail(
+                    &mut report,
+                    &mut errors,
+                    "measurement-pcrs-sha256",
+                    "selected SHA-256 profile/variant has no PCR specs".to_string(),
+                ),
+                Ok(specs) => {
+                    for spec in specs {
+                        verify_pcr_spec256(
+                            &mut report,
+                            &mut errors,
+                            spec,
+                            pcrs,
+                            &inputs.response.tpm.event_log_hashes,
+                            inputs.response.tpm.pcr0_startup_locality,
+                        );
+                    }
                 }
+                Err(detail) => fail(&mut report, &mut errors, "measurement-pcrs-sha256", detail),
             }
-            Err(detail) => fail(&mut report, &mut errors, "measurement-pcrs", detail),
+        }
+        if matches!(
+            profile.pcr_bank_selection,
+            PcrBankSelection::Sha384 | PcrBankSelection::Sha256AndSha384
+        ) {
+            match effective_pcr_specs384(profile, variant) {
+                Ok(specs) if specs.is_empty() => fail(
+                    &mut report,
+                    &mut errors,
+                    "measurement-pcrs-sha384",
+                    "selected SHA-384 profile/variant has no PCR specs".to_string(),
+                ),
+                Ok(specs) => {
+                    for spec in specs {
+                        verify_pcr_spec384(
+                            &mut report,
+                            &mut errors,
+                            spec,
+                            pcrs,
+                            &inputs.response.tpm.event_log_hashes,
+                            inputs.response.tpm.pcr0_startup_locality,
+                        );
+                    }
+                }
+                Err(detail) => fail(&mut report, &mut errors, "measurement-pcrs-sha384", detail),
+            }
         }
     } else {
         fail(
@@ -1509,12 +1613,12 @@ fn verify_tls_attestation_internal(
     }
 }
 
-fn effective_pcr_specs<'a>(
+fn effective_pcr_specs256<'a>(
     profile: &'a MeasurementProfile,
     variant: &'a MeasurementVariant,
-) -> std::result::Result<Vec<&'a PcrSpec>, String> {
+) -> std::result::Result<Vec<&'a PcrSpec256>, String> {
     let mut specs = BTreeMap::new();
-    for spec in &profile.invariants {
+    for spec in &profile.invariants256 {
         if specs.insert(spec.pcr_index, spec).is_some() {
             return Err(format!(
                 "duplicate invariant PCR index {} in profile {}",
@@ -1523,22 +1627,17 @@ fn effective_pcr_specs<'a>(
         }
     }
 
-    let mut override_indices = BTreeSet::new();
-    for spec in &variant.override_pcrs {
-        if !override_indices.insert(spec.pcr_index) {
+    let mut variant_indices = BTreeSet::new();
+    for spec in &variant.variant_pcrs256 {
+        if !variant_indices.insert(spec.pcr_index) {
             return Err(format!(
-                "duplicate override PCR index {} in variant {}",
+                "duplicate SHA-256 variant PCR index {} in variant {}",
                 spec.pcr_index, variant.name
             ));
         }
-        // A profile invariant always holds. `override_pcrs` is a historical field name: its
-        // entries must be disjoint from `profile.invariants` and may only pin indices the
-        // profile leaves unpinned. Overwriting here would silently drop the stricter
-        // platform-level spec and disagree with on-chain evaluation, which rejects the
-        // overlap (SessionRegistry.PcrVariantOverridesInvariant).
         if specs.contains_key(&spec.pcr_index) {
             return Err(format!(
-                "variant {} pins PCR index {} that profile {} declares invariant; \
+                "variant {} contains SHA-256 PCR index {} that profile {} declares invariant; \
                  profile invariants always hold and cannot be overridden",
                 variant.name, spec.pcr_index, profile.name
             ));
@@ -1546,6 +1645,39 @@ fn effective_pcr_specs<'a>(
         specs.insert(spec.pcr_index, spec);
     }
 
+    Ok(specs.into_values().collect())
+}
+
+fn effective_pcr_specs384<'a>(
+    profile: &'a MeasurementProfile,
+    variant: &'a MeasurementVariant,
+) -> std::result::Result<Vec<&'a PcrSpec384>, String> {
+    let mut specs = BTreeMap::new();
+    for spec in &profile.invariants384 {
+        if specs.insert(spec.pcr_index, spec).is_some() {
+            return Err(format!(
+                "duplicate SHA-384 invariant PCR index {} in profile {}",
+                spec.pcr_index, profile.name
+            ));
+        }
+    }
+    let mut variant_indices = BTreeSet::new();
+    for spec in &variant.variant_pcrs384 {
+        if !variant_indices.insert(spec.pcr_index) {
+            return Err(format!(
+                "duplicate SHA-384 variant PCR index {} in variant {}",
+                spec.pcr_index, variant.name
+            ));
+        }
+        if specs.contains_key(&spec.pcr_index) {
+            return Err(format!(
+                "variant {} contains SHA-384 PCR index {} that profile {} declares invariant; \
+                 profile invariants always hold and cannot be overridden",
+                variant.name, spec.pcr_index, profile.name
+            ));
+        }
+        specs.insert(spec.pcr_index, spec);
+    }
     Ok(specs.into_values().collect())
 }
 
@@ -2216,14 +2348,15 @@ fn abi_word_usize(value: usize) -> [u8; 32] {
     out
 }
 
-fn verify_pcr_spec(
+fn verify_pcr_spec256(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
-    spec: &PcrSpec,
+    spec: &PcrSpec256,
     pcrs: &[PcrEvidence],
     event_log_hashes: &[PcrEventHashes],
+    startup_locality: u8,
 ) {
-    let check_name = format!("pcr-{}-{}", spec.pcr_index, spec.verify_type);
+    let check_name = format!("pcr-sha256-{}-{}", spec.pcr_index, spec.verify_type);
     if spec.verify_type.eq_ignore_ascii_case("static") && spec.match_data.len() != 1 {
         fail(
             report,
@@ -2260,16 +2393,12 @@ fn verify_pcr_spec(
             .iter()
             .map(|value| normalize_hex(value))
             .collect::<Vec<_>>();
-        let actual = [&pcr.sha256, &pcr.sha384]
-            .into_iter()
-            .filter_map(|value| value.as_ref())
-            .map(|value| normalize_hex(value))
-            .collect::<Vec<_>>();
+        let actual = pcr.sha256.as_ref().map(|value| normalize_hex(value));
         check(
             report,
             errors,
             &check_name,
-            actual.iter().any(|value| expected.contains(value)),
+            actual.is_some_and(|value| expected.contains(&value)),
             format!(
                 "PCR {} did not match any static measurement",
                 spec.pcr_index
@@ -2327,14 +2456,322 @@ fn verify_pcr_spec(
             return;
         }
     };
-    let policy = SessionPcrPolicy {
-        pcr_index: spec.pcr_index,
-        verify_type,
-        match_data: spec.match_data.clone(),
+    let expected = spec
+        .match_data
+        .iter()
+        .map(|value| decode_hex_array::<32>("matchData", value))
+        .collect::<Result<Vec<_>>>();
+    let expected = match expected {
+        Ok(expected) => expected,
+        Err(error) => {
+            fail(report, errors, &check_name, error.to_string());
+            return;
+        }
     };
-    match verification_core::evaluate_pcr_policy(&policy, measured, &decoded) {
+    match evaluate_pcr_policy256(
+        verify_type,
+        &expected,
+        measured,
+        &decoded,
+        spec.pcr_index,
+        startup_locality,
+    ) {
         Ok(()) => pass(report, &check_name),
         Err(detail) => fail(report, errors, &check_name, detail),
+    }
+}
+
+fn verify_pcr_spec384(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    spec: &PcrSpec384,
+    pcrs: &[PcrEvidence],
+    event_log_hashes: &[PcrEventHashes],
+    startup_locality: u8,
+) {
+    let check_name = format!("pcr-sha384-{}-{}", spec.pcr_index, spec.verify_type);
+    if spec.verify_type.eq_ignore_ascii_case("static") && spec.match_data.len() != 1 {
+        fail(
+            report,
+            errors,
+            &check_name,
+            format!(
+                "STATIC PCR spec requires exactly one matchData entry, got {}",
+                spec.match_data.len()
+            ),
+        );
+        return;
+    }
+    if spec.match_data.is_empty() {
+        fail(
+            report,
+            errors,
+            &check_name,
+            "PCR spec has no matchData".to_string(),
+        );
+        return;
+    }
+    let Some(pcr) = pcrs.iter().find(|pcr| pcr.index == spec.pcr_index) else {
+        fail(
+            report,
+            errors,
+            &check_name,
+            format!("TPM evidence does not contain PCR {}", spec.pcr_index),
+        );
+        return;
+    };
+    if spec.verify_type.eq_ignore_ascii_case("static") {
+        let expected = normalize_hex(&spec.match_data[0]);
+        let actual = pcr.sha384.as_ref().map(|value| normalize_hex(value));
+        check(
+            report,
+            errors,
+            &check_name,
+            actual.as_deref() == Some(expected.as_str()),
+            format!(
+                "SHA-384 PCR {} did not match the static measurement",
+                spec.pcr_index
+            ),
+        );
+        return;
+    }
+
+    let verify_type = match parse_pcr_verify_type(&spec.verify_type) {
+        Ok(value) => value,
+        Err(detail) => {
+            fail(report, errors, &check_name, detail);
+            return;
+        }
+    };
+    let Some(measured_sha384) = pcr.sha384.as_deref() else {
+        fail(
+            report,
+            errors,
+            &check_name,
+            "dynamic PCR has no SHA-384 value".to_string(),
+        );
+        return;
+    };
+    let measured = match decode_hex_array::<48>("pcr.sha384", measured_sha384) {
+        Ok(value) => value,
+        Err(error) => {
+            fail(report, errors, &check_name, error.to_string());
+            return;
+        }
+    };
+    let event_values = event_log_hashes
+        .iter()
+        .find(|events| events.pcr_index == spec.pcr_index)
+        .map(|events| events.sha384.as_slice())
+        .unwrap_or_default();
+    let decoded = event_values
+        .iter()
+        .map(|event| decode_hex_array::<48>("eventLogHashes.sha384", event))
+        .collect::<Result<Vec<_>>>();
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            fail(report, errors, &check_name, error.to_string());
+            return;
+        }
+    };
+    let expected = spec
+        .match_data
+        .iter()
+        .map(|value| decode_hex_array::<48>("matchData", value))
+        .collect::<Result<Vec<_>>>();
+    let expected = match expected {
+        Ok(expected) => expected,
+        Err(error) => {
+            fail(report, errors, &check_name, error.to_string());
+            return;
+        }
+    };
+    match evaluate_pcr_policy384(
+        verify_type,
+        &expected,
+        measured,
+        &decoded,
+        spec.pcr_index,
+        startup_locality,
+    ) {
+        Ok(()) => pass(report, &check_name),
+        Err(detail) => fail(report, errors, &check_name, detail),
+    }
+}
+
+fn parse_pcr_verify_type(value: &str) -> std::result::Result<SessionPcrVerifyType, String> {
+    match value.to_ascii_uppercase().as_str() {
+        "STATIC" => Ok(SessionPcrVerifyType::Static),
+        "DYNAMICSUBSET" | "DYNAMIC_SUBSET" | "DYNAMIC-SUBSET" => {
+            Ok(SessionPcrVerifyType::DynamicSubset)
+        }
+        "DYNAMICSUBSEQUENCE" | "DYNAMIC_SUBSEQUENCE" | "DYNAMIC-SUBSEQUENCE" => {
+            Ok(SessionPcrVerifyType::DynamicSubsequence)
+        }
+        other => Err(format!("unsupported PCR verifyType {other}")),
+    }
+}
+
+fn evaluate_pcr_policy256(
+    verify_type: SessionPcrVerifyType,
+    expected: &[[u8; 32]],
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    match verify_type {
+        SessionPcrVerifyType::Static => {
+            if expected.len() != 1 || measured_value != expected[0] {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+        }
+        SessionPcrVerifyType::DynamicSubset => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSET policy or measured event log is empty".to_string());
+            }
+            if expected
+                .iter()
+                .any(|required| !measured_events.contains(required))
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+            verify_sha256_event_replay(
+                measured_value,
+                measured_events,
+                pcr_index,
+                startup_locality,
+            )?;
+        }
+        SessionPcrVerifyType::DynamicSubsequence => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSEQUENCE policy or measured event log is empty".to_string());
+            }
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected.get(landmark) == Some(event) {
+                    landmark += 1;
+                }
+            }
+            if landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+            verify_sha256_event_replay(
+                measured_value,
+                measured_events,
+                pcr_index,
+                startup_locality,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_sha256_event_replay(
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    if startup_locality != 0xff && startup_locality > 4 {
+        return Err(format!("invalid PCR0 StartupLocality {startup_locality}"));
+    }
+    let mut replay = [0u8; 32];
+    if pcr_index == 0 && startup_locality != 0xff {
+        replay[31] = startup_locality;
+    }
+    for event in measured_events {
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&replay);
+        input[32..].copy_from_slice(event);
+        replay = Sha256::digest(input).into();
+    }
+    if replay == measured_value {
+        Ok(())
+    } else {
+        Err("SHA-256 PCR event replay does not match measured value".to_string())
+    }
+}
+
+fn evaluate_pcr_policy384(
+    verify_type: SessionPcrVerifyType,
+    expected: &[[u8; 48]],
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    match verify_type {
+        SessionPcrVerifyType::Static => {
+            if expected.len() != 1 || measured_value != expected[0] {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+        }
+        SessionPcrVerifyType::DynamicSubset => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSET policy or measured event log is empty".to_string());
+            }
+            if expected
+                .iter()
+                .any(|required| !measured_events.contains(required))
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+            verify_sha384_event_replay(
+                measured_value,
+                measured_events,
+                pcr_index,
+                startup_locality,
+            )?;
+        }
+        SessionPcrVerifyType::DynamicSubsequence => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSEQUENCE policy or measured event log is empty".to_string());
+            }
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected.get(landmark) == Some(event) {
+                    landmark += 1;
+                }
+            }
+            if landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+            verify_sha384_event_replay(
+                measured_value,
+                measured_events,
+                pcr_index,
+                startup_locality,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_sha384_event_replay(
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    if startup_locality != 0xff && startup_locality > 4 {
+        return Err(format!("invalid PCR0 StartupLocality {startup_locality}"));
+    }
+    let mut replay = [0u8; 48];
+    if pcr_index == 0 && startup_locality != 0xff {
+        replay[47] = startup_locality;
+    }
+    for event in measured_events {
+        let mut input = [0u8; 96];
+        input[..48].copy_from_slice(&replay);
+        input[48..].copy_from_slice(event);
+        replay = Sha384::digest(input).into();
+    }
+    if replay == measured_value {
+        Ok(())
+    } else {
+        Err("SHA-384 PCR event replay does not match measured value".to_string())
     }
 }
 
@@ -2497,7 +2934,7 @@ mod tests {
             });
         }
         TlsAttestationResponse {
-            format: 1,
+            format: 2,
             nonce: URL_SAFE_NO_PAD.encode(nonce),
             tls_cert_der: URL_SAFE_NO_PAD.encode(cert),
             tls_cert_sha256: hex0x(&cert_sha),
@@ -2511,6 +2948,7 @@ mod tests {
                 ak_public: URL_SAFE_NO_PAD.encode(ak_public),
                 quote: URL_SAFE_NO_PAD.encode(quote),
                 signature: URL_SAFE_NO_PAD.encode(signature),
+                pcr0_startup_locality: 0,
                 pcrs,
                 event_log_hashes: Vec::new(),
             },
@@ -2540,7 +2978,7 @@ mod tests {
         let (ak_public, signature, cert_chain, roots) = fake_gcp_ak_chain_and_signature(&quote);
         (
             TlsAttestationResponse {
-                format: 1,
+                format: 2,
                 nonce: URL_SAFE_NO_PAD.encode(nonce),
                 tls_cert_der: URL_SAFE_NO_PAD.encode(cert),
                 tls_cert_sha256: hex0x(&cert_sha),
@@ -2554,6 +2992,7 @@ mod tests {
                     ak_public: URL_SAFE_NO_PAD.encode(ak_public),
                     quote: URL_SAFE_NO_PAD.encode(quote),
                     signature: URL_SAFE_NO_PAD.encode(signature),
+                    pcr0_startup_locality: 0,
                     pcrs: vec![
                         PcrEvidence {
                             index: 4,
@@ -2604,7 +3043,7 @@ mod tests {
         let (ak_public, signature, cert_chain, roots) = fake_gcp_ak_chain_and_signature(&quote);
         (
             TlsAttestationResponse {
-                format: 1,
+                format: 2,
                 nonce: URL_SAFE_NO_PAD.encode(nonce),
                 tls_cert_der: URL_SAFE_NO_PAD.encode(cert),
                 tls_cert_sha256: hex0x(&cert_sha),
@@ -2618,6 +3057,7 @@ mod tests {
                     ak_public: URL_SAFE_NO_PAD.encode(ak_public),
                     quote: URL_SAFE_NO_PAD.encode(quote),
                     signature: URL_SAFE_NO_PAD.encode(signature),
+                    pcr0_startup_locality: 0,
                     pcrs: vec![
                         PcrEvidence {
                             index: 4,
@@ -2859,9 +3299,9 @@ mod tests {
     type FakeGcpAkChain = (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>);
     type FakeGcpAkMaterial = (P256SigningKey, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-    fn fake_gcp_ak_chain_and_signature(tpm2b_attest: &[u8]) -> FakeGcpAkChain {
+    fn fake_gcp_ak_chain_and_signature(tpms_attest: &[u8]) -> FakeGcpAkChain {
         let (signing_key, ak_public, cert_chain, roots) = fake_gcp_ak_chain();
-        let signature: P256Signature = signing_key.sign(tpm2b_attest_body(tpm2b_attest).unwrap());
+        let signature: P256Signature = signing_key.sign(tpms_attest_body(tpms_attest).unwrap());
         (
             ak_public,
             fake_tpmt_signature_ecdsa(&signature),
@@ -2967,10 +3407,10 @@ mod tests {
         );
     }
 
-    fn fake_ak_and_signature(tpm2b_attest: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn fake_ak_and_signature(tpms_attest: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let signing_key = P256SigningKey::from_slice(&[7u8; 32]).expect("test signing key");
         let verify_key = signing_key.verifying_key();
-        let signature: P256Signature = signing_key.sign(tpm2b_attest_body(tpm2b_attest).unwrap());
+        let signature: P256Signature = signing_key.sign(tpms_attest_body(tpms_attest).unwrap());
         (
             fake_tpmt_public_ecc(verify_key),
             fake_tpmt_signature_ecdsa(&signature),
@@ -3061,19 +3501,19 @@ mod tests {
         out
     }
 
-    fn fake_azure_ak_binding_and_signature(tpm2b_attest: &[u8]) -> (AkBinding, Vec<u8>, Vec<u8>) {
-        fake_azure_ak_binding_and_signature_for_tee(tpm2b_attest, "tdx")
+    fn fake_azure_ak_binding_and_signature(tpms_attest: &[u8]) -> (AkBinding, Vec<u8>, Vec<u8>) {
+        fake_azure_ak_binding_and_signature_for_tee(tpms_attest, "tdx")
     }
 
     fn fake_azure_ak_binding_and_signature_for_tee(
-        tpm2b_attest: &[u8],
+        tpms_attest: &[u8],
         tee: &str,
     ) -> (AkBinding, Vec<u8>, Vec<u8>) {
         let signing_key = RsaKeyPair::generate(KeySize::Rsa2048).expect("test RSA key");
         let public_key = RsaPublicKeyComponents::<Vec<u8>>::from(signing_key.public_key());
         let signature = sign_rsa_sha256(
             &signing_key,
-            tpm2b_attest_body(tpm2b_attest).expect("TPM attest body"),
+            tpms_attest_body(tpms_attest).expect("TPM attest body"),
         );
         let hcl_var_data = serde_json::json!({
             "keys": [{
@@ -3314,7 +3754,7 @@ mod tests {
         MeasurementPolicy {
             source: "test-pack".to_string(),
             pack: MeasurementPack {
-                schema: "atakit.measurement-pack.v1".to_string(),
+                schema: "atakit.measurement-pack.v2".to_string(),
                 revision: 1,
                 published_at: "2026-07-07T00:00:00Z".to_string(),
                 base_image: BaseImage {
@@ -3329,7 +3769,8 @@ mod tests {
                     id: hex0x(&profile_id),
                     cloud: cloud.to_string(),
                     tee: tee.to_string(),
-                    invariants: vec![PcrSpec {
+                    pcr_bank_selection: PcrBankSelection::Sha256,
+                    invariants256: vec![PcrSpec256 {
                         pcr_index: 4,
                         verify_type: "static".to_string(),
                         match_data: vec![expected_pcr.to_string()],
@@ -3340,9 +3781,11 @@ mod tests {
                         name: machine_type.to_string(),
                         id: hex0x(&variant_id),
                         machine_types: vec![machine_type.to_string()],
-                        override_pcrs: Vec::new(),
+                        variant_pcrs256: Vec::new(),
+                        variant_pcrs384: Vec::new(),
                         attributes: Vec::new(),
                     }],
+                    invariants384: Vec::new(),
                     attributes: Vec::new(),
                 }],
             },
@@ -3423,7 +3866,7 @@ mod tests {
             "tpm-quote-signature",
             "gcp-tdx-rtmr3-binding",
             "gcp-tee-vtpm-binding",
-            "pcr-4-static",
+            "pcr-sha256-4-static",
         ] {
             assert_check_passed(&failure, check);
         }
@@ -3802,7 +4245,7 @@ mod tests {
         assert_check_passed(&failure, "base-image-id");
         assert_check_passed(&failure, "platform-profile-id");
         assert_check_passed(&failure, "variant-id");
-        assert_check_passed(&failure, "pcr-4-static");
+        assert_check_passed(&failure, "pcr-sha256-4-static");
     }
 
     #[test]
@@ -4130,8 +4573,8 @@ mod tests {
         // machine actually reports. Previously the override won and `pcr-4-static` passed.
         let mut policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
         policy.pack.profiles[0].variants[0]
-            .override_pcrs
-            .push(PcrSpec {
+            .variant_pcrs256
+            .push(PcrSpec256 {
                 pcr_index: 4,
                 verify_type: "static".to_string(),
                 match_data: vec![format!("0x{}", "aa".repeat(32))],
@@ -4156,7 +4599,7 @@ mod tests {
         let overlap = failure
             .errors
             .iter()
-            .find(|error| error.check == "measurement-pcrs")
+            .find(|error| error.check == "measurement-pcrs-sha256")
             .expect("expected a measurement-pcrs failure");
         assert!(
             overlap.detail.contains("declares invariant"),
@@ -4169,7 +4612,7 @@ mod tests {
                 .report
                 .checks
                 .iter()
-                .any(|check| check.name == "pcr-4-static"),
+                .any(|check| check.name == "pcr-sha256-4-static"),
             "the overriding spec was evaluated: {:?}",
             failure.report.checks
         );
@@ -4180,7 +4623,7 @@ mod tests {
         let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
         let profile = &policy.pack.profiles[0];
         let mut variant = profile.variants[0].clone();
-        variant.override_pcrs.push(PcrSpec {
+        variant.variant_pcrs256.push(PcrSpec256 {
             pcr_index: 4,
             verify_type: "static".to_string(),
             match_data: vec![format!("0x{}", "aa".repeat(32))],
@@ -4188,7 +4631,7 @@ mod tests {
             total_events: None,
         });
 
-        let error = effective_pcr_specs(profile, &variant)
+        let error = effective_pcr_specs256(profile, &variant)
             .expect_err("overlap with a profile invariant must be rejected");
         assert!(error.contains("declares invariant"), "unexpected: {error}");
     }
@@ -4198,7 +4641,7 @@ mod tests {
         let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
         let profile = &policy.pack.profiles[0];
         let mut variant = profile.variants[0].clone();
-        variant.override_pcrs.push(PcrSpec {
+        variant.variant_pcrs256.push(PcrSpec256 {
             pcr_index: 10,
             verify_type: "static".to_string(),
             match_data: vec![format!("0x{}", "cc".repeat(32))],
@@ -4206,7 +4649,7 @@ mod tests {
             total_events: None,
         });
 
-        let specs = effective_pcr_specs(profile, &variant).expect("disjoint variant is allowed");
+        let specs = effective_pcr_specs256(profile, &variant).expect("disjoint variant is allowed");
         let indices: Vec<u8> = specs.iter().map(|spec| spec.pcr_index).collect();
         assert_eq!(indices, vec![4, 10]);
     }
@@ -4217,7 +4660,7 @@ mod tests {
         let cert = b"cert";
         let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariants[0]
+        policy.pack.profiles[0].invariants256[0]
             .match_data
             .push(format!("0x{}", "bb".repeat(32)));
 
@@ -4238,7 +4681,7 @@ mod tests {
         let check = failure
             .errors
             .iter()
-            .find(|error| error.check == "pcr-4-static")
+            .find(|error| error.check == "pcr-sha256-4-static")
             .expect("expected pcr-4-static failure");
         assert!(
             check
@@ -4341,7 +4784,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariants.clear();
+        policy.pack.profiles[0].invariants256.clear();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4357,7 +4800,7 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "measurement-pcrs"));
+            .any(|error| error.check == "measurement-pcrs-sha256"));
     }
 
     #[test]
@@ -4366,7 +4809,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariants[0].verify_type = "dynamicSubset".to_string();
+        policy.pack.profiles[0].invariants256[0].verify_type = "dynamicSubset".to_string();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4382,7 +4825,7 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "pcr-4-dynamicSubset"
+            .any(|error| error.check == "pcr-sha256-4-dynamicSubset"
                 && error.detail.contains("measured event log is empty")));
     }
 
@@ -4392,7 +4835,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariants[0].verify_type = "dynamicSubsequence".to_string();
+        policy.pack.profiles[0].invariants256[0].verify_type = "dynamicSubsequence".to_string();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4406,7 +4849,7 @@ mod tests {
         .expect_err("dynamic PCR without an event log should fail closed");
 
         assert!(failure.errors.iter().any(|error| {
-            error.check == "pcr-4-dynamicSubsequence"
+            error.check == "pcr-sha256-4-dynamicSubsequence"
                 && error.detail.contains("measured event log is empty")
         }));
     }
@@ -4432,7 +4875,7 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "pcr-4-static"));
+            .any(|error| error.check == "pcr-sha256-4-static"));
     }
 
     #[test]
@@ -4505,7 +4948,7 @@ mod tests {
         assert!(failure
             .errors
             .iter()
-            .any(|error| error.check == "pcr-4-static"));
+            .any(|error| error.check == "pcr-sha256-4-static"));
         assert_check_passed(&failure, "tpm-quote-pcr-digest");
     }
 
@@ -4541,10 +4984,10 @@ mod tests {
             Some(expected_sha384.as_str())
         );
 
-        verify_pcr_spec(
+        verify_pcr_spec384(
             &mut report,
             &mut errors,
-            &PcrSpec {
+            &PcrSpec384 {
                 pcr_index: 4,
                 verify_type: "static".into(),
                 match_data: vec![hex0x(&sha384)],
@@ -4553,6 +4996,7 @@ mod tests {
             },
             &authenticated,
             &[],
+            0,
         );
         assert!(errors.is_empty(), "{errors:?}");
     }
@@ -5603,7 +6047,7 @@ mod tests {
         let quote = fake_tpm_quote(&qualifying_data, &[(4, pcr4), (15, pcr15)]);
         let (ak_signing_key, ak_public, ak_chain, ak_roots) = fake_gcp_ak_chain();
         let quote_signature: P256Signature =
-            ak_signing_key.sign(tpm2b_attest_body(&quote).expect("Quote body"));
+            ak_signing_key.sign(tpms_attest_body(&quote).expect("Quote body"));
         let quote_signature = fake_tpmt_signature_ecdsa(&quote_signature);
 
         let tpm_signing_key = P256SigningKey::from_slice(&[9u8; 32]).expect("TPM signing key");
@@ -5616,7 +6060,7 @@ mod tests {
             fake_tpmt_public_ecc_with_attributes(tpm_signing_key.verifying_key(), 0x0004_0072);
         let certify = fake_tpm_certify(&tpmt_public);
         let certify_signature: P256Signature =
-            ak_signing_key.sign(tpm2b_attest_body(&certify).expect("Certify body"));
+            ak_signing_key.sign(tpms_attest_body(&certify).expect("Certify body"));
         let certify_signature = fake_tpmt_signature_ecdsa(&certify_signature);
 
         let session_signing_key = K256SigningKey::random(&mut OsRng);
@@ -5685,24 +6129,25 @@ mod tests {
                 )),
             },
             tpm_quote: TpmQuoteEvidence {
-                tpm2b_attest: URL_SAFE_NO_PAD.encode(&quote),
+                tpms_attest: URL_SAFE_NO_PAD.encode(&quote),
                 tpm_signature: URL_SAFE_NO_PAD.encode(&quote_signature),
                 signature_hash: hex0x(&quote_signature_hash),
+                pcr0_startup_locality: 0,
             },
             tpm_certify: TpmCertifyEvidence {
-                tpm2b_attest: URL_SAFE_NO_PAD.encode(&certify),
+                tpms_attest: URL_SAFE_NO_PAD.encode(&certify),
                 tpm_signature: URL_SAFE_NO_PAD.encode(&certify_signature),
                 tpmt_public: URL_SAFE_NO_PAD.encode(&tpmt_public),
             },
             pcr_values: vec![
                 SessionPcrValue {
                     index: 4,
-                    sha256: hex0x(&pcr4),
+                    sha256: Some(hex0x(&pcr4)),
                     sha384: None,
                 },
                 SessionPcrValue {
                     index: 15,
-                    sha256: hex0x(&pcr15),
+                    sha256: Some(hex0x(&pcr15)),
                     sha384: None,
                 },
             ],
@@ -5710,10 +6155,12 @@ mod tests {
                 SessionEventHashes {
                     pcr_index: 4,
                     sha256: Vec::new(),
+                    sha384: Vec::new(),
                 },
                 SessionEventHashes {
                     pcr_index: 15,
                     sha256: Vec::new(),
+                    sha384: Vec::new(),
                 },
             ],
             session_key: SessionPublicKey {
@@ -5737,7 +6184,9 @@ mod tests {
                 base_image_id: hex0x(&base_image_id),
                 platform_profile_id: hex0x(&platform_profile_id),
                 measurement_variant_id: hex0x(&measurement_variant_id),
-                pcr_specs: vec![pcr4_policy.clone()],
+                pcr_bank_selection: PcrBankSelection::Sha256,
+                pcr_specs384: Vec::new(),
+                pcr_specs256: vec![pcr4_policy.clone()],
             },
             owner: SessionOwner {
                 fingerprint: hex0x(&owner_fingerprint),
@@ -5786,7 +6235,9 @@ mod tests {
                     base_image_id,
                     platform_profile_id,
                     measurement_variant_id,
-                    pcr_specs: vec![pcr4_policy],
+                    pcr_bank_selection: PcrBankSelection::Sha256,
+                    pcr_specs384: Vec::new(),
+                    pcr_specs256: vec![pcr4_policy],
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
                     amd_snp_security_policies: vec![AmdSnpSecurityPolicy {
@@ -6022,20 +6473,31 @@ mod tests {
     #[test]
     fn parse_measurement_pack_json() {
         let bytes = br#"{
-          "schema":"atakit.measurement-pack.v1",
+          "schema":"atakit.measurement-pack.v2",
           "revision":1,
           "publishedAt":"2026-07-07T00:00:00Z",
           "baseImage":{"name":"automata-linux","version":"v0.5.0","id":"0x00"},
           "profiles":[]
         }"#;
         let pack = parse_measurement_pack(bytes).unwrap();
-        assert_eq!(pack.schema, "atakit.measurement-pack.v1");
+        assert_eq!(pack.schema, "atakit.measurement-pack.v2");
         assert_eq!(pack.base_image.name, "automata-linux");
     }
 
     #[test]
-    fn verify_measurement_pack_accepts_trusted_es256k_signature() {
+    fn parse_measurement_pack_rejects_version_1() {
         let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v1"}"#;
+
+        let err = parse_measurement_pack(bytes).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("unsupported schema atakit.measurement-pack.v1"));
+    }
+
+    #[test]
+    fn verify_measurement_pack_accepts_trusted_es256k_signature() {
+        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v2"}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
         let trusted_key = signing_key
@@ -6051,7 +6513,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_rejects_missing_trusted_key() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v1"}"#;
+        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v2"}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
 
@@ -6064,7 +6526,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_rejects_untrusted_signature() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v1"}"#;
+        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v2"}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let other_key = K256SigningKey::from_slice(&[8u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
@@ -6082,7 +6544,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_rejects_noncanonical_json() {
-        let bytes = br#"{"schema":"atakit.measurement-pack.v1","revision":1,"publishedAt":"2026-07-07T00:00:00Z","baseImage":{"name":"base","version":"v1","id":"0x00"},"profiles":[]}"#;
+        let bytes = br#"{"schema":"atakit.measurement-pack.v2","revision":1,"publishedAt":"2026-07-07T00:00:00Z","baseImage":{"name":"base","version":"v1","id":"0x00"},"profiles":[]}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
         let trusted_key = signing_key

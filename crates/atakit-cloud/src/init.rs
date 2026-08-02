@@ -25,12 +25,13 @@ use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::error::CloudError;
+use crate::pcr_policy::ResolvedPcrPolicyConfig;
 use crate::tdx_dcap::{
     fetch_automata_collateral, fetch_http_collateral, parse_dcap_collateral_json,
     AutomataPccsOverrides,
 };
 
-pub const INIT_SCHEMA_VERSION: u32 = 2;
+pub const INIT_SCHEMA_VERSION: u32 = 3;
 pub const PORTAL_READINESS_TIMEOUT_SECONDS: u64 = 300;
 pub const PORTAL_PROOF_TIMEOUT_SECONDS: u64 = 900;
 pub const INITIALIZATION_COMPLETION_BUFFER_SECONDS: u64 = 60;
@@ -65,6 +66,7 @@ pub struct InitConfig {
     /// Backend-neutral credential delegated to the selected prover daemon.
     /// The internal field name is retained during the compatibility cycle.
     pub prover_credential: Option<InitKeyConfig>,
+    pub pcr_policy: Option<ResolvedPcrPolicyConfig>,
     /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
     /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
     /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
@@ -452,6 +454,10 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             "options": prover.options,
         });
     }
+    if let Some(policy) = &config.pcr_policy {
+        portal_config["pcr_policy"] = serde_json::to_value(policy)
+            .expect("ResolvedPcrPolicyConfig serialization cannot fail");
+    }
 
     // Only emit `disks` when there is at least one passphrase. The portal
     // treats an absent `disks` field as an empty map.
@@ -530,7 +536,7 @@ pub fn write_tls_attestation_report(
 
 /// Load an offline measurement policy for TLS attestation.
 ///
-/// V1 accepts either a measurement-pack JSON file or a directory containing
+/// Accept either a measurement-pack JSON file or a directory containing
 /// `measurement-pack.json` and `measurement-pack.sig`. If no explicit path is
 /// supplied, a `--base-image name:version` lookup searches the local atakit
 /// data directory under `baseimage/measurements/<name>/<version>/`.
@@ -739,24 +745,6 @@ fn local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> Pat
         .join(encode_image_ref_path_segment(version))
 }
 
-fn legacy_local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> PathBuf {
-    data_dir
-        .join("baseimage")
-        .join("measurements")
-        .join(legacy_measurement_path_segment(name))
-        .join(legacy_measurement_path_segment(version))
-}
-
-fn legacy_measurement_path_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
-            _ => '_',
-        })
-        .collect()
-}
-
 struct LocalMeasurementPackSelection {
     path: PathBuf,
     detected: bool,
@@ -767,26 +755,9 @@ fn select_local_measurement_pack_dir(
     name: &str,
     version: &str,
 ) -> Result<LocalMeasurementPackSelection, CloudError> {
-    let new_path = local_measurement_pack_dir(data_dir, name, version);
-    if measurement_pack_artifact_exists(&new_path)? {
-        return Ok(LocalMeasurementPackSelection {
-            path: new_path,
-            detected: true,
-        });
-    }
-
-    let legacy_path = legacy_local_measurement_pack_dir(data_dir, name, version);
-    if measurement_pack_artifact_exists(&legacy_path)? {
-        return Ok(LocalMeasurementPackSelection {
-            path: legacy_path,
-            detected: true,
-        });
-    }
-
-    Ok(LocalMeasurementPackSelection {
-        path: new_path,
-        detected: false,
-    })
+    let path = local_measurement_pack_dir(data_dir, name, version);
+    let detected = measurement_pack_artifact_exists(&path)?;
+    Ok(LocalMeasurementPackSelection { path, detected })
 }
 
 fn measurement_pack_artifact_exists(dir: &Path) -> Result<bool, CloudError> {
@@ -2183,6 +2154,7 @@ mod tests {
                 key_type: "es256k".to_string(),
                 private_key: Some("0xSP1".to_string()),
             }),
+            pcr_policy: None,
             disks: BTreeMap::new(),
         }
     }
@@ -2311,7 +2283,7 @@ mod tests {
             .to_string(),
         );
         let response = TlsAttestationResponse {
-            format: 1,
+            format: 2,
             nonce: String::new(),
             tls_cert_der: String::new(),
             tls_cert_sha256: String::new(),
@@ -2325,6 +2297,7 @@ mod tests {
                 ak_public: String::new(),
                 quote: String::new(),
                 signature: String::new(),
+                pcr0_startup_locality: 0,
                 pcrs: vec![],
                 event_log_hashes: vec![],
             },
@@ -2344,7 +2317,7 @@ mod tests {
     #[test]
     fn azure_snp_verification_collateral_stays_separate_from_portal_collateral() {
         let response = TlsAttestationResponse {
-            format: 1,
+            format: 2,
             nonce: String::new(),
             tls_cert_der: String::new(),
             tls_cert_sha256: String::new(),
@@ -2358,6 +2331,7 @@ mod tests {
                 ak_public: String::new(),
                 quote: String::new(),
                 signature: String::new(),
+                pcr0_startup_locality: 0,
                 pcrs: vec![],
                 event_log_hashes: vec![],
             },
@@ -2566,7 +2540,7 @@ mod tests {
 
     fn measurement_pack_json(name: &str, version: &str) -> String {
         format!(
-            r#"{{"baseImage":{{"id":"0x{}","name":"{name}","version":"{version}"}},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v1"}}"#,
+            r#"{{"baseImage":{{"id":"0x{}","name":"{name}","version":"{version}"}},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v2"}}"#,
             "00".repeat(32)
         )
     }
@@ -2581,15 +2555,6 @@ mod tests {
                 .as_bytes(),
         );
         (signature.to_bytes().to_vec(), vec![publisher_key])
-    }
-
-    fn write_signed_measurement_pack(pack_dir: &Path, name: &str, version: &str) -> Vec<String> {
-        let json = measurement_pack_json(name, version);
-        let (signature, publisher_keys) = signed_measurement_pack(&json);
-        std::fs::create_dir_all(pack_dir).unwrap();
-        std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
-        std::fs::write(pack_dir.join("measurement-pack.sig"), signature).unwrap();
-        publisher_keys
     }
 
     #[test]
@@ -2702,97 +2667,17 @@ mod tests {
     }
 
     #[test]
-    fn load_measurement_policy_reads_legacy_safe_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "automata-linux", "v1");
-        let keys = write_signed_measurement_pack(&legacy, "automata-linux", "v1");
-
-        let policy =
-            load_measurement_policy(None, Some("automata-linux:v1"), &keys, Some(dir.path()))
-                .unwrap()
-                .unwrap();
-        assert_eq!(policy.source, format!("local:{}", legacy.display()));
-    }
-
-    #[test]
-    fn load_measurement_policy_reads_legacy_sanitized_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
-        let keys = write_signed_measurement_pack(&legacy, "foo@bar", "v1");
-
-        let policy = load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(policy.pack.base_image.name, "foo@bar");
-    }
-
-    #[test]
-    fn load_measurement_policy_rejects_legacy_collision_identity_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "foo@bar", "v1");
-        let keys = write_signed_measurement_pack(&legacy, "foo_bar", "v1");
-
-        let error =
-            load_measurement_policy(None, Some("foo@bar:v1"), &keys, Some(dir.path())).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("measurement pack is for foo_bar:v1, not foo@bar:v1"),
-            "got: {error}"
-        );
-    }
-
-    #[test]
-    fn incomplete_legacy_pack_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(
-            legacy.join("measurement-pack.json"),
-            measurement_pack_json("base", "v1"),
-        )
-        .unwrap();
-
-        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
-        let error =
-            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("baseimage/measurements/base/v1/measurement-pack.sig"),
-            "got: {error}"
-        );
-    }
-
-    #[test]
-    fn new_pack_path_takes_priority_over_legacy_path() {
+    fn incomplete_pack_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
-        let keys = write_signed_measurement_pack(&new_path, "base", "v1");
-        write_signed_measurement_pack(&legacy, "wrong", "v1");
-
-        let policy = load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(policy.source, format!("local:{}", new_path.display()));
-    }
-
-    #[test]
-    fn incomplete_new_pack_does_not_fall_back_to_legacy_pack() {
-        let dir = tempfile::tempdir().unwrap();
-        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
-        let legacy = legacy_local_measurement_pack_dir(dir.path(), "base", "v1");
         std::fs::create_dir_all(&new_path).unwrap();
         std::fs::write(
             new_path.join("measurement-pack.json"),
             measurement_pack_json("base", "v1"),
         )
         .unwrap();
-        let keys = write_signed_measurement_pack(&legacy, "base", "v1");
-
         let error =
-            load_measurement_policy(None, Some("base:v1"), &keys, Some(dir.path())).unwrap_err();
+            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
         assert!(
             error
                 .to_string()

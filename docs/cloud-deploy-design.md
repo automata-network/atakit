@@ -299,7 +299,7 @@ A single-target deploy performs these logical stages:
 7. Verify the portal TLS certificate against fresh attestation and the selected
    measurement policy.
 8. Unless `--skip-init` or `--image-only` is set, require `GET /status` to
-   report `init_schema_version = 2`, send the one-shot multipart `POST /init`
+   report `init_schema_version = 3`, send the one-shot multipart `POST /init`
    request, and poll portal state.
 
 The init upload timeout is controlled by `--init-upload-timeout`. Portal

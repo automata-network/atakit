@@ -48,7 +48,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Blockchain
 alloy-ext = "1.7.4"
 alloy = { version = "1.7.3", default-features = false }
-automata-tee-workload-measurement = "0.1.2"
+automata-tee-workload-measurement = { version = "0.2.0", path = "../../automata-tee-workload-measurement/crates/automata-tee-workload-measurement" }
 aws-lc-rs = "1"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }

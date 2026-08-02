@@ -7,9 +7,9 @@ use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
     verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustKey, BindingMode,
     CertificateTrust, IntelTdxDcapCollateral, SessionAttribute, SessionEvidenceBundle,
-    SessionPcrPolicy, SessionPcrVerifyType, SessionPlatformTrust, SessionRequestBinding,
-    SessionTrust, SessionVerificationInputs, TrustedSessionBinding, TrustedSessionPolicy,
-    VerificationReport, VerifiedSession, VerifiedTlsIdentity,
+    SessionPcrPolicy, SessionPcrPolicy384, SessionPcrVerifyType, SessionPlatformTrust,
+    SessionRequestBinding, SessionTrust, SessionVerificationInputs, TrustedSessionBinding,
+    TrustedSessionPolicy, VerificationReport, VerifiedSession, VerifiedTlsIdentity,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -274,14 +274,23 @@ fn trusted_policy(
         &bundle.platform.machine_type,
     )?;
 
-    let pcr_specs = combined_pcr_specs(effective_pcr_specs(profile, variant)?, workload.pcr_specs);
+    let pcr_specs256 = combined_pcr_specs(
+        effective_pcr_specs256(profile, variant)?,
+        workload.pcr_specs256,
+    );
+    let pcr_specs384 = combined_pcr_specs384(
+        effective_pcr_specs384(profile, variant)?,
+        workload.pcr_specs384,
+    );
 
     Ok(TrustedSessionPolicy {
         workload_id: workload.workload_id,
         base_image_id,
         platform_profile_id,
         measurement_variant_id,
-        pcr_specs,
+        pcr_bank_selection: profile.pcr_bank_selection,
+        pcr_specs256,
+        pcr_specs384,
         effective_attributes: effective_attributes(profile, variant)?,
         attribute_requirements: workload.attribute_requirements,
         amd_snp_security_policies: context.trust_anchors.amd_snp_security_policies.clone(),
@@ -292,6 +301,14 @@ fn combined_pcr_specs(
     mut base_image: Vec<SessionPcrPolicy>,
     workload: Vec<SessionPcrPolicy>,
 ) -> Vec<SessionPcrPolicy> {
+    base_image.extend(workload);
+    base_image
+}
+
+fn combined_pcr_specs384(
+    mut base_image: Vec<SessionPcrPolicy384>,
+    workload: Vec<SessionPcrPolicy384>,
+) -> Vec<SessionPcrPolicy384> {
     base_image.extend(workload);
     base_image
 }
@@ -351,12 +368,12 @@ fn select_variant<'a>(
     }
 }
 
-fn effective_pcr_specs(
+fn effective_pcr_specs256(
     profile: &MeasurementProfile,
     variant: &MeasurementVariant,
 ) -> Result<Vec<SessionPcrPolicy>, AttestationClientError> {
     let mut specs = BTreeMap::new();
-    for spec in &profile.invariants {
+    for spec in &profile.invariants256 {
         if specs.insert(spec.pcr_index, spec).is_some() {
             return Err(session_error(format!(
                 "duplicate PCR {} in profile {}",
@@ -365,15 +382,15 @@ fn effective_pcr_specs(
         }
     }
     let mut overrides = BTreeSet::new();
-    for spec in &variant.override_pcrs {
+    for spec in &variant.variant_pcrs256 {
         if !overrides.insert(spec.pcr_index) {
             return Err(session_error(format!(
                 "duplicate PCR {} in variant {}",
                 spec.pcr_index, variant.name
             )));
         }
-        // A profile invariant always holds. `override_pcrs` is a historical field name: its
-        // entries must be disjoint from `profile.invariants`. Overwriting here would accept a
+        // A profile invariant always holds. `variant_pcrs256` is a historical field name: its
+        // entries must be disjoint from `profile.invariants256`. Overwriting here would accept a
         // committed session that on-chain registration rejects
         // (SessionRegistry.PcrVariantOverridesInvariant).
         if specs.contains_key(&spec.pcr_index) {
@@ -400,6 +417,55 @@ fn effective_pcr_specs(
                 )));
             }
             Ok(SessionPcrPolicy {
+                pcr_index: spec.pcr_index,
+                verify_type,
+                match_data: spec.match_data.clone(),
+            })
+        })
+        .collect()
+}
+
+fn effective_pcr_specs384(
+    profile: &MeasurementProfile,
+    variant: &MeasurementVariant,
+) -> Result<Vec<SessionPcrPolicy384>, AttestationClientError> {
+    let mut specs = BTreeMap::new();
+    for spec in &profile.invariants384 {
+        if specs.insert(spec.pcr_index, spec).is_some() {
+            return Err(session_error(format!(
+                "duplicate SHA-384 PCR {} in profile {}",
+                spec.pcr_index, profile.name
+            )));
+        }
+    }
+    let mut variant_indexes = BTreeSet::new();
+    for spec in &variant.variant_pcrs384 {
+        if !variant_indexes.insert(spec.pcr_index) {
+            return Err(session_error(format!(
+                "duplicate SHA-384 PCR {} in variant {}",
+                spec.pcr_index, variant.name
+            )));
+        }
+        if specs.contains_key(&spec.pcr_index) {
+            return Err(session_error(format!(
+                "variant {} pins SHA-384 PCR {} that profile {} declares invariant",
+                variant.name, spec.pcr_index, profile.name
+            )));
+        }
+        specs.insert(spec.pcr_index, spec);
+    }
+    specs
+        .into_values()
+        .map(|spec| {
+            let verify_type = parse_verify_type(&spec.verify_type)?;
+            if verify_type == SessionPcrVerifyType::Static && spec.match_data.len() != 1 {
+                return Err(session_error(format!(
+                    "STATIC SHA-384 PCR {} requires exactly one matchData entry, got {}",
+                    spec.pcr_index,
+                    spec.match_data.len()
+                )));
+            }
+            Ok(SessionPcrPolicy384 {
                 pcr_index: spec.pcr_index,
                 verify_type,
                 match_data: spec.match_data.clone(),
@@ -651,7 +717,7 @@ fn random_challenge() -> Result<[u8; 32], AttestationClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atakit_attestation::{BaseImage, MeasurementPack, PcrSpec};
+    use atakit_attestation::{BaseImage, MeasurementPack, PcrBankSelection, PcrSpec256};
 
     fn profile() -> MeasurementProfile {
         MeasurementProfile {
@@ -659,7 +725,8 @@ mod tests {
             id: format!("0x{}", "11".repeat(32)),
             cloud: "gcp".into(),
             tee: "tdx".into(),
-            invariants: vec![PcrSpec {
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariants256: vec![PcrSpec256 {
                 pcr_index: 4,
                 verify_type: "dynamicSubsequence".into(),
                 match_data: vec![format!("0x{}", "aa".repeat(32))],
@@ -670,9 +737,11 @@ mod tests {
                 name: "c3-standard-4".into(),
                 id: format!("0x{}", "22".repeat(32)),
                 machine_types: vec!["c3-standard-4".into()],
-                override_pcrs: Vec::new(),
+                variant_pcrs256: Vec::new(),
+                variant_pcrs384: Vec::new(),
                 attributes: Vec::new(),
             }],
+            invariants384: Vec::new(),
             attributes: Vec::new(),
         }
     }
@@ -683,7 +752,7 @@ mod tests {
         let policy = MeasurementPolicy {
             source: "test".into(),
             pack: MeasurementPack {
-                schema: "atakit.measurement-pack.v1".into(),
+                schema: "atakit.measurement-pack.v2".into(),
                 revision: 1,
                 published_at: "2026-07-17T00:00:00Z".into(),
                 base_image: BaseImage {
@@ -698,7 +767,7 @@ mod tests {
         };
         let selected = select_profile(&policy, [0x11; 32]).unwrap();
         let variant = select_variant(selected, [0x22; 32], "c3-standard-4").unwrap();
-        let pcrs = effective_pcr_specs(selected, variant).unwrap();
+        let pcrs = effective_pcr_specs256(selected, variant).unwrap();
         assert_eq!(pcrs.len(), 1);
         assert_eq!(
             pcrs[0].verify_type,
@@ -713,7 +782,7 @@ mod tests {
     #[test]
     fn effective_pcr_specs_rejects_variant_pinning_an_invariant() {
         let mut profile = profile();
-        profile.variants[0].override_pcrs = vec![PcrSpec {
+        profile.variants[0].variant_pcrs256 = vec![PcrSpec256 {
             pcr_index: 4,
             verify_type: "static".into(),
             match_data: vec![format!("0x{}", "bb".repeat(32))],
@@ -721,7 +790,7 @@ mod tests {
             total_events: None,
         }];
 
-        let error = effective_pcr_specs(&profile, &profile.variants[0])
+        let error = effective_pcr_specs256(&profile, &profile.variants[0])
             .expect_err("overlap with a profile invariant must be rejected");
         assert!(
             error.to_string().contains("declares invariant"),
@@ -733,7 +802,7 @@ mod tests {
     #[test]
     fn effective_pcr_specs_allows_disjoint_variant() {
         let mut profile = profile();
-        profile.variants[0].override_pcrs = vec![PcrSpec {
+        profile.variants[0].variant_pcrs256 = vec![PcrSpec256 {
             pcr_index: 10,
             verify_type: "static".into(),
             match_data: vec![format!("0x{}", "cc".repeat(32))],
@@ -741,7 +810,7 @@ mod tests {
             total_events: None,
         }];
 
-        let pcrs = effective_pcr_specs(&profile, &profile.variants[0])
+        let pcrs = effective_pcr_specs256(&profile, &profile.variants[0])
             .expect("disjoint variant is allowed");
         let indices: Vec<u8> = pcrs.iter().map(|spec| spec.pcr_index).collect();
         assert_eq!(indices, vec![4, 10]);
@@ -750,13 +819,13 @@ mod tests {
     #[test]
     fn effective_pcr_specs_rejects_static_without_exactly_one_match_data_entry() {
         let mut profile = profile();
-        profile.invariants[0].verify_type = "static".into();
-        profile.invariants[0].match_data = vec![
+        profile.invariants256[0].verify_type = "static".into();
+        profile.invariants256[0].match_data = vec![
             format!("0x{}", "aa".repeat(32)),
             format!("0x{}", "bb".repeat(32)),
         ];
 
-        let error = effective_pcr_specs(&profile, &profile.variants[0])
+        let error = effective_pcr_specs256(&profile, &profile.variants[0])
             .expect_err("STATIC with two matchData entries must be rejected");
         assert!(
             error

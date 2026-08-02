@@ -112,7 +112,7 @@ done
 config_file=$(mktemp /tmp/config-XXXXXX.json)
 cat > "$config_file" <<EOF
 {
-  "format": 2,
+  "format": 3,
   "chain": {
     "registration": "required",
     "rpc_url": "${RPC_URL}",

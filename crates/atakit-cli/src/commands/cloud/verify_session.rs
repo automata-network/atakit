@@ -108,10 +108,10 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         .base_image_id
         .ok_or_else(|| anyhow::anyhow!("TLS verification did not select a base image ID"))?;
     eprint!("Verify current session... ");
-    let verified = if let Some(client) = chain_client
-        .as_ref()
-        .filter(|_| args.verification.trusted_workload_pcr23.is_none())
-    {
+    let verified = if let Some(client) = chain_client.as_ref().filter(|_| {
+        args.verification.trusted_workload_pcr23_sha256.is_none()
+            && args.verification.trusted_workload_pcr23_sha384.is_none()
+    }) {
         client
             .verify_current_session(
                 &verified_tls,
@@ -125,7 +125,8 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     } else {
         let workload_policy = resolve_verifier_workload_policy(
             &subject.workload_ref,
-            args.verification.trusted_workload_pcr23.as_deref(),
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
             chain_client.as_ref(),
             base_image_id,
         )

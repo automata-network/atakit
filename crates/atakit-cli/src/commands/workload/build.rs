@@ -143,7 +143,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             Some(mut existing) => {
                 existing.workload_id = format!("0x{}", hex::encode(workload_id));
                 existing.sha256 = Some(inspect.sha256);
-                existing.pcr23 = Some(inspect.pcr23);
+                existing.pcr23 = Some(inspect.pcr23_sha256);
                 existing.archive_size = Some(size);
                 existing.added_at = now;
                 existing
@@ -153,7 +153,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                 name: name.clone(),
                 version: version.clone(),
                 sha256: Some(inspect.sha256),
-                pcr23: Some(inspect.pcr23),
+                pcr23: Some(inspect.pcr23_sha256),
                 owner: None,
                 archive_size: Some(size),
                 on_chain_spec: None,

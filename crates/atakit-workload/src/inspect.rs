@@ -1,7 +1,7 @@
 use std::io::{Cursor, Read, Seek};
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 
 use crate::data::DataRoots;
 use crate::image::ContainerEngine;
@@ -31,7 +31,11 @@ pub struct InspectResult {
     /// SHA-256 of manifest bytes as `0x<64-hex-chars>` (the event hash).
     pub sha256: String,
     /// Final PCR23 register value as `0x<64-hex-chars>`: `SHA-256(zeros_32 || sha256)`.
-    pub pcr23: String,
+    pub pcr23_sha256: String,
+    /// Final SHA-384 PCR23 register value.
+    pub pcr23_sha384: String,
+    /// SHA-384 of manifest bytes as `0x<96-hex-chars>`.
+    pub sha384: String,
     /// SHA-256 hash of the manifest as `sha256:<64-hex-chars>`.
     pub manifest_hash: String,
     /// Parsed manifest.
@@ -426,11 +430,19 @@ fn compute_pcr_result(
     let mut extend_hasher = Sha256::new();
     extend_hasher.update([0u8; 32]);
     extend_hasher.update(event_hash);
-    let pcr23_hex = format!("0x{:x}", extend_hasher.finalize());
+    let pcr23_sha256 = format!("0x{:x}", extend_hasher.finalize());
+
+    let event_hash384 = Sha384::digest(manifest_raw.as_bytes());
+    let mut extend_hasher384 = Sha384::new();
+    extend_hasher384.update([0u8; 48]);
+    extend_hasher384.update(event_hash384);
+    let pcr23_sha384 = format!("0x{:x}", extend_hasher384.finalize());
 
     Ok(InspectResult {
         sha256: format!("0x{hex}"),
-        pcr23: pcr23_hex,
+        pcr23_sha256,
+        pcr23_sha384,
+        sha384: format!("0x{:x}", event_hash384),
         manifest_hash: format!("sha256:{hex}"),
         manifest,
         manifest_raw,
@@ -489,7 +501,7 @@ mod tests {
     fn event_hash_and_pcr23_are_distinct() {
         let result = build_result_json(minimal_manifest_json()).unwrap();
         assert_ne!(
-            result.sha256, result.pcr23,
+            result.sha256, result.pcr23_sha256,
             "event hash (sha256) and final PCR23 must be different values"
         );
     }
@@ -512,7 +524,7 @@ mod tests {
             format!("0x{:x}", h.finalize())
         };
 
-        assert_eq!(result.pcr23, expected_pcr23);
+        assert_eq!(result.pcr23_sha256, expected_pcr23);
         assert_eq!(result.sha256, format!("0x{:x}", event_hash));
     }
 
@@ -523,8 +535,8 @@ mod tests {
         assert!(result.sha256.starts_with("0x"));
         assert_eq!(result.sha256.len(), 66);
 
-        assert!(result.pcr23.starts_with("0x"));
-        assert_eq!(result.pcr23.len(), 66);
+        assert!(result.pcr23_sha256.starts_with("0x"));
+        assert_eq!(result.pcr23_sha256.len(), 66);
 
         assert!(result.manifest_hash.starts_with("sha256:"));
 

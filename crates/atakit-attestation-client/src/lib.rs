@@ -16,8 +16,9 @@ use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use atakit_attestation::{
     AmdSnpSecurityPolicy, AzureMaaTrustKey, BaseImage, MeasurementPack, MeasurementPolicy,
-    MeasurementProfile, MeasurementVariant, PcrSpec, SessionAttributeRequirement, SessionPcrPolicy,
-    SessionPcrVerifyType, TrustedSessionBinding,
+    MeasurementProfile, MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384,
+    SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, SessionPcrVerifyType,
+    TrustedSessionBinding,
 };
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
@@ -68,7 +69,8 @@ pub struct ChainVerificationContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedWorkloadSessionPolicy {
     pub workload_id: [u8; 32],
-    pub pcr_specs: Vec<SessionPcrPolicy>,
+    pub pcr_specs256: Vec<SessionPcrPolicy>,
+    pub pcr_specs384: Vec<SessionPcrPolicy384>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
 }
 
@@ -649,10 +651,15 @@ fn hierarchy_to_measurement_policy(
                     name: variant.name.clone(),
                     id: hex0x(variant_id),
                     machine_types: vec![variant.name.clone()],
-                    override_pcrs: variant
-                        .overridePcrs
+                    variant_pcrs256: variant
+                        .variantPcrs256
                         .iter()
-                        .map(chain_pcr_spec_to_measurement)
+                        .map(chain_pcr_spec256_to_measurement)
+                        .collect(),
+                    variant_pcrs384: variant
+                        .variantPcrs384
+                        .iter()
+                        .map(chain_pcr_spec384_to_measurement)
                         .collect(),
                     attributes: variant
                         .attributes
@@ -671,11 +678,18 @@ fn hierarchy_to_measurement_policy(
                 id: hex0x(profile.profile_id),
                 cloud: cloud.to_string(),
                 tee: tee.to_string(),
-                invariants: profile
+                pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
+                invariants256: profile
                     .profile
-                    .invariants
+                    .invariants256
                     .iter()
-                    .map(chain_pcr_spec_to_measurement)
+                    .map(chain_pcr_spec256_to_measurement)
+                    .collect(),
+                invariants384: profile
+                    .profile
+                    .invariants384
+                    .iter()
+                    .map(chain_pcr_spec384_to_measurement)
                     .collect(),
                 variants,
                 attributes: profile
@@ -696,7 +710,7 @@ fn hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v1".to_string(),
+            schema: "atakit.measurement-pack.v2".to_string(),
             revision: 1,
             published_at: chrono::Utc::now().to_rfc3339(),
             base_image: BaseImage {
@@ -711,10 +725,10 @@ fn hierarchy_to_measurement_policy(
     })
 }
 
-fn chain_pcr_spec_to_measurement(
-    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec,
-) -> PcrSpec {
-    PcrSpec {
+fn chain_pcr_spec256_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256,
+) -> PcrSpec256 {
+    PcrSpec256 {
         pcr_index: spec.pcrIndex,
         verify_type: match spec.verifyType {
             0 => "static".to_string(),
@@ -725,6 +739,45 @@ fn chain_pcr_spec_to_measurement(
         match_data: spec.matchData.iter().map(hex0x).collect(),
         event_indices: Vec::new(),
         total_events: None,
+    }
+}
+
+fn chain_pcr_spec384_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec384,
+) -> PcrSpec384 {
+    PcrSpec384 {
+        pcr_index: spec.pcrIndex,
+        verify_type: chain_verify_type(spec.verifyType as u8),
+        match_data: spec
+            .matchData
+            .iter()
+            .map(|value| {
+                let mut bytes = [0u8; 48];
+                bytes[..32].copy_from_slice(value.first.as_slice());
+                bytes[32..].copy_from_slice(value.second.as_slice());
+                hex0x(&bytes)
+            })
+            .collect(),
+        event_indices: Vec::new(),
+        total_events: None,
+    }
+}
+
+fn chain_verify_type(value: u8) -> String {
+    match value {
+        0 => "static".to_string(),
+        1 => "dynamicSubset".to_string(),
+        2 => "dynamicSubsequence".to_string(),
+        other => format!("unknown-{other}"),
+    }
+}
+
+fn chain_pcr_bank_selection(value: u8) -> PcrBankSelection {
+    match value {
+        0 => PcrBankSelection::Sha256,
+        1 => PcrBankSelection::Sha384,
+        2 => PcrBankSelection::Sha256AndSha384,
+        _ => unreachable!("Solidity enum decoder rejects invalid values"),
     }
 }
 
@@ -775,8 +828,8 @@ fn trusted_workload_policy(
         B256::from(selected_base_image_id),
     )?;
 
-    let pcr_specs = spec
-        .pcrs
+    let pcr_specs256 = spec
+        .workloadPcrs256
         .iter()
         .map(|spec| {
             let verify_type = match spec.verifyType {
@@ -797,6 +850,37 @@ fn trusted_workload_policy(
             })
         })
         .collect::<Result<Vec<_>, AttestationClientError>>()?;
+    let pcr_specs384 = spec
+        .workloadPcrs384
+        .iter()
+        .map(|spec| {
+            let verify_type = match spec.verifyType {
+                0 => SessionPcrVerifyType::Static,
+                1 => SessionPcrVerifyType::DynamicSubset,
+                2 => SessionPcrVerifyType::DynamicSubsequence,
+                value => {
+                    return Err(AttestationClientError::WorkloadPolicy(format!(
+                    "trusted WorkloadSpec has unsupported SHA-384 PCR verifyType {value} for PCR{}",
+                    spec.pcrIndex
+                )))
+                }
+            };
+            Ok(SessionPcrPolicy384 {
+                pcr_index: spec.pcrIndex,
+                verify_type,
+                match_data: spec
+                    .matchData
+                    .iter()
+                    .map(|value| {
+                        let mut bytes = [0u8; 48];
+                        bytes[..32].copy_from_slice(value.first.as_slice());
+                        bytes[32..].copy_from_slice(value.second.as_slice());
+                        hex0x(&bytes)
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let attribute_requirements = spec
         .requirements
         .iter()
@@ -812,7 +896,8 @@ fn trusted_workload_policy(
 
     Ok(TrustedWorkloadSessionPolicy {
         workload_id,
-        pcr_specs,
+        pcr_specs256,
+        pcr_specs384,
         attribute_requirements,
     })
 }

@@ -8,8 +8,8 @@ use owo_colors::OwoColorize;
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
-    resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
-    synthesize_off_init_chain, synthesize_self_generated_key,
+    resolve_init_pcr_policy, resolve_tls_measurement_policy, resolve_unmeasured_tar,
+    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -121,15 +121,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .collect();
     let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
 
-    let init_config = InitConfig {
+    let mut init_config = InitConfig {
         platform: args.platform.clone(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
         prover_credential: prover_init,
+        pcr_policy: None,
         disks: disk_passphrases,
     };
+    if !registration_off && args.pcr_policy.is_some() {
+        bail!("--pcr-policy requires effective chain registration = \"off\"");
+    }
     let initialization_timeout_secs = init::initialization_timeout_seconds(
         args.init_timeout,
         init_config.owner_operations.op_expiry_seconds,
@@ -188,13 +192,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!("{}", "done".green());
 
     eprint!("  [2/{step_count}] Verify portal TLS... ");
-    let portal_client = if args.unsafe_skip_tls_attestation {
+    let verified_tls = if args.unsafe_skip_tls_attestation {
         eprintln!("{}", "unsafe bypass".yellow());
         crate::commands::cloud::warn_unsafe_skip_tls_attestation();
-        init::unsafe_portal_client(std::time::Duration::from_secs(
-            init::PORTAL_READINESS_TIMEOUT_SECONDS,
-        ))
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        None
     } else {
         let measurement_policy = resolve_tls_measurement_policy(
             args.measurements.as_deref(),
@@ -248,8 +249,24 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         } else {
             eprintln!("{}", "done".green());
         }
-        verified_tls.client
+        Some(verified_tls)
     };
+    let portal_client = match &verified_tls {
+        Some(verified) => verified.client.clone(),
+        None => init::unsafe_portal_client(std::time::Duration::from_secs(
+            init::PORTAL_READINESS_TIMEOUT_SECONDS,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+    init_config.pcr_policy = resolve_init_pcr_policy(
+        args.pcr_policy.as_deref(),
+        &init_config,
+        registration_off,
+        verified_tls.as_ref(),
+        &workload_name,
+        &workload_version,
+    )
+    .await?;
 
     // 7. Initialize workload.
     eprintln!("  [3/{step_count}] Initialize workload...");

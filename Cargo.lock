@@ -1508,9 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "automata-tee-workload-measurement"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c869627fd4a369b891700c46a2f47956259a5662a377ee6bc18eb6397f3b7fa8"
+version = "0.2.0"
 dependencies = [
  "alloy-ext",
  "anyhow",

@@ -17,11 +17,11 @@ use base64::Engine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 use sha3::Keccak256;
 use signature::{hazmat::PrehashVerifier, Verifier};
 
-use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral};
+use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral, PcrBankSelection};
 
 const SESSION_DOMAIN: &str = "CVM_SESSION_V1";
 const KEY_DOMAIN: &str = "KEY_RESOLVER_V1";
@@ -97,14 +97,15 @@ pub struct AkEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TpmQuoteEvidence {
-    pub tpm2b_attest: String,
+    pub tpms_attest: String,
     pub tpm_signature: String,
     pub signature_hash: String,
+    pub pcr0_startup_locality: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TpmCertifyEvidence {
-    pub tpm2b_attest: String,
+    pub tpms_attest: String,
     pub tpm_signature: String,
     pub tpmt_public: String,
 }
@@ -112,7 +113,7 @@ pub struct TpmCertifyEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPcrValue {
     pub index: u8,
-    pub sha256: String,
+    pub sha256: Option<String>,
     pub sha384: Option<String>,
 }
 
@@ -120,6 +121,7 @@ pub struct SessionPcrValue {
 pub struct SessionEventHashes {
     pub pcr_index: u8,
     pub sha256: Vec<String>,
+    pub sha384: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,11 +145,20 @@ pub struct SessionPolicy {
     pub base_image_id: String,
     pub platform_profile_id: String,
     pub measurement_variant_id: String,
-    pub pcr_specs: Vec<SessionPcrPolicy>,
+    pub pcr_bank_selection: PcrBankSelection,
+    pub pcr_specs256: Vec<SessionPcrPolicy>,
+    pub pcr_specs384: Vec<SessionPcrPolicy384>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPcrPolicy {
+    pub pcr_index: u8,
+    pub verify_type: SessionPcrVerifyType,
+    pub match_data: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPcrPolicy384 {
     pub pcr_index: u8,
     pub verify_type: SessionPcrVerifyType,
     pub match_data: Vec<String>,
@@ -263,7 +274,9 @@ pub struct TrustedSessionPolicy {
     pub base_image_id: [u8; 32],
     pub platform_profile_id: [u8; 32],
     pub measurement_variant_id: [u8; 32],
-    pub pcr_specs: Vec<SessionPcrPolicy>,
+    pub pcr_bank_selection: PcrBankSelection,
+    pub pcr_specs256: Vec<SessionPcrPolicy>,
+    pub pcr_specs384: Vec<SessionPcrPolicy384>,
     pub effective_attributes: Vec<SessionAttribute>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
     /// AMD SEV-SNP registry defaults supplied by the verifier or read from
@@ -644,8 +657,8 @@ fn verify_gcp_platform(
         errors,
     );
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let quote_signature = decode_b64(
@@ -698,7 +711,7 @@ fn verify_gcp_platform(
         .iter()
         .map(|pcr| super::PcrEvidence {
             index: pcr.index,
-            sha256: Some(pcr.sha256.clone()),
+            sha256: pcr.sha256.clone(),
             sha384: pcr.sha384.clone(),
         })
         .collect::<Vec<_>>();
@@ -762,8 +775,8 @@ fn verify_azure_platform(
 ) -> Option<u16> {
     let binding = azure_ak_binding(bundle, errors)?;
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let quote_signature = decode_b64(
@@ -1052,8 +1065,8 @@ fn verify_raw_quote(
     errors: &mut Vec<String>,
 ) -> Option<Vec<super::PcrEvidence>> {
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let signature = decode_b64(
@@ -1089,7 +1102,7 @@ fn verify_raw_quote(
         .iter()
         .map(|pcr| super::PcrEvidence {
             index: pcr.index,
-            sha256: Some(pcr.sha256.clone()),
+            sha256: pcr.sha256.clone(),
             sha384: pcr.sha384.clone(),
         })
         .collect::<Vec<_>>();
@@ -1164,8 +1177,8 @@ fn verify_raw_certify(
     errors: &mut Vec<String>,
 ) {
     let attest = decode_b64(
-        &bundle.tpm_certify.tpm2b_attest,
-        "tpm_certify.tpm2b_attest",
+        &bundle.tpm_certify.tpms_attest,
+        "tpm_certify.tpms_attest",
         errors,
     );
     let signature = decode_b64(
@@ -1187,7 +1200,7 @@ fn verify_raw_certify(
     else {
         return;
     };
-    let body = match super::verification_core::tpm2b_attest_body(&attest) {
+    let body = match super::verification_core::tpms_attest_body(&attest) {
         Ok(body) => body,
         Err(detail) => {
             record(checks, errors, "tpm-certify-structure", false, &detail);
@@ -1510,6 +1523,117 @@ pub fn evaluate_session_pcr_policy(
 ) -> std::result::Result<(), String> {
     super::verification_core::evaluate_pcr_policy(policy, measured_value, measured_events)
 }
+
+fn evaluate_session_pcr_policy_with_startup_locality(
+    policy: &SessionPcrPolicy,
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    evaluate_landmark_policy(
+        policy.verify_type,
+        policy
+            .match_data
+            .iter()
+            .map(|value| decode_hex_array(value))
+            .collect::<Result<Vec<_>, _>>()?,
+        measured_value,
+        measured_events,
+        policy.pcr_index,
+        startup_locality,
+        |input| Sha256::digest(input).into(),
+    )
+}
+
+fn evaluate_session_pcr_policy384(
+    policy: &SessionPcrPolicy384,
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    evaluate_landmark_policy(
+        policy.verify_type,
+        policy
+            .match_data
+            .iter()
+            .map(|value| decode_hex_48(value))
+            .collect::<Result<Vec<_>, _>>()?,
+        measured_value,
+        measured_events,
+        policy.pcr_index,
+        startup_locality,
+        |input| Sha384::digest(input).into(),
+    )
+}
+
+fn evaluate_landmark_policy<const N: usize>(
+    verify_type: SessionPcrVerifyType,
+    expected: Vec<[u8; N]>,
+    measured_value: [u8; N],
+    measured_events: &[[u8; N]],
+    pcr_index: u8,
+    startup_locality: u8,
+    hash: impl Fn(&[u8]) -> [u8; N],
+) -> std::result::Result<(), String> {
+    match verify_type {
+        SessionPcrVerifyType::Static => {
+            if expected.len() != 1 {
+                return Err(format!(
+                    "STATIC policy requires exactly one match_data entry, got {}",
+                    expected.len()
+                ));
+            }
+            if measured_value != expected[0] {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        SessionPcrVerifyType::DynamicSubset => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSET policy or measured event log is empty".to_string());
+            }
+            if expected
+                .iter()
+                .any(|required| !measured_events.contains(required))
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+        }
+        SessionPcrVerifyType::DynamicSubsequence => {
+            if expected.is_empty() || measured_events.is_empty() {
+                return Err("DYNAMIC_SUBSEQUENCE policy or measured event log is empty".to_string());
+            }
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected.get(landmark) == Some(event) {
+                    landmark += 1;
+                }
+            }
+            if landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+        }
+    }
+
+    if startup_locality != 0xff && startup_locality > 4 {
+        return Err(format!("invalid PCR0 StartupLocality {startup_locality}"));
+    }
+    let mut replay = [0u8; N];
+    if pcr_index == 0 && startup_locality != 0xff {
+        replay[N - 1] = startup_locality;
+    }
+    for event in measured_events {
+        let mut input = Vec::with_capacity(N * 2);
+        input.extend_from_slice(&replay);
+        input.extend_from_slice(event);
+        replay = hash(&input);
+    }
+    if replay == measured_value {
+        Ok(())
+    } else {
+        Err("PCR event replay does not match measured value".to_string())
+    }
+}
 fn verify_binding(
     bundle: &SessionEvidenceBundle,
     trusted: Option<&TrustedSessionBinding>,
@@ -1636,11 +1760,14 @@ fn verify_policies(
         checks,
         errors,
         "trusted-pcr-policy-projection",
-        bundle.policy.pcr_specs.is_empty() || bundle.policy.pcr_specs == trusted.pcr_specs,
+        bundle.policy.pcr_specs256.is_empty() && bundle.policy.pcr_specs384.is_empty()
+            || (bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
+                && bundle.policy.pcr_specs256 == trusted.pcr_specs256
+                && bundle.policy.pcr_specs384 == trusted.pcr_specs384),
         "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
     );
     verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
-    if trusted.pcr_specs.is_empty() {
+    if trusted.pcr_specs256.is_empty() && trusted.pcr_specs384.is_empty() {
         record(
             checks,
             errors,
@@ -1651,8 +1778,8 @@ fn verify_policies(
         return;
     }
 
-    for policy in &trusted.pcr_specs {
-        let name = format!("pcr-policy-{}", policy.pcr_index);
+    for policy in &trusted.pcr_specs256 {
+        let name = format!("pcr-policy-sha256-{}", policy.pcr_index);
         let Some(value) = bundle
             .pcr_values
             .iter()
@@ -1661,7 +1788,11 @@ fn verify_policies(
             record(checks, errors, &name, false, "PCR value is absent");
             continue;
         };
-        let Some(measured) = decode_hex_32(&value.sha256, "pcr_values.sha256", errors) else {
+        let Some(measured_value) = value.sha256.as_deref() else {
+            record(checks, errors, &name, false, "SHA-256 PCR value is absent");
+            continue;
+        };
+        let Some(measured) = decode_hex_32(measured_value, "pcr_values.sha256", errors) else {
             continue;
         };
         let events = bundle
@@ -1677,10 +1808,58 @@ fn verify_policies(
             })
             .transpose();
         match events {
-            Ok(events) => match evaluate_session_pcr_policy(
+            Ok(events) => match evaluate_session_pcr_policy_with_startup_locality(
                 policy,
                 measured,
                 events.as_deref().unwrap_or_default(),
+                bundle.tpm_quote.pcr0_startup_locality,
+            ) {
+                Ok(()) => record(checks, errors, &name, true, ""),
+                Err(detail) => record(checks, errors, &name, false, &detail),
+            },
+            Err(detail) => record(checks, errors, &name, false, &detail),
+        }
+    }
+
+    for policy in &trusted.pcr_specs384 {
+        let name = format!("pcr-policy-sha384-{}", policy.pcr_index);
+        let Some(value) = bundle
+            .pcr_values
+            .iter()
+            .find(|value| value.index == policy.pcr_index)
+        else {
+            record(checks, errors, &name, false, "PCR value is absent");
+            continue;
+        };
+        let Some(measured_value) = value.sha384.as_deref() else {
+            record(checks, errors, &name, false, "SHA-384 PCR value is absent");
+            continue;
+        };
+        let measured = match decode_hex_48(measured_value) {
+            Ok(value) => value,
+            Err(detail) => {
+                record(checks, errors, &name, false, &detail);
+                continue;
+            }
+        };
+        let events = bundle
+            .event_log_hashes
+            .iter()
+            .find(|events| events.pcr_index == policy.pcr_index)
+            .map(|events| {
+                events
+                    .sha384
+                    .iter()
+                    .map(|event| decode_hex_48(event))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .transpose();
+        match events {
+            Ok(events) => match evaluate_session_pcr_policy384(
+                policy,
+                measured,
+                events.as_deref().unwrap_or_default(),
+                bundle.tpm_quote.pcr0_startup_locality,
             ) {
                 Ok(()) => record(checks, errors, &name, true, ""),
                 Err(detail) => record(checks, errors, &name, false, &detail),
@@ -2309,6 +2488,14 @@ fn decode_hex_array(value: &str) -> Result<[u8; 32], String> {
         .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, got {}", bytes.len()))
 }
 
+fn decode_hex_48(value: &str) -> Result<[u8; 48], String> {
+    let raw = value.strip_prefix("0x").ok_or("missing 0x prefix")?;
+    let bytes = hex::decode(raw).map_err(|error| error.to_string())?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("expected 48 bytes, got {}", bytes.len()))
+}
+
 fn keccak(bytes: &[u8]) -> [u8; 32] {
     Keccak256::digest(bytes).into()
 }
@@ -2551,18 +2738,19 @@ mod tests {
                 collateral: String::new(),
             },
             tpm_quote: TpmQuoteEvidence {
-                tpm2b_attest: String::new(),
+                tpms_attest: String::new(),
                 tpm_signature: String::new(),
                 signature_hash: format!("0x{}", "00".repeat(32)),
+                pcr0_startup_locality: 0,
             },
             tpm_certify: TpmCertifyEvidence {
-                tpm2b_attest: String::new(),
+                tpms_attest: String::new(),
                 tpm_signature: String::new(),
                 tpmt_public: String::new(),
             },
             pcr_values: vec![SessionPcrValue {
                 index: 7,
-                sha256: format!("0x{}", "11".repeat(32)),
+                sha256: Some(format!("0x{}", "11".repeat(32))),
                 sha384: None,
             }],
             event_log_hashes: Vec::new(),
@@ -2737,7 +2925,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: vec![pcr.clone()],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: vec![pcr.clone()],
         };
         let bundle = bundle_for_policy(policy);
         let trusted = TrustedSessionPolicy {
@@ -2745,7 +2935,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: vec![pcr],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: vec![pcr],
             effective_attributes: vec![SessionAttribute {
                 key: [0x10; 32],
                 value: [0x20; 32],
@@ -2825,7 +3017,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -2837,7 +3031,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
             effective_attributes: vec![SessionAttribute {
                 key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
                 value: atakit_core::tee_attributes::ATTRIBUTE_TRUE,
@@ -2899,7 +3095,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let bundle = tdx_bundle_for_policy(policy);
         let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
@@ -2909,7 +3107,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
             effective_attributes: vec![SessionAttribute {
                 key,
                 value: relaxed_mask,
@@ -2968,7 +3168,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -2990,7 +3192,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3029,7 +3233,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3048,7 +3254,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3106,7 +3314,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3133,7 +3343,9 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
             effective_attributes: vec![
                 SessionAttribute {
                     key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
@@ -3206,7 +3418,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
 
         for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN {
@@ -3279,7 +3493,9 @@ mod tests {
                             base_image_id: [2; 32],
                             platform_profile_id: [3; 32],
                             measurement_variant_id: [4; 32],
-                            pcr_specs: Vec::new(),
+                            pcr_bank_selection: PcrBankSelection::Sha256,
+                            pcr_specs384: Vec::new(),
+                            pcr_specs256: Vec::new(),
                             effective_attributes,
                             attribute_requirements,
                             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3326,7 +3542,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut quote = vec![0u8; crate::TDX_QUOTE_HEADER_LEN + 6 + 648];
@@ -3391,7 +3609,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         });
         bundle.platform.cloud = "gcp".into();
         bundle.platform.tee = "sev-snp".into();
@@ -3434,7 +3654,9 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         });
         let mut checks = Vec::new();
         let mut errors = Vec::new();
@@ -3471,16 +3693,19 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
             sha256: Vec::new(),
+            sha384: Vec::new(),
         }];
         bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
         let authenticated = vec![crate::PcrEvidence {
             index: 7,
-            sha256: Some(bundle.pcr_values[0].sha256.clone()),
+            sha256: bundle.pcr_values[0].sha256.clone(),
             sha384: bundle.pcr_values[0].sha384.clone(),
         }];
         let mut checks = Vec::new();
@@ -3498,11 +3723,14 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
             sha256: Vec::new(),
+            sha384: Vec::new(),
         }];
         bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
         let authenticated = vec![crate::PcrEvidence {

@@ -5,8 +5,8 @@ use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
-    BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrVerifyType,
-    TrustedSessionBinding, VerifiedSession,
+    BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384,
+    SessionPcrVerifyType, TrustedSessionBinding, VerifiedSession,
 };
 use atakit_cloud::cli::SessionVerificationArgs;
 use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
@@ -28,7 +28,8 @@ use crate::config::{ChainConfig, Config};
 /// provide the exact WorkloadSpec.
 pub(crate) async fn resolve_verifier_workload_policy(
     workload_ref: &str,
-    trusted_workload_pcr23: Option<&str>,
+    trusted_workload_pcr23_sha256: Option<&str>,
+    trusted_workload_pcr23_sha384: Option<&str>,
     chain_client: Option<&atakit_attestation_client::AttestationClient>,
     selected_base_image_id: [u8; 32],
 ) -> Result<TrustedWorkloadSessionPolicy> {
@@ -38,20 +39,33 @@ pub(crate) async fn resolve_verifier_workload_policy(
     };
     let workload_id = crate::commands::workload::compute_workload_id(&name, &version).0;
 
-    if let Some(value) = trusted_workload_pcr23 {
-        return Ok(TrustedWorkloadSessionPolicy {
-            workload_id,
-            pcr_specs: vec![static_pcr23_policy(decode_hex_32(
-                value,
-                "--trusted-workload-pcr23",
-            )?)],
-            attribute_requirements: Vec::new(),
-        });
+    match (
+        trusted_workload_pcr23_sha256,
+        trusted_workload_pcr23_sha384,
+    ) {
+        (Some(sha256), Some(sha384)) => {
+            return Ok(TrustedWorkloadSessionPolicy {
+                workload_id,
+                pcr_specs256: vec![static_pcr23_policy(decode_hex_32(
+                    sha256,
+                    "--trusted-workload-pcr23-sha256",
+                )?)],
+                pcr_specs384: vec![static_pcr23_policy384(decode_hex_48(
+                    sha384,
+                    "--trusted-workload-pcr23-sha384",
+                )?)],
+                attribute_requirements: Vec::new(),
+            });
+        }
+        (None, None) => {}
+        _ => bail!(
+            "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
+        ),
     }
 
     let Some(chain_client) = chain_client else {
         bail!(
-            "no trusted workload collateral is available; select a verifier chain with --chain or provide --trusted-workload-pcr23"
+            "no trusted workload collateral is available; select a verifier chain with --chain or provide both --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384"
         );
     };
     chain_client
@@ -360,7 +374,16 @@ async fn resolve_trusted_workload_policy(
 ) -> Result<TrustedWorkloadSessionPolicy> {
     let registry_available =
         init_chain.workload_registry != super::ZERO_ADDR && !init_chain.rpc_url.trim().is_empty();
-    let manual_pcr23 = verification.trusted_workload_pcr23.as_deref();
+    let manual_pcr23 = match (
+        verification.trusted_workload_pcr23_sha256.as_deref(),
+        verification.trusted_workload_pcr23_sha384.as_deref(),
+    ) {
+        (Some(sha256), Some(sha384)) => Some((sha256, sha384)),
+        (None, None) => None,
+        _ => bail!(
+            "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
+        ),
+    };
     let mut policy = if !registration_is_off(registration) || registry_available {
         load_registered_workload_policy(
             &state.workload_name,
@@ -375,18 +398,25 @@ async fn resolve_trusted_workload_policy(
     } else if manual_pcr23.is_some() {
         TrustedWorkloadSessionPolicy {
             workload_id,
-            pcr_specs: Vec::new(),
+            pcr_specs256: Vec::new(),
+            pcr_specs384: Vec::new(),
             attribute_requirements: Vec::new(),
         }
     } else {
         load_local_workload_policy(state, workload_id).await?
     };
 
-    if let Some(value) = manual_pcr23 {
-        policy.pcr_specs.push(static_pcr23_policy(decode_hex_32(
-            value,
-            "--trusted-workload-pcr23",
+    if let Some((sha256, sha384)) = manual_pcr23 {
+        policy.pcr_specs256.push(static_pcr23_policy(decode_hex_32(
+            sha256,
+            "--trusted-workload-pcr23-sha256",
         )?));
+        policy
+            .pcr_specs384
+            .push(static_pcr23_policy384(decode_hex_48(
+                sha384,
+                "--trusted-workload-pcr23-sha384",
+            )?));
     }
     Ok(policy)
 }
@@ -454,8 +484,8 @@ fn trusted_policy_from_workload_spec(
         B256::from(selected_base_image_id),
     )?;
 
-    let pcr_specs = spec
-        .pcrs
+    let pcr_specs256 = spec
+        .workloadPcrs256
         .iter()
         .map(|spec| {
             Ok(SessionPcrPolicy {
@@ -477,6 +507,34 @@ fn trusted_policy_from_workload_spec(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let pcr_specs384 = spec
+        .workloadPcrs384
+        .iter()
+        .map(|spec| {
+            Ok(SessionPcrPolicy384 {
+                pcr_index: spec.pcrIndex,
+                verify_type: match spec.verifyType {
+                    0 => SessionPcrVerifyType::Static,
+                    1 => SessionPcrVerifyType::DynamicSubset,
+                    2 => SessionPcrVerifyType::DynamicSubsequence,
+                    value => bail!(
+                        "trusted WorkloadSpec has unsupported SHA-384 PCR verifyType {value} for PCR{}",
+                        spec.pcrIndex
+                    ),
+                },
+                match_data: spec
+                    .matchData
+                    .iter()
+                    .map(|value| {
+                        let mut bytes = [0u8; 48];
+                        bytes[..32].copy_from_slice(value.first.as_slice());
+                        bytes[32..].copy_from_slice(value.second.as_slice());
+                        format!("0x{}", hex::encode(bytes))
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let attribute_requirements = spec
         .requirements
         .iter()
@@ -492,7 +550,8 @@ fn trusted_policy_from_workload_spec(
 
     Ok(TrustedWorkloadSessionPolicy {
         workload_id,
-        pcr_specs,
+        pcr_specs256,
+        pcr_specs384,
         attribute_requirements,
     })
 }
@@ -504,7 +563,7 @@ async fn load_local_workload_policy(
     let archive_path = Path::new(&state.archive_path);
     if archive_path.extension().and_then(|value| value.to_str()) != Some("atawl") {
         bail!(
-            "saved workload archive {} is not a .atawl file; provide --trusted-workload-pcr23",
+            "saved workload archive {} is not a .atawl file; provide both --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384",
             archive_path.display()
         );
     }
@@ -549,9 +608,13 @@ async fn load_local_workload_policy(
 
     Ok(TrustedWorkloadSessionPolicy {
         workload_id,
-        pcr_specs: vec![static_pcr23_policy(decode_hex_32(
-            &inspection.pcr23,
+        pcr_specs256: vec![static_pcr23_policy(decode_hex_32(
+            &inspection.pcr23_sha256,
             "trusted workload archive PCR23",
+        )?)],
+        pcr_specs384: vec![static_pcr23_policy384(decode_hex_48(
+            &inspection.pcr23_sha384,
+            "trusted workload archive SHA-384 PCR23",
         )?)],
         attribute_requirements: inspection
             .manifest
@@ -595,12 +658,28 @@ pub(crate) fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
     }
 }
 
+pub(crate) fn static_pcr23_policy384(value: [u8; 48]) -> SessionPcrPolicy384 {
+    SessionPcrPolicy384 {
+        pcr_index: 23,
+        verify_type: SessionPcrVerifyType::Static,
+        match_data: vec![format!("0x{}", hex::encode(value))],
+    }
+}
+
 pub(crate) fn decode_hex_32(value: &str, label: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
         .with_context(|| format!("decode {label} as hex"))?;
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("{label} must be exactly 32 bytes"))
+}
+
+pub(crate) fn decode_hex_48(value: &str, label: &str) -> Result<[u8; 48]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .with_context(|| format!("decode {label} as hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label} must be exactly 48 bytes"))
 }
 
 fn required_binding_for_registration(registration: Option<&str>) -> Option<BindingMode> {
@@ -618,7 +697,7 @@ mod tests {
 
     use atakit_cloud::{NewDeployParams, PersistedInitEnv, PlatformKind, PortalPorts};
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, PcrSpec,
+        AttributeRequirement, PcrSpec256,
     };
     use tempfile::TempDir;
 
@@ -767,25 +846,26 @@ mod tests {
         let spec = WorkloadSpec {
             name: "test".into(),
             version: "v0.0.1".into(),
-            ttl: 0,
+            sessionTtl: 0,
             baseImageMode: 2,
             baseImageIds: vec![selected_base_image],
             requirements: vec![AttributeRequirement {
                 key: B256::repeat_byte(0xaa),
                 allowedValues: vec![B256::repeat_byte(0xbb)],
             }],
-            pcrs: vec![
-                PcrSpec {
+            workloadPcrs256: vec![
+                PcrSpec256 {
                     pcrIndex: 20,
                     verifyType: 2,
                     matchData: vec![B256::repeat_byte(0x20)],
                 },
-                PcrSpec {
+                PcrSpec256 {
                     pcrIndex: 23,
                     verifyType: 0,
                     matchData: vec![B256::repeat_byte(0x23)],
                 },
             ],
+            workloadPcrs384: Vec::new(),
         };
 
         let policy = trusted_policy_from_workload_spec(
@@ -797,15 +877,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.workload_id, [0x11; 32]);
-        assert_eq!(policy.pcr_specs.len(), 2);
-        assert_eq!(policy.pcr_specs[0].pcr_index, 20);
+        assert_eq!(policy.pcr_specs256.len(), 2);
+        assert_eq!(policy.pcr_specs256[0].pcr_index, 20);
         assert_eq!(
-            policy.pcr_specs[0].verify_type,
+            policy.pcr_specs256[0].verify_type,
             SessionPcrVerifyType::DynamicSubsequence
         );
-        assert_eq!(policy.pcr_specs[1].pcr_index, 23);
+        assert_eq!(policy.pcr_specs256[1].pcr_index, 23);
         assert_eq!(
-            policy.pcr_specs[1].verify_type,
+            policy.pcr_specs256[1].verify_type,
             SessionPcrVerifyType::Static
         );
         assert_eq!(policy.attribute_requirements.len(), 1);
@@ -838,10 +918,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(policy.workload_id, [0x33; 32]);
-        assert_eq!(policy.pcr_specs.len(), 1);
-        assert_eq!(policy.pcr_specs[0].pcr_index, 23);
+        assert_eq!(policy.pcr_specs256.len(), 1);
+        assert_eq!(policy.pcr_specs256[0].pcr_index, 23);
         assert_eq!(
-            policy.pcr_specs[0].verify_type,
+            policy.pcr_specs256[0].verify_type,
             SessionPcrVerifyType::Static
         );
         assert_eq!(policy.attribute_requirements.len(), 1);
@@ -867,10 +947,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manually_trusted_workload_pcr23_is_available_without_a_local_archive() {
+    async fn manually_trusted_workload_pcr23_banks_are_available_without_a_local_archive() {
         let state = deployed_state("/missing/workload.atawl".into(), String::new());
         let verification = SessionVerificationArgs {
-            trusted_workload_pcr23: Some(format!("0x{}", hex::encode([0x55; 32]))),
+            trusted_workload_pcr23_sha256: Some(format!("0x{}", hex::encode([0x55; 32]))),
+            trusted_workload_pcr23_sha384: Some(format!("0x{}", hex::encode([0x66; 48]))),
             ..Default::default()
         };
         let init_chain = super::super::synthesize_off_init_chain();
@@ -885,6 +966,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(policy.pcr_specs, [static_pcr23_policy([0x55; 32])]);
+        assert_eq!(policy.pcr_specs256, [static_pcr23_policy([0x55; 32])]);
+        assert_eq!(policy.pcr_specs384, [static_pcr23_policy384([0x66; 48])]);
     }
 }

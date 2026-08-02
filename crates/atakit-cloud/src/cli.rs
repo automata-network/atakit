@@ -199,6 +199,10 @@ pub struct DeployArgs {
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
 
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
+
     /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
@@ -447,6 +451,10 @@ pub struct InitArgs {
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
 
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
+
     /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
@@ -546,10 +554,23 @@ pub struct SessionVerificationArgs {
     #[arg(long)]
     pub chain: Option<String>,
 
-    /// Manually trusted final PCR23 value for the workload manifest.
-    /// For verify-session, this selects an explicit PCR23-only workload policy.
-    #[arg(long, value_name = "0xBYTES32")]
-    pub trusted_workload_pcr23: Option<String>,
+    /// Manually trusted SHA-256 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha384.
+    #[arg(
+        long,
+        value_name = "0xBYTES32",
+        requires = "trusted_workload_pcr23_sha384"
+    )]
+    pub trusted_workload_pcr23_sha256: Option<String>,
+
+    /// Manually trusted SHA-384 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha256.
+    #[arg(
+        long,
+        value_name = "0xBYTES48",
+        requires = "trusted_workload_pcr23_sha256"
+    )]
+    pub trusted_workload_pcr23_sha384: Option<String>,
 
     /// Expected base image for the signed measurement policy.
     #[arg(long, value_name = "NAME:VERSION")]
@@ -779,22 +800,29 @@ mod tests {
     }
 
     #[test]
-    fn trusted_workload_pcr23_is_shared_by_verification_and_lifecycle_commands() {
-        let value = format!("0x{}", "55".repeat(32));
+    fn trusted_workload_pcr23_banks_are_shared_by_verification_and_lifecycle_commands() {
+        let sha256 = format!("0x{}", "55".repeat(32));
+        let sha384 = format!("0x{}", "66".repeat(48));
         let cli = TestCli::try_parse_from([
             "test",
             "verify-session",
             "gcp-vm",
-            "--trusted-workload-pcr23",
-            &value,
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
         ])
         .expect("verify-session arguments");
         let CloudCommand::VerifySession(args) = cli.command else {
             panic!("expected verify-session command");
         };
         assert_eq!(
-            args.verification.trusted_workload_pcr23.as_deref(),
-            Some(value.as_str())
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
         );
 
         let cli = TestCli::try_parse_from([
@@ -802,24 +830,30 @@ mod tests {
             "session",
             "renew",
             "gcp-vm",
-            "--trusted-workload-pcr23",
-            &value,
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
         ])
         .expect("session renew arguments");
         let CloudCommand::Session(SessionCommand::Renew(args)) = cli.command else {
             panic!("expected session renew command");
         };
         assert_eq!(
-            args.verification.trusted_workload_pcr23.as_deref(),
-            Some(value.as_str())
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
         );
 
         let help = TestCli::try_parse_from(["test", "verify-session", "--help"])
             .err()
             .expect("verify-session help response")
             .to_string();
-        assert!(help.contains("--trusted-workload-pcr23 <0xBYTES32>"));
-        assert!(help.contains("final PCR23 value for the workload manifest"));
+        assert!(help.contains("--trusted-workload-pcr23-sha256 <0xBYTES32>"));
+        assert!(help.contains("--trusted-workload-pcr23-sha384 <0xBYTES48>"));
     }
 
     #[test]

@@ -19,14 +19,21 @@ use alloy_ext::core::primitives::Address;
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
-    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrSpec,
+    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant,
+    PcrBankSelection, PcrSpec256, PcrSpec384,
 };
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{InitChainConfig, InitKeyConfig, InitProverConfig, PortalTerminalState};
+use atakit_cloud::init::{
+    InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig, PortalTerminalState,
+};
+use atakit_cloud::pcr_policy::{
+    resolve_init_pcr_policy as resolve_pcr_policy_for_init, PcrPolicyIdentifiers,
+    ResolvedPcrPolicyConfig,
+};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
@@ -267,6 +274,37 @@ pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
     registration == Some("off")
 }
 
+pub(crate) async fn resolve_init_pcr_policy(
+    path: Option<&Path>,
+    config: &InitConfig,
+    registration_off: bool,
+    verified_tls: Option<&atakit_cloud::init::VerifiedPortalTls>,
+    workload_name: &str,
+    workload_version: &str,
+) -> Result<Option<ResolvedPcrPolicyConfig>> {
+    let identifiers = verified_tls.and_then(|verified| {
+        Some(PcrPolicyIdentifiers {
+            workload_id: crate::commands::workload::compute_workload_id(
+                workload_name,
+                workload_version,
+            )
+            .0,
+            base_image_id: verified.identity.base_image_id?,
+            platform_profile_id: verified.identity.platform_profile_id?,
+            measurement_variant_id: verified.identity.variant_id?,
+        })
+    });
+    resolve_pcr_policy_for_init(
+        registration_off,
+        path,
+        &config.chain,
+        identifiers,
+        &config.platform,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+}
+
 pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
     InitKeyConfig {
         mode: "self_generated".to_string(),
@@ -418,10 +456,15 @@ fn chain_hierarchy_to_measurement_policy(
                     name: variant.name.clone(),
                     id: hex0x(variant_id),
                     machine_types: vec![variant.name.clone()],
-                    override_pcrs: variant
-                        .overridePcrs
+                    variant_pcrs256: variant
+                        .variantPcrs256
                         .iter()
-                        .map(chain_pcr_spec_to_measurement)
+                        .map(chain_pcr_spec256_to_measurement)
+                        .collect(),
+                    variant_pcrs384: variant
+                        .variantPcrs384
+                        .iter()
+                        .map(chain_pcr_spec384_to_measurement)
                         .collect(),
                     attributes: variant
                         .attributes
@@ -440,11 +483,18 @@ fn chain_hierarchy_to_measurement_policy(
                 id: hex0x(profile.profile_id),
                 cloud: cloud.to_string(),
                 tee: tee.to_string(),
-                invariants: profile
+                pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
+                invariants256: profile
                     .profile
-                    .invariants
+                    .invariants256
                     .iter()
-                    .map(chain_pcr_spec_to_measurement)
+                    .map(chain_pcr_spec256_to_measurement)
+                    .collect(),
+                invariants384: profile
+                    .profile
+                    .invariants384
+                    .iter()
+                    .map(chain_pcr_spec384_to_measurement)
                     .collect(),
                 variants,
                 attributes: profile
@@ -465,7 +515,7 @@ fn chain_hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v1".to_string(),
+            schema: "atakit.measurement-pack.v2".to_string(),
             revision: 1,
             published_at: chrono::Utc::now().to_rfc3339(),
             base_image: BaseImage {
@@ -484,10 +534,10 @@ fn chain_hierarchy_to_measurement_policy(
     })
 }
 
-fn chain_pcr_spec_to_measurement(
-    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec,
-) -> PcrSpec {
-    PcrSpec {
+fn chain_pcr_spec256_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256,
+) -> PcrSpec256 {
+    PcrSpec256 {
         pcr_index: spec.pcrIndex,
         verify_type: match spec.verifyType {
             0 => "static".to_string(),
@@ -498,6 +548,45 @@ fn chain_pcr_spec_to_measurement(
         match_data: spec.matchData.iter().map(hex0x).collect(),
         event_indices: Vec::new(),
         total_events: None,
+    }
+}
+
+fn chain_pcr_spec384_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec384,
+) -> PcrSpec384 {
+    PcrSpec384 {
+        pcr_index: spec.pcrIndex,
+        verify_type: chain_verify_type(spec.verifyType as u8),
+        match_data: spec
+            .matchData
+            .iter()
+            .map(|value| {
+                let mut bytes = [0u8; 48];
+                bytes[..32].copy_from_slice(value.first.as_slice());
+                bytes[32..].copy_from_slice(value.second.as_slice());
+                hex0x(&bytes)
+            })
+            .collect(),
+        event_indices: Vec::new(),
+        total_events: None,
+    }
+}
+
+fn chain_verify_type(value: u8) -> String {
+    match value {
+        0 => "static".to_string(),
+        1 => "dynamicSubset".to_string(),
+        2 => "dynamicSubsequence".to_string(),
+        other => format!("unknown-{other}"),
+    }
+}
+
+fn chain_pcr_bank_selection(value: u8) -> PcrBankSelection {
+    match value {
+        0 => PcrBankSelection::Sha256,
+        1 => PcrBankSelection::Sha384,
+        2 => PcrBankSelection::Sha256AndSha384,
+        _ => unreachable!("Solidity enum decoder rejects invalid values"),
     }
 }
 
@@ -1851,13 +1940,13 @@ mod tls_measurement_policy_tests {
 
     #[test]
     fn converts_chain_pcr_spec_to_measurement_pack_shape() {
-        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec {
+        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256 {
             pcrIndex: 4,
             verifyType: 0,
             matchData: vec![B256::repeat_byte(0xaa)],
         };
 
-        let got = chain_pcr_spec_to_measurement(&spec);
+        let got = chain_pcr_spec256_to_measurement(&spec);
 
         assert_eq!(got.pcr_index, 4);
         assert_eq!(got.verify_type, "static");

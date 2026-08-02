@@ -106,7 +106,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     );
     println!("  {:<18}{}", "Size:", format_size(archive_size));
     println!("  {:<18}{}", "Manifest SHA256:", result.sha256.dimmed());
-    println!("  {:<18}{}", "PCR23:", result.pcr23.dimmed());
+    println!("  {:<18}{}", "PCR23:", result.pcr23_sha256.dimmed());
     println!("  {:<18}{}", "Workload ID:", workload_id_hex.dimmed());
     println!("  {:<18}{}", "Repository:", repo_uri.cyan());
     println!();
@@ -142,7 +142,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         coords,
         archive_path: archive_path.as_path(),
         manifest_sha256: result.sha256.clone(),
-        pcr23: result.pcr23.clone(),
+        pcr23: result.pcr23_sha256.clone(),
     };
 
     println!("Uploading to {}...", repo_uri.dimmed());

@@ -89,7 +89,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     print_info(
         &result.manifest,
         &result.sha256,
-        &result.pcr23,
+        &result.pcr23_sha256,
         chain_data.as_ref(),
     );
     Ok(())
