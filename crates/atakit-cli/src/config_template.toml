@@ -219,7 +219,7 @@
 
 # [cloud.targets.my-aws-snp]
 # provider = "my-aws"
-# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP (AMD SEV-SNP families: m6a/c6a/r6a/m7a/c7a/r7a)
+# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP; exact supported shared-tenancy types are validated
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
