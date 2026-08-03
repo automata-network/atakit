@@ -12,6 +12,8 @@ pub enum CloudCommand {
     Destroy(DestroyArgs),
     /// Show deployment status
     Status(StatusArgs),
+    /// Reboot a saved AWS deployment
+    Reboot(RebootArgs),
     /// List all deployments
     #[command(alias = "list")]
     Ls(ListArgs),
@@ -306,6 +308,21 @@ pub struct StatusArgs {
     /// Query live status from cloud provider
     #[arg(long)]
     pub live: bool,
+}
+
+/// Arguments for `cloud reboot`.
+#[derive(Args)]
+pub struct RebootArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 /// Arguments for `cloud list`.
@@ -720,6 +737,26 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: CloudCommand,
+    }
+
+    #[test]
+    fn reboot_accepts_exact_instance_target_and_confirmation_arguments() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "reboot",
+            "aws-vm",
+            "--target",
+            "aws-m6a-large",
+            "--yes",
+        ])
+        .expect("reboot arguments");
+
+        let CloudCommand::Reboot(args) = cli.command else {
+            panic!("expected reboot command");
+        };
+        assert_eq!(args.instance, "aws-vm");
+        assert_eq!(args.target.as_deref(), Some("aws-m6a-large"));
+        assert!(args.yes);
     }
 
     #[test]

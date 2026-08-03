@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
             }
             CloudCommand::Destroy(args) => commands::cloud::destroy::run(args, &env, &config).await,
             CloudCommand::Status(args) => commands::cloud::status::run(args, &env, &config).await,
+            CloudCommand::Reboot(args) => commands::cloud::reboot::run(args, &env, &config).await,
             CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
             CloudCommand::Ssh(args) => commands::cloud::ssh::run(args, &env, &config),
             CloudCommand::Serial(args) => commands::cloud::serial::run(args, &env, &config).await,

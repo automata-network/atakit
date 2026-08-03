@@ -4,6 +4,7 @@ pub mod image;
 pub mod init;
 pub mod list;
 pub mod provider;
+pub mod reboot;
 pub mod serial;
 pub mod session;
 mod session_access;
