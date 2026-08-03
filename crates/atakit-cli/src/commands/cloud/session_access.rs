@@ -1,21 +1,19 @@
 use std::path::Path;
-use std::time::Duration;
 
-use alloy_ext::core::primitives::{Address, B256};
-use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
     BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrVerifyType,
     TrustedSessionBinding, VerifiedSession,
 };
+use atakit_attestation_client::{
+    verify_current_session, AttestationClient, AttestationClientConfig,
+    TrustedWorkloadSessionPolicy,
+};
 use atakit_cloud::cli::SessionVerificationArgs;
 use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
-use atakit_cloud::session::{self, TrustedWorkloadSessionPolicy};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_core::Env;
 use atakit_workload::{inspect_workload, InspectOptions};
-use automata_tee_workload_measurement::stubs::WorkloadRegistry::WorkloadSpec;
-use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 
 use super::{
     init_chain_from_config, portal_endpoints, registration_is_off, resolve_instance,
@@ -23,41 +21,19 @@ use super::{
 };
 use crate::config::{ChainConfig, Config};
 
-/// Resolve workload policy from sources selected by an independent verifier.
-/// Explicit PCR23 collateral wins; otherwise the verifier-selected chain must
-/// provide the exact WorkloadSpec.
-pub(crate) async fn resolve_verifier_workload_policy(
-    workload_ref: &str,
-    trusted_workload_pcr23: Option<&str>,
-    chain_client: Option<&atakit_attestation_client::AttestationClient>,
-    selected_base_image_id: [u8; 32],
-) -> Result<TrustedWorkloadSessionPolicy> {
-    let parsed = crate::commands::workload::parse_workload_ref(workload_ref)?;
-    let crate::commands::workload::WorkloadRef::NameVersion { name, version } = parsed else {
-        bail!("--workload-ref requires a canonical name:version reference, not a workload ID");
-    };
-    let workload_id = crate::commands::workload::compute_workload_id(&name, &version).0;
-
-    if let Some(value) = trusted_workload_pcr23 {
-        return Ok(TrustedWorkloadSessionPolicy {
-            workload_id,
-            pcr_specs: vec![static_pcr23_policy(decode_hex_32(
-                value,
-                "--trusted-workload-pcr23",
-            )?)],
-            attribute_requirements: Vec::new(),
-        });
-    }
-
-    let Some(chain_client) = chain_client else {
-        bail!(
-            "no trusted workload collateral is available; select a verifier chain with --chain or provide --trusted-workload-pcr23"
-        );
-    };
-    chain_client
-        .resolve_workload_policy(workload_ref, selected_base_image_id)
-        .await
-        .map_err(anyhow::Error::new)
+pub(crate) async fn connect_attestation_client(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<AttestationClient> {
+    AttestationClient::connect(AttestationClientConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        expected_chain_id: chain.chain_id,
+        expected_base_image_registry: chain.base_image_registry.clone(),
+        expected_workload_registry: chain.workload_registry.clone(),
+    })
+    .await
+    .with_context(|| format!("connect attestation client for chain '{chain_name}'"))
 }
 
 pub(crate) struct VerifiedPortalAccess {
@@ -86,7 +62,7 @@ pub(crate) struct VerifiedCloudSessionAccess {
 
 impl VerifiedCloudSessionAccess {
     pub async fn verify_current_session(&self) -> Result<VerifiedSession> {
-        session::verify_current_session(
+        verify_current_session(
             &self.verified_tls,
             &self.host,
             self.status_port,
@@ -233,35 +209,33 @@ pub(crate) async fn resolve_verified_session_access(
     verification: &SessionVerificationArgs,
     config: &Config,
 ) -> Result<VerifiedCloudSessionAccess> {
-    let (init_chain, trusted_binding) = match portal.chain_name.as_deref() {
+    let chain_client = match portal.chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => {
-                let prover = chain
-                    .prover
-                    .as_ref()
-                    .and_then(|prover| config.provers.get(prover));
-                let init_chain =
-                    init_chain_from_config(name, chain, portal.registration.as_deref(), prover)
-                        .await?;
-                let trusted_binding = resolve_trusted_session_binding(name, chain).await?;
-                (init_chain, Some(trusted_binding))
+            Some(chain)
+                if should_resolve_registered_workload_policy(
+                    portal.registration.as_deref(),
+                    chain,
+                ) =>
+            {
+                Some(connect_attestation_client(name, chain).await?)
             }
+            Some(_) => None,
             None => bail!("chain '{name}' not found in [chains]"),
         },
-        None if registration_is_off(portal.registration.as_deref()) => {
-            (synthesize_off_init_chain(), None)
-        }
+        None if registration_is_off(portal.registration.as_deref()) => None,
         None => bail!("no chain config is available for verifier trust lookup"),
     };
+    let trusted_binding = chain_client
+        .as_ref()
+        .map(AttestationClient::trusted_session_binding);
     let workload_id = crate::commands::workload::compute_workload_id(
         &portal.state.workload_name,
         &portal.state.workload_version,
     );
     let workload_policy = resolve_trusted_workload_policy(
         &portal.state,
-        portal.registration.as_deref(),
         verification,
-        &init_chain,
+        chain_client.as_ref(),
         workload_id.0,
         portal.verified_tls.identity.base_image_id,
     )
@@ -279,38 +253,6 @@ pub(crate) async fn resolve_verified_session_access(
         verified_tls: portal.verified_tls,
         workload_policy,
         trusted_binding,
-    })
-}
-
-pub(crate) async fn resolve_trusted_session_binding(
-    chain_name: &str,
-    chain: &ChainConfig,
-) -> Result<TrustedSessionBinding> {
-    let registry: Address = chain.session_registry.parse().with_context(|| {
-        format!(
-            "invalid session_registry address in chain '{chain_name}': {}",
-            chain.session_registry
-        )
-    })?;
-    let provider = NetworkProvider::with_http(
-        &chain.rpc_url,
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(37)),
-        100,
-    )
-    .await
-    .with_context(|| format!("connect to rpc_url for chain '{chain_name}'"))?;
-    let chain_id = provider.chain_id();
-    if let Some(configured) = chain.chain_id {
-        if configured != chain_id {
-            bail!(
-                "chain_id in chain '{chain_name}' is {configured}, but its rpc_url reports {chain_id}"
-            );
-        }
-    }
-    Ok(TrustedSessionBinding {
-        chain_id,
-        registry: registry.into_array(),
     })
 }
 
@@ -350,28 +292,37 @@ fn tls_needs_registry_derivation(
         && !registration_is_off(registration)
 }
 
+fn should_resolve_registered_workload_policy(
+    registration: Option<&str>,
+    chain: &ChainConfig,
+) -> bool {
+    if !registration_is_off(registration) {
+        return true;
+    }
+    !chain.rpc_url.trim().is_empty()
+        && chain
+            .workload_registry
+            .as_deref()
+            .is_some_and(|address| address != super::ZERO_ADDR)
+}
+
 async fn resolve_trusted_workload_policy(
     state: &DeployState,
-    registration: Option<&str>,
     verification: &SessionVerificationArgs,
-    init_chain: &InitChainConfig,
+    chain_client: Option<&AttestationClient>,
     workload_id: [u8; 32],
     selected_base_image_id: Option<[u8; 32]>,
 ) -> Result<TrustedWorkloadSessionPolicy> {
-    let registry_available =
-        init_chain.workload_registry != super::ZERO_ADDR && !init_chain.rpc_url.trim().is_empty();
     let manual_pcr23 = verification.trusted_workload_pcr23.as_deref();
-    let mut policy = if !registration_is_off(registration) || registry_available {
-        load_registered_workload_policy(
-            &state.workload_name,
-            &state.workload_version,
-            init_chain,
-            workload_id,
-            selected_base_image_id.ok_or_else(|| {
-                anyhow::anyhow!("TLS verification did not select a base image ID")
-            })?,
-        )
-        .await?
+    let mut policy = if let Some(client) = chain_client {
+        client
+            .resolve_workload_policy(
+                &format!("{}:{}", state.workload_name, state.workload_version),
+                selected_base_image_id.ok_or_else(|| {
+                    anyhow::anyhow!("TLS verification did not select a base image ID")
+                })?,
+            )
+            .await?
     } else if manual_pcr23.is_some() {
         TrustedWorkloadSessionPolicy {
             workload_id,
@@ -389,112 +340,6 @@ async fn resolve_trusted_workload_policy(
         )?));
     }
     Ok(policy)
-}
-
-async fn load_registered_workload_policy(
-    expected_name: &str,
-    expected_version: &str,
-    init_chain: &InitChainConfig,
-    workload_id: [u8; 32],
-    selected_base_image_id: [u8; 32],
-) -> Result<TrustedWorkloadSessionPolicy> {
-    let registry_address: Address = init_chain.workload_registry.parse().with_context(|| {
-        format!(
-            "invalid configured WorkloadRegistry address: {}",
-            init_chain.workload_registry
-        )
-    })?;
-    let provider = NetworkProvider::with_http(
-        &init_chain.rpc_url,
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(37)),
-        100,
-    )
-    .await
-    .context("connect to configured WorkloadRegistry RPC")?;
-    let registry = WorkloadRegistry::new(registry_address, provider);
-    let spec = registry
-        .get_workload_spec(B256::from(workload_id))
-        .await
-        .with_context(|| {
-            format!(
-                "resolve trusted WorkloadSpec 0x{} from configured WorkloadRegistry",
-                hex::encode(workload_id)
-            )
-        })?;
-
-    trusted_policy_from_workload_spec(
-        expected_name,
-        expected_version,
-        workload_id,
-        selected_base_image_id,
-        &spec,
-    )
-}
-
-fn trusted_policy_from_workload_spec(
-    expected_name: &str,
-    expected_version: &str,
-    workload_id: [u8; 32],
-    selected_base_image_id: [u8; 32],
-    spec: &WorkloadSpec,
-) -> Result<TrustedWorkloadSessionPolicy> {
-    if spec.name != expected_name || spec.version != expected_version {
-        bail!(
-            "trusted WorkloadSpec identity {}/{} does not match expected workload {}/{}",
-            spec.name,
-            spec.version,
-            expected_name,
-            expected_version
-        );
-    }
-    ensure_base_image_allowed(
-        spec.baseImageMode,
-        &spec.baseImageIds,
-        B256::from(selected_base_image_id),
-    )?;
-
-    let pcr_specs = spec
-        .pcrs
-        .iter()
-        .map(|spec| {
-            Ok(SessionPcrPolicy {
-                pcr_index: spec.pcrIndex,
-                verify_type: match spec.verifyType {
-                    0 => SessionPcrVerifyType::Static,
-                    1 => SessionPcrVerifyType::DynamicSubset,
-                    2 => SessionPcrVerifyType::DynamicSubsequence,
-                    value => bail!(
-                        "trusted WorkloadSpec has unsupported PCR verifyType {value} for PCR{}",
-                        spec.pcrIndex
-                    ),
-                },
-                match_data: spec
-                    .matchData
-                    .iter()
-                    .map(|value| format!("0x{}", hex::encode(value)))
-                    .collect(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let attribute_requirements = spec
-        .requirements
-        .iter()
-        .map(|requirement| SessionAttributeRequirement {
-            key: requirement.key.0,
-            allowed_values: requirement
-                .allowedValues
-                .iter()
-                .map(|value| value.0)
-                .collect(),
-        })
-        .collect();
-
-    Ok(TrustedWorkloadSessionPolicy {
-        workload_id,
-        pcr_specs,
-        attribute_requirements,
-    })
 }
 
 async fn load_local_workload_policy(
@@ -571,22 +416,6 @@ async fn load_local_workload_policy(
     })
 }
 
-fn ensure_base_image_allowed(mode: u8, configured: &[B256], selected: B256) -> Result<()> {
-    let allowed = match mode {
-        0 => true,
-        1 => !configured.contains(&selected),
-        2 => configured.contains(&selected),
-        value => bail!("trusted WorkloadSpec has unsupported baseImageMode {value}"),
-    };
-    if !allowed {
-        bail!(
-            "TLS-selected base image 0x{} is not allowed by the trusted WorkloadSpec",
-            hex::encode(selected)
-        );
-    }
-    Ok(())
-}
-
 pub(crate) fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
     SessionPcrPolicy {
         pcr_index: 23,
@@ -617,9 +446,6 @@ mod tests {
     use std::io::Cursor;
 
     use atakit_cloud::{NewDeployParams, PersistedInitEnv, PlatformKind, PortalPorts};
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, PcrSpec,
-    };
     use tempfile::TempDir;
 
     use super::*;
@@ -761,71 +587,30 @@ mod tests {
     }
 
     #[test]
-    fn workload_spec_converts_all_pcrs_requirements_and_base_image_policy() {
-        let state = deployed_state(String::new(), String::new());
-        let selected_base_image = B256::repeat_byte(0x44);
-        let spec = WorkloadSpec {
-            name: "test".into(),
-            version: "v0.0.1".into(),
-            ttl: 0,
-            baseImageMode: 2,
-            baseImageIds: vec![selected_base_image],
-            requirements: vec![AttributeRequirement {
-                key: B256::repeat_byte(0xaa),
-                allowedValues: vec![B256::repeat_byte(0xbb)],
-            }],
-            pcrs: vec![
-                PcrSpec {
-                    pcrIndex: 20,
-                    verifyType: 2,
-                    matchData: vec![B256::repeat_byte(0x20)],
-                },
-                PcrSpec {
-                    pcrIndex: 23,
-                    verifyType: 0,
-                    matchData: vec![B256::repeat_byte(0x23)],
-                },
-            ],
-        };
+    fn registration_off_without_configured_workload_registry_uses_local_policy() {
+        let mut chain = super::super::test_chain_config();
+        assert!(!should_resolve_registered_workload_policy(
+            Some("off"),
+            &chain
+        ));
 
-        let policy = trusted_policy_from_workload_spec(
-            &state.workload_name,
-            &state.workload_version,
-            [0x11; 32],
-            selected_base_image.0,
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(policy.workload_id, [0x11; 32]);
-        assert_eq!(policy.pcr_specs.len(), 2);
-        assert_eq!(policy.pcr_specs[0].pcr_index, 20);
-        assert_eq!(
-            policy.pcr_specs[0].verify_type,
-            SessionPcrVerifyType::DynamicSubsequence
-        );
-        assert_eq!(policy.pcr_specs[1].pcr_index, 23);
-        assert_eq!(
-            policy.pcr_specs[1].verify_type,
-            SessionPcrVerifyType::Static
-        );
-        assert_eq!(policy.attribute_requirements.len(), 1);
-        assert_eq!(policy.attribute_requirements[0].key, [0xaa; 32]);
-        assert_eq!(
-            policy.attribute_requirements[0].allowed_values,
-            [[0xbb; 32]]
-        );
-    }
+        chain.workload_registry = Some(super::super::ZERO_ADDR.to_string());
+        assert!(!should_resolve_registered_workload_policy(
+            Some("off"),
+            &chain
+        ));
 
-    #[test]
-    fn workload_spec_base_image_modes_are_enforced() {
-        let selected = B256::repeat_byte(0x11);
-        let other = B256::repeat_byte(0x22);
-        ensure_base_image_allowed(0, &[], selected).unwrap();
-        ensure_base_image_allowed(1, &[other], selected).unwrap();
-        ensure_base_image_allowed(2, &[selected], selected).unwrap();
-        assert!(ensure_base_image_allowed(1, &[selected], selected).is_err());
-        assert!(ensure_base_image_allowed(2, &[other], selected).is_err());
-        assert!(ensure_base_image_allowed(3, &[], selected).is_err());
+        chain.workload_registry = Some("0x2222222222222222222222222222222222222222".into());
+        assert!(should_resolve_registered_workload_policy(
+            Some("off"),
+            &chain
+        ));
+
+        chain.workload_registry = None;
+        assert!(should_resolve_registered_workload_policy(
+            Some("required"),
+            &chain
+        ));
     }
 
     #[tokio::test]
@@ -873,18 +658,9 @@ mod tests {
             trusted_workload_pcr23: Some(format!("0x{}", hex::encode([0x55; 32]))),
             ..Default::default()
         };
-        let init_chain = super::super::synthesize_off_init_chain();
-
-        let policy = resolve_trusted_workload_policy(
-            &state,
-            Some("off"),
-            &verification,
-            &init_chain,
-            [0x66; 32],
-            None,
-        )
-        .await
-        .unwrap();
+        let policy = resolve_trusted_workload_policy(&state, &verification, None, [0x66; 32], None)
+            .await
+            .unwrap();
         assert_eq!(policy.pcr_specs, [static_pcr23_policy([0x55; 32])]);
     }
 }
