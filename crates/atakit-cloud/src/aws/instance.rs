@@ -2,6 +2,11 @@ use crate::error::CloudError;
 use crate::exec::CommandRunner;
 use crate::plan::DiskSpec;
 
+use std::time::Duration;
+
+const REBOOT_TRANSITION_POLL_ATTEMPTS: usize = 60;
+const REBOOT_TRANSITION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Find a subnet to launch into, preferring a default-for-AZ subnet so the
 /// instance receives an auto-assigned public IP.
 pub async fn find_subnet(region: &str, runner: &dyn CommandRunner) -> Result<String, CloudError> {
@@ -200,12 +205,82 @@ pub async fn get_instance_public_ip(
     }
 }
 
-/// Reboot an EC2 instance and wait for both AWS instance status checks to pass.
+async fn instance_status_checks(
+    region: &str,
+    instance_id: &str,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, CloudError> {
+    let output = runner
+        .run_capture(
+            "aws",
+            &[
+                "ec2",
+                "describe-instance-status",
+                "--region",
+                region,
+                "--instance-ids",
+                instance_id,
+                "--include-all-instances",
+                "--query",
+                "InstanceStatuses[0].[InstanceStatus.Status,SystemStatus.Status]",
+                "--output",
+                "text",
+            ],
+        )
+        .await?;
+    Ok(output
+        .stdout
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
+}
+
+async fn wait_for_reboot_transition(
+    region: &str,
+    instance_id: &str,
+    status_before_reboot: &[String],
+    runner: &dyn CommandRunner,
+    attempts: usize,
+    interval: Duration,
+) -> Result<(), CloudError> {
+    for attempt in 0..attempts {
+        let current = instance_status_checks(region, instance_id, runner)
+            .await
+            .map_err(|e| CloudError::InstanceError {
+                message: format!(
+                    "failed to observe AWS status checks for instance '{instance_id}' after reboot request: {e}"
+                ),
+            })?;
+        if current != status_before_reboot {
+            return Ok(());
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    Err(CloudError::InstanceError {
+        message: format!(
+            "AWS did not report a status-check transition for instance '{instance_id}' after reboot request"
+        ),
+    })
+}
+
+/// Reboot an EC2 instance, observe the reboot transition, and then wait for
+/// both AWS instance status checks to pass again.
 pub async fn reboot_instance(
     region: &str,
     instance_id: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), CloudError> {
+    let status_before_reboot = instance_status_checks(region, instance_id, runner)
+        .await
+        .map_err(|e| CloudError::InstanceError {
+            message: format!(
+                "failed to read AWS status checks for instance '{instance_id}' before reboot: {e}"
+            ),
+        })?;
+
     runner
         .run_capture(
             "aws",
@@ -222,6 +297,16 @@ pub async fn reboot_instance(
         .map_err(|e| CloudError::InstanceError {
             message: format!("failed to reboot instance '{instance_id}': {e}"),
         })?;
+
+    wait_for_reboot_transition(
+        region,
+        instance_id,
+        &status_before_reboot,
+        runner,
+        REBOOT_TRANSITION_POLL_ATTEMPTS,
+        REBOOT_TRANSITION_POLL_INTERVAL,
+    )
+    .await?;
 
     runner
         .run_capture(
@@ -332,6 +417,7 @@ pub async fn get_console_output(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use super::*;
@@ -340,6 +426,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+        outputs: Mutex<VecDeque<String>>,
+    }
+
+    impl RecordingRunner {
+        fn with_outputs(outputs: &[&str]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                outputs: Mutex::new(outputs.iter().map(|output| output.to_string()).collect()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -353,9 +449,15 @@ mod tests {
                 program.to_string(),
                 args.iter().map(|arg| (*arg).to_string()).collect(),
             ));
+            let stdout = self
+                .outputs
+                .lock()
+                .expect("outputs lock")
+                .pop_front()
+                .unwrap_or_default();
             Ok(CommandOutput {
                 status: 0,
-                stdout: String::new(),
+                stdout,
                 stderr: String::new(),
             })
         }
@@ -371,17 +473,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reboot_uses_exact_region_instance_and_status_wait() {
-        let runner = RecordingRunner::default();
+    async fn reboot_observes_transition_before_status_wait() {
+        let runner = RecordingRunner::with_outputs(&["ok\tok\n", "", "initializing\tok\n", ""]);
         reboot_instance("us-east-2", "i-0123456789abcdef0", &runner)
             .await
             .expect("reboot instance");
 
         let calls = runner.calls.lock().expect("calls lock");
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "aws");
         assert_eq!(
             calls[0].1,
+            [
+                "ec2",
+                "describe-instance-status",
+                "--region",
+                "us-east-2",
+                "--instance-ids",
+                "i-0123456789abcdef0",
+                "--include-all-instances",
+                "--query",
+                "InstanceStatuses[0].[InstanceStatus.Status,SystemStatus.Status]",
+                "--output",
+                "text",
+            ]
+        );
+        assert_eq!(calls[1].0, "aws");
+        assert_eq!(
+            calls[1].1,
             [
                 "ec2",
                 "reboot-instances",
@@ -391,9 +510,26 @@ mod tests {
                 "i-0123456789abcdef0",
             ]
         );
-        assert_eq!(calls[1].0, "aws");
+        assert_eq!(calls[2].0, "aws");
         assert_eq!(
-            calls[1].1,
+            calls[2].1,
+            [
+                "ec2",
+                "describe-instance-status",
+                "--region",
+                "us-east-2",
+                "--instance-ids",
+                "i-0123456789abcdef0",
+                "--include-all-instances",
+                "--query",
+                "InstanceStatuses[0].[InstanceStatus.Status,SystemStatus.Status]",
+                "--output",
+                "text",
+            ]
+        );
+        assert_eq!(calls[3].0, "aws");
+        assert_eq!(
+            calls[3].1,
             [
                 "ec2",
                 "wait",
@@ -404,5 +540,27 @@ mod tests {
                 "i-0123456789abcdef0",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn reboot_transition_poll_rejects_unchanged_status() {
+        let runner = RecordingRunner::with_outputs(&["ok\tok\n", "ok\tok\n"]);
+        let status_before_reboot = vec!["ok".to_string(), "ok".to_string()];
+
+        let error = wait_for_reboot_transition(
+            "us-east-2",
+            "i-0123456789abcdef0",
+            &status_before_reboot,
+            &runner,
+            2,
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("unchanged status must fail");
+
+        assert!(error.to_string().contains(
+            "AWS did not report a status-check transition for instance 'i-0123456789abcdef0'"
+        ));
+        assert_eq!(runner.calls.lock().expect("calls lock").len(), 2);
     }
 }
