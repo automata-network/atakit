@@ -72,6 +72,59 @@ pub struct TrustedWorkloadSessionPolicy {
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
 }
 
+fn parse_canonical_workload_ref(workload: &str) -> Result<AppRef, AttestationClientError> {
+    let Some((name, version)) = workload.split_once(':') else {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload reference must use name:version, got {workload:?}"
+        )));
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        || name.starts_with('-')
+    {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload name must be nonempty, must not start with '-', and must contain only ASCII alphanumeric characters or '-', got {name:?}"
+        )));
+    }
+    if version.len() < 2 || !version.starts_with('v') {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload version must start with 'v' and contain at least one following character, got {version:?}"
+        )));
+    }
+    if !version[1..]
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+    {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload version may contain only ASCII alphanumeric characters, '.', '-', or '_' after 'v', got {version:?}"
+        )));
+    }
+    Ok(AppRef::new(name, version))
+}
+
+impl TrustedWorkloadSessionPolicy {
+    /// Construct an explicit policy that accepts exactly one workload-manifest
+    /// PCR23 value. The canonical workload reference determines the workload
+    /// ID; portal evidence cannot select it.
+    pub fn from_manifest_pcr23(
+        workload: &str,
+        manifest_pcr23: [u8; 32],
+    ) -> Result<Self, AttestationClientError> {
+        let app_ref = parse_canonical_workload_ref(workload)?;
+        Ok(Self {
+            workload_id: WorkloadRegistry::get_workload_id(&app_ref).0,
+            pcr_specs: vec![SessionPcrPolicy {
+                pcr_index: 23,
+                verify_type: SessionPcrVerifyType::Static,
+                match_data: vec![hex0x(manifest_pcr23)],
+            }],
+            attribute_requirements: Vec::new(),
+        })
+    }
+}
+
 /// Read-only client for verifier-selected chain state.
 #[derive(Debug, Clone)]
 pub struct AttestationClient {
@@ -215,11 +268,7 @@ impl AttestationClient {
         workload: &str,
         selected_base_image_id: [u8; 32],
     ) -> Result<TrustedWorkloadSessionPolicy, AttestationClientError> {
-        let app_ref: AppRef = workload.parse().map_err(|error| {
-            AttestationClientError::WorkloadPolicy(format!(
-                "parse canonical workload reference {workload:?}: {error}"
-            ))
-        })?;
+        let app_ref = parse_canonical_workload_ref(workload)?;
         let workload_id = WorkloadRegistry::get_workload_id(&app_ref);
         let registry_address =
             parse_address("resolved WorkloadRegistry", &self.context.workload_registry)?;
@@ -1057,6 +1106,107 @@ fn abi_word_bool(word: &[u8]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_manifest_pcr23_policy_uses_canonical_workload_reference() {
+        let policy =
+            TrustedWorkloadSessionPolicy::from_manifest_pcr23("storage-service:v0.1.0", [0x55; 32])
+                .unwrap();
+
+        assert_eq!(policy.pcr_specs.len(), 1);
+        assert_eq!(policy.pcr_specs[0].pcr_index, 23);
+        assert_eq!(
+            policy.pcr_specs[0].verify_type,
+            SessionPcrVerifyType::Static
+        );
+        assert_eq!(policy.pcr_specs[0].match_data, [hex0x([0x55; 32])]);
+        assert!(policy.attribute_requirements.is_empty());
+    }
+
+    #[test]
+    fn explicit_manifest_pcr23_policy_rejects_noncanonical_workload_references() {
+        for workload in [
+            "",
+            "storage-service",
+            ":v0.1.0",
+            "storage-service:",
+            "-storage-service:v0.1.0",
+            "storage/service:v0.1.0",
+            "storage-service:0.1.0",
+            "storage-service:v",
+            "storage-service:v0/1",
+            "storage-service:v0:1",
+        ] {
+            assert!(
+                TrustedWorkloadSessionPolicy::from_manifest_pcr23(workload, [0x55; 32]).is_err(),
+                "accepted noncanonical workload reference {workload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_workload_policy_converts_all_rules() {
+        use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
+            AttributeRequirement, PcrSpec as WorkloadPcrSpec,
+        };
+
+        let selected_base_image = B256::repeat_byte(0x44);
+        let spec = WorkloadSpec {
+            name: "test".into(),
+            version: "v0.0.1".into(),
+            ttl: 0,
+            baseImageMode: 2,
+            baseImageIds: vec![selected_base_image],
+            requirements: vec![AttributeRequirement {
+                key: B256::repeat_byte(0xaa),
+                allowedValues: vec![B256::repeat_byte(0xbb)],
+            }],
+            pcrs: vec![
+                WorkloadPcrSpec {
+                    pcrIndex: 20,
+                    verifyType: 2,
+                    matchData: vec![B256::repeat_byte(0x20)],
+                },
+                WorkloadPcrSpec {
+                    pcrIndex: 23,
+                    verifyType: 0,
+                    matchData: vec![B256::repeat_byte(0x23)],
+                },
+            ],
+        };
+        let app_ref: AppRef = "test:v0.0.1".parse().unwrap();
+
+        let policy =
+            trusted_workload_policy(&app_ref, [0x11; 32], selected_base_image.0, &spec).unwrap();
+
+        assert_eq!(policy.workload_id, [0x11; 32]);
+        assert_eq!(policy.pcr_specs.len(), 2);
+        assert_eq!(
+            policy.pcr_specs[0].verify_type,
+            SessionPcrVerifyType::DynamicSubsequence
+        );
+        assert_eq!(
+            policy.pcr_specs[1].verify_type,
+            SessionPcrVerifyType::Static
+        );
+        assert_eq!(policy.attribute_requirements[0].key, [0xaa; 32]);
+        assert_eq!(
+            policy.attribute_requirements[0].allowed_values,
+            [[0xbb; 32]]
+        );
+    }
+
+    #[test]
+    fn registered_workload_base_image_modes_are_enforced() {
+        let selected = B256::repeat_byte(0x11);
+        let other = B256::repeat_byte(0x22);
+        ensure_base_image_allowed(0, &[], selected).unwrap();
+        ensure_base_image_allowed(1, &[other], selected).unwrap();
+        ensure_base_image_allowed(2, &[selected], selected).unwrap();
+        assert!(ensure_base_image_allowed(1, &[selected], selected).is_err());
+        assert!(ensure_base_image_allowed(2, &[other], selected).is_err());
+        assert!(ensure_base_image_allowed(3, &[], selected).is_err());
+    }
 
     #[test]
     fn profile_name_selects_exact_platform() {

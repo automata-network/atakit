@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use atakit_attestation_client::{AttestationClient, AttestationClientConfig};
+use atakit_attestation_client::{AttestationClient, TrustedWorkloadSessionPolicy};
 use atakit_cloud::cli::VerifySessionArgs;
 use atakit_cloud::init;
+use atakit_cloud::session::{
+    verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
+};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::DEFAULT_PORTAL_STATUS_PORT;
 use atakit_core::Env;
 use owo_colors::OwoColorize;
 
-use super::session_access::resolve_verifier_workload_policy;
+use super::session_access::{connect_attestation_client, decode_hex_32};
 use super::{resolve_instance, resolve_verifier_tls_measurement_policy, synthesize_off_init_chain};
 use crate::config::Config;
 
@@ -29,14 +32,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
                 .chains
                 .get(chain_name)
                 .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in config"))?;
-            let client = AttestationClient::connect(AttestationClientConfig {
-                rpc_url: chain.rpc_url.clone(),
-                session_registry: chain.session_registry.clone(),
-                expected_chain_id: chain.chain_id,
-                expected_base_image_registry: chain.base_image_registry.clone(),
-                expected_workload_registry: chain.workload_registry.clone(),
-            })
-            .await?;
+            let client = connect_attestation_client(chain_name, chain).await?;
             let context = client.context();
             let init_chain = init::InitChainConfig {
                 rpc_url: chain.rpc_url.clone(),
@@ -87,62 +83,43 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    eprint!("Verify portal TLS... ");
-    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
-        &subject.host,
-        subject.status_port,
-        Some(measurement_policy),
-        None,
-        tls_verification_trust,
-        init::azure_maa_trust_config_from_init_chain(&init_chain),
-        tdx_dcap,
-        None,
-        None,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
-    eprintln!("{}", "done".green());
-
-    let base_image_id = verified_tls
-        .identity
-        .base_image_id
-        .ok_or_else(|| anyhow::anyhow!("TLS verification did not select a base image ID"))?;
-    eprint!("Verify current session... ");
-    let verified = if let Some(client) = chain_client
-        .as_ref()
-        .filter(|_| args.verification.trusted_workload_pcr23.is_none())
-    {
-        client
-            .verify_current_session(
-                &verified_tls,
-                &subject.host,
-                subject.status_port,
+    let workload_policy = if let Some(value) = args.verification.trusted_workload_pcr23.as_deref() {
+        SessionWorkloadPolicySource::Explicit {
+            policy: TrustedWorkloadSessionPolicy::from_manifest_pcr23(
                 &subject.workload_ref,
-                None,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-    } else {
-        let workload_policy = resolve_verifier_workload_policy(
-            &subject.workload_ref,
-            args.verification.trusted_workload_pcr23.as_deref(),
-            chain_client.as_ref(),
-            base_image_id,
-        )
-        .await?;
-        atakit_cloud::session::verify_current_session(
-            &verified_tls,
-            &subject.host,
-            subject.status_port,
-            workload_policy,
-            None,
-            chain_client
+                decode_hex_32(value, "--trusted-workload-pcr23")?,
+            )?,
+            trusted_binding: chain_client
                 .as_ref()
                 .map(AttestationClient::trusted_session_binding),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?
+        }
+    } else {
+        let client = chain_client.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no trusted workload collateral is available; select a verifier chain with --chain or provide --trusted-workload-pcr23"
+            )
+        })?;
+        SessionWorkloadPolicySource::Registry {
+            client,
+            workload: subject.workload_ref.clone(),
+        }
     };
+
+    eprint!("Verify portal TLS and current session... ");
+    let verified = verify_portal_session(PortalSessionVerificationRequest {
+        host: subject.host.clone(),
+        status_port: subject.status_port,
+        measurement_policy,
+        tls_verification_trust,
+        azure_maa_trust: init::azure_maa_trust_config_from_init_chain(&init_chain),
+        tdx_dcap_collateral: tdx_dcap,
+        report_path: None,
+        workload_policy,
+        required_binding: None,
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?
+    .session;
     eprintln!("{}", "done".green());
 
     if let Some(parent) = subject.report_path.parent() {

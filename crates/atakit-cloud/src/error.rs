@@ -108,3 +108,20 @@ pub enum CloudError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CloudError;
+
+    #[test]
+    fn portal_session_verification_error_keeps_message_field() {
+        let error = CloudError::PortalSessionVerificationFailed {
+            message: "invalid session evidence".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "portal session verification failed: invalid session evidence"
+        );
+    }
+}
