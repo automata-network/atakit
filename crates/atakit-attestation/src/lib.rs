@@ -21,10 +21,12 @@ use x509_parser::prelude::{FromDer, X509Certificate, X509Version};
 use x509_parser::time::ASN1Time;
 
 mod amd_snp_policy;
+mod aws_nitrotpm;
 mod session;
 mod tdx_dcap;
 mod verification_core;
 pub use amd_snp_policy::*;
+pub use aws_nitrotpm::aws_nitro_root_certificate;
 pub use session::*;
 pub use tdx_dcap::*;
 
@@ -263,6 +265,21 @@ impl AmdSnpVerificationCollateral {
         }
     }
 
+    pub fn from_vlek_chain(
+        ark_der: Vec<u8>,
+        asvk_der: Vec<u8>,
+        vlek_der: Vec<u8>,
+        crls_der: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            ark_der,
+            intermediate_ca_der: asvk_der,
+            vcek_der: None,
+            vlek_der: Some(vlek_der),
+            crls_der,
+        }
+    }
+
     pub fn from_certificate_table(
         table: &[u8],
         crls_der: Vec<Vec<u8>>,
@@ -299,6 +316,17 @@ impl AmdSnpVerificationCollateral {
     pub fn crls_der(&self) -> &[Vec<u8>] {
         &self.crls_der
     }
+}
+
+pub fn amd_snp_vlek_from_certificate_table(
+    table: &[u8],
+) -> std::result::Result<Vec<u8>, AmdSnpVerificationCollateralError> {
+    verification_core::parse_amd_snp_cert_table(table)
+        .map_err(AmdSnpVerificationCollateralError::CertificateTable)?
+        .vlek
+        .ok_or(AmdSnpVerificationCollateralError::MissingCertificate(
+            "VLEK",
+        ))
 }
 
 /// Return the ARK DER certificate from a standard SNP certificate table.
@@ -559,6 +587,9 @@ pub struct TrustAnchors {
     /// AmdSnpSecurityPolicyRegistry.
     pub amd_snp_security_policies: Vec<AmdSnpSecurityPolicy>,
     pub aws_nitro_roots: Vec<Vec<u8>>,
+    pub aws_nitro_root_hashes: Vec<[u8; 32]>,
+    pub aws_document_maximum_age_seconds: Option<u64>,
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,13 +1110,7 @@ fn verify_tls_attestation_internal(
     }
 
     match inputs.response.platform.cloud.as_str() {
-        "gcp" | "azure" => pass(&mut report, "platform-supported"),
-        "aws" => fail(
-            &mut report,
-            &mut errors,
-            "platform-supported",
-            "AWS NitroTPM verifier is unsupported in v1".to_string(),
-        ),
+        "gcp" | "azure" | "aws" => pass(&mut report, "platform-supported"),
         cloud => fail(
             &mut report,
             &mut errors,
@@ -1288,6 +1313,47 @@ fn verify_tls_attestation_internal(
                 &mut errors,
                 "azure-tee-ak-binding",
                 "Azure TEE evidence or AK binding is missing".to_string(),
+            ),
+        }
+    } else if inputs.response.platform.cloud == "aws" {
+        match (
+            inputs.response.ak_binding.as_ref(),
+            inputs.response.tee_evidence.as_ref(),
+            tpm_ak_public.as_deref(),
+            response_cert_sha,
+        ) {
+            (Some(binding), Some(evidence), Some(ak_public), Some(cert_sha)) => {
+                let expected_qualifying_data =
+                    compute_tls_bootstrap_qualifying_data(&inputs.nonce, &cert_sha);
+                aws_nitrotpm::verify_aws_tls_attestation(
+                    &mut report,
+                    &mut errors,
+                    binding,
+                    evidence,
+                    ak_public,
+                    authenticated_pcrs.as_deref().unwrap_or(&[]),
+                    &expected_qualifying_data,
+                    &inputs.trust_anchors,
+                    current_time,
+                );
+                verification_core::verify_aws_snp_vendor_report(
+                    &mut report,
+                    &mut errors,
+                    Some(evidence),
+                    inputs.amd_snp_collateral.as_ref(),
+                    verification_core::AmdSnpTrust {
+                        ark_roots: &inputs.trust_anchors.amd_ark_roots,
+                        ark_root_hashes: &inputs.trust_anchors.amd_ark_root_hashes,
+                    },
+                    current_time,
+                );
+            }
+            _ => fail(
+                &mut report,
+                &mut errors,
+                "aws-nitrotpm-binding",
+                "AWS NitroTPM binding requires akBinding, teeEvidence, tpm.akPublic, and a valid TLS certificate hash"
+                    .to_string(),
             ),
         }
     }
@@ -6429,7 +6495,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_aws_v1() {
+    fn verifier_enters_aws_nitrotpm_verification() {
         let nonce = [1u8; 32];
         let cert = b"cert";
         let response = response_for(nonce, cert, "aws");
@@ -6442,11 +6508,16 @@ mod tests {
             measurement_policy: None,
             trust_anchors: TrustAnchors::default(),
         });
-        assert!(result
-            .unwrap_err()
+        let failure = result.unwrap_err();
+        assert!(failure
+            .report
+            .checks
+            .iter()
+            .any(|check| check.name == "platform-supported" && check.result == CheckResult::Pass));
+        assert!(failure
             .errors
             .iter()
-            .any(|e| e.check == "platform-supported"));
+            .any(|error| error.check == "aws-nitrotpm-binding"));
     }
 
     #[test]

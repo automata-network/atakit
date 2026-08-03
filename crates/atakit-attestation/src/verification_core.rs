@@ -273,7 +273,7 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
     pass(report, "gcp-ak-cert-chain");
 }
 
-fn verify_ca_certificate_role(
+pub(super) fn verify_ca_certificate_role(
     cert: &X509Certificate<'_>,
     label: &str,
     ca_certificates_below: usize,
@@ -306,7 +306,7 @@ fn verify_ca_certificate_role(
     Ok(())
 }
 
-fn verify_end_entity_certificate_role(
+pub(super) fn verify_end_entity_certificate_role(
     cert: &X509Certificate<'_>,
     label: &str,
 ) -> std::result::Result<(), String> {
@@ -816,6 +816,28 @@ pub(super) fn verify_azure_snp_vendor_report(
         current_time,
         "azure-tee-vendor-report",
         "Azure",
+    );
+}
+
+pub(super) fn verify_aws_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: Option<&AmdSnpVerificationCollateral>,
+    amd_snp_trust: AmdSnpTrust<'_>,
+    current_time: SystemTime,
+) {
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
+        current_time,
+        "aws-tee-vendor-report",
+        "AWS",
     );
 }
 

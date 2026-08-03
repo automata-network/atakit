@@ -37,6 +37,10 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(37);
 const REQUEST_RETRIES: u64 = 100;
+const AMD_SEV_SNP_V1_PROGRAM_IDENTIFIER: [u8; 32] = [
+    0x00, 0xbc, 0x5b, 0xae, 0x7f, 0x7c, 0x20, 0x0e, 0xc9, 0x1f, 0x86, 0x6e, 0xe2, 0xf2, 0x92, 0x7c,
+    0xc0, 0x1f, 0xcf, 0x36, 0x5a, 0x55, 0xf7, 0x6c, 0x81, 0x96, 0x48, 0xe5, 0x27, 0x7d, 0x12, 0x86,
+];
 
 /// Configuration selected by the verifier.
 ///
@@ -321,11 +325,29 @@ impl AttestationClient {
                 "SessionRegistry.teeVerifier",
             )
             .await?;
-        let snp_attestation = self
+        let zk_verifier_registry = self
             .resolve_address_call(
                 &tee_verifier,
+                "zkVerifierRegistry()",
+                "TeeVerifier.zkVerifierRegistry",
+            )
+            .await?;
+        let adapter_result = self
+            .eth_call(
+                &zk_verifier_registry,
+                encode_zk_verifier_adapter_call(1, 2, AMD_SEV_SNP_V1_PROGRAM_IDENTIFIER),
+                "ZkVerifierRegistry.resolveVerifierAdapter for amd_sev_snp.v1",
+            )
+            .await?;
+        let amd_sev_snp_adapter = decode_address_return(
+            &adapter_result,
+            "ZkVerifierRegistry.resolveVerifierAdapter for amd_sev_snp.v1",
+        )?;
+        let snp_attestation = self
+            .resolve_address_call(
+                &amd_sev_snp_adapter,
                 "snpAttestation()",
-                "TeeVerifier.snpAttestation",
+                "AmdSevSnpZkVerifierAdapter.snpAttestation",
             )
             .await?;
         for processor_model in 0..8u64 {
@@ -350,6 +372,55 @@ impl AttestationClient {
             "SnpAttestation {snp_attestation} does not trust AMD ARK sha256(ark_der)={}",
             hex0x(ark_hash)
         )))
+    }
+
+    /// Require the AWS Nitro root certificate to be approved by the selected
+    /// `SessionRegistry`. Returns the trusted Keccak-256 root hash.
+    pub async fn resolve_aws_nitro_root(
+        &self,
+        root_der: &[u8],
+    ) -> Result<[u8; 32], AttestationClientError> {
+        let root_hash: [u8; 32] = Keccak256::digest(root_der).into();
+        let trusted = self
+            .resolve_bool_call(
+                &self.context.session_registry,
+                encode_bytes32_arg_call("trustedAwsNitroRootCertHashes(bytes32)", root_hash),
+                "SessionRegistry.trustedAwsNitroRootCertHashes",
+            )
+            .await?;
+        if !trusted {
+            return Err(AttestationClientError::Rpc(format!(
+                "SessionRegistry {} does not trust AWS Nitro root keccak256(root_der)={}",
+                self.context.session_registry,
+                hex0x(root_hash)
+            )));
+        }
+        Ok(root_hash)
+    }
+
+    /// Read the exact AWS NitroTPM document freshness limits from the
+    /// verifier-selected `SessionRegistry`.
+    pub async fn resolve_aws_document_freshness_limits(
+        &self,
+    ) -> Result<(u64, u64), AttestationClientError> {
+        let maximum_age = self
+            .eth_call(
+                &self.context.session_registry,
+                encode_no_arg_call("awsDocumentMaximumAgeSeconds()"),
+                "SessionRegistry.awsDocumentMaximumAgeSeconds",
+            )
+            .await?;
+        let allowed_future = self
+            .eth_call(
+                &self.context.session_registry,
+                encode_no_arg_call("awsDocumentAllowedFutureClockDifferenceSeconds()"),
+                "SessionRegistry.awsDocumentAllowedFutureClockDifferenceSeconds",
+            )
+            .await?;
+        Ok((
+            abi_word_to_u64(&maximum_age)?,
+            abi_word_to_u64(&allowed_future)?,
+        ))
     }
 
     /// Read the active AMD SEV-SNP policy defaults for the report's exact
@@ -1030,6 +1101,21 @@ fn encode_uint_arg_call(signature: &str, argument: u64) -> Vec<u8> {
     output
 }
 
+fn encode_zk_verifier_adapter_call(
+    proof_type: u8,
+    verification_backend_type: u8,
+    program_identifier: [u8; 32],
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(100);
+    output.extend_from_slice(&function_selector(
+        "resolveVerifierAdapter(uint8,uint8,bytes32)",
+    ));
+    output.extend_from_slice(&abi_word_u64(u64::from(proof_type)));
+    output.extend_from_slice(&abi_word_u64(u64::from(verification_backend_type)));
+    output.extend_from_slice(&program_identifier);
+    output
+}
+
 fn decode_address_return(bytes: &[u8], label: &str) -> Result<String, AttestationClientError> {
     if bytes.len() != 32 {
         return Err(AttestationClientError::Rpc(format!(
@@ -1153,6 +1239,19 @@ mod tests {
             infer_cloud_tee_from_profile_name("azure-sev-snp").unwrap(),
             ("azure", "sev-snp")
         );
+    }
+
+    #[test]
+    fn amd_sev_snp_v1_adapter_call_uses_exact_route() {
+        let call = encode_zk_verifier_adapter_call(1, 2, AMD_SEV_SNP_V1_PROGRAM_IDENTIFIER);
+        assert_eq!(call.len(), 100);
+        assert_eq!(
+            &call[..4],
+            &function_selector("resolveVerifierAdapter(uint8,uint8,bytes32)")
+        );
+        assert_eq!(&call[4..36], &abi_word_u64(1));
+        assert_eq!(&call[36..68], &abi_word_u64(2));
+        assert_eq!(&call[68..], &AMD_SEV_SNP_V1_PROGRAM_IDENTIFIER);
     }
 
     #[test]

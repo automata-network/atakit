@@ -243,6 +243,33 @@ fn build_session_trust(
                 session_error("verified TLS context has no Azure SNP verification collateral")
             })?,
         },
+        ("aws", "sev-snp") => SessionPlatformTrust::AwsSnp {
+            aws_nitro_roots: certificate_trust(
+                &context.trust_anchors.aws_nitro_roots,
+                &context.trust_anchors.aws_nitro_root_hashes,
+            ),
+            aws_document_maximum_age_seconds: context
+                .trust_anchors
+                .aws_document_maximum_age_seconds
+                .ok_or_else(|| {
+                    session_error("verified TLS context has no AWS NitroTPM document maximum age")
+                })?,
+            aws_document_allowed_future_clock_difference_seconds: context
+                .trust_anchors
+                .aws_document_allowed_future_clock_difference_seconds
+                .ok_or_else(|| {
+                    session_error(
+                        "verified TLS context has no AWS NitroTPM allowed future clock difference",
+                    )
+                })?,
+            amd_ark_roots: certificate_trust(
+                &context.trust_anchors.amd_ark_roots,
+                &context.trust_anchors.amd_ark_root_hashes,
+            ),
+            amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
+                session_error("verified TLS context has no AWS SNP verification collateral")
+            })?,
+        },
         (cloud, tee) => {
             return Err(session_error(format!(
                 "CLI session verification is not yet wired for cloud={cloud}, tee={tee}"
@@ -401,9 +428,6 @@ fn effective_pcr_specs256(
             )));
         }
         specs.insert(spec.pcr_index, spec);
-    }
-    if specs.is_empty() {
-        return Err(session_error("trusted session PCR policy is empty"));
     }
     specs
         .into_values()
@@ -814,6 +838,17 @@ mod tests {
             .expect("disjoint variant is allowed");
         let indices: Vec<u8> = pcrs.iter().map(|spec| spec.pcr_index).collect();
         assert_eq!(indices, vec![4, 10]);
+    }
+
+    #[test]
+    fn effective_pcr_specs256_allows_sha384_only_profile() {
+        let mut profile = profile();
+        profile.pcr_bank_selection = PcrBankSelection::Sha384;
+        profile.invariants256.clear();
+
+        let pcrs = effective_pcr_specs256(&profile, &profile.variants[0])
+            .expect("a SHA-384-only profile has no SHA-256 base-image PCR rules");
+        assert!(pcrs.is_empty());
     }
 
     #[test]

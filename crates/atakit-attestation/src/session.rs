@@ -252,7 +252,10 @@ pub enum SessionPlatformTrust {
     },
     AwsSnp {
         aws_nitro_roots: CertificateTrust,
+        aws_document_maximum_age_seconds: u64,
+        aws_document_allowed_future_clock_difference_seconds: u64,
         amd_ark_roots: CertificateTrust,
+        amd_snp_collateral: AmdSnpVerificationCollateral,
     },
 }
 
@@ -593,13 +596,26 @@ fn verify_platform_attestation(
                 errors,
             )
         }
-        SessionPlatformTrust::AwsSnp { .. } => {
-            record(
+        SessionPlatformTrust::AwsSnp {
+            aws_nitro_roots,
+            aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds,
+            amd_ark_roots,
+            amd_snp_collateral,
+        } => {
+            if !require_platform(bundle, "aws", "sev-snp", checks, errors) {
+                return None;
+            }
+            verify_aws_platform(
+                bundle,
+                aws_nitro_roots,
+                *aws_document_maximum_age_seconds,
+                *aws_document_allowed_future_clock_difference_seconds,
+                amd_ark_roots,
+                amd_snp_collateral,
+                current_time,
                 checks,
                 errors,
-                "platform-attestation",
-                false,
-                "AWS session-bundle verification is unsupported until Nitro attestation and raw SNP evidence are verified as one chain",
             );
             None
         }
@@ -757,6 +773,111 @@ fn verify_gcp_platform(
     };
     import_core_checks(report, checks, errors);
     tdx_tcb_status_bit
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_aws_platform(
+    bundle: &SessionEvidenceBundle,
+    aws_nitro_roots: &CertificateTrust,
+    aws_document_maximum_age_seconds: u64,
+    aws_document_allowed_future_clock_difference_seconds: u64,
+    amd_ark_roots: &CertificateTrust,
+    amd_snp_collateral: &AmdSnpVerificationCollateral,
+    current_time: SystemTime,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    if bundle.tee_evidence.kind != "configfs_tsm" {
+        record(
+            checks,
+            errors,
+            "aws-nitrotpm-binding",
+            false,
+            "AWS session verification requires tee_evidence.kind=configfs_tsm",
+        );
+        return;
+    }
+    if bundle.ak_evidence.kind != "aws_nitro_doc" {
+        record(
+            checks,
+            errors,
+            "aws-nitrotpm-binding",
+            false,
+            "AWS session verification requires ak_evidence.kind=aws_nitro_doc",
+        );
+        return;
+    }
+    let Some(ak_public) = decode_b64(
+        &bundle.ak_evidence.ak_public,
+        "ak_evidence.ak_public",
+        errors,
+    ) else {
+        return;
+    };
+    let Some(qualifying_data) = decode_hex_32(
+        &bundle.binding.qualifying_data,
+        "binding.qualifying_data",
+        errors,
+    ) else {
+        return;
+    };
+    let evidence = super::TeeEvidence {
+        kind: "configfs-tsm".to_string(),
+        report: bundle.tee_evidence.report.clone(),
+        auxiliary: bundle.tee_evidence.auxiliary.clone(),
+    };
+    let binding = super::AkBinding {
+        kind: "aws-nitro-doc".to_string(),
+        data: bundle.ak_evidence.collateral.clone(),
+    };
+    let pcrs = bundle
+        .pcr_values
+        .iter()
+        .map(|pcr| super::PcrEvidence {
+            index: pcr.index,
+            sha256: pcr.sha256.clone(),
+            sha384: pcr.sha384.clone(),
+        })
+        .collect::<Vec<_>>();
+    let trust = super::TrustAnchors {
+        amd_ark_roots: amd_ark_roots.certificates.clone(),
+        amd_ark_root_hashes: amd_ark_roots.hashes.clone(),
+        aws_nitro_roots: aws_nitro_roots.certificates.clone(),
+        aws_nitro_root_hashes: aws_nitro_roots.hashes.clone(),
+        aws_document_maximum_age_seconds: Some(aws_document_maximum_age_seconds),
+        aws_document_allowed_future_clock_difference_seconds: Some(
+            aws_document_allowed_future_clock_difference_seconds,
+        ),
+        ..super::TrustAnchors::default()
+    };
+    let mut report = super::VerificationReport {
+        checks: Vec::new(),
+        evidence: super::EvidenceSummary::default(),
+    };
+    let mut core_errors = Vec::new();
+    super::aws_nitrotpm::verify_aws_tls_attestation(
+        &mut report,
+        &mut core_errors,
+        &binding,
+        &evidence,
+        &ak_public,
+        &pcrs,
+        &qualifying_data,
+        &trust,
+        current_time,
+    );
+    super::verification_core::verify_aws_snp_vendor_report(
+        &mut report,
+        &mut core_errors,
+        Some(&evidence),
+        Some(amd_snp_collateral),
+        super::verification_core::AmdSnpTrust {
+            ark_roots: &amd_ark_roots.certificates,
+            ark_root_hashes: &amd_ark_roots.hashes,
+        },
+        current_time,
+    );
+    import_core_checks(report, checks, errors);
 }
 
 struct AzureSnpTrust<'a> {
@@ -1164,10 +1285,17 @@ fn verify_quote_projection(
                     .iter()
                     .zip(&bundle.pcr_values)
                     .all(|(authenticated, supplied)| {
-                        authenticated.index == supplied.index && authenticated.sha256.is_some()
+                        authenticated.index == supplied.index
+                            && match bundle.policy.pcr_bank_selection {
+                                PcrBankSelection::Sha256 => authenticated.sha256.is_some(),
+                                PcrBankSelection::Sha384 => authenticated.sha384.is_some(),
+                                PcrBankSelection::Sha256AndSha384 => {
+                                    authenticated.sha256.is_some() && authenticated.sha384.is_some()
+                                }
+                            }
                     })
         }),
-        "session policy requires the Quote to select an authenticated SHA-256 value for every supplied PCR; the Quote may also select SHA-384",
+        "the Quote did not authenticate every supplied PCR in every policy-selected bank",
     );
 }
 
@@ -1767,18 +1895,29 @@ fn verify_policies(
         "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
     );
     verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
-    if trusted.pcr_specs256.is_empty() && trusted.pcr_specs384.is_empty() {
+    let selected_policy_is_empty = match trusted.pcr_bank_selection {
+        PcrBankSelection::Sha256 => trusted.pcr_specs256.is_empty(),
+        PcrBankSelection::Sha384 => trusted.pcr_specs384.is_empty(),
+        PcrBankSelection::Sha256AndSha384 => {
+            trusted.pcr_specs256.is_empty() && trusted.pcr_specs384.is_empty()
+        }
+    };
+    if selected_policy_is_empty {
         record(
             checks,
             errors,
             "trusted-pcr-policy",
             false,
-            "caller-supplied trusted PCR policy is empty",
+            "caller-supplied trusted PCR policy has no rule in a selected bank",
         );
         return;
     }
 
-    for policy in &trusted.pcr_specs256 {
+    for policy in trusted
+        .pcr_specs256
+        .iter()
+        .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384))
+    {
         let name = format!("pcr-policy-sha256-{}", policy.pcr_index);
         let Some(value) = bundle
             .pcr_values
@@ -1821,7 +1960,11 @@ fn verify_policies(
         }
     }
 
-    for policy in &trusted.pcr_specs384 {
+    for policy in trusted
+        .pcr_specs384
+        .iter()
+        .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256))
+    {
         let name = format!("pcr-policy-sha384-{}", policy.pcr_index);
         let Some(value) = bundle
             .pcr_values
@@ -3011,6 +3154,55 @@ mod tests {
     }
 
     #[test]
+    fn sha384_session_does_not_evaluate_committed_sha256_rules() {
+        let pcr256 = SessionPcrPolicy {
+            pcr_index: 7,
+            verify_type: SessionPcrVerifyType::Static,
+            match_data: vec![format!("0x{}", "11".repeat(32))],
+        };
+        let pcr384 = SessionPcrPolicy384 {
+            pcr_index: 7,
+            verify_type: SessionPcrVerifyType::Static,
+            match_data: vec![format!("0x{}", "22".repeat(48))],
+        };
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            pcr_specs256: vec![pcr256.clone()],
+            pcr_specs384: vec![pcr384.clone()],
+        });
+        bundle.pcr_values[0].sha256 = None;
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            pcr_specs256: vec![pcr256],
+            pcr_specs384: vec![pcr384],
+            effective_attributes: Vec::new(),
+            attribute_requirements: Vec::new(),
+            amd_snp_security_policies: Vec::new(),
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_policies(&bundle, &trusted, None, &mut checks, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!checks
+            .iter()
+            .any(|check| check.name == "pcr-policy-sha256-7"));
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "pcr-policy-sha384-7" && check.valid));
+    }
+
+    #[test]
     fn verified_tdx_debug_drives_base_image_and_workload_policy() {
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
@@ -3706,6 +3898,37 @@ mod tests {
         let authenticated = vec![crate::PcrEvidence {
             index: 7,
             sha256: bundle.pcr_values[0].sha256.clone(),
+            sha384: bundle.pcr_values[0].sha384.clone(),
+        }];
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_quote_projection(&bundle, Some(&authenticated), &mut checks, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn session_projection_accepts_sha384_only_authentication_for_sha384_policy() {
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            pcr_specs384: Vec::new(),
+            pcr_specs256: Vec::new(),
+        });
+        bundle.event_log_hashes = vec![SessionEventHashes {
+            pcr_index: 7,
+            sha256: Vec::new(),
+            sha384: Vec::new(),
+        }];
+        bundle.pcr_values[0].sha256 = None;
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let authenticated = vec![crate::PcrEvidence {
+            index: 7,
+            sha256: None,
             sha384: bundle.pcr_values[0].sha384.clone(),
         }];
         let mut checks = Vec::new();

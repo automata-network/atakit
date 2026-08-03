@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use atakit_attestation::{
     amd_snp_kds_product, amd_snp_security_state, amd_snp_signing_key_type, amd_snp_vcek_request,
+    amd_snp_vlek_from_certificate_table, aws_nitro_root_certificate,
     parse_amd_snp_security_policy_file_json, select_azure_maa_manual_trust_key,
     verify_measurement_pack, verify_tls_attestation,
     verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpSigningKeyType,
@@ -1147,7 +1148,8 @@ async fn resolve_amd_snp_collateral(
     }
     let is_azure = response.platform.cloud.eq_ignore_ascii_case("azure");
     let is_gcp = response.platform.cloud.eq_ignore_ascii_case("gcp");
-    if !is_azure && !is_gcp {
+    let is_aws = response.platform.cloud.eq_ignore_ascii_case("aws");
+    if !is_azure && !is_gcp && !is_aws {
         return Ok(None);
     }
     let crls = resolve_amd_snp_crls(response, configured_crls).await?;
@@ -1158,19 +1160,76 @@ async fn resolve_amd_snp_collateral(
         let evidence = response
             .tee_evidence
             .as_ref()
-            .ok_or_else(|| "GCP SNP response is missing teeEvidence".to_string())?;
+            .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
         let auxiliary = evidence
             .auxiliary
             .as_ref()
-            .ok_or_else(|| "GCP SNP response is missing teeEvidence.auxiliary".to_string())?;
+            .ok_or_else(|| "SNP response is missing teeEvidence.auxiliary".to_string())?;
         let certificate_table = URL_SAFE_NO_PAD
             .decode(auxiliary)
-            .map_err(|error| format!("decode GCP SNP auxiliary certificate table: {error}"))?;
+            .map_err(|error| format!("decode SNP auxiliary certificate table: {error}"))?;
         return AmdSnpVerificationCollateral::from_certificate_table(&certificate_table, crls)
             .map(Some)
             .map_err(|error| error.to_string());
     }
+    if is_aws {
+        return fetch_aws_snp_collateral(response, crls).await.map(Some);
+    }
     unreachable!("supported AMD SEV-SNP cloud checked above")
+}
+
+async fn fetch_aws_snp_collateral(
+    response: &TlsAttestationResponse,
+    crls: Vec<Vec<u8>>,
+) -> Result<AmdSnpVerificationCollateral, String> {
+    let evidence = response
+        .tee_evidence
+        .as_ref()
+        .ok_or_else(|| "AWS SNP response is missing teeEvidence".to_string())?;
+    let report = URL_SAFE_NO_PAD
+        .decode(&evidence.report)
+        .map_err(|error| format!("decode AWS SNP report: {error}"))?;
+    let auxiliary = evidence
+        .auxiliary
+        .as_ref()
+        .ok_or_else(|| "AWS SNP response is missing teeEvidence.auxiliary".to_string())?;
+    let certificate_table = URL_SAFE_NO_PAD
+        .decode(auxiliary)
+        .map_err(|error| format!("decode AWS SNP auxiliary certificate table: {error}"))?;
+    let vlek = amd_snp_vlek_from_certificate_table(&certificate_table)
+        .map_err(|error| error.to_string())?;
+    let product = amd_snp_kds_product(&report)?;
+    let chain_url = format!("https://kdsintf.amd.com/vlek/v1/{product}/cert_chain");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("build AMD KDS client: {error}"))?;
+    let chain_response = client
+        .get(&chain_url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch AMD {product} VLEK certificate chain: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch AMD {product} VLEK certificate chain: {error}"))?;
+    let chain = read_response_bytes_limited(
+        chain_response,
+        MAX_AMD_COLLATERAL_BYTES,
+        &format!("AMD {product} VLEK certificate chain"),
+    )
+    .await?;
+    let certs = parse_pem_certificates(&chain)?;
+    let [asvk, ark] = certs.as_slice() else {
+        return Err(format!(
+            "AMD {product} VLEK certificate chain contains {} certificates, expected ASVK then ARK",
+            certs.len()
+        ));
+    };
+    Ok(AmdSnpVerificationCollateral::from_vlek_chain(
+        ark.clone(),
+        asvk.clone(),
+        vlek,
+        crls,
+    ))
 }
 
 async fn fetch_azure_snp_collateral(
@@ -1353,6 +1412,7 @@ async fn resolve_chain_trust_anchors(
     {
         if !response.platform.cloud.eq_ignore_ascii_case("gcp")
             && !response.platform.cloud.eq_ignore_ascii_case("azure")
+            && !response.platform.cloud.eq_ignore_ascii_case("aws")
         {
             return Ok(());
         }
@@ -1364,6 +1424,36 @@ async fn resolve_chain_trust_anchors(
             .await
             .map_err(|error| error.to_string())?;
         trust_anchors.amd_ark_root_hashes.push(ark_hash);
+    }
+
+    if response.platform.cloud.eq_ignore_ascii_case("aws") {
+        let binding = response
+            .ak_binding
+            .as_ref()
+            .ok_or_else(|| "AWS response is missing akBinding".to_string())?;
+        if trust_anchors.aws_nitro_roots.is_empty()
+            && trust_anchors.aws_nitro_root_hashes.is_empty()
+        {
+            let root = aws_nitro_root_certificate(binding)?;
+            let root_hash = client
+                .resolve_aws_nitro_root(&root)
+                .await
+                .map_err(|error| error.to_string())?;
+            trust_anchors.aws_nitro_root_hashes.push(root_hash);
+        }
+        if trust_anchors.aws_document_maximum_age_seconds.is_none()
+            || trust_anchors
+                .aws_document_allowed_future_clock_difference_seconds
+                .is_none()
+        {
+            let (maximum_age, allowed_future) = client
+                .resolve_aws_document_freshness_limits()
+                .await
+                .map_err(|error| error.to_string())?;
+            trust_anchors.aws_document_maximum_age_seconds = Some(maximum_age);
+            trust_anchors.aws_document_allowed_future_clock_difference_seconds =
+                Some(allowed_future);
+        }
     }
 
     if response.platform.tee.eq_ignore_ascii_case("sev-snp") {
