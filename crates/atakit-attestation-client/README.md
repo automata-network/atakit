@@ -92,5 +92,10 @@ fetches `GET /session/evidence-bundle`, resolves the committed Azure MAA key
 when required, constructs `SessionVerificationInputs`, and calls
 `atakit_attestation::verify_session_bundle`.
 
+The concrete portal TLS plus current-session workflow lives in
+`atakit_cloud::session::verify_portal_session`. This client starts from
+`VerifiedPortalTls`, so platform-specific portal TLS collection remains
+outside this crate.
+
 Use `atakit_attestation::verify_session_bundle` directly when all typed inputs
 are already available and no network access is required.
