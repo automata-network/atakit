@@ -275,7 +275,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 /// 1. Compute the expected final PCR23 from that sha256 (event hash):
 ///    `SHA-256(zeros_32 || event_hash)`.
 /// 2. Query the on-chain workload spec for `(name, version)` in parallel.
-/// 3. If the spec exists and contains a PCR23 matchData entry, compare
+/// 3. If the spec contains a STATIC PCR23 `comparison`, compare
 ///    the computed value to the on-chain value.
 /// 4. On mismatch: mark the entry as `divergent` (rendered red) and emit
 ///    a stderr warning.

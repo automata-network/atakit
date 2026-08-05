@@ -59,7 +59,7 @@ pub async fn run(args: RebootArgs, env: &Env, _config: &Config) -> Result<()> {
 
     eprintln!();
     eprintln!(
-        "  {} Reboot requested for {}/{}; AWS instance status checks passed",
+        "  {} Reboot request accepted for {}/{}; current AWS instance status checks passed",
         "*".green(),
         target_name,
         instance_name.bold()

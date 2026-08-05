@@ -17,12 +17,12 @@ use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use atakit_attestation::{
     AmdSnpSecurityPolicy, AzureMaaTrustKey, BaseImage, MeasurementPack, MeasurementPolicy,
     MeasurementProfile, MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384,
-    SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, SessionPcrVerifyType,
-    TrustedSessionBinding,
+    SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, TrustedSessionBinding,
 };
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
 };
+use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::WorkloadSpec;
 use automata_tee_workload_measurement::types::AppRef;
@@ -125,13 +125,11 @@ impl TrustedWorkloadSessionPolicy {
             workload_id: WorkloadRegistry::get_workload_id(&app_ref).0,
             pcr_specs256: vec![SessionPcrPolicy {
                 pcr_index: 23,
-                verify_type: SessionPcrVerifyType::Static,
-                match_data: vec![hex0x(manifest_pcr23_sha256)],
+                comparison: hex0x(encode_static256(manifest_pcr23_sha256.into())),
             }],
             pcr_specs384: vec![SessionPcrPolicy384 {
                 pcr_index: 23,
-                verify_type: SessionPcrVerifyType::Static,
-                match_data: vec![hex0x(manifest_pcr23_sha384)],
+                comparison: hex0x(encode_static384(manifest_pcr23_sha384)),
             }],
             attribute_requirements: Vec::new(),
         })
@@ -806,15 +804,15 @@ fn hierarchy_to_measurement_policy(
                 cloud: cloud.to_string(),
                 tee: tee.to_string(),
                 pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
-                invariants256: profile
+                invariant_pcrs256: profile
                     .profile
-                    .invariants256
+                    .invariantPcrs256
                     .iter()
                     .map(chain_pcr_spec256_to_measurement)
                     .collect(),
-                invariants384: profile
+                invariant_pcrs384: profile
                     .profile
-                    .invariants384
+                    .invariantPcrs384
                     .iter()
                     .map(chain_pcr_spec384_to_measurement)
                     .collect(),
@@ -837,7 +835,7 @@ fn hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v2".to_string(),
+            schema: "atakit.measurement-pack.v3".to_string(),
             revision: 1,
             published_at: chrono::Utc::now().to_rfc3339(),
             base_image: BaseImage {
@@ -857,15 +855,7 @@ fn chain_pcr_spec256_to_measurement(
 ) -> PcrSpec256 {
     PcrSpec256 {
         pcr_index: spec.pcrIndex,
-        verify_type: match spec.verifyType {
-            0 => "static".to_string(),
-            1 => "dynamicSubset".to_string(),
-            2 => "dynamicSubsequence".to_string(),
-            other => format!("unknown-{other}"),
-        },
-        match_data: spec.matchData.iter().map(hex0x).collect(),
-        event_indices: Vec::new(),
-        total_events: None,
+        comparison: hex0x(&spec.comparison),
     }
 }
 
@@ -874,28 +864,7 @@ fn chain_pcr_spec384_to_measurement(
 ) -> PcrSpec384 {
     PcrSpec384 {
         pcr_index: spec.pcrIndex,
-        verify_type: chain_verify_type(spec.verifyType),
-        match_data: spec
-            .matchData
-            .iter()
-            .map(|value| {
-                let mut bytes = [0u8; 48];
-                bytes[..32].copy_from_slice(value.first.as_slice());
-                bytes[32..].copy_from_slice(value.second.as_slice());
-                hex0x(bytes)
-            })
-            .collect(),
-        event_indices: Vec::new(),
-        total_events: None,
-    }
-}
-
-fn chain_verify_type(value: u8) -> String {
-    match value {
-        0 => "static".to_string(),
-        1 => "dynamicSubset".to_string(),
-        2 => "dynamicSubsequence".to_string(),
-        other => format!("unknown-{other}"),
+        comparison: hex0x(&spec.comparison),
     }
 }
 
@@ -958,56 +927,19 @@ fn trusted_workload_policy(
     let pcr_specs256 = spec
         .workloadPcrs256
         .iter()
-        .map(|spec| {
-            let verify_type = match spec.verifyType {
-                0 => SessionPcrVerifyType::Static,
-                1 => SessionPcrVerifyType::DynamicSubset,
-                2 => SessionPcrVerifyType::DynamicSubsequence,
-                value => {
-                    return Err(AttestationClientError::WorkloadPolicy(format!(
-                        "trusted WorkloadSpec has unsupported PCR verifyType {value} for PCR{}",
-                        spec.pcrIndex
-                    )))
-                }
-            };
-            Ok(SessionPcrPolicy {
-                pcr_index: spec.pcrIndex,
-                verify_type,
-                match_data: spec.matchData.iter().map(hex0x).collect(),
-            })
+        .map(|spec| SessionPcrPolicy {
+            pcr_index: spec.pcrIndex,
+            comparison: hex0x(&spec.comparison),
         })
-        .collect::<Result<Vec<_>, AttestationClientError>>()?;
+        .collect();
     let pcr_specs384 = spec
         .workloadPcrs384
         .iter()
-        .map(|spec| {
-            let verify_type = match spec.verifyType {
-                0 => SessionPcrVerifyType::Static,
-                1 => SessionPcrVerifyType::DynamicSubset,
-                2 => SessionPcrVerifyType::DynamicSubsequence,
-                value => {
-                    return Err(AttestationClientError::WorkloadPolicy(format!(
-                    "trusted WorkloadSpec has unsupported SHA-384 PCR verifyType {value} for PCR{}",
-                    spec.pcrIndex
-                )))
-                }
-            };
-            Ok(SessionPcrPolicy384 {
-                pcr_index: spec.pcrIndex,
-                verify_type,
-                match_data: spec
-                    .matchData
-                    .iter()
-                    .map(|value| {
-                        let mut bytes = [0u8; 48];
-                        bytes[..32].copy_from_slice(value.first.as_slice());
-                        bytes[32..].copy_from_slice(value.second.as_slice());
-                        hex0x(bytes)
-                    })
-                    .collect(),
-            })
+        .map(|spec| SessionPcrPolicy384 {
+            pcr_index: spec.pcrIndex,
+            comparison: hex0x(&spec.comparison),
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
     let attribute_requirements = spec
         .requirements
         .iter()
@@ -1297,17 +1229,15 @@ mod tests {
         assert_eq!(policy.pcr_specs256.len(), 1);
         assert_eq!(policy.pcr_specs256[0].pcr_index, 23);
         assert_eq!(
-            policy.pcr_specs256[0].verify_type,
-            SessionPcrVerifyType::Static
+            policy.pcr_specs256[0].comparison,
+            hex0x(encode_static256([0x55; 32].into()))
         );
-        assert_eq!(policy.pcr_specs256[0].match_data, [hex0x([0x55; 32])]);
         assert_eq!(policy.pcr_specs384.len(), 1);
         assert_eq!(policy.pcr_specs384[0].pcr_index, 23);
         assert_eq!(
-            policy.pcr_specs384[0].verify_type,
-            SessionPcrVerifyType::Static
+            policy.pcr_specs384[0].comparison,
+            hex0x(encode_static384([0x66; 48]))
         );
-        assert_eq!(policy.pcr_specs384[0].match_data, [hex0x([0x66; 48])]);
         assert!(policy.attribute_requirements.is_empty());
     }
 
@@ -1339,10 +1269,18 @@ mod tests {
 
     #[test]
     fn registered_workload_policy_converts_all_rules() {
+        use automata_tee_workload_measurement::pcr_comparison::{
+            encode_dynamic256, DYNAMIC_SUBSEQUENCE,
+        };
         use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-            AttributeRequirement, Bytes48, PcrSpec256 as WorkloadPcrSpec256,
+            AttributeRequirement, PcrSpec256 as WorkloadPcrSpec256,
             PcrSpec384 as WorkloadPcrSpec384,
         };
+
+        let dynamic_comparison =
+            encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![B256::repeat_byte(0x20)]).unwrap();
+        let static_comparison = encode_static256(B256::repeat_byte(0x23));
+        let static_comparison384 = encode_static384([0x38; 48]);
 
         let selected_base_image = B256::repeat_byte(0x44);
         let spec = WorkloadSpec {
@@ -1358,22 +1296,16 @@ mod tests {
             workloadPcrs256: vec![
                 WorkloadPcrSpec256 {
                     pcrIndex: 20,
-                    verifyType: 2,
-                    matchData: vec![B256::repeat_byte(0x20)],
+                    comparison: dynamic_comparison.clone(),
                 },
                 WorkloadPcrSpec256 {
                     pcrIndex: 23,
-                    verifyType: 0,
-                    matchData: vec![B256::repeat_byte(0x23)],
+                    comparison: static_comparison.clone(),
                 },
             ],
             workloadPcrs384: vec![WorkloadPcrSpec384 {
                 pcrIndex: 23,
-                verifyType: 0,
-                matchData: vec![Bytes48 {
-                    first: B256::repeat_byte(0x38),
-                    second: [0x48; 16].into(),
-                }],
+                comparison: static_comparison384.clone(),
             }],
         };
         let app_ref: AppRef = "test:v0.0.1".parse().unwrap();
@@ -1383,22 +1315,12 @@ mod tests {
 
         assert_eq!(policy.workload_id, [0x11; 32]);
         assert_eq!(policy.pcr_specs256.len(), 2);
-        assert_eq!(
-            policy.pcr_specs256[0].verify_type,
-            SessionPcrVerifyType::DynamicSubsequence
-        );
-        assert_eq!(
-            policy.pcr_specs256[1].verify_type,
-            SessionPcrVerifyType::Static
-        );
+        assert_eq!(policy.pcr_specs256[0].comparison, hex0x(dynamic_comparison));
+        assert_eq!(policy.pcr_specs256[1].comparison, hex0x(static_comparison));
         assert_eq!(policy.pcr_specs384.len(), 1);
         assert_eq!(
-            policy.pcr_specs384[0].verify_type,
-            SessionPcrVerifyType::Static
-        );
-        assert_eq!(
-            policy.pcr_specs384[0].match_data,
-            [format!("0x{}{}", "38".repeat(32), "48".repeat(16))]
+            policy.pcr_specs384[0].comparison,
+            hex0x(static_comparison384)
         );
         assert_eq!(policy.attribute_requirements[0].key, [0xaa; 32]);
         assert_eq!(

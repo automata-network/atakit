@@ -12,6 +12,11 @@
 
 use std::time::SystemTime;
 
+use alloy::primitives::B256;
+use automata_tee_workload_measurement::pcr_comparison::{
+    decode256, decode384, encode_extend_from_zero256, encode_extend_from_zero384, PcrComparison256,
+    PcrComparison384,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
@@ -153,23 +158,13 @@ pub struct SessionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPcrPolicy {
     pub pcr_index: u8,
-    pub verify_type: SessionPcrVerifyType,
-    pub match_data: Vec<String>,
+    pub comparison: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPcrPolicy384 {
     pub pcr_index: u8,
-    pub verify_type: SessionPcrVerifyType,
-    pub match_data: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SessionPcrVerifyType {
-    Static,
-    DynamicSubset,
-    DynamicSubsequence,
+    pub comparison: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,9 +432,16 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
+    let resolved_policy = resolve_provider_pcr_rules(
+        bundle,
+        &inputs.trust.platform,
+        &inputs.trust.policy,
+        &mut checks,
+        &mut errors,
+    );
     verify_policies(
         bundle,
-        &inputs.trust.policy,
+        &resolved_policy,
         verified_tdx_tcb_status_bit,
         &mut checks,
         &mut errors,
@@ -722,22 +724,6 @@ fn verify_gcp_platform(
         report: bundle.tee_evidence.report.clone(),
         auxiliary: bundle.tee_evidence.auxiliary.clone(),
     };
-    let pcrs = bundle
-        .pcr_values
-        .iter()
-        .map(|pcr| super::PcrEvidence {
-            index: pcr.index,
-            sha256: pcr.sha256.clone(),
-            sha384: pcr.sha384.clone(),
-        })
-        .collect::<Vec<_>>();
-    super::verification_core::verify_gcp_tee_vtpm_binding(
-        &mut report,
-        &mut core_errors,
-        Some(&tee_evidence),
-        &bundle.platform.tee,
-        &pcrs,
-    );
     let tdx_tcb_status_bit = match (amd_snp_trust, dcap_collateral) {
         (Some((amd, collateral)), None) => {
             super::verification_core::verify_gcp_snp_vendor_report(
@@ -1649,100 +1635,262 @@ pub fn evaluate_session_pcr_policy(
     measured_value: [u8; 32],
     measured_events: &[[u8; 32]],
 ) -> std::result::Result<(), String> {
-    super::verification_core::evaluate_pcr_policy(policy, measured_value, measured_events)
+    evaluate_session_pcr_policy_with_startup_locality(policy, measured_value, measured_events, 0xff)
 }
 
-fn evaluate_session_pcr_policy_with_startup_locality(
+pub(crate) fn evaluate_session_pcr_policy_with_startup_locality(
     policy: &SessionPcrPolicy,
     measured_value: [u8; 32],
     measured_events: &[[u8; 32]],
     startup_locality: u8,
 ) -> std::result::Result<(), String> {
-    evaluate_landmark_policy(
-        policy.verify_type,
-        policy
-            .match_data
-            .iter()
-            .map(|value| decode_hex_array(value))
-            .collect::<Result<Vec<_>, _>>()?,
+    let comparison = decode_policy_comparison_hex(&policy.comparison)?;
+    let comparison = decode256(&comparison).map_err(|error| error.to_string())?;
+    evaluate_comparison256(
+        &comparison,
         measured_value,
         measured_events,
         policy.pcr_index,
         startup_locality,
-        |input| Sha256::digest(input).into(),
     )
 }
 
-fn evaluate_session_pcr_policy384(
+pub(crate) fn evaluate_session_pcr_policy384(
     policy: &SessionPcrPolicy384,
     measured_value: [u8; 48],
     measured_events: &[[u8; 48]],
     startup_locality: u8,
 ) -> std::result::Result<(), String> {
-    evaluate_landmark_policy(
-        policy.verify_type,
-        policy
-            .match_data
-            .iter()
-            .map(|value| decode_hex_48(value))
-            .collect::<Result<Vec<_>, _>>()?,
+    let comparison = decode_policy_comparison_hex(&policy.comparison)?;
+    let comparison = decode384(&comparison).map_err(|error| error.to_string())?;
+    evaluate_comparison384(
+        &comparison,
         measured_value,
         measured_events,
         policy.pcr_index,
         startup_locality,
-        |input| Sha384::digest(input).into(),
     )
 }
 
-fn evaluate_landmark_policy<const N: usize>(
-    verify_type: SessionPcrVerifyType,
-    expected: Vec<[u8; N]>,
-    measured_value: [u8; N],
-    measured_events: &[[u8; N]],
+fn decode_policy_comparison_hex(value: &str) -> std::result::Result<Vec<u8>, String> {
+    let clean = value.strip_prefix("0x").unwrap_or(value);
+    hex::decode(clean).map_err(|error| format!("invalid PCR comparison hex: {error}"))
+}
+
+fn evaluate_comparison256(
+    comparison: &PcrComparison256,
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
     pcr_index: u8,
     startup_locality: u8,
-    hash: impl Fn(&[u8]) -> [u8; N],
 ) -> std::result::Result<(), String> {
-    match verify_type {
-        SessionPcrVerifyType::Static => {
-            if expected.len() != 1 {
-                return Err(format!(
-                    "STATIC policy requires exactly one match_data entry, got {}",
-                    expected.len()
-                ));
-            }
-            if measured_value != expected[0] {
+    match comparison {
+        PcrComparison256::Static(expected) => {
+            if expected.as_slice() != measured_value {
                 return Err("STATIC PCR value mismatch".to_string());
             }
             return Ok(());
         }
-        SessionPcrVerifyType::DynamicSubset => {
-            if expected.is_empty() || measured_events.is_empty() {
-                return Err("DYNAMIC_SUBSET policy or measured event log is empty".to_string());
+        PcrComparison256::ExtendFromZero(extend_value) => {
+            let mut input = [0u8; 64];
+            input[32..].copy_from_slice(extend_value.as_slice());
+            let expected: [u8; 32] = Sha256::digest(input).into();
+            if expected != measured_value {
+                return Err("EXTEND_FROM_ZERO PCR value mismatch".to_string());
             }
-            if expected
-                .iter()
-                .any(|required| !measured_events.contains(required))
+            return Ok(());
+        }
+        PcrComparison256::DynamicSubset(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSET")?;
+            if expected.is_empty()
+                || expected.iter().any(|required| {
+                    !measured_events
+                        .iter()
+                        .any(|event| required.as_slice() == event)
+                })
             {
                 return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
             }
         }
-        SessionPcrVerifyType::DynamicSubsequence => {
-            if expected.is_empty() || measured_events.is_empty() {
-                return Err("DYNAMIC_SUBSEQUENCE policy or measured event log is empty".to_string());
+        PcrComparison256::DynamicSubsequence(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSEQUENCE")?;
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected
+                    .get(landmark)
+                    .is_some_and(|required| required.as_slice() == event)
+                {
+                    landmark += 1;
+                }
             }
+            if expected.is_empty() || landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+        }
+        PcrComparison256::DynamicIndexedEventSets(rule) => {
+            require_dynamic_events(measured_events, "DYNAMIC_INDEXED_EVENT_SETS")?;
+            if measured_events.len() != usize::from(rule.expected_event_count) {
+                return Err("DYNAMIC_INDEXED_EVENT_SETS event count mismatch".to_string());
+            }
+            validate_indexed_events(
+                rule.checked_events
+                    .iter()
+                    .map(|checked| {
+                        (
+                            checked.event_index,
+                            checked.allowed_values.len(),
+                            checked
+                                .allowed_values
+                                .windows(2)
+                                .all(|pair| pair[0] < pair[1]),
+                            measured_events
+                                .get(usize::from(checked.event_index))
+                                .is_some_and(|measured| {
+                                    checked
+                                        .allowed_values
+                                        .iter()
+                                        .any(|allowed| allowed.as_slice() == measured)
+                                }),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                rule.expected_event_count,
+            )?;
+        }
+    }
+    verify_event_replay(
+        measured_value,
+        measured_events,
+        pcr_index,
+        startup_locality,
+        |input| Sha256::digest(input).into(),
+    )
+}
+
+fn evaluate_comparison384(
+    comparison: &PcrComparison384,
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    match comparison {
+        PcrComparison384::Static(expected) => {
+            if expected != &measured_value {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison384::ExtendFromZero(extend_value) => {
+            let mut input = [0u8; 96];
+            input[48..].copy_from_slice(extend_value);
+            let expected: [u8; 48] = Sha384::digest(input).into();
+            if expected != measured_value {
+                return Err("EXTEND_FROM_ZERO PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison384::DynamicSubset(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSET")?;
+            if expected.is_empty()
+                || expected
+                    .iter()
+                    .any(|required| !measured_events.contains(required))
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+        }
+        PcrComparison384::DynamicSubsequence(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSEQUENCE")?;
             let mut landmark = 0;
             for event in measured_events {
                 if expected.get(landmark) == Some(event) {
                     landmark += 1;
                 }
             }
-            if landmark != expected.len() {
+            if expected.is_empty() || landmark != expected.len() {
                 return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
             }
         }
+        PcrComparison384::DynamicIndexedEventSets(rule) => {
+            require_dynamic_events(measured_events, "DYNAMIC_INDEXED_EVENT_SETS")?;
+            if measured_events.len() != usize::from(rule.expected_event_count) {
+                return Err("DYNAMIC_INDEXED_EVENT_SETS event count mismatch".to_string());
+            }
+            validate_indexed_events(
+                rule.checked_events
+                    .iter()
+                    .map(|checked| {
+                        (
+                            checked.event_index,
+                            checked.allowed_values.len(),
+                            checked
+                                .allowed_values
+                                .windows(2)
+                                .all(|pair| pair[0] < pair[1]),
+                            measured_events
+                                .get(usize::from(checked.event_index))
+                                .is_some_and(|measured| checked.allowed_values.contains(measured)),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                rule.expected_event_count,
+            )?;
+        }
     }
+    verify_event_replay(
+        measured_value,
+        measured_events,
+        pcr_index,
+        startup_locality,
+        |input| Sha384::digest(input).into(),
+    )
+}
 
+fn require_dynamic_events<const N: usize>(
+    measured_events: &[[u8; N]],
+    comparison_type: &str,
+) -> std::result::Result<(), String> {
+    if measured_events.is_empty() {
+        Err(format!("{comparison_type} measured event log is empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_indexed_events(
+    checks: Vec<(u16, usize, bool, bool)>,
+    expected_event_count: u16,
+) -> std::result::Result<(), String> {
+    if checks.is_empty() {
+        return Err("DYNAMIC_INDEXED_EVENT_SETS has no checked events".to_string());
+    }
+    let mut previous = None;
+    for (event_index, allowed_count, allowed_sorted, matched) in checks {
+        if event_index >= expected_event_count {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked index is out of range".to_string());
+        }
+        if previous.is_some_and(|previous| event_index <= previous) {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked indexes are not sorted".to_string());
+        }
+        if allowed_count == 0 || !allowed_sorted {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS allowed set is not canonical".to_string());
+        }
+        if !matched {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked event mismatch".to_string());
+        }
+        previous = Some(event_index);
+    }
+    Ok(())
+}
+
+fn verify_event_replay<const N: usize>(
+    measured_value: [u8; N],
+    measured_events: &[[u8; N]],
+    pcr_index: u8,
+    startup_locality: u8,
+    hash: impl Fn(&[u8]) -> [u8; N],
+) -> std::result::Result<(), String> {
     if startup_locality != 0xff && startup_locality > 4 {
         return Err(format!("invalid PCR0 StartupLocality {startup_locality}"));
     }
@@ -1847,6 +1995,112 @@ fn verify_trusted_binding(
         registry == trusted.registry,
         "authenticated session registry differs from the verifier-selected SessionRegistry",
     );
+}
+
+fn resolve_provider_pcr_rules(
+    bundle: &SessionEvidenceBundle,
+    platform: &SessionPlatformTrust,
+    trusted: &TrustedSessionPolicy,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) -> TrustedSessionPolicy {
+    let mut resolved = trusted.clone();
+    let result = (|| -> std::result::Result<(), String> {
+        let mut decode_errors = Vec::new();
+        let report = decode_b64(
+            &bundle.tee_evidence.report,
+            "tee_evidence.report",
+            &mut decode_errors,
+        )
+        .ok_or_else(|| decode_errors.join("; "))?;
+
+        match platform {
+            SessionPlatformTrust::AzureTdx { .. } | SessionPlatformTrust::AzureSnp { .. } => {}
+            SessionPlatformTrust::GcpTdx { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384) {
+                    return Err("GCP provider PCR15 requires the SHA-256 PCR bank".to_string());
+                }
+                let report_start = super::verification_core::tdx_quote_report_start(&report)?;
+                let uuid_start = report_start + super::TDX_REPORT_REPORT_DATA_OFFSET;
+                let uuid = report
+                    .get(uuid_start..uuid_start + super::GCP_TDX_UUID_LEN)
+                    .ok_or_else(|| {
+                        "GCP TDX quote is too short for the REPORT_DATA UUID".to_string()
+                    })?;
+                let mut extend_value = [0u8; 32];
+                extend_value[16..].copy_from_slice(uuid);
+                resolved.pcr_specs256.push(SessionPcrPolicy {
+                    pcr_index: 15,
+                    comparison: format!(
+                        "0x{}",
+                        hex::encode(encode_extend_from_zero256(B256::from(extend_value)))
+                    ),
+                });
+            }
+            SessionPlatformTrust::GcpSnp { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384) {
+                    return Err("GCP provider PCR15 requires the SHA-256 PCR bank".to_string());
+                }
+                if report.len() != super::SNP_REPORT_SIZE {
+                    return Err(format!(
+                        "AMD SEV-SNP report must contain {} bytes, got {}",
+                        super::SNP_REPORT_SIZE,
+                        report.len()
+                    ));
+                }
+                let report_id = B256::from_slice(
+                    &report[super::SNP_REPORT_REPORT_ID_OFFSET
+                        ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN],
+                );
+                resolved.pcr_specs256.push(SessionPcrPolicy {
+                    pcr_index: 15,
+                    comparison: format!("0x{}", hex::encode(encode_extend_from_zero256(report_id))),
+                });
+            }
+            SessionPlatformTrust::AwsSnp { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256) {
+                    return Err("AWS provider PCR15 requires the SHA-384 PCR bank".to_string());
+                }
+                if report.len() != super::SNP_REPORT_SIZE {
+                    return Err(format!(
+                        "AMD SEV-SNP report must contain {} bytes, got {}",
+                        super::SNP_REPORT_SIZE,
+                        report.len()
+                    ));
+                }
+                let report_id = &report[super::SNP_REPORT_REPORT_ID_OFFSET
+                    ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN];
+                let mut extend_value384 = [0u8; 48];
+                extend_value384[16..].copy_from_slice(report_id);
+                resolved.pcr_specs384.push(SessionPcrPolicy384 {
+                    pcr_index: 15,
+                    comparison: format!(
+                        "0x{}",
+                        hex::encode(encode_extend_from_zero384(extend_value384))
+                    ),
+                });
+                if matches!(
+                    trusted.pcr_bank_selection,
+                    PcrBankSelection::Sha256AndSha384
+                ) {
+                    resolved.pcr_specs256.push(SessionPcrPolicy {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero256(B256::from_slice(report_id)))
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => record(checks, errors, "provider-pcr15-rule", true, ""),
+        Err(detail) => record(checks, errors, "provider-pcr15-rule", false, &detail),
+    }
+    resolved
 }
 
 fn verify_policies(
@@ -2646,6 +2900,9 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automata_tee_workload_measurement::pcr_comparison::{
+        encode_dynamic256, encode_static256, encode_static384, DYNAMIC_SUBSEQUENCE, DYNAMIC_SUBSET,
+    };
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use k256::ecdsa::SigningKey;
 
@@ -2967,63 +3224,76 @@ mod tests {
     fn all_policy_modes_and_ordered_landmarks() {
         let events = [[1u8; 32], [2u8; 32], [3u8; 32]];
         let final_value = replay(&events);
-        let hex = |value: [u8; 32]| format!("0x{}", hex::encode(value));
+        let comparison = |value: &[u8]| format!("0x{}", hex::encode(value));
 
         let static_policy = SessionPcrPolicy {
             pcr_index: 0,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![hex(final_value)],
+            comparison: comparison(&encode_static256(final_value.into())),
         };
         evaluate_session_pcr_policy(&static_policy, final_value, &events).unwrap();
-        for malformed in [Vec::new(), vec![hex(final_value), hex(final_value)]] {
+        for malformed in ["0x".to_string(), format!("{}00", static_policy.comparison)] {
             let policy = SessionPcrPolicy {
-                match_data: malformed,
+                comparison: malformed,
                 ..static_policy.clone()
             };
-            assert!(evaluate_session_pcr_policy(&policy, final_value, &events)
-                .unwrap_err()
-                .contains("requires exactly one match_data entry"));
+            assert!(evaluate_session_pcr_policy(&policy, final_value, &events).is_err());
         }
 
         let subset = SessionPcrPolicy {
             pcr_index: 10,
-            verify_type: SessionPcrVerifyType::DynamicSubset,
-            match_data: vec![hex(events[2]), hex(events[0])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[2].into(), events[0].into()])
+                    .unwrap(),
+            ),
         };
         evaluate_session_pcr_policy(&subset, final_value, &events).unwrap();
         let empty_subset = SessionPcrPolicy {
-            match_data: Vec::new(),
+            comparison: comparison(&encode_dynamic256(DYNAMIC_SUBSET, Vec::new()).unwrap()),
             ..subset.clone()
         };
         assert_eq!(
             evaluate_session_pcr_policy(&empty_subset, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSET policy has no required landmarks"
+            "DYNAMIC_SUBSET required landmark is missing"
         );
         let missing_subset = SessionPcrPolicy {
-            match_data: vec![hex(events[0]), hex([4u8; 32])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[0].into(), [4u8; 32].into()])
+                    .unwrap(),
+            ),
             ..subset
         };
         assert_eq!(
             evaluate_session_pcr_policy(&missing_subset, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSET required landmark 1 is missing"
+            "DYNAMIC_SUBSET required landmark is missing"
         );
 
         let subsequence = SessionPcrPolicy {
             pcr_index: 10,
-            verify_type: SessionPcrVerifyType::DynamicSubsequence,
-            match_data: vec![hex(events[0]), hex(events[2])],
+            comparison: comparison(
+                &encode_dynamic256(
+                    DYNAMIC_SUBSEQUENCE,
+                    vec![events[0].into(), events[2].into()],
+                )
+                .unwrap(),
+            ),
         };
         evaluate_session_pcr_policy(&subsequence, final_value, &events).unwrap();
         let empty_subsequence = SessionPcrPolicy {
-            match_data: Vec::new(),
+            comparison: comparison(&encode_dynamic256(DYNAMIC_SUBSEQUENCE, Vec::new()).unwrap()),
             ..subsequence.clone()
         };
         assert_eq!(
             evaluate_session_pcr_policy(&empty_subsequence, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSEQUENCE policy has no required landmarks"
+            "DYNAMIC_SUBSEQUENCE required landmark is missing"
         );
         let reversed = SessionPcrPolicy {
-            match_data: vec![hex(events[2]), hex(events[0])],
+            comparison: comparison(
+                &encode_dynamic256(
+                    DYNAMIC_SUBSEQUENCE,
+                    vec![events[2].into(), events[0].into()],
+                )
+                .unwrap(),
+            ),
             ..subsequence
         };
         assert!(evaluate_session_pcr_policy(&reversed, final_value, &events).is_err());
@@ -3060,8 +3330,7 @@ mod tests {
     fn trusted_policy_must_match_bundle_projection_and_drives_evaluation() {
         let pcr = SessionPcrPolicy {
             pcr_index: 7,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![format!("0x{}", "11".repeat(32))],
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32].into()))),
         };
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
@@ -3157,13 +3426,11 @@ mod tests {
     fn sha384_session_does_not_evaluate_committed_sha256_rules() {
         let pcr256 = SessionPcrPolicy {
             pcr_index: 7,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![format!("0x{}", "11".repeat(32))],
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32].into()))),
         };
         let pcr384 = SessionPcrPolicy384 {
             pcr_index: 7,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![format!("0x{}", "22".repeat(48))],
+            comparison: format!("0x{}", hex::encode(encode_static384([0x22; 48]))),
         };
         let mut bundle = bundle_for_policy(SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),

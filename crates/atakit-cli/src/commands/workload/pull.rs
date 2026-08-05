@@ -10,7 +10,7 @@ use atakit_workload::{
 use futures_util::future::join_all;
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, hex_equal, parse_workload_ref, WorkloadRef};
+use super::{compute_workload_id, hex_equal, parse_workload_ref, static_pcr256_value, WorkloadRef};
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
 
@@ -503,9 +503,9 @@ fn select_candidate(reference: &str, candidates: Vec<Candidate>) -> Result<Candi
     Ok(candidates.into_iter().nth(pick - 1).unwrap())
 }
 
-/// Verify the archive's PCR23 (final register value) against on-chain matchData.
+/// Verify the archive's PCR23 against the on-chain STATIC `comparison`.
 ///
-/// On-chain STATIC matchData for PCR23 contains the final PCR value
+/// The on-chain STATIC `comparison` for PCR23 contains the final PCR value
 /// (SHA-256(zeros_32 || event_hash)), which matches `InspectResult.pcr23`.
 ///
 /// # Modes
@@ -619,13 +619,13 @@ async fn verify_pcr23(
         }
     };
 
-    // Find PCR23 in the spec. matchData[0] is the final PCR register value.
+    // Find PCR23 and decode its STATIC comparison.
     let on_chain_pcr23 = spec
         .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
-        .and_then(|p| p.matchData.first())
-        .map(|b| format!("0x{}", hex::encode(b)));
+        .and_then(|p| static_pcr256_value(&p.comparison))
+        .map(|value| format!("0x{}", hex::encode(value)));
 
     match on_chain_pcr23 {
         Some(ref expected) => {

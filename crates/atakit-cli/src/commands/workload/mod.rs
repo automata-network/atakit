@@ -19,6 +19,7 @@ use alloy_ext::core::primitives::{keccak256, B256};
 use alloy_ext::core::sol_types::SolValue;
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadStore};
+use automata_tee_workload_measurement::pcr_comparison::{decode256, PcrComparison256};
 use sha2::{Digest, Sha256};
 
 /// Look for a single `.atawl` file in the directory.
@@ -70,6 +71,13 @@ pub fn compute_base_image_id(name: &str, version: &str) -> B256 {
     let domain = keccak256("CVM_BASEIMAGE_V1");
     let encoded = (domain, name.to_string(), version.to_string()).abi_encode_params();
     keccak256(&encoded)
+}
+
+pub(crate) fn static_pcr256_value(comparison: &[u8]) -> Option<[u8; 32]> {
+    match decode256(comparison).ok()? {
+        PcrComparison256::Static(value) => Some(value.into()),
+        _ => None,
+    }
 }
 
 /// Parsed workload reference: either `name:version` or a hex workload ID.
@@ -226,7 +234,7 @@ pub struct ChainData {
     pub owner: Option<String>,
     pub revoked: bool,
     pub spec: Option<CachedChainSpec>,
-    /// PCR23 from on-chain matchData (STATIC).
+    /// PCR23 decoded from an on-chain STATIC `comparison`.
     pub pcr23: Option<String>,
 }
 
@@ -284,8 +292,8 @@ pub async fn query_chain_data(
         .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
-        .and_then(|p| p.matchData.first())
-        .map(|b| format!("0x{}", hex::encode(b)));
+        .and_then(|p| static_pcr256_value(&p.comparison))
+        .map(|value| format!("0x{}", hex::encode(value)));
 
     let cached = CachedChainSpec {
         session_ttl: spec.sessionTtl,
@@ -300,12 +308,7 @@ pub async fn query_chain_data(
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
-                verify_type: p.verifyType,
-                match_data: p
-                    .matchData
-                    .iter()
-                    .map(|b| format!("0x{}", hex::encode(b)))
-                    .collect(),
+                comparison: format!("0x{}", hex::encode(&p.comparison)),
             })
             .collect(),
     };

@@ -2630,7 +2630,7 @@ mod tests {
 
     fn measurement_pack_json(name: &str, version: &str) -> String {
         format!(
-            r#"{{"baseImage":{{"id":"0x{}","name":"{name}","version":"{version}"}},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v2"}}"#,
+            r#"{{"baseImage":{{"id":"0x{}","name":"{name}","version":"{version}"}},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v3"}}"#,
             "00".repeat(32)
         )
     }

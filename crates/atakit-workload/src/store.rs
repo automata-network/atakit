@@ -41,8 +41,7 @@ pub struct CachedChainSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPcrSpec {
     pub pcr_index: u8,
-    pub verify_type: u8,
-    pub match_data: Vec<String>,
+    pub comparison: String,
 }
 
 /// Per-workload metadata stored as `meta.json`.

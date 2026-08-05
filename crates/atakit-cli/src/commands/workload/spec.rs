@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use atakit_workload::cli::SpecArgs;
+use automata_tee_workload_measurement::pcr_comparison::{
+    decode256, decode384, PcrComparison256, PcrComparison384,
+};
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use super::resolve_chain;
 use crate::config::Config;
@@ -117,69 +119,10 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
         println!("    {}", "none".dimmed());
     } else {
         for pcr in &spec.workloadPcrs256 {
-            let verify_type = match pcr.verifyType {
-                0 => "STATIC",
-                1 => "DYNAMIC_SUBSET",
-                2 => "DYNAMIC_SUBSEQUENCE",
-                _ => "UNKNOWN",
-            };
-            println!(
-                "    PCR{:<4} {} ({})",
-                pcr.pcrIndex,
-                verify_type.dimmed(),
-                pcr.verifyType,
-            );
-            match pcr.verifyType {
-                // STATIC: matchData[0] is the expected final PCR value.
-                0 => {
-                    if let Some(expected) = pcr.matchData.first() {
-                        println!(
-                            "      value  {}",
-                            format!("0x{}", hex::encode(expected)).green()
-                        );
-                    }
-                }
-                // DYNAMIC: matchData contains event hashes.
-                // PCR = extend(0x00..00, event1, event2, ...)
-                // where extend(pcr, event) = SHA-256(pcr || event)
-                _ => {
-                    let mut pcr_value = [0u8; 32];
-                    for data in &pcr.matchData {
-                        let mut hasher = Sha256::new();
-                        hasher.update(pcr_value);
-                        hasher.update(data.as_slice());
-                        pcr_value = hasher.finalize().into();
-                        println!(
-                            "      event  {}",
-                            format!("0x{}", hex::encode(data)).dimmed()
-                        );
-                    }
-                    println!(
-                        "      value  {}",
-                        format!("0x{}", hex::encode(pcr_value)).green()
-                    );
-                }
-            }
+            print_comparison256(pcr.pcrIndex, &pcr.comparison);
         }
         for pcr in &spec.workloadPcrs384 {
-            let verify_type = match pcr.verifyType {
-                0 => "STATIC",
-                1 => "DYNAMIC_SUBSET",
-                2 => "DYNAMIC_SUBSEQUENCE",
-                _ => "UNKNOWN",
-            };
-            println!(
-                "    SHA-384 PCR{:<4} {} ({})",
-                pcr.pcrIndex,
-                verify_type.dimmed(),
-                pcr.verifyType,
-            );
-            for (i, value) in pcr.matchData.iter().enumerate() {
-                let mut bytes = [0u8; 48];
-                bytes[..32].copy_from_slice(value.first.as_slice());
-                bytes[32..].copy_from_slice(value.second.as_slice());
-                println!("      matchData[{i}]: 0x{}", hex::encode(bytes));
-            }
+            print_comparison384(pcr.pcrIndex, &pcr.comparison);
         }
     }
     println!();
@@ -215,6 +158,104 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_comparison256(pcr_index: u8, comparison: &[u8]) {
+    match decode256(comparison) {
+        Ok(PcrComparison256::Static(value)) => {
+            println!("    PCR{pcr_index:<4} {} (0)", "STATIC".dimmed());
+            println!("      value  {}", format!("{value:#x}").green());
+        }
+        Ok(PcrComparison256::DynamicSubset(values)) => {
+            println!("    PCR{pcr_index:<4} {} (1)", "DYNAMIC_SUBSET".dimmed());
+            print_values256("landmark", &values);
+        }
+        Ok(PcrComparison256::DynamicSubsequence(values)) => {
+            println!(
+                "    PCR{pcr_index:<4} {} (2)",
+                "DYNAMIC_SUBSEQUENCE".dimmed()
+            );
+            print_values256("landmark", &values);
+        }
+        Ok(PcrComparison256::DynamicIndexedEventSets(rule)) => {
+            println!(
+                "    PCR{pcr_index:<4} {} (3)",
+                "DYNAMIC_INDEXED_EVENT_SETS".dimmed()
+            );
+            println!("      expected event count: {}", rule.expected_event_count);
+            for checked in rule.checked_events {
+                println!("      event index {}:", checked.event_index);
+                print_values256("allowed", &checked.allowed_values);
+            }
+        }
+        Ok(PcrComparison256::ExtendFromZero(value)) => {
+            println!("    PCR{pcr_index:<4} {} (4)", "EXTEND_FROM_ZERO".dimmed());
+            println!("      extend value  {}", format!("{value:#x}").green());
+        }
+        Err(error) => {
+            println!("    PCR{pcr_index:<4} {}", "UNKNOWN".dimmed());
+            println!("      comparison: 0x{}", hex::encode(comparison));
+            println!("      decode error: {error}");
+        }
+    }
+}
+
+fn print_values256(label: &str, values: &[alloy_ext::core::primitives::B256]) {
+    for value in values {
+        println!("      {label}: {value:#x}");
+    }
+}
+
+fn print_comparison384(pcr_index: u8, comparison: &[u8]) {
+    match decode384(comparison) {
+        Ok(PcrComparison384::Static(value)) => {
+            println!("    SHA-384 PCR{pcr_index:<4} {} (0)", "STATIC".dimmed());
+            println!("      value: 0x{}", hex::encode(value));
+        }
+        Ok(PcrComparison384::DynamicSubset(values)) => {
+            println!(
+                "    SHA-384 PCR{pcr_index:<4} {} (1)",
+                "DYNAMIC_SUBSET".dimmed()
+            );
+            print_values384("landmark", &values);
+        }
+        Ok(PcrComparison384::DynamicSubsequence(values)) => {
+            println!(
+                "    SHA-384 PCR{pcr_index:<4} {} (2)",
+                "DYNAMIC_SUBSEQUENCE".dimmed()
+            );
+            print_values384("landmark", &values);
+        }
+        Ok(PcrComparison384::DynamicIndexedEventSets(rule)) => {
+            println!(
+                "    SHA-384 PCR{pcr_index:<4} {} (3)",
+                "DYNAMIC_INDEXED_EVENT_SETS".dimmed()
+            );
+            println!("      expected event count: {}", rule.expected_event_count);
+            for checked in rule.checked_events {
+                println!("      event index {}:", checked.event_index);
+                print_values384("allowed", &checked.allowed_values);
+            }
+        }
+        Ok(PcrComparison384::ExtendFromZero(value)) => {
+            println!(
+                "    SHA-384 PCR{pcr_index:<4} {} (4)",
+                "EXTEND_FROM_ZERO".dimmed()
+            );
+            println!("      extend value: 0x{}", hex::encode(value));
+        }
+        Err(error) => {
+            println!("    SHA-384 PCR{pcr_index:<4} {}", "UNKNOWN".dimmed());
+            println!("      comparison: 0x{}", hex::encode(comparison));
+            println!("      decode error: {error}");
+        }
+    }
+}
+
+fn print_values384(label: &str, values: &[[u8; 48]]) {
+    for value in values {
+        println!("      {label}: 0x{}", hex::encode(value));
+    }
 }
 
 fn format_ttl(ttl: u64) -> String {

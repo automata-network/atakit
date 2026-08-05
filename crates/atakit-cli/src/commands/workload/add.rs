@@ -5,7 +5,9 @@ use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::{CachedChainSpec, WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, parse_workload_ref, resolve_chain, WorkloadRef};
+use super::{
+    compute_workload_id, parse_workload_ref, resolve_chain, static_pcr256_value, WorkloadRef,
+};
 use crate::config::Config;
 
 pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
@@ -130,13 +132,13 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         (name, version)
     };
 
-    // On-chain STATIC matchData stores the final PCR23 value
+    // The on-chain STATIC `comparison` commits the final PCR23 value.
     let chain_pcr23 = spec
         .workloadPcrs256
         .iter()
         .find(|p| p.pcrIndex == 23)
-        .and_then(|p| p.matchData.first())
-        .map(|b| format!("0x{}", hex::encode(b)));
+        .and_then(|p| static_pcr256_value(&p.comparison))
+        .map(|value| format!("0x{}", hex::encode(value)));
 
     let sha256 = archive_sha256;
     let pcr23 = archive_pcr23.or(chain_pcr23);
@@ -155,12 +157,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
-                verify_type: p.verifyType,
-                match_data: p
-                    .matchData
-                    .iter()
-                    .map(|b| format!("0x{}", hex::encode(b)))
-                    .collect(),
+                comparison: format!("0x{}", hex::encode(&p.comparison)),
             })
             .collect(),
     };

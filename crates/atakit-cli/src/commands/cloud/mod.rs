@@ -485,15 +485,15 @@ fn chain_hierarchy_to_measurement_policy(
                 cloud: cloud.to_string(),
                 tee: tee.to_string(),
                 pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
-                invariants256: profile
+                invariant_pcrs256: profile
                     .profile
-                    .invariants256
+                    .invariantPcrs256
                     .iter()
                     .map(chain_pcr_spec256_to_measurement)
                     .collect(),
-                invariants384: profile
+                invariant_pcrs384: profile
                     .profile
-                    .invariants384
+                    .invariantPcrs384
                     .iter()
                     .map(chain_pcr_spec384_to_measurement)
                     .collect(),
@@ -516,7 +516,7 @@ fn chain_hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v2".to_string(),
+            schema: "atakit.measurement-pack.v3".to_string(),
             revision: 1,
             published_at: chrono::Utc::now().to_rfc3339(),
             base_image: BaseImage {
@@ -540,15 +540,7 @@ fn chain_pcr_spec256_to_measurement(
 ) -> PcrSpec256 {
     PcrSpec256 {
         pcr_index: spec.pcrIndex,
-        verify_type: match spec.verifyType {
-            0 => "static".to_string(),
-            1 => "dynamicSubset".to_string(),
-            2 => "dynamicSubsequence".to_string(),
-            other => format!("unknown-{other}"),
-        },
-        match_data: spec.matchData.iter().map(hex0x).collect(),
-        event_indices: Vec::new(),
-        total_events: None,
+        comparison: hex0x(&spec.comparison),
     }
 }
 
@@ -557,28 +549,7 @@ fn chain_pcr_spec384_to_measurement(
 ) -> PcrSpec384 {
     PcrSpec384 {
         pcr_index: spec.pcrIndex,
-        verify_type: chain_verify_type(spec.verifyType as u8),
-        match_data: spec
-            .matchData
-            .iter()
-            .map(|value| {
-                let mut bytes = [0u8; 48];
-                bytes[..32].copy_from_slice(value.first.as_slice());
-                bytes[32..].copy_from_slice(value.second.as_slice());
-                hex0x(&bytes)
-            })
-            .collect(),
-        event_indices: Vec::new(),
-        total_events: None,
-    }
-}
-
-fn chain_verify_type(value: u8) -> String {
-    match value {
-        0 => "static".to_string(),
-        1 => "dynamicSubset".to_string(),
-        2 => "dynamicSubsequence".to_string(),
-        other => format!("unknown-{other}"),
+        comparison: hex0x(&spec.comparison),
     }
 }
 
@@ -1941,19 +1912,18 @@ mod tls_measurement_policy_tests {
 
     #[test]
     fn converts_chain_pcr_spec_to_measurement_pack_shape() {
+        let comparison = automata_tee_workload_measurement::pcr_comparison::encode_static256(
+            B256::repeat_byte(0xaa),
+        );
         let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256 {
             pcrIndex: 4,
-            verifyType: 0,
-            matchData: vec![B256::repeat_byte(0xaa)],
+            comparison: comparison.clone(),
         };
 
         let got = chain_pcr_spec256_to_measurement(&spec);
 
         assert_eq!(got.pcr_index, 4);
-        assert_eq!(got.verify_type, "static");
-        assert_eq!(got.match_data, vec![format!("0x{}", "aa".repeat(32))]);
-        assert!(got.event_indices.is_empty());
-        assert_eq!(got.total_events, None);
+        assert_eq!(got.comparison, hex0x(comparison));
     }
 
     #[test]

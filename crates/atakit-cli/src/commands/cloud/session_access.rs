@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
     BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384,
-    SessionPcrVerifyType, TrustedSessionBinding, VerifiedSession,
+    TrustedSessionBinding, VerifiedSession,
 };
 use atakit_attestation_client::{
     verify_current_session, AttestationClient, AttestationClientConfig,
@@ -14,6 +14,7 @@ use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_core::Env;
 use atakit_workload::{inspect_workload, InspectOptions};
+use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
 
 use super::{
     init_chain_from_config, portal_endpoints, registration_is_off, resolve_instance,
@@ -439,16 +440,14 @@ async fn load_local_workload_policy(
 pub(crate) fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
     SessionPcrPolicy {
         pcr_index: 23,
-        verify_type: SessionPcrVerifyType::Static,
-        match_data: vec![format!("0x{}", hex::encode(value))],
+        comparison: format!("0x{}", hex::encode(encode_static256(value.into()))),
     }
 }
 
 pub(crate) fn static_pcr23_policy384(value: [u8; 48]) -> SessionPcrPolicy384 {
     SessionPcrPolicy384 {
         pcr_index: 23,
-        verify_type: SessionPcrVerifyType::Static,
-        match_data: vec![format!("0x{}", hex::encode(value))],
+        comparison: format!("0x{}", hex::encode(encode_static384(value))),
     }
 }
 
@@ -661,10 +660,17 @@ mod tests {
         assert_eq!(policy.workload_id, [0x33; 32]);
         assert_eq!(policy.pcr_specs256.len(), 1);
         assert_eq!(policy.pcr_specs256[0].pcr_index, 23);
-        assert_eq!(
-            policy.pcr_specs256[0].verify_type,
-            SessionPcrVerifyType::Static
-        );
+        let comparison = hex::decode(
+            policy.pcr_specs256[0]
+                .comparison
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            automata_tee_workload_measurement::pcr_comparison::decode256(&comparison).unwrap(),
+            automata_tee_workload_measurement::pcr_comparison::PcrComparison256::Static(_)
+        ));
         assert_eq!(policy.attribute_requirements.len(), 1);
         assert_eq!(
             policy.attribute_requirements[0].key,

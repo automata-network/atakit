@@ -87,7 +87,6 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         .context("invalid PCR23 hex")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
     let pcr23_sha384_hex = result
         .pcr23_sha384
         .strip_prefix("0x")
@@ -149,8 +148,9 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     }
 
     // Build WorkloadSpec using the contract's generated types
+    use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, Bytes48, PcrSpec256, PcrSpec384, WorkloadSpec,
+        AttributeRequirement, PcrSpec256, PcrSpec384, WorkloadSpec,
     };
 
     let requirements = manifest
@@ -180,18 +180,11 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         requirements,
         workloadPcrs256: vec![PcrSpec256 {
             pcrIndex: 23,
-            verifyType: 0, // STATIC
-            matchData: vec![pcr23_b256],
+            comparison: encode_static256(pcr23_bytes.into()),
         }],
         workloadPcrs384: vec![PcrSpec384 {
             pcrIndex: 23,
-            verifyType: 0,
-            matchData: vec![Bytes48 {
-                first: alloy_ext::core::primitives::B256::from_slice(&pcr23_sha384[..32]),
-                second: pcr23_sha384[32..]
-                    .try_into()
-                    .expect("16-byte SHA-384 suffix"),
-            }],
+            comparison: encode_static384(pcr23_sha384),
         }],
     };
 

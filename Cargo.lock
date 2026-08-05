@@ -1251,7 +1251,9 @@ dependencies = [
 name = "atakit-attestation"
 version = "0.5.5"
 dependencies = [
+ "alloy",
  "atakit-core",
+ "automata-tee-workload-measurement",
  "aws-lc-rs",
  "base64",
  "ciborium",

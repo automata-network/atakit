@@ -6,8 +6,8 @@ pub use crate::TrustedWorkloadSessionPolicy;
 use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
     verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustKey, BindingMode,
-    CertificateTrust, IntelTdxDcapCollateral, SessionAttribute, SessionEvidenceBundle,
-    SessionPcrPolicy, SessionPcrPolicy384, SessionPcrVerifyType, SessionPlatformTrust,
+    CertificateTrust, IntelTdxDcapCollateral, PcrBankSelection, SessionAttribute,
+    SessionEvidenceBundle, SessionPcrPolicy, SessionPcrPolicy384, SessionPlatformTrust,
     SessionRequestBinding, SessionTrust, SessionVerificationInputs, TrustedSessionBinding,
     TrustedSessionPolicy, VerificationReport, VerifiedSession, VerifiedTlsIdentity,
 };
@@ -301,11 +301,10 @@ fn trusted_policy(
         &bundle.platform.machine_type,
     )?;
 
-    let pcr_specs256 = combined_pcr_specs(
+    let (pcr_specs256, pcr_specs384) = combined_pcr_specs_for_selection(
+        profile.pcr_bank_selection,
         effective_pcr_specs256(profile, variant)?,
         workload.pcr_specs256,
-    );
-    let pcr_specs384 = combined_pcr_specs384(
         effective_pcr_specs384(profile, variant)?,
         workload.pcr_specs384,
     );
@@ -338,6 +337,26 @@ fn combined_pcr_specs384(
 ) -> Vec<SessionPcrPolicy384> {
     base_image.extend(workload);
     base_image
+}
+
+fn combined_pcr_specs_for_selection(
+    selection: PcrBankSelection,
+    base_image256: Vec<SessionPcrPolicy>,
+    workload256: Vec<SessionPcrPolicy>,
+    base_image384: Vec<SessionPcrPolicy384>,
+    workload384: Vec<SessionPcrPolicy384>,
+) -> (Vec<SessionPcrPolicy>, Vec<SessionPcrPolicy384>) {
+    match selection {
+        PcrBankSelection::Sha256 => (combined_pcr_specs(base_image256, workload256), Vec::new()),
+        PcrBankSelection::Sha384 => (
+            Vec::new(),
+            combined_pcr_specs384(base_image384, workload384),
+        ),
+        PcrBankSelection::Sha256AndSha384 => (
+            combined_pcr_specs(base_image256, workload256),
+            combined_pcr_specs384(base_image384, workload384),
+        ),
+    }
 }
 
 fn required_identity_id(
@@ -400,7 +419,7 @@ fn effective_pcr_specs256(
     variant: &MeasurementVariant,
 ) -> Result<Vec<SessionPcrPolicy>, AttestationClientError> {
     let mut specs = BTreeMap::new();
-    for spec in &profile.invariants256 {
+    for spec in &profile.invariant_pcrs256 {
         if specs.insert(spec.pcr_index, spec).is_some() {
             return Err(session_error(format!(
                 "duplicate PCR {} in profile {}",
@@ -417,7 +436,7 @@ fn effective_pcr_specs256(
             )));
         }
         // A profile invariant always holds. `variant_pcrs256` is a historical field name: its
-        // entries must be disjoint from `profile.invariants256`. Overwriting here would accept a
+        // entries must be disjoint from `profile.invariant_pcrs256`. Overwriting here would accept a
         // committed session that on-chain registration rejects
         // (SessionRegistry.PcrVariantOverridesInvariant).
         if specs.contains_key(&spec.pcr_index) {
@@ -429,24 +448,13 @@ fn effective_pcr_specs256(
         }
         specs.insert(spec.pcr_index, spec);
     }
-    specs
+    Ok(specs
         .into_values()
-        .map(|spec| {
-            let verify_type = parse_verify_type(&spec.verify_type)?;
-            if verify_type == SessionPcrVerifyType::Static && spec.match_data.len() != 1 {
-                return Err(session_error(format!(
-                    "STATIC PCR {} in the effective session policy requires exactly one matchData entry, got {}",
-                    spec.pcr_index,
-                    spec.match_data.len()
-                )));
-            }
-            Ok(SessionPcrPolicy {
-                pcr_index: spec.pcr_index,
-                verify_type,
-                match_data: spec.match_data.clone(),
-            })
+        .map(|spec| SessionPcrPolicy {
+            pcr_index: spec.pcr_index,
+            comparison: spec.comparison.clone(),
         })
-        .collect()
+        .collect())
 }
 
 fn effective_pcr_specs384(
@@ -454,7 +462,7 @@ fn effective_pcr_specs384(
     variant: &MeasurementVariant,
 ) -> Result<Vec<SessionPcrPolicy384>, AttestationClientError> {
     let mut specs = BTreeMap::new();
-    for spec in &profile.invariants384 {
+    for spec in &profile.invariant_pcrs384 {
         if specs.insert(spec.pcr_index, spec).is_some() {
             return Err(session_error(format!(
                 "duplicate SHA-384 PCR {} in profile {}",
@@ -478,40 +486,13 @@ fn effective_pcr_specs384(
         }
         specs.insert(spec.pcr_index, spec);
     }
-    specs
+    Ok(specs
         .into_values()
-        .map(|spec| {
-            let verify_type = parse_verify_type(&spec.verify_type)?;
-            if verify_type == SessionPcrVerifyType::Static && spec.match_data.len() != 1 {
-                return Err(session_error(format!(
-                    "STATIC SHA-384 PCR {} requires exactly one matchData entry, got {}",
-                    spec.pcr_index,
-                    spec.match_data.len()
-                )));
-            }
-            Ok(SessionPcrPolicy384 {
-                pcr_index: spec.pcr_index,
-                verify_type,
-                match_data: spec.match_data.clone(),
-            })
+        .map(|spec| SessionPcrPolicy384 {
+            pcr_index: spec.pcr_index,
+            comparison: spec.comparison.clone(),
         })
-        .collect()
-}
-
-fn parse_verify_type(value: &str) -> Result<SessionPcrVerifyType, AttestationClientError> {
-    let normalized = value
-        .chars()
-        .filter(|ch| !matches!(ch, '_' | '-'))
-        .flat_map(char::to_uppercase)
-        .collect::<String>();
-    match normalized.as_str() {
-        "STATIC" => Ok(SessionPcrVerifyType::Static),
-        "DYNAMICSUBSET" => Ok(SessionPcrVerifyType::DynamicSubset),
-        "DYNAMICSUBSEQUENCE" => Ok(SessionPcrVerifyType::DynamicSubsequence),
-        _ => Err(session_error(format!(
-            "unsupported PCR verify type {value:?}"
-        ))),
-    }
+        .collect())
 }
 
 fn effective_attributes(
@@ -741,7 +722,21 @@ fn random_challenge() -> Result<[u8; 32], AttestationClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atakit_attestation::{BaseImage, MeasurementPack, PcrBankSelection, PcrSpec256};
+    use atakit_attestation::{BaseImage, MeasurementPack, PcrSpec256};
+    use automata_tee_workload_measurement::pcr_comparison::{
+        encode_dynamic256, encode_static256, DYNAMIC_SUBSEQUENCE,
+    };
+
+    fn dynamic_subsequence_comparison(value: [u8; 32]) -> String {
+        format!(
+            "0x{}",
+            hex::encode(encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![value.into()]).unwrap())
+        )
+    }
+
+    fn static_comparison(value: [u8; 32]) -> String {
+        format!("0x{}", hex::encode(encode_static256(value.into())))
+    }
 
     fn profile() -> MeasurementProfile {
         MeasurementProfile {
@@ -750,12 +745,9 @@ mod tests {
             cloud: "gcp".into(),
             tee: "tdx".into(),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            invariants256: vec![PcrSpec256 {
+            invariant_pcrs256: vec![PcrSpec256 {
                 pcr_index: 4,
-                verify_type: "dynamicSubsequence".into(),
-                match_data: vec![format!("0x{}", "aa".repeat(32))],
-                event_indices: Vec::new(),
-                total_events: None,
+                comparison: dynamic_subsequence_comparison([0xaa; 32]),
             }],
             variants: vec![MeasurementVariant {
                 name: "c3-standard-4".into(),
@@ -765,7 +757,7 @@ mod tests {
                 variant_pcrs384: Vec::new(),
                 attributes: Vec::new(),
             }],
-            invariants384: Vec::new(),
+            invariant_pcrs384: Vec::new(),
             attributes: Vec::new(),
         }
     }
@@ -776,7 +768,7 @@ mod tests {
         let policy = MeasurementPolicy {
             source: "test".into(),
             pack: MeasurementPack {
-                schema: "atakit.measurement-pack.v2".into(),
+                schema: "atakit.measurement-pack.v3".into(),
                 revision: 1,
                 published_at: "2026-07-17T00:00:00Z".into(),
                 base_image: BaseImage {
@@ -794,8 +786,8 @@ mod tests {
         let pcrs = effective_pcr_specs256(selected, variant).unwrap();
         assert_eq!(pcrs.len(), 1);
         assert_eq!(
-            pcrs[0].verify_type,
-            SessionPcrVerifyType::DynamicSubsequence
+            pcrs[0].comparison,
+            dynamic_subsequence_comparison([0xaa; 32])
         );
     }
 
@@ -808,10 +800,7 @@ mod tests {
         let mut profile = profile();
         profile.variants[0].variant_pcrs256 = vec![PcrSpec256 {
             pcr_index: 4,
-            verify_type: "static".into(),
-            match_data: vec![format!("0x{}", "bb".repeat(32))],
-            event_indices: Vec::new(),
-            total_events: None,
+            comparison: static_comparison([0xbb; 32]),
         }];
 
         let error = effective_pcr_specs256(&profile, &profile.variants[0])
@@ -828,10 +817,7 @@ mod tests {
         let mut profile = profile();
         profile.variants[0].variant_pcrs256 = vec![PcrSpec256 {
             pcr_index: 10,
-            verify_type: "static".into(),
-            match_data: vec![format!("0x{}", "cc".repeat(32))],
-            event_indices: Vec::new(),
-            total_events: None,
+            comparison: static_comparison([0xcc; 32]),
         }];
 
         let pcrs = effective_pcr_specs256(&profile, &profile.variants[0])
@@ -844,7 +830,7 @@ mod tests {
     fn effective_pcr_specs256_allows_sha384_only_profile() {
         let mut profile = profile();
         profile.pcr_bank_selection = PcrBankSelection::Sha384;
-        profile.invariants256.clear();
+        profile.invariant_pcrs256.clear();
 
         let pcrs = effective_pcr_specs256(&profile, &profile.variants[0])
             .expect("a SHA-384-only profile has no SHA-256 base-image PCR rules");
@@ -852,22 +838,12 @@ mod tests {
     }
 
     #[test]
-    fn effective_pcr_specs_rejects_static_without_exactly_one_match_data_entry() {
+    fn effective_pcr_specs_preserves_the_opaque_comparison() {
         let mut profile = profile();
-        profile.invariants256[0].verify_type = "static".into();
-        profile.invariants256[0].match_data = vec![
-            format!("0x{}", "aa".repeat(32)),
-            format!("0x{}", "bb".repeat(32)),
-        ];
+        profile.invariant_pcrs256[0].comparison = "0x1234".into();
 
-        let error = effective_pcr_specs256(&profile, &profile.variants[0])
-            .expect_err("STATIC with two matchData entries must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("requires exactly one matchData entry, got 2"),
-            "unexpected: {error}"
-        );
+        let pcrs = effective_pcr_specs256(&profile, &profile.variants[0]).unwrap();
+        assert_eq!(pcrs[0].comparison, "0x1234");
     }
 
     #[test]
@@ -1051,17 +1027,54 @@ mod tests {
     fn workload_pcr_rule_does_not_replace_base_image_rule_for_same_pcr() {
         let base_image_rule = SessionPcrPolicy {
             pcr_index: 23,
-            verify_type: SessionPcrVerifyType::DynamicSubsequence,
-            match_data: vec![format!("0x{}", hex::encode([0x11; 32]))],
+            comparison: dynamic_subsequence_comparison([0x11; 32]),
         };
         let workload_rule = SessionPcrPolicy {
             pcr_index: 23,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![format!("0x{}", hex::encode([0x22; 32]))],
+            comparison: static_comparison([0x22; 32]),
         };
         let combined =
             combined_pcr_specs(vec![base_image_rule.clone()], vec![workload_rule.clone()]);
 
         assert_eq!(combined, [base_image_rule, workload_rule]);
+    }
+
+    #[test]
+    fn trusted_policy_omits_rules_from_unselected_pcr_banks() {
+        let sha256_rules = vec![SessionPcrPolicy {
+            pcr_index: 4,
+            comparison: static_comparison([0x11; 32]),
+        }];
+        let sha384_rules = vec![SessionPcrPolicy384 {
+            pcr_index: 4,
+            comparison: "0x1234".into(),
+        }];
+
+        let selected256 = combined_pcr_specs_for_selection(
+            PcrBankSelection::Sha256,
+            sha256_rules.clone(),
+            Vec::new(),
+            sha384_rules.clone(),
+            Vec::new(),
+        );
+        assert_eq!(selected256, (sha256_rules.clone(), Vec::new()));
+
+        let selected384 = combined_pcr_specs_for_selection(
+            PcrBankSelection::Sha384,
+            sha256_rules.clone(),
+            Vec::new(),
+            sha384_rules.clone(),
+            Vec::new(),
+        );
+        assert_eq!(selected384, (Vec::new(), sha384_rules.clone()));
+
+        let selected_both = combined_pcr_specs_for_selection(
+            PcrBankSelection::Sha256AndSha384,
+            sha256_rules.clone(),
+            Vec::new(),
+            sha384_rules.clone(),
+            Vec::new(),
+        );
+        assert_eq!(selected_both, (sha256_rules, sha384_rules));
     }
 }

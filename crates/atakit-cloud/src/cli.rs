@@ -225,7 +225,7 @@ pub struct DeployArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -492,7 +492,7 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -617,7 +617,7 @@ pub struct SessionVerificationArgs {
     #[arg(long, value_name = "HEX")]
     pub amd_snp_crl: Vec<String>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
