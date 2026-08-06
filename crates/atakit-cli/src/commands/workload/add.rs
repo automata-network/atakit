@@ -134,7 +134,8 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // The on-chain STATIC `comparison` commits the final PCR23 value.
     let chain_pcr23 = spec
-        .workloadPcrs256
+        .workloadPcrPolicy
+        .pcrSpecs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| static_pcr256_value(&p.comparison))
@@ -153,7 +154,8 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             .map(|b| format!("0x{}", hex::encode(b)))
             .collect(),
         pcrs: spec
-            .workloadPcrs256
+            .workloadPcrPolicy
+            .pcrSpecs256
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
@@ -164,7 +166,12 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Check if entry exists - merge if so
     let now = chrono::Local::now().to_rfc3339();
-    let meta = if let Some(existing) = store.get(&name, &version)? {
+    let existing_entry = match store.get(&name, &version) {
+        Ok(entry) => entry,
+        Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) if args.force => None,
+        Err(error) => return Err(error.into()),
+    };
+    let meta = if let Some(existing) = existing_entry {
         let mut m = existing.meta;
         m.on_chain_spec = Some(chain_spec);
         m.revoked = revoked;
@@ -189,6 +196,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         m
     } else {
         WorkloadMeta {
+            metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
             workload_id: workload_id_hex.clone(),
             name: name.clone(),
             version: version.clone(),

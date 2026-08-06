@@ -309,10 +309,38 @@ async fn stage_image(
 fn build_result_json(manifest_raw: String) -> Result<InspectResult, WorkloadError> {
     let mut value: serde_json::Value =
         serde_json::from_str(&manifest_raw).map_err(|e| WorkloadError::Json(e.to_string()))?;
+    validate_json_manifest_format(&value)?;
     normalize_legacy_service_disks(&mut value)?;
     let manifest: Manifest =
         serde_json::from_value(value).map_err(|e| WorkloadError::Json(e.to_string()))?;
     compute_pcr_result(manifest, manifest_raw)
+}
+
+fn validate_json_manifest_format(value: &serde_json::Value) -> Result<(), WorkloadError> {
+    let format = value
+        .get("meta")
+        .and_then(|meta| meta.get("format"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            WorkloadError::Validation(
+                "workload archive manifest.json is missing integer meta.format; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format 6"
+                    .to_string(),
+            )
+        })?;
+
+    if (2..=u64::from(crate::FORMAT_VERSION)).contains(&format) {
+        return Ok(());
+    }
+    if format > u64::from(crate::FORMAT_VERSION) {
+        return Err(WorkloadError::Validation(format!(
+            "workload manifest format {format} is newer than supported format {}; upgrade atakit to a version that supports workload manifest format {format}",
+            crate::FORMAT_VERSION
+        )));
+    }
+    Err(WorkloadError::Validation(format!(
+        "workload manifest format {format} is not supported in manifest.json; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+        crate::FORMAT_VERSION
+    )))
 }
 
 fn normalize_legacy_service_disks(value: &mut serde_json::Value) -> Result<(), WorkloadError> {
@@ -412,6 +440,21 @@ fn build_result_toml(manifest_raw: String) -> Result<InspectResult, WorkloadErro
             path: "manifest.toml".into(),
             source: e,
         })?;
+    if v1.meta.format != 1 {
+        let format = v1.meta.format;
+        let detail = if format > crate::FORMAT_VERSION {
+            format!(
+                "workload manifest format {format} is newer than supported format {}; upgrade atakit to a version that supports workload manifest format {format}",
+                crate::FORMAT_VERSION
+            )
+        } else {
+            format!(
+                "workload manifest format {format} is not supported in manifest.toml; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+                crate::FORMAT_VERSION
+            )
+        };
+        return Err(WorkloadError::Validation(detail));
+    }
     let manifest = crate::manifest_v1::convert_to_current(v1);
     compute_pcr_result(manifest, manifest_raw)
 }
@@ -626,6 +669,49 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_older_json_format_reports_rebuild_command() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["meta"]["format"] = serde_json::json!(1);
+
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected manifest format 1 to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("workload manifest format 1 is not supported"));
+        assert!(message.contains("atakit workload build <workload-directory>"));
+        assert!(message.contains("manifest format 6"));
+    }
+
+    #[test]
+    fn newer_json_format_reports_atakit_upgrade() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["meta"]["format"] = serde_json::json!(7);
+
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected manifest format 7 to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("workload manifest format 7 is newer"));
+        assert!(message.contains("upgrade atakit"));
+    }
+
+    #[test]
+    fn missing_json_format_reports_rebuild_command() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["meta"].as_object_mut().unwrap().remove("format");
+
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected missing manifest format to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("manifest.json is missing integer meta.format"));
+        assert!(message.contains("atakit workload build <workload-directory>"));
+    }
+
+    #[test]
     fn v1_toml_compat() {
         let toml = r#"
 [meta]
@@ -647,6 +733,30 @@ cvm_agent = true
         assert_eq!(result.manifest.config.gid_group, "old-workload");
         // Omitted restart in v1 must default to "no", not "".
         assert_eq!(result.manifest.config.restart, "no");
+    }
+
+    #[test]
+    fn unsupported_toml_format_reports_rebuild_command() {
+        let toml = r#"
+[meta]
+format = 0
+name = "old-workload"
+version = "v0.1.0"
+
+[config]
+image = "old:v0.1.0"
+base-image-mode = "blacklist"
+
+[hashes]
+"images/old.tar" = "sha256:abcd"
+"#;
+        let err = match build_result_toml(toml.to_string()) {
+            Ok(_) => panic!("expected manifest format 0 to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("workload manifest format 0 is not supported"));
+        assert!(message.contains("atakit workload build <workload-directory>"));
     }
 
     #[test]

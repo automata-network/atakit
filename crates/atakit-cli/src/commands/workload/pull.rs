@@ -412,7 +412,12 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     store.import_blob(&coords.name, &coords.version, &tmp_path)?;
 
     let now = chrono::Local::now().to_rfc3339();
-    let meta = match store.load_meta(&coords.name, &coords.version)? {
+    let existing_meta = match store.load_meta(&coords.name, &coords.version) {
+        Ok(meta) => meta,
+        Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) if args.force => None,
+        Err(error) => return Err(error.into()),
+    };
+    let meta = match existing_meta {
         Some(mut existing) => {
             existing.workload_id = coords.workload_id.clone();
             existing.sha256 = Some(sha256.clone());
@@ -425,6 +430,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
             existing
         }
         None => WorkloadMeta {
+            metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
             workload_id: coords.workload_id.clone(),
             name: coords.name.clone(),
             version: coords.version.clone(),
@@ -621,7 +627,8 @@ async fn verify_pcr23(
 
     // Find PCR23 and decode its STATIC comparison.
     let on_chain_pcr23 = spec
-        .workloadPcrs256
+        .workloadPcrPolicy
+        .pcrSpecs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| static_pcr256_value(&p.comparison))

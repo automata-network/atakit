@@ -37,7 +37,12 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
     // Build and save metadata (merge into existing to preserve chain data)
     let workload_id = compute_workload_id(name, version);
     let now = chrono::Local::now().to_rfc3339();
-    let meta = match store.load_meta(name, version)? {
+    let existing_meta = match store.load_meta(name, version) {
+        Ok(meta) => meta,
+        Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) if args.force => None,
+        Err(error) => return Err(error.into()),
+    };
+    let meta = match existing_meta {
         Some(mut existing) => {
             existing.workload_id = format!("0x{}", hex::encode(workload_id));
             existing.sha256 = Some(result.sha256.clone());
@@ -47,6 +52,7 @@ pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
             existing
         }
         None => WorkloadMeta {
+            metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
             workload_id: format!("0x{}", hex::encode(workload_id)),
             name: name.clone(),
             version: version.clone(),

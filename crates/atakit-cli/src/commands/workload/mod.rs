@@ -289,7 +289,8 @@ pub async fn query_chain_data(
         .unwrap_or(false);
 
     let pcr23 = spec
-        .workloadPcrs256
+        .workloadPcrPolicy
+        .pcrSpecs256
         .iter()
         .find(|p| p.pcrIndex == 23)
         .and_then(|p| static_pcr256_value(&p.comparison))
@@ -304,7 +305,8 @@ pub async fn query_chain_data(
             .map(|b| format!("0x{}", hex::encode(b)))
             .collect(),
         pcrs: spec
-            .workloadPcrs256
+            .workloadPcrPolicy
+            .pcrSpecs256
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,

@@ -150,7 +150,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // Build WorkloadSpec using the contract's generated types
     use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, PcrSpec256, PcrSpec384, WorkloadSpec,
+        AttributeRequirement, PcrPolicyBlock, PcrSpec256, PcrSpec384, WorkloadSpec,
     };
 
     let requirements = manifest
@@ -178,14 +178,16 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         baseImageMode: base_image_mode,
         baseImageIds: base_image_ids,
         requirements,
-        workloadPcrs256: vec![PcrSpec256 {
-            pcrIndex: 23,
-            comparison: encode_static256(pcr23_bytes.into()),
-        }],
-        workloadPcrs384: vec![PcrSpec384 {
-            pcrIndex: 23,
-            comparison: encode_static384(pcr23_sha384),
-        }],
+        workloadPcrPolicy: PcrPolicyBlock {
+            pcrSpecs256: vec![PcrSpec256 {
+                pcrIndex: 23,
+                comparison: encode_static256(pcr23_bytes.into()),
+            }],
+            pcrSpecs384: vec![PcrSpec384 {
+                pcrIndex: 23,
+                comparison: encode_static384(pcr23_sha384),
+            }],
+        },
     };
 
     // Resolve relay key for transaction submission.
@@ -383,7 +385,12 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         {
             let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
-            let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
+            let existing_meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version) {
+                Ok(meta) => meta,
+                Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let meta = match existing_meta {
                 Some(mut m) => {
                     m.workload_id = workload_id_hex.clone();
                     m.sha256 = Some(result.sha256.clone());
@@ -394,6 +401,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 }
                 None => {
                     let mut m = WorkloadMeta {
+                        metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                         workload_id: workload_id_hex.clone(),
                         name: manifest.meta.name.clone(),
                         version: manifest.meta.version.clone(),
@@ -443,7 +451,12 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
         let store = WorkloadStore::new(&env.workload_dir);
         let now = chrono::Local::now().to_rfc3339();
-        let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
+        let existing_meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version) {
+            Ok(meta) => meta,
+            Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let meta = match existing_meta {
             Some(mut m) => {
                 m.workload_id = workload_id_hex.clone();
                 m.sha256 = Some(result.sha256.clone());
@@ -454,6 +467,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             }
             None => {
                 let mut m = WorkloadMeta {
+                    metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                     workload_id: workload_id_hex.clone(),
                     name: manifest.meta.name.clone(),
                     version: manifest.meta.version.clone(),

@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::WorkloadError;
 
+/// Format of `meta.json` in the local workload store.
+///
+/// The older PCR policy cache used unversioned `verify_type` and
+/// `match_data` fields. Format 1 starts with the opaque `comparison` field.
+pub const WORKLOAD_META_FORMAT_VERSION: u32 = 1;
+
 /// Validate that a name or version component is safe for use as a path segment.
 /// Rejects empty strings, path separators, `..`, and `.`.
 fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
@@ -47,6 +53,8 @@ pub struct CachedPcrSpec {
 /// Per-workload metadata stored as `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadMeta {
+    #[serde(default = "current_workload_meta_format")]
+    pub metadata_format: u32,
     pub workload_id: String,
     pub name: String,
     pub version: String,
@@ -69,6 +77,10 @@ pub struct WorkloadMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "registries")]
     pub repositories: Vec<String>,
     pub added_at: String,
+}
+
+fn current_workload_meta_format() -> u32 {
+    WORKLOAD_META_FORMAT_VERSION
 }
 
 fn is_false(b: &bool) -> bool {
@@ -394,11 +406,110 @@ impl WorkloadStore {
             path: path.to_path_buf(),
             source: e,
         })?;
-        serde_json::from_str(&content).map_err(|e| WorkloadError::ParseMeta {
+        let value: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| WorkloadError::ParseMeta {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        self.validate_meta_format(path, &value)?;
+        serde_json::from_value(value).map_err(|e| WorkloadError::ParseMeta {
             path: path.to_path_buf(),
             reason: e.to_string(),
         })
     }
+
+    fn validate_meta_format(
+        &self,
+        path: &Path,
+        value: &serde_json::Value,
+    ) -> Result<(), WorkloadError> {
+        let declared_format = value.get("metadata_format");
+        if let Some(format_value) = declared_format {
+            let Some(format) = format_value.as_u64() else {
+                return Err(
+                    self.unsupported_meta(path, "metadata_format is not an integer".to_string())
+                );
+            };
+            if format == u64::from(WORKLOAD_META_FORMAT_VERSION) {
+                return Ok(());
+            }
+            if format > u64::from(WORKLOAD_META_FORMAT_VERSION) {
+                return Err(WorkloadError::UnsupportedMeta {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "metadata format {format} is newer than supported format {}",
+                        WORKLOAD_META_FORMAT_VERSION
+                    ),
+                    recovery: format!(
+                        "upgrade atakit to a version that supports local workload metadata format {format}"
+                    ),
+                });
+            }
+            return Err(self.unsupported_meta(
+                path,
+                format!(
+                    "metadata format {format} is older than supported format {}",
+                    WORKLOAD_META_FORMAT_VERSION
+                ),
+            ));
+        }
+
+        if uses_retired_pcr_rule_fields(value) {
+            return Err(self.unsupported_meta(
+                path,
+                "the unversioned metadata uses the retired verify_type and match_data PCR-rule fields"
+                    .to_string(),
+            ));
+        }
+
+        // The opaque-comparison implementation briefly wrote unversioned
+        // metadata. It already has the format-1 shape, so accept it. The next
+        // save writes `metadata_format: 1`.
+        Ok(())
+    }
+
+    fn unsupported_meta(&self, path: &Path, reason: String) -> WorkloadError {
+        let archive_path = path.with_file_name("archive.atawl");
+        let recovery = if archive_path.exists() {
+            format!(
+                "rebuild the cached metadata from its stored archive with `atakit workload import --force {}`; rebuild the workload from source with `atakit workload build <workload-directory>` if the archive manifest is also unsupported",
+                archive_path.display()
+            )
+        } else {
+            let version = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|part| part.to_str());
+            let name = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|part| part.to_str());
+            match (name, version) {
+                (Some(name), Some(version)) => format!(
+                    "refresh the cached metadata from the configured chain with `atakit workload add --force --chain <chain> {name}:{version}`, or rebuild the workload from source with `atakit workload build <workload-directory>`"
+                ),
+                _ => "rebuild the workload from source with `atakit workload build <workload-directory>`"
+                    .to_string(),
+            }
+        };
+        WorkloadError::UnsupportedMeta {
+            path: path.to_path_buf(),
+            reason,
+            recovery,
+        }
+    }
+}
+
+fn uses_retired_pcr_rule_fields(value: &serde_json::Value) -> bool {
+    value
+        .get("on_chain_spec")
+        .and_then(|spec| spec.get("pcrs"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|pcrs| {
+            pcrs.iter()
+                .any(|pcr| pcr.get("verify_type").is_some() || pcr.get("match_data").is_some())
+        })
 }
 
 #[cfg(test)]
@@ -407,6 +518,7 @@ mod tests {
 
     fn test_meta(name: &str, version: &str) -> WorkloadMeta {
         WorkloadMeta {
+            metadata_format: WORKLOAD_META_FORMAT_VERSION,
             workload_id: "0xtest".to_string(),
             name: name.to_string(),
             version: version.to_string(),
@@ -500,6 +612,124 @@ mod tests {
         assert_eq!(loaded.workload_id, "0xtest");
         assert_eq!(loaded.name, "my-app");
         assert_eq!(loaded.version, "v0.0.1");
+        assert_eq!(loaded.metadata_format, WORKLOAD_META_FORMAT_VERSION);
+
+        let saved: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(store.meta_path("my-app", "v0.0.1").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["metadata_format"], WORKLOAD_META_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn retired_pcr_rule_metadata_reports_archive_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let dir = store.entry_dir("old-app", "v1").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("archive.atawl"), b"archive").unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            r#"{
+                "workload_id": "0xtest",
+                "name": "old-app",
+                "version": "v1",
+                "on_chain_spec": {
+                    "session_ttl": 0,
+                    "base_image_mode": 2,
+                    "base_image_ids": [],
+                    "pcrs": [{"pcr_index": 23, "verify_type": 0, "match_data": []}]
+                },
+                "added_at": "2025-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+
+        let error = store.load_meta("old-app", "v1").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("retired verify_type and match_data"));
+        assert!(message.contains("atakit workload import --force"));
+        assert!(message.contains("archive.atawl"));
+    }
+
+    #[test]
+    fn retired_pcr_rule_metadata_without_archive_reports_chain_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let dir = store.entry_dir("old-app", "v1").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            r#"{
+                "workload_id": "0xtest",
+                "name": "old-app",
+                "version": "v1",
+                "on_chain_spec": {
+                    "session_ttl": 0,
+                    "base_image_mode": 2,
+                    "base_image_ids": [],
+                    "pcrs": [{"pcr_index": 23, "verify_type": 0, "match_data": []}]
+                },
+                "added_at": "2025-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+
+        let error = store.load_meta("old-app", "v1").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("atakit workload add --force --chain <chain> old-app:v1"));
+    }
+
+    #[test]
+    fn newer_metadata_format_reports_atakit_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let dir = store.entry_dir("future-app", "v1").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            r#"{
+                "metadata_format": 2,
+                "workload_id": "0xtest",
+                "name": "future-app",
+                "version": "v1",
+                "added_at": "2025-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+
+        let error = store.load_meta("future-app", "v1").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("metadata format 2 is newer than supported format 1"));
+        assert!(message.contains("upgrade atakit"));
+    }
+
+    #[test]
+    fn unversioned_opaque_comparison_metadata_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkloadStore::new(tmp.path());
+        let dir = store.entry_dir("current-app", "v1").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            r#"{
+                "workload_id": "0xtest",
+                "name": "current-app",
+                "version": "v1",
+                "on_chain_spec": {
+                    "session_ttl": 0,
+                    "base_image_mode": 2,
+                    "base_image_ids": [],
+                    "pcrs": [{"pcr_index": 23, "comparison": "0x00"}]
+                },
+                "added_at": "2025-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+
+        let meta = store.load_meta("current-app", "v1").unwrap().unwrap();
+        assert_eq!(meta.metadata_format, WORKLOAD_META_FORMAT_VERSION);
+        assert_eq!(meta.on_chain_spec.unwrap().pcrs[0].comparison, "0x00");
     }
 
     #[test]

@@ -96,7 +96,18 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         let version = &inspect.manifest.meta.version;
 
         // Check if an existing entry has a different PCR23 and confirm before overwriting
-        let existing_meta = store.load_meta(name, version)?;
+        let existing_meta = match store.load_meta(name, version) {
+            Ok(meta) => meta,
+            Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => {
+                println!(
+                    "{}",
+                    "Replacing unsupported local workload metadata with the current format."
+                        .yellow()
+                );
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Some(ref existing) = existing_meta {
             if let Some(ref old_sha256) = existing.sha256 {
                 if *old_sha256 != inspect.sha256 {
@@ -149,6 +160,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                 existing
             }
             None => WorkloadMeta {
+                metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                 workload_id: format!("0x{}", hex::encode(workload_id)),
                 name: name.clone(),
                 version: version.clone(),

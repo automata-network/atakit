@@ -115,13 +115,15 @@ pub async fn run(args: SpecArgs, config: &Config) -> Result<()> {
 
     // PCR specs
     println!("  {}", "PCR Specs:".cyan().bold());
-    if spec.workloadPcrs256.is_empty() && spec.workloadPcrs384.is_empty() {
+    if spec.workloadPcrPolicy.pcrSpecs256.is_empty()
+        && spec.workloadPcrPolicy.pcrSpecs384.is_empty()
+    {
         println!("    {}", "none".dimmed());
     } else {
-        for pcr in &spec.workloadPcrs256 {
+        for pcr in &spec.workloadPcrPolicy.pcrSpecs256 {
             print_comparison256(pcr.pcrIndex, &pcr.comparison);
         }
-        for pcr in &spec.workloadPcrs384 {
+        for pcr in &spec.workloadPcrPolicy.pcrSpecs384 {
             print_comparison384(pcr.pcrIndex, &pcr.comparison);
         }
     }

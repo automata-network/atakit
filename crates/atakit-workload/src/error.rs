@@ -91,6 +91,13 @@ pub enum WorkloadError {
     #[error("failed to parse metadata {path}: {reason}")]
     ParseMeta { path: PathBuf, reason: String },
 
+    #[error("unsupported local workload metadata {path}: {reason}\nRecovery: {recovery}")]
+    UnsupportedMeta {
+        path: PathBuf,
+        reason: String,
+        recovery: String,
+    },
+
     // ── repository ───────────────────────────────────────
     #[error("repository error: {message}")]
     Repository { message: String },
