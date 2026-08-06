@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::{keccak256, B256};
+use alloy::sol_types::{sol_data, SolType};
 use ciborium::value::Value;
 use p256::pkcs8::DecodePublicKey;
 
@@ -41,8 +43,10 @@ pub(super) fn verify_aws_tls_attestation(
     binding: &AkBinding,
     evidence: &TeeEvidence,
     ak_public: &[u8],
+    tpms_attest: &[u8],
     authenticated_pcrs: &[PcrEvidence],
     expected_qualifying_data: &[u8; 32],
+    report_data_binds_pcr_commitment: bool,
     trust: &TrustAnchors,
     verification_time: SystemTime,
 ) {
@@ -50,8 +54,10 @@ pub(super) fn verify_aws_tls_attestation(
         binding,
         evidence,
         ak_public,
+        tpms_attest,
         authenticated_pcrs,
         expected_qualifying_data,
+        report_data_binds_pcr_commitment,
         trust,
         verification_time,
     );
@@ -66,8 +72,10 @@ fn verify_aws_tls_attestation_inner(
     binding: &AkBinding,
     evidence: &TeeEvidence,
     ak_public: &[u8],
+    tpms_attest: &[u8],
     authenticated_pcrs: &[PcrEvidence],
     expected_qualifying_data: &[u8; 32],
+    report_data_binds_pcr_commitment: bool,
     trust: &TrustAnchors,
     verification_time: SystemTime,
 ) -> std::result::Result<(), String> {
@@ -113,13 +121,6 @@ fn verify_aws_tls_attestation_inner(
                 .to_string(),
         );
     }
-    if snp_report[SNP_REPORT_DATA_OFFSET + 32..SNP_REPORT_DATA_OFFSET + 64]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err("AMD SEV-SNP REPORT_DATA suffix is not zero".to_string());
-    }
-
     let report_id = &snp_report
         [SNP_REPORT_REPORT_ID_OFFSET..SNP_REPORT_REPORT_ID_OFFSET + SNP_REPORT_REPORT_ID_LEN];
     let mut pcr15_extend = [0u8; 96];
@@ -129,31 +130,119 @@ fn verify_aws_tls_attestation_inner(
         return Err("NitroTPM SHA-384 PCR15 does not bind AMD SEV-SNP REPORT_ID".to_string());
     }
 
+    if report_data_binds_pcr_commitment {
+        let pcr_commitment =
+            nitrotpm_pcr_commitment(tpms_attest, authenticated_pcrs, &payload.pcrs)?;
+        let expected_hash = aws_report_data_pcr_commitment_hash(
+            pcr_commitment.pcr_select,
+            pcr_commitment.pcr_digest,
+        );
+        if &snp_report[SNP_REPORT_DATA_OFFSET + 32..SNP_REPORT_DATA_OFFSET + 64]
+            != expected_hash.as_slice()
+        {
+            return Err(
+                "AMD SEV-SNP REPORT_DATA does not contain the PcrCommitment hash".to_string(),
+            );
+        }
+    } else if snp_report[SNP_REPORT_DATA_OFFSET + 32..SNP_REPORT_DATA_OFFSET + 64] != [0u8; 32] {
+        return Err("AWS TLS AMD SEV-SNP REPORT_DATA suffix is not zero".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PcrCommitment {
+    pcr_select: [u8; 32],
+    pcr_digest: [u8; 32],
+}
+
+fn nitrotpm_pcr_commitment(
+    tpms_attest: &[u8],
+    authenticated_pcrs: &[PcrEvidence],
+    nitrotpm_pcrs384: &[[u8; 48]; PCR_COUNT],
+) -> std::result::Result<PcrCommitment, String> {
+    let parsed = verification_core::parse_tpm_quote(tpms_attest)?;
+    let canonical_bank_order = match parsed.pcr_selections.as_slice() {
+        [selection] => matches!(selection.hash_alg, TPM_ALG_SHA256 | TPM_ALG_SHA384),
+        [first, second] => first.hash_alg == TPM_ALG_SHA256 && second.hash_alg == TPM_ALG_SHA384,
+        _ => false,
+    };
+    if !canonical_bank_order {
+        return Err("TPM Quote must select one bank or select SHA-256 before SHA-384".to_string());
+    }
+
+    let mut pcr_select = [0u8; 32];
+    let mut digest_input = Vec::new();
     let mut saw_sha384_pcr15 = false;
-    for pcr in authenticated_pcrs {
-        let Some(value) = &pcr.sha384 else {
-            continue;
-        };
-        let value =
-            decode_hex_array::<48>("tpm.pcrs.sha384", value).map_err(|error| error.to_string())?;
-        if usize::from(pcr.index) >= PCR_COUNT {
-            return Err(format!(
-                "TPM Quote contains unsupported SHA-384 PCR{}",
-                pcr.index
-            ));
+    for (bank_index, selection) in parsed.pcr_selections.iter().enumerate() {
+        let offset = bank_index * 5;
+        pcr_select[offset..offset + 2].copy_from_slice(&selection.hash_alg.to_be_bytes());
+        pcr_select[offset + 2..offset + 5].copy_from_slice(&selection.select);
+        for index in &selection.indices {
+            let evidence = authenticated_pcrs
+                .iter()
+                .find(|pcr| pcr.index == *index)
+                .ok_or_else(|| format!("authenticated TPM Quote omits PCR{index}"))?;
+            match selection.hash_alg {
+                TPM_ALG_SHA256 => {
+                    let value = evidence.sha256.as_deref().ok_or_else(|| {
+                        format!("authenticated TPM Quote omits SHA-256 PCR{index}")
+                    })?;
+                    digest_input.extend_from_slice(
+                        &decode_hex_array::<32>("tpm.pcrs.sha256", value)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                TPM_ALG_SHA384 => {
+                    let evidence_value = evidence.sha384.as_deref().ok_or_else(|| {
+                        format!("authenticated TPM Quote omits SHA-384 PCR{index}")
+                    })?;
+                    let evidence_value = decode_hex_array::<48>("tpm.pcrs.sha384", evidence_value)
+                        .map_err(|error| error.to_string())?;
+                    let nitrotpm_value = nitrotpm_pcrs384[usize::from(*index)];
+                    if nitrotpm_value != evidence_value {
+                        return Err(format!(
+                            "NitroTPM document SHA-384 PCR{index} does not match the authenticated TPM Quote value"
+                        ));
+                    }
+                    digest_input.extend_from_slice(&nitrotpm_value);
+                    saw_sha384_pcr15 |= *index == 15;
+                }
+                other => {
+                    return Err(format!(
+                        "TPM Quote selects unsupported PCR bank algorithm 0x{other:04x}"
+                    ));
+                }
+            }
         }
-        if payload.pcrs[usize::from(pcr.index)] != value {
-            return Err(format!(
-                "NitroTPM document SHA-384 PCR{} does not match the authenticated TPM Quote value",
-                pcr.index
-            ));
-        }
-        saw_sha384_pcr15 |= pcr.index == 15;
     }
     if !saw_sha384_pcr15 {
         return Err("authenticated TPM Quote does not select SHA-384 PCR15".to_string());
     }
-    Ok(())
+
+    let pcr_digest: [u8; 32] = Sha256::digest(digest_input).into();
+    if parsed.pcr_digest != pcr_digest {
+        return Err(
+            "NitroTPM PcrCommitment does not equal the signed TPM Quote PcrCommitment".to_string(),
+        );
+    }
+    Ok(PcrCommitment {
+        pcr_select,
+        pcr_digest,
+    })
+}
+
+fn aws_report_data_pcr_commitment_hash(pcr_select: [u8; 32], pcr_digest: [u8; 32]) -> B256 {
+    type Input = (
+        sol_data::FixedBytes<32>,
+        sol_data::FixedBytes<32>,
+        sol_data::FixedBytes<32>,
+    );
+    keccak256(Input::abi_encode_params(&(
+        keccak256(b"CVM_AWS_REPORT_DATA_PCR_COMMITMENT_V1"),
+        B256::from(pcr_select),
+        B256::from(pcr_digest),
+    )))
 }
 
 fn decode_binding(binding: &AkBinding) -> std::result::Result<Vec<u8>, String> {
@@ -451,6 +540,96 @@ fn encode_byte_string(bytes: &[u8], output: &mut Vec<u8>) {
         }
     }
     output.extend_from_slice(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_pcr_commitment_matches_dual_bank_quote_and_rejects_swapped_quote() {
+        let pcrs = vec![
+            PcrEvidence {
+                index: 1,
+                sha256: Some(format!("0x{}", hex::encode([0x11; 32]))),
+                sha384: Some(format!("0x{}", hex::encode([0x33; 48]))),
+            },
+            PcrEvidence {
+                index: 15,
+                sha256: Some(format!("0x{}", hex::encode([0x22; 32]))),
+                sha384: Some(format!("0x{}", hex::encode([0x44; 48]))),
+            },
+        ];
+        let mut nitrotpm_pcrs384 = [[0u8; 48]; PCR_COUNT];
+        nitrotpm_pcrs384[1] = [0x33; 48];
+        nitrotpm_pcrs384[15] = [0x44; 48];
+        let digest: [u8; 32] = Sha256::digest(
+            [
+                [0x11; 32].as_slice(),
+                [0x22; 32].as_slice(),
+                [0x33; 48].as_slice(),
+                [0x44; 48].as_slice(),
+            ]
+            .concat(),
+        )
+        .into();
+        let quote = quote_attest(
+            &[
+                (TPM_ALG_SHA256, [0x02, 0x80, 0]),
+                (TPM_ALG_SHA384, [0x02, 0x80, 0]),
+            ],
+            digest,
+        );
+        let commitment = nitrotpm_pcr_commitment(&quote, &pcrs, &nitrotpm_pcrs384)
+            .expect("matching Quote and NitroTPM values");
+        assert_eq!(
+            &commitment.pcr_select[..10],
+            &[0x00, 0x0b, 0x02, 0x80, 0x00, 0x00, 0x0c, 0x02, 0x80, 0x00]
+        );
+        assert_eq!(commitment.pcr_digest, digest);
+
+        let swapped_quote = quote_attest(
+            &[
+                (TPM_ALG_SHA256, [0x02, 0x80, 0]),
+                (TPM_ALG_SHA384, [0x02, 0x80, 0]),
+            ],
+            [0x55; 32],
+        );
+        assert!(nitrotpm_pcr_commitment(&swapped_quote, &pcrs, &nitrotpm_pcrs384).is_err());
+    }
+
+    #[test]
+    fn aws_report_data_hash_binds_selection_and_digest() {
+        let expected = aws_report_data_pcr_commitment_hash([0x11; 32], [0x22; 32]);
+        assert_ne!(
+            aws_report_data_pcr_commitment_hash([0x12; 32], [0x22; 32]),
+            expected
+        );
+        assert_ne!(
+            aws_report_data_pcr_commitment_hash([0x11; 32], [0x23; 32]),
+            expected
+        );
+    }
+
+    fn quote_attest(selections: &[(u16, [u8; 3])], pcr_digest: [u8; 32]) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(&TPM_GENERATED_VALUE.to_be_bytes());
+        output.extend_from_slice(&TPM_ST_ATTEST_QUOTE.to_be_bytes());
+        output.extend_from_slice(&0u16.to_be_bytes());
+        output.extend_from_slice(&32u16.to_be_bytes());
+        output.extend_from_slice(&[0x77; 32]);
+        output.extend_from_slice(&[0u8; 17]);
+        output.extend_from_slice(&[0u8; 8]);
+        output.extend_from_slice(&(selections.len() as u32).to_be_bytes());
+        for (bank_id, bitmap) in selections {
+            output.extend_from_slice(&bank_id.to_be_bytes());
+            output.push(3);
+            output.extend_from_slice(bitmap);
+        }
+        output.extend_from_slice(&32u16.to_be_bytes());
+        output.extend_from_slice(&pcr_digest);
+        output
+    }
 }
 
 fn decode_one(bytes: &[u8]) -> std::result::Result<Value, String> {

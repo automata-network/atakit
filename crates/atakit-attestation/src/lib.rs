@@ -1319,8 +1319,10 @@ fn verify_tls_attestation_internal(
                     binding,
                     evidence,
                     ak_public,
+                    tpm_quote_bytes.as_deref().unwrap_or(&[]),
                     authenticated_pcrs.as_deref().unwrap_or(&[]),
                     &expected_qualifying_data,
+                    false,
                     &inputs.trust_anchors,
                     current_time,
                 );
@@ -3444,6 +3446,15 @@ mod tests {
         sha256_pcrs: &[(u8, [u8; 32])],
         sha384_pcrs: &[(u8, [u8; 48])],
     ) -> Vec<u8> {
+        fake_tpm_quote_banks_with_order(qualifying_data, sha256_pcrs, sha384_pcrs, false)
+    }
+
+    fn fake_tpm_quote_banks_with_order(
+        qualifying_data: &[u8; 32],
+        sha256_pcrs: &[(u8, [u8; 32])],
+        sha384_pcrs: &[(u8, [u8; 48])],
+        sha384_first: bool,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&TPM_GENERATED_VALUE.to_be_bytes());
         body.extend_from_slice(&TPM_ST_ATTEST_QUOTE.to_be_bytes());
@@ -3455,22 +3466,23 @@ mod tests {
         let selection_count =
             u32::from(!sha256_pcrs.is_empty()) + u32::from(!sha384_pcrs.is_empty());
         body.extend_from_slice(&selection_count.to_be_bytes());
-        for (hash_alg, indices) in [
-            (
-                TPM_ALG_SHA256,
-                sha256_pcrs
+        let bank_order = if sha384_first {
+            [TPM_ALG_SHA384, TPM_ALG_SHA256]
+        } else {
+            [TPM_ALG_SHA256, TPM_ALG_SHA384]
+        };
+        for hash_alg in bank_order {
+            let indices = match hash_alg {
+                TPM_ALG_SHA256 => sha256_pcrs
                     .iter()
                     .map(|(index, _)| *index)
                     .collect::<Vec<_>>(),
-            ),
-            (
-                TPM_ALG_SHA384,
-                sha384_pcrs
+                TPM_ALG_SHA384 => sha384_pcrs
                     .iter()
                     .map(|(index, _)| *index)
                     .collect::<Vec<_>>(),
-            ),
-        ] {
+                _ => unreachable!(),
+            };
             if indices.is_empty() {
                 continue;
             }
@@ -3483,11 +3495,20 @@ mod tests {
             body.extend_from_slice(&select);
         }
         let mut pcr_concat = Vec::with_capacity(sha256_pcrs.len() * 32 + sha384_pcrs.len() * 48);
-        for (_, value) in sha256_pcrs {
-            pcr_concat.extend_from_slice(value);
-        }
-        for (_, value) in sha384_pcrs {
-            pcr_concat.extend_from_slice(value);
+        for hash_alg in bank_order {
+            match hash_alg {
+                TPM_ALG_SHA256 => {
+                    for (_, value) in sha256_pcrs {
+                        pcr_concat.extend_from_slice(value);
+                    }
+                }
+                TPM_ALG_SHA384 => {
+                    for (_, value) in sha384_pcrs {
+                        pcr_concat.extend_from_slice(value);
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
         let digest: [u8; 32] = Sha256::digest(&pcr_concat).into();
         body.extend_from_slice(&(digest.len() as u16).to_be_bytes());
@@ -4794,6 +4815,38 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_sha384_before_sha256() {
+        let qualifying_data = [0x22; 32];
+        let sha256 = [0x33; 32];
+        let sha384 = [0x44; 48];
+        let quote =
+            fake_tpm_quote_banks_with_order(&qualifying_data, &[(4, sha256)], &[(4, sha384)], true);
+        let evidence = vec![PcrEvidence {
+            index: 4,
+            sha256: Some(hex0x(&sha256)),
+            sha384: Some(hex0x(&sha384)),
+        }];
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+
+        assert!(verify_tpm_quote(
+            &mut report,
+            &mut errors,
+            &quote,
+            &qualifying_data,
+            &evidence,
+        )
+        .is_none());
+        assert!(errors.iter().any(|error| {
+            error.check == "tpm-quote-pcr-selection"
+                && error.detail.contains("SHA-256 before SHA-384")
+        }));
+    }
+
+    #[test]
     fn verifier_rejects_pcr_values_outside_quote_selection() {
         let nonce = [1u8; 32];
         let cert = b"cert";
@@ -5948,8 +6001,16 @@ mod tests {
                 platform_profile_id: hex0x(&platform_profile_id),
                 measurement_variant_id: hex0x(&measurement_variant_id),
                 pcr_bank_selection: PcrBankSelection::Sha256,
-                pcr_specs384: Vec::new(),
-                pcr_specs256: vec![pcr4_policy.clone(), pcr15_policy],
+                invariant_pcr_policy: SessionPcrPolicyBlock {
+                    pcr_specs384: Vec::new(),
+                    pcr_specs256: vec![pcr4_policy.clone()],
+                },
+                variant_pcr_policy: SessionPcrPolicyBlock::default(),
+                workload_pcr_policy: SessionPcrPolicyBlock::default(),
+                provider_pcr_policy: SessionPcrPolicyBlock {
+                    pcr_specs384: Vec::new(),
+                    pcr_specs256: vec![pcr15_policy],
+                },
             },
             owner: SessionOwner {
                 fingerprint: hex0x(&owner_fingerprint),

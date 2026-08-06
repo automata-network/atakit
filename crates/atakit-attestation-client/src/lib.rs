@@ -777,12 +777,14 @@ fn hierarchy_to_measurement_policy(
                     id: hex0x(variant_id),
                     machine_types: vec![variant.name.clone()],
                     variant_pcrs256: variant
-                        .variantPcrs256
+                        .variantPcrPolicy
+                        .pcrSpecs256
                         .iter()
                         .map(chain_pcr_spec256_to_measurement)
                         .collect(),
                     variant_pcrs384: variant
-                        .variantPcrs384
+                        .variantPcrPolicy
+                        .pcrSpecs384
                         .iter()
                         .map(chain_pcr_spec384_to_measurement)
                         .collect(),
@@ -806,13 +808,15 @@ fn hierarchy_to_measurement_policy(
                 pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
                 invariant_pcrs256: profile
                     .profile
-                    .invariantPcrs256
+                    .invariantPcrPolicy
+                    .pcrSpecs256
                     .iter()
                     .map(chain_pcr_spec256_to_measurement)
                     .collect(),
                 invariant_pcrs384: profile
                     .profile
-                    .invariantPcrs384
+                    .invariantPcrPolicy
+                    .pcrSpecs384
                     .iter()
                     .map(chain_pcr_spec384_to_measurement)
                     .collect(),
@@ -925,7 +929,8 @@ fn trusted_workload_policy(
     )?;
 
     let pcr_specs256 = spec
-        .workloadPcrs256
+        .workloadPcrPolicy
+        .pcrSpecs256
         .iter()
         .map(|spec| SessionPcrPolicy {
             pcr_index: spec.pcrIndex,
@@ -933,7 +938,8 @@ fn trusted_workload_policy(
         })
         .collect();
     let pcr_specs384 = spec
-        .workloadPcrs384
+        .workloadPcrPolicy
+        .pcrSpecs384
         .iter()
         .map(|spec| SessionPcrPolicy384 {
             pcr_index: spec.pcrIndex,
@@ -1273,7 +1279,7 @@ mod tests {
             encode_dynamic256, DYNAMIC_SUBSEQUENCE,
         };
         use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-            AttributeRequirement, PcrSpec256 as WorkloadPcrSpec256,
+            AttributeRequirement, PcrPolicyBlock, PcrSpec256 as WorkloadPcrSpec256,
             PcrSpec384 as WorkloadPcrSpec384,
         };
 
@@ -1293,20 +1299,22 @@ mod tests {
                 key: B256::repeat_byte(0xaa),
                 allowedValues: vec![B256::repeat_byte(0xbb)],
             }],
-            workloadPcrs256: vec![
-                WorkloadPcrSpec256 {
-                    pcrIndex: 20,
-                    comparison: dynamic_comparison.clone(),
-                },
-                WorkloadPcrSpec256 {
+            workloadPcrPolicy: PcrPolicyBlock {
+                pcrSpecs256: vec![
+                    WorkloadPcrSpec256 {
+                        pcrIndex: 20,
+                        comparison: dynamic_comparison.clone(),
+                    },
+                    WorkloadPcrSpec256 {
+                        pcrIndex: 23,
+                        comparison: static_comparison.clone(),
+                    },
+                ],
+                pcrSpecs384: vec![WorkloadPcrSpec384 {
                     pcrIndex: 23,
-                    comparison: static_comparison.clone(),
-                },
-            ],
-            workloadPcrs384: vec![WorkloadPcrSpec384 {
-                pcrIndex: 23,
-                comparison: static_comparison384.clone(),
-            }],
+                    comparison: static_comparison384.clone(),
+                }],
+            },
         };
         let app_ref: AppRef = "test:v0.0.1".parse().unwrap();
 

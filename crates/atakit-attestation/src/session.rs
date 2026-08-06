@@ -151,8 +151,42 @@ pub struct SessionPolicy {
     pub platform_profile_id: String,
     pub measurement_variant_id: String,
     pub pcr_bank_selection: PcrBankSelection,
+    pub invariant_pcr_policy: SessionPcrPolicyBlock,
+    pub variant_pcr_policy: SessionPcrPolicyBlock,
+    pub workload_pcr_policy: SessionPcrPolicyBlock,
+    pub provider_pcr_policy: SessionPcrPolicyBlock,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPcrPolicyBlock {
     pub pcr_specs256: Vec<SessionPcrPolicy>,
     pub pcr_specs384: Vec<SessionPcrPolicy384>,
+}
+
+impl SessionPolicy {
+    fn complete_pcr_specs256(&self) -> Vec<SessionPcrPolicy> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs256.iter().cloned())
+        .collect()
+    }
+
+    fn complete_pcr_specs384(&self) -> Vec<SessionPcrPolicy384> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs384.iter().cloned())
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +834,13 @@ fn verify_aws_platform(
     ) else {
         return;
     };
+    let Some(tpms_attest) = decode_b64(
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
+        errors,
+    ) else {
+        return;
+    };
     let Some(qualifying_data) = decode_hex_32(
         &bundle.binding.qualifying_data,
         "binding.qualifying_data",
@@ -847,8 +888,10 @@ fn verify_aws_platform(
         &binding,
         &evidence,
         &ak_public,
+        &tpms_attest,
         &pcrs,
         &qualifying_data,
+        true,
         &trust,
         current_time,
     );
@@ -2142,10 +2185,9 @@ fn verify_policies(
         checks,
         errors,
         "trusted-pcr-policy-projection",
-        bundle.policy.pcr_specs256.is_empty() && bundle.policy.pcr_specs384.is_empty()
-            || (bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
-                && bundle.policy.pcr_specs256 == trusted.pcr_specs256
-                && bundle.policy.pcr_specs384 == trusted.pcr_specs384),
+        bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
+            && bundle.policy.complete_pcr_specs256() == trusted.pcr_specs256
+            && bundle.policy.complete_pcr_specs384() == trusted.pcr_specs384,
         "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
     );
     verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
@@ -3338,8 +3380,13 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: vec![pcr.clone()],
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs384: Vec::new(),
+                pcr_specs256: vec![pcr.clone()],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let bundle = bundle_for_policy(policy);
         let trusted = TrustedSessionPolicy {
@@ -3438,8 +3485,13 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha384,
-            pcr_specs256: vec![pcr256.clone()],
-            pcr_specs384: vec![pcr384.clone()],
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs256: vec![pcr256.clone()],
+                pcr_specs384: vec![pcr384.clone()],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.pcr_values[0].sha256 = None;
         bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
@@ -3477,8 +3529,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3555,8 +3609,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let bundle = tdx_bundle_for_policy(policy);
         let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
@@ -3628,8 +3684,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3693,8 +3751,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3774,8 +3834,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3878,8 +3940,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
 
         for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN {
@@ -4002,8 +4066,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut quote = vec![0u8; crate::TDX_QUOTE_HEADER_LEN + 6 + 648];
@@ -4069,8 +4135,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.platform.cloud = "gcp".into();
         bundle.platform.tee = "sev-snp".into();
@@ -4114,8 +4182,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         let mut checks = Vec::new();
         let mut errors = Vec::new();
@@ -4153,8 +4223,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
@@ -4183,8 +4255,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha384,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
@@ -4214,8 +4288,10 @@ mod tests {
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,

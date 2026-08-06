@@ -2672,6 +2672,20 @@ pub(super) fn verify_tpm_quote(
         }
         selected_indices.extend(selection.indices.iter().copied());
     }
+    let canonical_bank_order = match parsed.pcr_selections.as_slice() {
+        [selection] => matches!(selection.hash_alg, TPM_ALG_SHA256 | TPM_ALG_SHA384),
+        [first, second] => first.hash_alg == TPM_ALG_SHA256 && second.hash_alg == TPM_ALG_SHA384,
+        _ => false,
+    };
+    if !canonical_bank_order {
+        fail(
+            report,
+            errors,
+            "tpm-quote-pcr-selection",
+            "TPM quote must select one bank or select SHA-256 before SHA-384".to_string(),
+        );
+        return None;
+    }
     let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
     if supplied_indices != selected_indices {
         fail(
@@ -2958,15 +2972,16 @@ pub(super) fn parse_tpmt_signature_rsassa_sha256(
 
 #[derive(Debug)]
 pub(super) struct ParsedTpmQuote {
-    extra_data: Vec<u8>,
-    pcr_selections: Vec<ParsedPcrSelection>,
-    pcr_digest: Vec<u8>,
+    pub(super) extra_data: Vec<u8>,
+    pub(super) pcr_selections: Vec<ParsedPcrSelection>,
+    pub(super) pcr_digest: Vec<u8>,
 }
 
 #[derive(Debug)]
-struct ParsedPcrSelection {
-    hash_alg: u16,
-    indices: Vec<u8>,
+pub(super) struct ParsedPcrSelection {
+    pub(super) hash_alg: u16,
+    pub(super) select: [u8; 3],
+    pub(super) indices: Vec<u8>,
 }
 
 pub(super) fn parse_tpm_quote(tpms_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
@@ -2992,26 +3007,45 @@ pub(super) fn parse_tpm_quote(tpms_attest: &[u8]) -> std::result::Result<ParsedT
     reader.read_exact("firmwareVersion", 8)?;
 
     let selection_count = reader.read_u32("attested.quote.pcrSelect.count")?;
+    if !matches!(selection_count, 1 | 2) {
+        return Err(format!(
+            "TPM Quote must select one or two PCR banks, got {selection_count}"
+        ));
+    }
     let mut pcr_selections = Vec::new();
     for selection_idx in 0..selection_count {
         let hash_alg = reader.read_u16("attested.quote.pcrSelect.hash")?;
         let select_len = reader.read_u8("attested.quote.pcrSelect.sizeofSelect")? as usize;
+        if select_len != 3 {
+            return Err(format!(
+                "TPM Quote PCR selection sizeofSelect must equal 3, got {select_len}"
+            ));
+        }
         let select = reader.read_exact("attested.quote.pcrSelect.pcrSelect", select_len)?;
         let mut indices = Vec::new();
         for (byte_idx, byte) in select.iter().enumerate() {
             for bit in 0..8 {
                 if byte & (1 << bit) != 0 {
                     let index = byte_idx * 8 + bit;
-                    if index > 23 {
+                    if index > 16 && index != 23 {
                         return Err(format!(
-                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected 0..=23"
+                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected PCR0 through PCR16 or PCR23"
                         ));
                     }
                     indices.push(index as u8);
                 }
             }
         }
-        pcr_selections.push(ParsedPcrSelection { hash_alg, indices });
+        if indices.is_empty() {
+            return Err(format!(
+                "PCR selection {selection_idx} for bank 0x{hash_alg:04x} is empty"
+            ));
+        }
+        pcr_selections.push(ParsedPcrSelection {
+            hash_alg,
+            select: select.try_into().expect("select length checked"),
+            indices,
+        });
     }
     let pcr_digest = reader.read_tpm2b("attested.quote.pcrDigest")?.to_vec();
     if !reader.is_empty() {

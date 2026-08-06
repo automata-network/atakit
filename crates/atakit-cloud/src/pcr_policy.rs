@@ -35,18 +35,21 @@ sol! {
     }
 
     #[derive(Debug)]
+    struct ChainPcrPolicyBlock {
+        ChainPcrSpec256[] pcrSpecs256;
+        ChainPcrSpec384[] pcrSpecs384;
+    }
+
+    #[derive(Debug)]
     struct ChainResolvedPcrPolicy {
         bytes32 workloadId;
         bytes32 baseImageId;
         bytes32 platformProfileId;
         bytes32 measurementVariantId;
         ChainPcrBankSelection pcrBankSelection;
-        ChainPcrSpec256[] invariantPcrs256;
-        ChainPcrSpec256[] variantPcrs256;
-        ChainPcrSpec256[] workloadPcrs256;
-        ChainPcrSpec384[] invariantPcrs384;
-        ChainPcrSpec384[] variantPcrs384;
-        ChainPcrSpec384[] workloadPcrs384;
+        ChainPcrPolicyBlock invariantPcrPolicy;
+        ChainPcrPolicyBlock variantPcrPolicy;
+        ChainPcrPolicyBlock workloadPcrPolicy;
     }
 
     #[sol(rpc)]
@@ -84,18 +87,22 @@ pub struct PcrSpec384Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PcrPolicyBlockConfig {
+    pub pcr_specs256: Vec<PcrSpec256Config>,
+    pub pcr_specs384: Vec<PcrSpec384Config>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedPcrPolicyConfig {
     pub workload_id: String,
     pub base_image_id: String,
     pub platform_profile_id: String,
     pub measurement_variant_id: String,
     pub pcr_bank_selection: PcrBankSelectionConfig,
-    pub invariant_pcrs256: Vec<PcrSpec256Config>,
-    pub variant_pcrs256: Vec<PcrSpec256Config>,
-    pub workload_pcrs256: Vec<PcrSpec256Config>,
-    pub invariant_pcrs384: Vec<PcrSpec384Config>,
-    pub variant_pcrs384: Vec<PcrSpec384Config>,
-    pub workload_pcrs384: Vec<PcrSpec384Config>,
+    pub invariant_pcr_policy: PcrPolicyBlockConfig,
+    pub variant_pcr_policy: PcrPolicyBlockConfig,
+    pub workload_pcr_policy: PcrPolicyBlockConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,12 +201,16 @@ fn convert_chain_policy(policy: ChainResolvedPcrPolicy) -> ResolvedPcrPolicyConf
             ChainPcrBankSelection::Sha256AndSha384 => PcrBankSelectionConfig::Sha256AndSha384,
             _ => unreachable!("Solidity enum decoder rejects invalid values"),
         },
-        invariant_pcrs256: convert_chain_specs256(policy.invariantPcrs256),
-        variant_pcrs256: convert_chain_specs256(policy.variantPcrs256),
-        workload_pcrs256: convert_chain_specs256(policy.workloadPcrs256),
-        invariant_pcrs384: convert_chain_specs384(policy.invariantPcrs384),
-        variant_pcrs384: convert_chain_specs384(policy.variantPcrs384),
-        workload_pcrs384: convert_chain_specs384(policy.workloadPcrs384),
+        invariant_pcr_policy: convert_chain_block(policy.invariantPcrPolicy),
+        variant_pcr_policy: convert_chain_block(policy.variantPcrPolicy),
+        workload_pcr_policy: convert_chain_block(policy.workloadPcrPolicy),
+    }
+}
+
+fn convert_chain_block(block: ChainPcrPolicyBlock) -> PcrPolicyBlockConfig {
+    PcrPolicyBlockConfig {
+        pcr_specs256: convert_chain_specs256(block.pcrSpecs256),
+        pcr_specs384: convert_chain_specs384(block.pcrSpecs384),
     }
 }
 
@@ -258,23 +269,36 @@ fn validate_policy(
         ));
     }
 
-    validate_rules256("invariantPcrs256", &policy.invariant_pcrs256)?;
-    validate_rules256("variantPcrs256", &policy.variant_pcrs256)?;
-    validate_rules256("workloadPcrs256", &policy.workload_pcrs256)?;
-    validate_rules384("invariantPcrs384", &policy.invariant_pcrs384)?;
-    validate_rules384("variantPcrs384", &policy.variant_pcrs384)?;
-    validate_rules384("workloadPcrs384", &policy.workload_pcrs384)?;
+    validate_policy_block("invariantPcrPolicy", &policy.invariant_pcr_policy)?;
+    validate_policy_block("variantPcrPolicy", &policy.variant_pcr_policy)?;
+    validate_policy_block("workloadPcrPolicy", &policy.workload_pcr_policy)?;
     reject_overlap(
-        "invariantPcrs256",
-        policy.invariant_pcrs256.iter().map(|rule| rule.pcr_index),
-        "variantPcrs256",
-        policy.variant_pcrs256.iter().map(|rule| rule.pcr_index),
+        "invariantPcrPolicy.pcrSpecs256",
+        policy
+            .invariant_pcr_policy
+            .pcr_specs256
+            .iter()
+            .map(|rule| rule.pcr_index),
+        "variantPcrPolicy.pcrSpecs256",
+        policy
+            .variant_pcr_policy
+            .pcr_specs256
+            .iter()
+            .map(|rule| rule.pcr_index),
     )?;
     reject_overlap(
-        "invariantPcrs384",
-        policy.invariant_pcrs384.iter().map(|rule| rule.pcr_index),
-        "variantPcrs384",
-        policy.variant_pcrs384.iter().map(|rule| rule.pcr_index),
+        "invariantPcrPolicy.pcrSpecs384",
+        policy
+            .invariant_pcr_policy
+            .pcr_specs384
+            .iter()
+            .map(|rule| rule.pcr_index),
+        "variantPcrPolicy.pcrSpecs384",
+        policy
+            .variant_pcr_policy
+            .pcr_specs384
+            .iter()
+            .map(|rule| rule.pcr_index),
     )?;
 
     match platform {
@@ -287,6 +311,11 @@ fn validate_policy(
         _ => {}
     }
     Ok(())
+}
+
+fn validate_policy_block(field: &str, block: &PcrPolicyBlockConfig) -> Result<(), CloudError> {
+    validate_rules256(&format!("{field}.pcrSpecs256"), &block.pcr_specs256)?;
+    validate_rules384(&format!("{field}.pcrSpecs384"), &block.pcr_specs384)
 }
 
 fn validate_rules256(field: &str, rules: &[PcrSpec256Config]) -> Result<(), CloudError> {
@@ -380,18 +409,24 @@ mod tests {
             platform_profile_id: format!("0x{}", "33".repeat(32)),
             measurement_variant_id: format!("0x{}", "44".repeat(32)),
             pcr_bank_selection: PcrBankSelectionConfig::Sha256AndSha384,
-            invariant_pcrs256: vec![PcrSpec256Config {
-                pcr_index: 0,
-                comparison: "0x1234".into(),
-            }],
-            variant_pcrs256: Vec::new(),
-            workload_pcrs256: Vec::new(),
-            invariant_pcrs384: vec![PcrSpec384Config {
-                pcr_index: 0,
-                comparison: "0x5678".into(),
-            }],
-            variant_pcrs384: Vec::new(),
-            workload_pcrs384: Vec::new(),
+            invariant_pcr_policy: PcrPolicyBlockConfig {
+                pcr_specs256: vec![PcrSpec256Config {
+                    pcr_index: 0,
+                    comparison: "0x1234".into(),
+                }],
+                pcr_specs384: vec![PcrSpec384Config {
+                    pcr_index: 0,
+                    comparison: "0x5678".into(),
+                }],
+            },
+            variant_pcr_policy: PcrPolicyBlockConfig {
+                pcr_specs256: Vec::new(),
+                pcr_specs384: Vec::new(),
+            },
+            workload_pcr_policy: PcrPolicyBlockConfig {
+                pcr_specs256: Vec::new(),
+                pcr_specs384: Vec::new(),
+            },
         }
     }
 
@@ -419,14 +454,17 @@ mod tests {
     #[test]
     fn strict_policy_rejects_unsorted_rules_and_malformed_comparison() {
         let mut value = policy();
-        value.invariant_pcrs256.push(PcrSpec256Config {
-            pcr_index: 0,
-            comparison: "0xxyz".into(),
-        });
+        value
+            .invariant_pcr_policy
+            .pcr_specs256
+            .push(PcrSpec256Config {
+                pcr_index: 0,
+                comparison: "0xxyz".into(),
+            });
         assert!(validate_policy(&value, identifiers(), "gcp").is_err());
 
         let mut value = policy();
-        value.invariant_pcrs256[0].comparison = "0x".into();
+        value.invariant_pcr_policy.pcr_specs256[0].comparison = "0x".into();
         assert!(validate_policy(&value, identifiers(), "gcp").is_err());
     }
 
