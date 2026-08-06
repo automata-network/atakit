@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy_ext::core::primitives::Address;
+use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
@@ -324,50 +324,51 @@ pub(crate) fn warn_unsafe_skip_tls_attestation() {
 
 pub(crate) async fn resolve_tls_measurement_policy(
     measurements: Option<&std::path::Path>,
-    base_image: Option<&str>,
+    expected_base_image: Option<&str>,
+    untrusted_portal_base_image_id: Option<[u8; 32]>,
     measurement_publisher_keys: &[String],
     data_dir: &std::path::Path,
     init_chain: &InitChainConfig,
-) -> Result<Option<MeasurementPolicy>> {
+) -> Result<MeasurementPolicy> {
     if measurements.is_some() {
         return atakit_cloud::init::load_measurement_policy(
             measurements,
-            base_image,
+            expected_base_image,
             measurement_publisher_keys,
             Some(data_dir),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"));
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"));
+    }
+    if !measurement_publisher_keys.is_empty() {
+        bail!("--measurement-publisher-key requires --measurements");
     }
 
-    let Some(base_image_ref) = base_image else {
-        return Ok(None);
-    };
+    if !chain_measurement_policy_available(init_chain) {
+        bail!(
+            "normal portal TLS attestation requires a configured chain with BaseImageRegistry or SessionRegistry; select a chain or provide --measurements for explicit offline verification"
+        );
+    }
 
-    if atakit_cloud::init::local_measurement_pack_exists(data_dir, base_image_ref)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-    {
-        return atakit_cloud::init::load_measurement_policy(
-            None,
-            Some(base_image_ref),
-            measurement_publisher_keys,
-            Some(data_dir),
+    let base_image_id = B256::from(untrusted_portal_base_image_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "normal portal TLS attestation requires the untrusted base_image_id from GET /status"
         )
-        .map_err(|e| anyhow::anyhow!("{e}"));
+    })?);
+    if let Some(expected_base_image) = expected_base_image {
+        let expected_ref: AppRef = expected_base_image.parse()?;
+        let expected_id = BaseImageRegistry::get_image_id(&expected_ref);
+        if expected_id != base_image_id {
+            bail!(
+                "GET /status claimed base_image_id {} but --base-image {expected_base_image} resolves to {}",
+                hex0x(base_image_id),
+                hex0x(expected_id)
+            );
+        }
     }
 
-    if chain_measurement_policy_available(init_chain) {
-        return Ok(Some(
-            load_measurement_policy_from_chain(base_image_ref, init_chain).await?,
-        ));
-    }
-
-    atakit_cloud::init::load_measurement_policy(
-        None,
-        Some(base_image_ref),
-        measurement_publisher_keys,
-        Some(data_dir),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    let base_image_registry = resolve_tls_base_image_registry(init_chain).await?;
+    load_measurement_policy_from_chain_id(base_image_id, &base_image_registry, init_chain).await
 }
 
 /// Resolve base-image measurement collateral from sources selected by the
@@ -405,19 +406,55 @@ pub(crate) async fn resolve_verifier_tls_measurement_policy(
 }
 
 fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
-    init_chain.base_image_registry != ZERO_ADDR && !init_chain.rpc_url.trim().is_empty()
+    !init_chain.rpc_url.trim().is_empty()
+        && (init_chain.base_image_registry != ZERO_ADDR || init_chain.session_registry != ZERO_ADDR)
 }
 
-async fn load_measurement_policy_from_chain(
-    base_image: &str,
+async fn resolve_tls_base_image_registry(init_chain: &InitChainConfig) -> Result<String> {
+    if init_chain.base_image_registry != ZERO_ADDR {
+        return Ok(init_chain.base_image_registry.clone());
+    }
+    let session_registry: Address = init_chain.session_registry.parse().with_context(|| {
+        format!(
+            "invalid session_registry address for TLS measurement lookup: {}",
+            init_chain.session_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &init_chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url while deriving BaseImageRegistry for TLS measurement lookup: {}",
+            init_chain.rpc_url
+        )
+    })?;
+    let base_image_registry = SessionRegistryInstance::new(session_registry, provider)
+        .baseImageRegistry()
+        .call()
+        .await
+        .context(
+            "failed to derive BaseImageRegistry from SessionRegistry for TLS measurement lookup",
+        )?;
+    if base_image_registry == Address::ZERO {
+        bail!("SessionRegistry returned the zero BaseImageRegistry address");
+    }
+    Ok(base_image_registry.to_string())
+}
+
+async fn load_measurement_policy_from_chain_id(
+    base_image_id: B256,
+    base_image_registry: &str,
     init_chain: &InitChainConfig,
 ) -> Result<MeasurementPolicy> {
-    let app_ref: AppRef = base_image.parse()?;
-    let base_image_id = BaseImageRegistry::get_image_id(&app_ref);
-    let registry_addr: Address = init_chain.base_image_registry.parse().with_context(|| {
+    let registry_addr: Address = base_image_registry.parse().with_context(|| {
         format!(
             "invalid base_image_registry address for TLS measurement lookup: {}",
-            init_chain.base_image_registry
+            base_image_registry
         )
     })?;
     let provider = NetworkProvider::with_http(
@@ -436,9 +473,21 @@ async fn load_measurement_policy_from_chain(
     let hierarchy = BaseImageRegistry::new(registry_addr, provider)
         .get_hierarchy(base_image_id)
         .await
-        .with_context(|| format!("failed to fetch BaseImageRegistry hierarchy for {base_image}"))?;
+        .with_context(|| {
+            format!(
+                "failed to fetch BaseImageRegistry hierarchy for untrusted portal base_image_id {}",
+                hex0x(base_image_id)
+            )
+        })?;
+    if hierarchy.base_image_id != base_image_id {
+        bail!(
+            "BaseImageRegistry returned hierarchy {} for requested base_image_id {}",
+            hex0x(hierarchy.base_image_id),
+            hex0x(base_image_id)
+        );
+    }
 
-    chain_hierarchy_to_measurement_policy(&hierarchy, &init_chain.base_image_registry)
+    chain_hierarchy_to_measurement_policy(&hierarchy, base_image_registry)
 }
 
 fn chain_hierarchy_to_measurement_policy(
@@ -458,12 +507,14 @@ fn chain_hierarchy_to_measurement_policy(
                     id: hex0x(variant_id),
                     machine_types: vec![variant.name.clone()],
                     variant_pcrs256: variant
-                        .variantPcrs256
+                        .variantPcrPolicy
+                        .pcrSpecs256
                         .iter()
                         .map(chain_pcr_spec256_to_measurement)
                         .collect(),
                     variant_pcrs384: variant
-                        .variantPcrs384
+                        .variantPcrPolicy
+                        .pcrSpecs384
                         .iter()
                         .map(chain_pcr_spec384_to_measurement)
                         .collect(),
@@ -487,13 +538,15 @@ fn chain_hierarchy_to_measurement_policy(
                 pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
                 invariant_pcrs256: profile
                     .profile
-                    .invariantPcrs256
+                    .invariantPcrPolicy
+                    .pcrSpecs256
                     .iter()
                     .map(chain_pcr_spec256_to_measurement)
                     .collect(),
                 invariant_pcrs384: profile
                     .profile
-                    .invariantPcrs384
+                    .invariantPcrPolicy
+                    .pcrSpecs384
                     .iter()
                     .map(chain_pcr_spec384_to_measurement)
                     .collect(),
@@ -1934,10 +1987,14 @@ mod tls_measurement_policy_tests {
         chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
 
         assert!(chain_measurement_policy_available(&chain));
+
+        chain.base_image_registry = ZERO_ADDR.to_string();
+        chain.session_registry = "0x2222222222222222222222222222222222222222".to_string();
+        assert!(chain_measurement_policy_available(&chain));
     }
 
     #[tokio::test]
-    async fn incomplete_local_pack_does_not_fallback_to_chain() {
+    async fn default_tls_policy_does_not_read_local_measurement_cache() {
         let data_dir = tempfile::tempdir().unwrap();
         let pack_dir = data_dir
             .path()
@@ -1948,18 +2005,71 @@ mod tls_measurement_policy_tests {
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
 
+        let chain = synthesize_off_init_chain();
+
+        let error = resolve_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured chain with BaseImageRegistry or SessionRegistry"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_image_flag_is_only_an_assertion_against_status_id() {
+        let data_dir = tempfile::tempdir().unwrap();
         let mut chain = synthesize_off_init_chain();
         chain.rpc_url = "https://rpc.example.com".to_string();
         chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
 
-        let error =
-            resolve_tls_measurement_policy(None, Some("base:v1"), &[], data_dir.path(), &chain)
-                .await
-                .unwrap_err();
+        let error = resolve_tls_measurement_policy(
+            None,
+            Some("base:v1"),
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
 
+        assert!(error.to_string().contains("--base-image"), "{error}");
         assert!(
-            error.to_string().contains("measurement-pack.sig"),
+            error
+                .to_string()
+                .contains("GET /status claimed base_image_id"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_publisher_key_requires_explicit_measurements() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chain = synthesize_off_init_chain();
+        let error = resolve_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &["0x02".to_string()],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--measurement-publisher-key requires --measurements"
         );
     }
 }

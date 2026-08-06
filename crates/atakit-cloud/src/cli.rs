@@ -193,11 +193,11 @@ pub struct DeployArgs {
     #[arg(long, value_name = "PORT")]
     pub status_port: Option<u16>,
 
-    /// Expected base image for TLS attestation measurement policy (name:version).
+    /// Optional expected base-image assertion for portal TLS attestation.
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,
 
-    /// Signed measurement pack JSON file or directory.
+    /// Explicit signed measurement pack for offline portal TLS verification.
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
 
@@ -460,11 +460,11 @@ pub struct InitArgs {
     #[arg(long, value_name = "NAME=VALUE")]
     pub disk_passphrase: Vec<String>,
 
-    /// Expected base image for TLS attestation measurement policy (name:version).
+    /// Optional expected base-image assertion for portal TLS attestation.
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,
 
-    /// Signed measurement pack JSON file or directory.
+    /// Explicit signed measurement pack for offline portal TLS verification.
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
 

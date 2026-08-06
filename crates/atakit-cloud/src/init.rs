@@ -1873,6 +1873,77 @@ pub async fn wait_for_portal_with_client(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct PortalBaseImageClaim {
+    base_image_id: Option<String>,
+}
+
+/// Read the portal's pre-TLS base-image claim from `GET /status`.
+///
+/// This value is not trusted. Callers may use it only as the lookup key for a
+/// trusted measurement policy. The later TLS attestation check must prove that
+/// the measured platform satisfies the policy returned for this exact ID.
+pub async fn read_untrusted_portal_base_image_id(
+    host: &str,
+    status_port: u16,
+) -> Result<[u8; 32], CloudError> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| CloudError::Http {
+            message: error.to_string(),
+        })?;
+    let url = format!("https://{host}:{status_port}/status");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| CloudError::PortalTlsAttestationFailed {
+            message: format!("read untrusted base_image_id from {url}: {error}"),
+        })?
+        .error_for_status()
+        .map_err(|error| CloudError::PortalTlsAttestationFailed {
+            message: format!("read untrusted base_image_id from {url}: {error}"),
+        })?;
+    let body = read_response_bytes_limited(
+        response,
+        MAX_PORTAL_STATUS_RESPONSE_BYTES,
+        "portal status response",
+    )
+    .await
+    .map_err(|message| CloudError::PortalTlsAttestationFailed {
+        message: format!("read untrusted base_image_id from {url}: {message}"),
+    })?;
+    let claim: PortalBaseImageClaim =
+        serde_json::from_slice(&body).map_err(|error| CloudError::PortalTlsAttestationFailed {
+            message: format!("parse untrusted base_image_id from {url}: {error}"),
+        })?;
+    parse_untrusted_portal_base_image_id(claim.base_image_id.as_deref())
+}
+
+fn parse_untrusted_portal_base_image_id(value: Option<&str>) -> Result<[u8; 32], CloudError> {
+    let value = value.ok_or_else(|| CloudError::PortalTlsAttestationFailed {
+        message: "GET /status did not return base_image_id".to_string(),
+    })?;
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| CloudError::PortalTlsAttestationFailed {
+            message: "GET /status base_image_id must use 0x-prefixed hexadecimal".to_string(),
+        })?;
+    let decoded = hex::decode(raw).map_err(|error| CloudError::PortalTlsAttestationFailed {
+        message: format!("GET /status base_image_id is invalid hexadecimal: {error}"),
+    })?;
+    decoded
+        .try_into()
+        .map_err(|decoded: Vec<u8>| CloudError::PortalTlsAttestationFailed {
+            message: format!(
+                "GET /status base_image_id must contain exactly 32 bytes, got {}",
+                decoded.len()
+            ),
+        })
+}
+
 /// Terminal state reached by the portal after `/init`.
 #[derive(Debug, Clone)]
 pub enum PortalTerminalState {
@@ -2917,6 +2988,19 @@ mod tests {
         let error = append_response_chunk_limited(&mut body, b"5", 4, "test response").unwrap_err();
         assert_eq!(body, b"1234");
         assert!(error.contains("4-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn parses_untrusted_portal_base_image_id_strictly() {
+        let value = format!("0x{}", "ab".repeat(32));
+        assert_eq!(
+            parse_untrusted_portal_base_image_id(Some(&value)).unwrap(),
+            [0xab; 32]
+        );
+
+        for invalid in [None, Some("ab"), Some("0x11"), Some("0xzzzz")] {
+            assert!(parse_untrusted_portal_base_image_id(invalid).is_err());
+        }
     }
 
     #[test]

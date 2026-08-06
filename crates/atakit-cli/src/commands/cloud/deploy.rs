@@ -944,9 +944,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     super::warn_unsafe_skip_tls_attestation();
                     None
                 } else {
+                    let untrusted_portal_base_image_id = if args.measurements.is_none() {
+                        Some(
+                            init::read_untrusted_portal_base_image_id(&ip, status_port)
+                                .await
+                                .map_err(|error| anyhow::anyhow!("{error}"))?,
+                        )
+                    } else {
+                        None
+                    };
                     let measurement_policy = resolve_tls_measurement_policy(
                         args.measurements.as_deref(),
                         args.base_image.as_deref(),
+                        untrusted_portal_base_image_id,
                         &args.measurement_publisher_key,
                         &env.data_dir,
                         &init_config.chain,
@@ -976,7 +986,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     let verified_tls = init::bootstrap_portal_tls_with_trust_config(
                         &ip,
                         status_port,
-                        measurement_policy,
+                        Some(measurement_policy),
                         Some(workload_attributes.clone()),
                         tls_verification_trust,
                         init::azure_maa_trust_config_from_init_chain(&init_config.chain),

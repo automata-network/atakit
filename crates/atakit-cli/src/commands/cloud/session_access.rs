@@ -105,26 +105,12 @@ pub(crate) async fn resolve_verified_portal_access(
         .or((!state.init_env.chain.is_empty()).then_some(state.init_env.chain.as_str()))
         .or(target.chain.as_deref())
         .map(str::to_string);
-    let base_image = verification
-        .base_image
-        .as_deref()
-        .or(state.base_image_ref.as_deref())
-        .unwrap_or(&state.image_ref);
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
             Some(chain) => {
-                let local_pack_exists = if verification.measurements.is_none() {
-                    init::local_measurement_pack_exists(&env.data_dir, base_image)
-                        .map_err(|error| anyhow::anyhow!("{error}"))?
-                } else {
-                    false
-                };
                 if tls_needs_registry_derivation(
-                    !base_image.is_empty(),
                     verification.measurements.is_some(),
-                    local_pack_exists,
                     chain.base_image_registry.is_some(),
-                    target.registration.as_deref(),
                 ) {
                     let prover = chain
                         .prover
@@ -145,9 +131,19 @@ pub(crate) async fn resolve_verified_portal_access(
         None => bail!("no chain config is available for verifier trust lookup"),
     };
 
+    let untrusted_portal_base_image_id = if verification.measurements.is_none() {
+        Some(
+            init::read_untrusted_portal_base_image_id(&host, status_port)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        )
+    } else {
+        None
+    };
     let measurement_policy = resolve_tls_measurement_policy(
         verification.measurements.as_deref(),
-        Some(base_image),
+        verification.base_image.as_deref(),
+        untrusted_portal_base_image_id,
         &verification.measurement_publisher_key,
         &env.data_dir,
         &init_chain,
@@ -178,7 +174,7 @@ pub(crate) async fn resolve_verified_portal_access(
     let verified_tls = init::bootstrap_portal_tls_with_trust_config(
         &host,
         status_port,
-        measurement_policy,
+        Some(measurement_policy),
         None,
         tls_verification_trust,
         init::azure_maa_trust_config_from_init_chain(&init_chain),
@@ -280,17 +276,10 @@ fn verification_chain_without_registry_derivation(
 }
 
 fn tls_needs_registry_derivation(
-    has_base_image: bool,
     has_explicit_measurements: bool,
-    local_pack_exists: bool,
     has_configured_base_image_registry: bool,
-    registration: Option<&str>,
 ) -> bool {
-    has_base_image
-        && !has_explicit_measurements
-        && !local_pack_exists
-        && !has_configured_base_image_registry
-        && !registration_is_off(registration)
+    !has_explicit_measurements && !has_configured_base_image_registry
 }
 
 fn should_resolve_registered_workload_policy(
@@ -583,42 +572,10 @@ mod tests {
     }
 
     #[test]
-    fn local_tls_measurements_defer_session_registry_derivation() {
-        assert!(!tls_needs_registry_derivation(
-            true,
-            true,
-            false,
-            false,
-            Some("required"),
-        ));
-        assert!(!tls_needs_registry_derivation(
-            true,
-            false,
-            true,
-            false,
-            Some("required"),
-        ));
-        assert!(!tls_needs_registry_derivation(
-            true,
-            false,
-            false,
-            true,
-            Some("required"),
-        ));
-        assert!(!tls_needs_registry_derivation(
-            true,
-            false,
-            false,
-            false,
-            Some("off"),
-        ));
-        assert!(tls_needs_registry_derivation(
-            true,
-            false,
-            false,
-            false,
-            Some("required"),
-        ));
+    fn only_default_chain_tls_needs_base_image_registry_derivation() {
+        assert!(!tls_needs_registry_derivation(true, false));
+        assert!(!tls_needs_registry_derivation(false, true));
+        assert!(tls_needs_registry_derivation(false, false));
     }
 
     #[test]

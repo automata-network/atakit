@@ -290,14 +290,17 @@ A single-target deploy performs these logical stages:
 
 1. Resolve and validate the workload archive, manifest policy, image, target,
    provider, CC type, disk secrets, registration policy, keys, and prover.
-2. Resolve the TLS measurement policy before provisioning unless
-   `--unsafe-skip-tls-attestation` is explicitly set.
+2. Validate any explicit offline TLS measurement policy before provisioning.
 3. Create and persist a provider-specific deployment plan and resource state.
 4. Upload/register the image when it is not already present.
 5. Create firewall/security-group rules, data disks, and the VM.
 6. Wait for `GET /status` on the configured status port.
-7. Verify the portal TLS certificate against fresh attestation and the selected
-   measurement policy.
+7. Unless `--unsafe-skip-tls-attestation` is explicitly set, read the portal's
+   unauthenticated `GET /status.base_image_id` as an untrusted lookup key. Fetch
+   that exact base-image policy from `BaseImageRegistry`, verify the portal TLS
+   certificate and fresh attestation against the fetched policy, and accept the
+   claimed base-image identity only after verification succeeds. An explicit
+   `--measurements` value selects the offline policy path instead.
 8. Unless `--skip-init` or `--image-only` is set, require `GET /status` to
    report `init_schema_version = 3`, send the one-shot multipart `POST /init`
    request, and poll portal state.
