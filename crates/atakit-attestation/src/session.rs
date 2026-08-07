@@ -335,6 +335,15 @@ pub struct SessionAttributeRequirement {
 pub struct VerifiedSession {
     pub session_id: [u8; 32],
     pub session_key_fingerprint: [u8; 32],
+    /// Algorithm identifier of the verified session public key. `verify_key_types`
+    /// requires ES256K (`3`) for the session request binding.
+    pub session_key_type_id: u8,
+    /// The verified session public key itself. `session_key_fingerprint` is
+    /// recomputed from these bytes and checked against the bundle's claim, and
+    /// `session_key_delegation.session_key_possession_signature` is verified
+    /// against it, so this surfaces an already-verified value rather than
+    /// introducing a new check.
+    pub session_public_key: Vec<u8>,
     pub binding_mode: BindingMode,
     pub binding_chain_id: u64,
     pub binding_registry: [u8; 20],
@@ -495,6 +504,8 @@ pub fn verify_session_bundle_at(
         Ok(VerifiedSession {
             session_id: session_id.expect("validated session id"),
             session_key_fingerprint: session_key_fingerprint.expect("validated session key"),
+            session_key_type_id: bundle.session_key.type_id,
+            session_public_key: session_key.expect("validated session key"),
             binding_mode: bundle.binding.mode,
             binding_chain_id: bundle.binding.chain_id,
             binding_registry: binding_registry.expect("validated binding registry"),
