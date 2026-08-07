@@ -3546,3 +3546,203 @@ mod explicit_trust_fixtures {
         );
     }
 }
+
+/// End-to-end Azure Intel TDX verification against captured live evidence.
+///
+/// The evidence in `testdata/` was taken from a real Azure Intel TDX CVM
+/// (`Standard_DC2es_v6`, `automata-linux:v0.2.8-debug`) on 2026-08-08, together
+/// with the Intel DCAP collateral for that exact quote and the Azure MAA
+/// signing certificate that signed its attestation token.
+///
+/// This replaces a live target for regression purposes. The step 1b acceptance
+/// baseline required the *same instance and session* to still exist, so it died
+/// the moment that instance was destroyed. Captured evidence does not expire,
+/// because `verify_tls_attestation_at` takes a caller-selected verification
+/// time and every certificate, collateral, and token check uses that one value.
+#[cfg(test)]
+mod azure_tdx_captured_evidence {
+    use super::*;
+    use atakit_attestation::{
+        verify_tls_attestation_at, CheckResult, IntelTdxDcapCollateral, TlsAttestationResponse,
+        TrustAnchors, VerificationFailure, VerificationInputs,
+    };
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ATTESTATION: &str = include_str!("testdata/azure-tdx-tls-attestation.json");
+    const DCAP_COLLATERAL: &str = include_str!("testdata/azure-tdx-dcap-collateral.json");
+    const MAA_CERTIFICATE: &[u8] = include_bytes!("testdata/azure-maa-sharedeus.der");
+
+    /// Inside the captured MAA token's window, 1786125506 to 1786154306.
+    const VERIFICATION_TIME: u64 = 1_786_130_000;
+
+    fn inputs() -> VerificationInputs {
+        let raw: serde_json::Value = serde_json::from_str(ATTESTATION).unwrap();
+        let quote = B64
+            .decode(raw["teeEvidence"]["report"].as_str().unwrap())
+            .unwrap();
+        let nonce: [u8; 32] = B64
+            .decode(raw["nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .expect("32-byte nonce");
+        let live_peer_cert_der = B64.decode(raw["tlsCertDer"].as_str().unwrap()).unwrap();
+        let response: TlsAttestationResponse = serde_json::from_str(ATTESTATION).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let maa_path = directory.path().join("maa.der");
+        std::fs::write(&maa_path, MAA_CERTIFICATE).unwrap();
+        let azure_maa_keys = parse_azure_maa_certificates(&[maa_path]).unwrap();
+
+        VerificationInputs {
+            nonce,
+            live_peer_cert_der,
+            response,
+            intel_tdx_dcap_collateral: Some(
+                IntelTdxDcapCollateral::from_file_json(DCAP_COLLATERAL, &quote).unwrap(),
+            ),
+            amd_snp_collateral: None,
+            measurement_policy: None,
+            trust_anchors: TrustAnchors {
+                azure_maa_keys,
+                ..TrustAnchors::default()
+            },
+        }
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    fn failed_checks(failure: &VerificationFailure) -> Vec<&str> {
+        failure
+            .report
+            .checks
+            .iter()
+            .filter(|check| matches!(check.result, CheckResult::Fail))
+            .map(|check| check.name.as_str())
+            .collect()
+    }
+
+    /// Every cryptographic check passes against the captured evidence. The
+    /// whole chain is exercised: the TPM quote over the nonce and the live TLS
+    /// certificate, the Azure MAA token under the fetched signing certificate,
+    /// and the Intel TDX vendor report against real DCAP collateral.
+    ///
+    /// `measurement-policy` is the sole expected failure. The fixture supplies
+    /// no measurement policy, because verifying the signed pack for
+    /// `automata-linux:v0.2.8-debug` needs the publisher key that signed it,
+    /// which is an operator secret and not committed here. In chain mode the
+    /// registry supplies that policy instead.
+    ///
+    /// Asserting the whole check vector rather than a boolean pins more than
+    /// success would: if the relocation of this code changes any check's
+    /// outcome, drops one, or reorders the evidence path, this fails.
+    #[test]
+    fn every_cryptographic_check_passes_against_captured_evidence() {
+        let failure = verify_tls_attestation_at(inputs(), at(VERIFICATION_TIME))
+            .expect_err("no measurement policy is supplied, so verification cannot succeed");
+
+        let failed: Vec<&str> = failure
+            .report
+            .checks
+            .iter()
+            .filter(|check| matches!(check.result, CheckResult::Fail))
+            .map(|check| check.name.as_str())
+            .collect();
+
+        assert_eq!(
+            failed,
+            vec!["measurement-policy"],
+            "only the deliberately absent measurement policy may fail"
+        );
+
+        // The checks that carry the actual security of the attestation.
+        for required in [
+            "nonce",
+            "tls-cert-der",
+            "tpm-quote",
+            "tpm-signature",
+            "live-cert-hash",
+            "qualifying-data",
+            "tpm-quote-challenge",
+            "tpm-quote-pcr-digest",
+            "azure-maa-jwt",
+            "tpm-quote-signature",
+            "tee-evidence",
+            "azure-tee-ak-binding",
+            "azure-tee-var-data-binding",
+            "azure-tee-vendor-report",
+            "ak-binding",
+        ] {
+            let check = failure
+                .report
+                .checks
+                .iter()
+                .find(|check| check.name == required)
+                .unwrap_or_else(|| panic!("check {required} is missing from the report"));
+            assert!(
+                matches!(check.result, CheckResult::Pass),
+                "{required} must pass against captured live evidence, got {:?}",
+                check.result
+            );
+        }
+    }
+
+    /// The nonce binds the attestation to one request. Changing it must fail:
+    /// the TPM signed the qualifying data derived from it, so a replayed
+    /// response cannot be presented against a different challenge.
+    #[test]
+    fn rejects_a_different_nonce() {
+        let mut inputs = inputs();
+        inputs.nonce[0] ^= 0xff;
+        let failure = verify_tls_attestation_at(inputs, at(VERIFICATION_TIME)).unwrap_err();
+        assert!(
+            failed_checks(&failure).contains(&"nonce"),
+            "a different nonce must fail the nonce check, not merely fail overall: {:?}",
+            failed_checks(&failure)
+        );
+    }
+
+    /// The quote binds the live TLS certificate. Substituting it must fail,
+    /// which is what stops evidence from one host vouching for another.
+    #[test]
+    fn rejects_a_substituted_tls_certificate() {
+        let mut inputs = inputs();
+        inputs.live_peer_cert_der = vec![0x30, 0x82, 0x01, 0x00];
+        let failure = verify_tls_attestation_at(inputs, at(VERIFICATION_TIME)).unwrap_err();
+        assert!(
+            failed_checks(&failure).contains(&"live-cert-hash"),
+            "a substituted certificate must fail the live certificate binding: {:?}",
+            failed_checks(&failure)
+        );
+    }
+
+    /// Verification is time-checked. After the MAA token expires the same
+    /// evidence must stop verifying, which is why the fixture pins a time
+    /// rather than using the wall clock.
+    #[test]
+    fn rejects_evidence_after_the_maa_token_expires() {
+        // One second past the captured token's exp.
+        let failure = verify_tls_attestation_at(inputs(), at(1_786_154_307)).unwrap_err();
+        assert!(
+            failed_checks(&failure).contains(&"azure-maa-jwt"),
+            "an expired MAA token must fail the MAA check: {:?}",
+            failed_checks(&failure)
+        );
+    }
+
+    /// Without the Azure MAA signing certificate there is no trust anchor for
+    /// the attestation token, so verification must fail closed.
+    #[test]
+    fn rejects_missing_azure_maa_trust_anchor() {
+        let mut inputs = inputs();
+        inputs.trust_anchors.azure_maa_keys.clear();
+        let failure = verify_tls_attestation_at(inputs, at(VERIFICATION_TIME)).unwrap_err();
+        assert!(
+            failed_checks(&failure).contains(&"azure-maa-jwt"),
+            "no MAA trust anchor must fail the MAA check: {:?}",
+            failed_checks(&failure)
+        );
+    }
+}
