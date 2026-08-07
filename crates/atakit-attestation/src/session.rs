@@ -271,6 +271,26 @@ pub struct AzureMaaTrustKey {
     pub public_key: Vec<u8>,
 }
 
+/// A verifier-supplied Azure MAA signing certificate, reduced to the two values
+/// a certificate actually carries.
+///
+/// There is deliberately no `kid` or `issuer` here. Both are JSON Web Token
+/// concepts that do not exist in X.509: `kid` names a key in a JWT header and
+/// `issuer` is the token's `iss` claim, an attestation instance URL. A verifier
+/// takes them from the token under verification, and the signature check is
+/// what binds a key to that token — a `kid` in the header is attacker-supplied
+/// and authenticates nothing on its own.
+#[derive(Debug, Clone)]
+pub struct AzureMaaTrustCertificate {
+    /// PKCS#1 DER or a supported RSA public-key encoding, taken from the
+    /// certificate's `SubjectPublicKeyInfo`.
+    pub public_key: Vec<u8>,
+    /// Unix seconds, taken from the certificate's validity period. A bare
+    /// public key cannot supply this, which is why the verifier takes a
+    /// certificate.
+    pub not_after: u64,
+}
+
 /// Policy selected by the verifier's caller. The policy projection in the
 /// evidence bundle is untrusted; its IDs and any non-empty PCR projection must
 /// match this value.
@@ -335,6 +355,15 @@ pub struct SessionAttributeRequirement {
 pub struct VerifiedSession {
     pub session_id: [u8; 32],
     pub session_key_fingerprint: [u8; 32],
+    /// Algorithm identifier of the verified session public key. `verify_key_types`
+    /// requires ES256K (`3`) for the session request binding.
+    pub session_key_type_id: u8,
+    /// The verified session public key itself. `session_key_fingerprint` is
+    /// recomputed from these bytes and checked against the bundle's claim, and
+    /// `session_key_delegation.session_key_possession_signature` is verified
+    /// against it, so this surfaces an already-verified value rather than
+    /// introducing a new check.
+    pub session_public_key: Vec<u8>,
     pub binding_mode: BindingMode,
     pub binding_chain_id: u64,
     pub binding_registry: [u8; 20],
@@ -495,6 +524,8 @@ pub fn verify_session_bundle_at(
         Ok(VerifiedSession {
             session_id: session_id.expect("validated session id"),
             session_key_fingerprint: session_key_fingerprint.expect("validated session key"),
+            session_key_type_id: bundle.session_key.type_id,
+            session_public_key: session_key.expect("validated session key"),
             binding_mode: bundle.binding.mode,
             binding_chain_id: bundle.binding.chain_id,
             binding_registry: binding_registry.expect("validated binding registry"),

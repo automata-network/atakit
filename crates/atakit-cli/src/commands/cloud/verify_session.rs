@@ -59,7 +59,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     .await?;
     let tls_verification_trust = init::load_tls_verification_trust(
         &args.verification.gcp_ak_root_cert,
-        &args.verification.azure_maa_key,
+        &args.verification.azure_maa_cert,
         &args.verification.amd_ark_root_cert,
         &args.verification.amd_snp_crl,
         args.verification.amd_snp_security_policy.as_deref(),

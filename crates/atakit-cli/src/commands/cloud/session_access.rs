@@ -151,7 +151,7 @@ pub(crate) async fn resolve_verified_portal_access(
     .await?;
     let tls_verification_trust = init::load_tls_verification_trust(
         &verification.gcp_ak_root_cert,
-        &verification.azure_maa_key,
+        &verification.azure_maa_cert,
         &verification.amd_ark_root_cert,
         &verification.amd_snp_crl,
         verification.amd_snp_security_policy.as_deref(),
