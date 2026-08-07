@@ -556,3 +556,49 @@ mod tests {
         .expect("verify quote with fetched collateral");
     }
 }
+
+#[cfg(test)]
+mod capture_fixture_collateral {
+    use super::*;
+
+    /// One-shot capture helper. Ignored by default because it reaches Intel's
+    /// Provisioning Certification Service over the network; the committed
+    /// artifact it produces is what the offline fixture actually uses.
+    ///
+    ///     cargo test -p atakit-cloud capture_azure_tdx_collateral -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn capture_azure_tdx_collateral() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use base64::Engine as _;
+
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/testdata/azure-tdx-tls-attestation.json"
+        ))
+        .expect("captured attestation response");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let quote = B64
+            .decode(response["teeEvidence"]["report"].as_str().unwrap())
+            .expect("decode TDX quote");
+
+        let collateral = fetch_http_collateral("https://api.trustedservices.intel.com", &quote)
+            .await
+            .expect("fetch Intel TDX DCAP collateral");
+
+        collateral
+            .ensure_quote_matches(&quote)
+            .expect("collateral must match the captured quote");
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/testdata/azure-tdx-dcap-collateral.json"
+        );
+        std::fs::write(path, collateral.to_file_json().unwrap()).unwrap();
+        println!("wrote {path}");
+        println!(
+            "tcb_evaluation_data_number = {}",
+            collateral.tcb_evaluation_data_number()
+        );
+    }
+}
