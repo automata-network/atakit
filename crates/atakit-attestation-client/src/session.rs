@@ -6,8 +6,8 @@ pub use crate::TrustedWorkloadSessionPolicy;
 use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
     verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustKey, BindingMode,
-    CertificateTrust, IntelTdxDcapCollateral, PcrBankSelection, SessionAttribute,
-    SessionEvidenceBundle, SessionPcrPolicy, SessionPcrPolicy384, SessionPlatformTrust,
+    CertificateTrust, IntelTdxDcapCollateral, SessionAttribute, SessionEvidenceBundle,
+    SessionPcrPolicy, SessionPcrPolicy384, SessionPcrPolicyBlock, SessionPlatformTrust,
     SessionRequestBinding, SessionTrust, SessionVerificationInputs, TrustedSessionBinding,
     TrustedSessionPolicy, VerificationReport, VerifiedSession, VerifiedTlsIdentity,
 };
@@ -301,13 +301,36 @@ fn trusted_policy(
         &bundle.platform.machine_type,
     )?;
 
-    let (pcr_specs256, pcr_specs384) = combined_pcr_specs_for_selection(
-        profile.pcr_bank_selection,
-        effective_pcr_specs256(profile, variant)?,
-        workload.pcr_specs256,
-        effective_pcr_specs384(profile, variant)?,
-        workload.pcr_specs384,
+    // Validate the profile and variant relationship without collapsing their
+    // separately committed policy blocks.
+    effective_pcr_specs256(profile, variant)?;
+    effective_pcr_specs384(profile, variant)?;
+
+    let invariant_pcr_policy = policy_block(
+        profile
+            .invariant_pcrs256
+            .iter()
+            .map(measurement_pcr_spec256)
+            .collect(),
+        profile
+            .invariant_pcrs384
+            .iter()
+            .map(measurement_pcr_spec384)
+            .collect(),
     );
+    let variant_pcr_policy = policy_block(
+        variant
+            .variant_pcrs256
+            .iter()
+            .map(measurement_pcr_spec256)
+            .collect(),
+        variant
+            .variant_pcrs384
+            .iter()
+            .map(measurement_pcr_spec384)
+            .collect(),
+    );
+    let workload_pcr_policy = policy_block(workload.pcr_specs256, workload.pcr_specs384);
 
     Ok(TrustedSessionPolicy {
         workload_id: workload.workload_id,
@@ -315,47 +338,37 @@ fn trusted_policy(
         platform_profile_id,
         measurement_variant_id,
         pcr_bank_selection: profile.pcr_bank_selection,
-        pcr_specs256,
-        pcr_specs384,
+        invariant_pcr_policy,
+        variant_pcr_policy,
+        workload_pcr_policy,
+        provider_pcr_policy: SessionPcrPolicyBlock::default(),
         effective_attributes: effective_attributes(profile, variant)?,
         attribute_requirements: workload.attribute_requirements,
         amd_snp_security_policies: context.trust_anchors.amd_snp_security_policies.clone(),
     })
 }
 
-fn combined_pcr_specs(
-    mut base_image: Vec<SessionPcrPolicy>,
-    workload: Vec<SessionPcrPolicy>,
-) -> Vec<SessionPcrPolicy> {
-    base_image.extend(workload);
-    base_image
+fn measurement_pcr_spec256(spec: &atakit_attestation::PcrSpec256) -> SessionPcrPolicy {
+    SessionPcrPolicy {
+        pcr_index: spec.pcr_index,
+        comparison: spec.comparison.clone(),
+    }
 }
 
-fn combined_pcr_specs384(
-    mut base_image: Vec<SessionPcrPolicy384>,
-    workload: Vec<SessionPcrPolicy384>,
-) -> Vec<SessionPcrPolicy384> {
-    base_image.extend(workload);
-    base_image
+fn measurement_pcr_spec384(spec: &atakit_attestation::PcrSpec384) -> SessionPcrPolicy384 {
+    SessionPcrPolicy384 {
+        pcr_index: spec.pcr_index,
+        comparison: spec.comparison.clone(),
+    }
 }
 
-fn combined_pcr_specs_for_selection(
-    selection: PcrBankSelection,
-    base_image256: Vec<SessionPcrPolicy>,
-    workload256: Vec<SessionPcrPolicy>,
-    base_image384: Vec<SessionPcrPolicy384>,
-    workload384: Vec<SessionPcrPolicy384>,
-) -> (Vec<SessionPcrPolicy>, Vec<SessionPcrPolicy384>) {
-    match selection {
-        PcrBankSelection::Sha256 => (combined_pcr_specs(base_image256, workload256), Vec::new()),
-        PcrBankSelection::Sha384 => (
-            Vec::new(),
-            combined_pcr_specs384(base_image384, workload384),
-        ),
-        PcrBankSelection::Sha256AndSha384 => (
-            combined_pcr_specs(base_image256, workload256),
-            combined_pcr_specs384(base_image384, workload384),
-        ),
+fn policy_block(
+    pcr_specs256: Vec<SessionPcrPolicy>,
+    pcr_specs384: Vec<SessionPcrPolicy384>,
+) -> SessionPcrPolicyBlock {
+    SessionPcrPolicyBlock {
+        pcr_specs256,
+        pcr_specs384,
     }
 }
 
@@ -722,7 +735,7 @@ fn random_challenge() -> Result<[u8; 32], AttestationClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atakit_attestation::{BaseImage, MeasurementPack, PcrSpec256};
+    use atakit_attestation::{BaseImage, MeasurementPack, PcrBankSelection, PcrSpec256};
     use automata_tee_workload_measurement::pcr_comparison::{
         encode_dynamic256, encode_static256, DYNAMIC_SUBSEQUENCE,
     };
@@ -1024,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn workload_pcr_rule_does_not_replace_base_image_rule_for_same_pcr() {
+    fn workload_pcr_rule_remains_in_its_named_policy_block() {
         let base_image_rule = SessionPcrPolicy {
             pcr_index: 23,
             comparison: dynamic_subsequence_comparison([0x11; 32]),
@@ -1033,14 +1046,15 @@ mod tests {
             pcr_index: 23,
             comparison: static_comparison([0x22; 32]),
         };
-        let combined =
-            combined_pcr_specs(vec![base_image_rule.clone()], vec![workload_rule.clone()]);
+        let invariant = policy_block(vec![base_image_rule.clone()], Vec::new());
+        let workload = policy_block(vec![workload_rule.clone()], Vec::new());
 
-        assert_eq!(combined, [base_image_rule, workload_rule]);
+        assert_eq!(invariant.pcr_specs256, [base_image_rule]);
+        assert_eq!(workload.pcr_specs256, [workload_rule]);
     }
 
     #[test]
-    fn trusted_policy_omits_rules_from_unselected_pcr_banks() {
+    fn trusted_policy_blocks_preserve_rules_from_both_pcr_banks() {
         let sha256_rules = vec![SessionPcrPolicy {
             pcr_index: 4,
             comparison: static_comparison([0x11; 32]),
@@ -1050,31 +1064,43 @@ mod tests {
             comparison: "0x1234".into(),
         }];
 
-        let selected256 = combined_pcr_specs_for_selection(
-            PcrBankSelection::Sha256,
-            sha256_rules.clone(),
-            Vec::new(),
-            sha384_rules.clone(),
-            Vec::new(),
-        );
-        assert_eq!(selected256, (sha256_rules.clone(), Vec::new()));
+        let block = policy_block(sha256_rules.clone(), sha384_rules.clone());
+        assert_eq!(block.pcr_specs256, sha256_rules);
+        assert_eq!(block.pcr_specs384, sha384_rules);
+    }
 
-        let selected384 = combined_pcr_specs_for_selection(
-            PcrBankSelection::Sha384,
-            sha256_rules.clone(),
-            Vec::new(),
-            sha384_rules.clone(),
-            Vec::new(),
-        );
-        assert_eq!(selected384, (Vec::new(), sha384_rules.clone()));
+    #[test]
+    fn azure_policy_blocks_do_not_gain_a_global_pcr_index_order() {
+        let rules = |indices: &[u8]| {
+            indices
+                .iter()
+                .map(|index| SessionPcrPolicy {
+                    pcr_index: *index,
+                    comparison: static_comparison([*index; 32]),
+                })
+                .collect::<Vec<_>>()
+        };
 
-        let selected_both = combined_pcr_specs_for_selection(
-            PcrBankSelection::Sha256AndSha384,
-            sha256_rules.clone(),
-            Vec::new(),
-            sha384_rules.clone(),
-            Vec::new(),
+        let invariant = policy_block(rules(&[4, 9, 11]), Vec::new());
+        let variant = policy_block(rules(&[0, 2, 3, 7]), Vec::new());
+        let workload = policy_block(rules(&[23]), Vec::new());
+
+        assert_eq!(
+            invariant
+                .pcr_specs256
+                .iter()
+                .map(|rule| rule.pcr_index)
+                .collect::<Vec<_>>(),
+            [4, 9, 11]
         );
-        assert_eq!(selected_both, (sha256_rules, sha384_rules));
+        assert_eq!(
+            variant
+                .pcr_specs256
+                .iter()
+                .map(|rule| rule.pcr_index)
+                .collect::<Vec<_>>(),
+            [0, 2, 3, 7]
+        );
+        assert_eq!(workload.pcr_specs256[0].pcr_index, 23);
     }
 }

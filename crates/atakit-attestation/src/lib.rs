@@ -6060,8 +6060,13 @@ mod tests {
                     platform_profile_id,
                     measurement_variant_id,
                     pcr_bank_selection: PcrBankSelection::Sha256,
-                    pcr_specs384: Vec::new(),
-                    pcr_specs256: vec![pcr4_policy],
+                    invariant_pcr_policy: SessionPcrPolicyBlock {
+                        pcr_specs384: Vec::new(),
+                        pcr_specs256: vec![pcr4_policy],
+                    },
+                    variant_pcr_policy: SessionPcrPolicyBlock::default(),
+                    workload_pcr_policy: SessionPcrPolicyBlock::default(),
+                    provider_pcr_policy: SessionPcrPolicyBlock::default(),
                     effective_attributes: Vec::new(),
                     attribute_requirements: Vec::new(),
                     amd_snp_security_policies: vec![AmdSnpSecurityPolicy {

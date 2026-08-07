@@ -163,32 +163,6 @@ pub struct SessionPcrPolicyBlock {
     pub pcr_specs384: Vec<SessionPcrPolicy384>,
 }
 
-impl SessionPolicy {
-    fn complete_pcr_specs256(&self) -> Vec<SessionPcrPolicy> {
-        [
-            &self.invariant_pcr_policy,
-            &self.variant_pcr_policy,
-            &self.workload_pcr_policy,
-            &self.provider_pcr_policy,
-        ]
-        .into_iter()
-        .flat_map(|block| block.pcr_specs256.iter().cloned())
-        .collect()
-    }
-
-    fn complete_pcr_specs384(&self) -> Vec<SessionPcrPolicy384> {
-        [
-            &self.invariant_pcr_policy,
-            &self.variant_pcr_policy,
-            &self.workload_pcr_policy,
-            &self.provider_pcr_policy,
-        ]
-        .into_iter()
-        .flat_map(|block| block.pcr_specs384.iter().cloned())
-        .collect()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPcrPolicy {
     pub pcr_index: u8,
@@ -307,13 +281,41 @@ pub struct TrustedSessionPolicy {
     pub platform_profile_id: [u8; 32],
     pub measurement_variant_id: [u8; 32],
     pub pcr_bank_selection: PcrBankSelection,
-    pub pcr_specs256: Vec<SessionPcrPolicy>,
-    pub pcr_specs384: Vec<SessionPcrPolicy384>,
+    pub invariant_pcr_policy: SessionPcrPolicyBlock,
+    pub variant_pcr_policy: SessionPcrPolicyBlock,
+    pub workload_pcr_policy: SessionPcrPolicyBlock,
+    pub provider_pcr_policy: SessionPcrPolicyBlock,
     pub effective_attributes: Vec<SessionAttribute>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
     /// AMD SEV-SNP registry defaults supplied by the verifier or read from
     /// AmdSnpSecurityPolicyRegistry.
     pub amd_snp_security_policies: Vec<super::AmdSnpSecurityPolicy>,
+}
+
+impl TrustedSessionPolicy {
+    fn complete_pcr_specs256(&self) -> Vec<SessionPcrPolicy> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs256.iter().cloned())
+        .collect()
+    }
+
+    fn complete_pcr_specs384(&self) -> Vec<SessionPcrPolicy384> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs384.iter().cloned())
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2072,13 +2074,16 @@ fn resolve_provider_pcr_rules(
                     })?;
                 let mut extend_value = [0u8; 32];
                 extend_value[16..].copy_from_slice(uuid);
-                resolved.pcr_specs256.push(SessionPcrPolicy {
-                    pcr_index: 15,
-                    comparison: format!(
-                        "0x{}",
-                        hex::encode(encode_extend_from_zero256(B256::from(extend_value)))
-                    ),
-                });
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs256
+                    .push(SessionPcrPolicy {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero256(B256::from(extend_value)))
+                        ),
+                    });
             }
             SessionPlatformTrust::GcpSnp { .. } => {
                 if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384) {
@@ -2095,10 +2100,16 @@ fn resolve_provider_pcr_rules(
                     &report[super::SNP_REPORT_REPORT_ID_OFFSET
                         ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN],
                 );
-                resolved.pcr_specs256.push(SessionPcrPolicy {
-                    pcr_index: 15,
-                    comparison: format!("0x{}", hex::encode(encode_extend_from_zero256(report_id))),
-                });
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs256
+                    .push(SessionPcrPolicy {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero256(report_id))
+                        ),
+                    });
             }
             SessionPlatformTrust::AwsSnp { .. } => {
                 if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256) {
@@ -2115,24 +2126,32 @@ fn resolve_provider_pcr_rules(
                     ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN];
                 let mut extend_value384 = [0u8; 48];
                 extend_value384[16..].copy_from_slice(report_id);
-                resolved.pcr_specs384.push(SessionPcrPolicy384 {
-                    pcr_index: 15,
-                    comparison: format!(
-                        "0x{}",
-                        hex::encode(encode_extend_from_zero384(extend_value384))
-                    ),
-                });
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs384
+                    .push(SessionPcrPolicy384 {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero384(extend_value384))
+                        ),
+                    });
                 if matches!(
                     trusted.pcr_bank_selection,
                     PcrBankSelection::Sha256AndSha384
                 ) {
-                    resolved.pcr_specs256.push(SessionPcrPolicy {
-                        pcr_index: 15,
-                        comparison: format!(
-                            "0x{}",
-                            hex::encode(encode_extend_from_zero256(B256::from_slice(report_id)))
-                        ),
-                    });
+                    resolved
+                        .provider_pcr_policy
+                        .pcr_specs256
+                        .push(SessionPcrPolicy {
+                            pcr_index: 15,
+                            comparison: format!(
+                                "0x{}",
+                                hex::encode(encode_extend_from_zero256(B256::from_slice(
+                                    report_id
+                                )))
+                            ),
+                        });
                 }
             }
         }
@@ -2186,17 +2205,19 @@ fn verify_policies(
         errors,
         "trusted-pcr-policy-projection",
         bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
-            && bundle.policy.complete_pcr_specs256() == trusted.pcr_specs256
-            && bundle.policy.complete_pcr_specs384() == trusted.pcr_specs384,
-        "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
+            && bundle.policy.invariant_pcr_policy == trusted.invariant_pcr_policy
+            && bundle.policy.variant_pcr_policy == trusted.variant_pcr_policy
+            && bundle.policy.workload_pcr_policy == trusted.workload_pcr_policy
+            && bundle.policy.provider_pcr_policy == trusted.provider_pcr_policy,
+        "bundle PCR policy blocks differ from the caller-supplied trusted policy blocks",
     );
+    let pcr_specs256 = trusted.complete_pcr_specs256();
+    let pcr_specs384 = trusted.complete_pcr_specs384();
     verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
     let selected_policy_is_empty = match trusted.pcr_bank_selection {
-        PcrBankSelection::Sha256 => trusted.pcr_specs256.is_empty(),
-        PcrBankSelection::Sha384 => trusted.pcr_specs384.is_empty(),
-        PcrBankSelection::Sha256AndSha384 => {
-            trusted.pcr_specs256.is_empty() && trusted.pcr_specs384.is_empty()
-        }
+        PcrBankSelection::Sha256 => pcr_specs256.is_empty(),
+        PcrBankSelection::Sha384 => pcr_specs384.is_empty(),
+        PcrBankSelection::Sha256AndSha384 => pcr_specs256.is_empty() && pcr_specs384.is_empty(),
     };
     if selected_policy_is_empty {
         record(
@@ -2209,8 +2230,7 @@ fn verify_policies(
         return;
     }
 
-    for policy in trusted
-        .pcr_specs256
+    for policy in pcr_specs256
         .iter()
         .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384))
     {
@@ -2256,8 +2276,7 @@ fn verify_policies(
         }
     }
 
-    for policy in trusted
-        .pcr_specs384
+    for policy in pcr_specs384
         .iter()
         .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256))
     {
@@ -3395,8 +3414,13 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: vec![pcr],
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs384: Vec::new(),
+                pcr_specs256: vec![pcr],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key: [0x10; 32],
                 value: [0x20; 32],
@@ -3470,6 +3494,89 @@ mod tests {
     }
 
     #[test]
+    fn trusted_policy_projection_preserves_named_azure_blocks() {
+        let rule = |pcr_index| SessionPcrPolicy {
+            pcr_index,
+            comparison: format!(
+                "0x{}",
+                hex::encode(encode_static256([pcr_index; 32].into()))
+            ),
+        };
+        let invariant_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: [4, 9, 11].into_iter().map(rule).collect(),
+            pcr_specs384: Vec::new(),
+        };
+        let variant_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: [0, 2, 3, 7].into_iter().map(rule).collect(),
+            pcr_specs384: Vec::new(),
+        };
+        let workload_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: vec![rule(23)],
+            pcr_specs384: Vec::new(),
+        };
+        let bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: invariant_pcr_policy.clone(),
+            variant_pcr_policy: variant_pcr_policy.clone(),
+            workload_pcr_policy: workload_pcr_policy.clone(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy,
+            variant_pcr_policy,
+            workload_pcr_policy,
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+            effective_attributes: Vec::new(),
+            attribute_requirements: Vec::new(),
+            amd_snp_security_policies: Vec::new(),
+        };
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(&bundle, &trusted, None, &mut checks, &mut errors);
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && check.valid }));
+
+        let mut moved_between_blocks = trusted.clone();
+        let moved_rule = moved_between_blocks
+            .variant_pcr_policy
+            .pcr_specs256
+            .remove(0);
+        moved_between_blocks
+            .invariant_pcr_policy
+            .pcr_specs256
+            .push(moved_rule);
+        assert_eq!(
+            trusted.complete_pcr_specs256(),
+            moved_between_blocks.complete_pcr_specs256(),
+            "the flattened rule sequence is deliberately unchanged"
+        );
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(
+            &bundle,
+            &moved_between_blocks,
+            None,
+            &mut checks,
+            &mut errors,
+        );
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && !check.valid }));
+    }
+
+    #[test]
     fn sha384_session_does_not_evaluate_committed_sha256_rules() {
         let pcr256 = SessionPcrPolicy {
             pcr_index: 7,
@@ -3501,8 +3608,13 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha384,
-            pcr_specs256: vec![pcr256],
-            pcr_specs384: vec![pcr384],
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs256: vec![pcr256],
+                pcr_specs384: vec![pcr384],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: Vec::new(),
@@ -3545,8 +3657,10 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
                 value: atakit_core::tee_attributes::ATTRIBUTE_TRUE,
@@ -3623,8 +3737,10 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key,
                 value: relaxed_mask,
@@ -3710,8 +3826,10 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3774,8 +3892,10 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3865,8 +3985,10 @@ mod tests {
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
             pcr_bank_selection: PcrBankSelection::Sha256,
-            pcr_specs384: Vec::new(),
-            pcr_specs256: Vec::new(),
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![
                 SessionAttribute {
                     key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
@@ -4017,8 +4139,10 @@ mod tests {
                             platform_profile_id: [3; 32],
                             measurement_variant_id: [4; 32],
                             pcr_bank_selection: PcrBankSelection::Sha256,
-                            pcr_specs384: Vec::new(),
-                            pcr_specs256: Vec::new(),
+                            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+                            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+                            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+                            provider_pcr_policy: SessionPcrPolicyBlock::default(),
                             effective_attributes,
                             attribute_requirements,
                             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
