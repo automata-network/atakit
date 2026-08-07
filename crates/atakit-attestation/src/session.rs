@@ -271,6 +271,26 @@ pub struct AzureMaaTrustKey {
     pub public_key: Vec<u8>,
 }
 
+/// A verifier-supplied Azure MAA signing certificate, reduced to the two values
+/// a certificate actually carries.
+///
+/// There is deliberately no `kid` or `issuer` here. Both are JSON Web Token
+/// concepts that do not exist in X.509: `kid` names a key in a JWT header and
+/// `issuer` is the token's `iss` claim, an attestation instance URL. A verifier
+/// takes them from the token under verification, and the signature check is
+/// what binds a key to that token — a `kid` in the header is attacker-supplied
+/// and authenticates nothing on its own.
+#[derive(Debug, Clone)]
+pub struct AzureMaaTrustCertificate {
+    /// PKCS#1 DER or a supported RSA public-key encoding, taken from the
+    /// certificate's `SubjectPublicKeyInfo`.
+    pub public_key: Vec<u8>,
+    /// Unix seconds, taken from the certificate's validity period. A bare
+    /// public key cannot supply this, which is why the verifier takes a
+    /// certificate.
+    pub not_after: u64,
+}
+
 /// Policy selected by the verifier's caller. The policy projection in the
 /// evidence bundle is untrusted; its IDs and any non-empty PCR projection must
 /// match this value.

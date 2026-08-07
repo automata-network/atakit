@@ -344,7 +344,7 @@ pub fn amd_snp_ark_from_cert_table(table: &[u8]) -> std::result::Result<Vec<u8>,
 /// removes it. Callers still perform complete TLS and session verification.
 pub fn select_azure_maa_manual_trust_key(
     binding: &AkBinding,
-    trusted_keys: &[Vec<u8>],
+    trusted_keys: &[AzureMaaTrustCertificate],
 ) -> std::result::Result<AzureMaaTrustKey, String> {
     if trusted_keys.is_empty() {
         return Err("no manually trusted Azure MAA signing keys configured".to_string());
@@ -363,8 +363,8 @@ pub fn select_azure_maa_manual_trust_key(
         return Err("MAA JWT issuer is empty".to_string());
     }
     let mut key_errors = Vec::new();
-    for key_bytes in trusted_keys {
-        let key = match verification_core::parse_rsa_public_key(key_bytes) {
+    for certificate in trusted_keys {
+        let key = match verification_core::parse_rsa_public_key(&certificate.public_key) {
             Ok(key) => key,
             Err(detail) => {
                 key_errors.push(detail);
@@ -372,11 +372,17 @@ pub fn select_azure_maa_manual_trust_key(
             }
         };
         if key.verify_sig(signing_input.as_bytes(), &signature).is_ok() {
+            // `not_after` comes from the certificate's validity period. It was
+            // previously `u64::MAX`, because a bare public key carries no
+            // expiry — which made the downstream expiry check in
+            // `verify_azure_maa_session_binding` unable to fire for any
+            // manually supplied key. `kid` and `issuer` still come from the
+            // token; a certificate cannot supply either.
             return Ok(AzureMaaTrustKey {
                 kid,
                 issuer: claims.iss,
-                not_after: u64::MAX,
-                public_key: key_bytes.clone(),
+                not_after: certificate.not_after,
+                public_key: certificate.public_key.clone(),
             });
         }
     }
@@ -568,7 +574,9 @@ pub struct MeasurementPolicy {
 pub struct TrustAnchors {
     pub gcp_roots: Vec<Vec<u8>>,
     pub gcp_root_hashes: Vec<[u8; 32]>,
-    pub azure_maa_keys: Vec<Vec<u8>>,
+    /// Verifier-supplied Azure MAA signing certificates. Each carries its own
+    /// expiry, so a manually trusted key expires like a chain-resolved one.
+    pub azure_maa_keys: Vec<AzureMaaTrustCertificate>,
     pub amd_ark_roots: Vec<Vec<u8>>,
     pub amd_ark_root_hashes: Vec<[u8; 32]>,
     /// AMD SEV-SNP registry defaults supplied by the verifier or read from
@@ -3341,6 +3349,15 @@ mod tests {
         evidence.auxiliary = Some(URL_SAFE_NO_PAD.encode(hcl_var_data));
     }
 
+    /// Wrap raw MAA key bytes as a trusted certificate that has not expired.
+    /// Tests asserting expiry behaviour build the certificate directly.
+    fn maa_cert(public_key: Vec<u8>) -> AzureMaaTrustCertificate {
+        AzureMaaTrustCertificate {
+            public_key,
+            not_after: u64::MAX,
+        }
+    }
+
     fn fake_azure_maa_jwt(hcl_var_data: &[u8], tee: &str) -> (String, Vec<u8>) {
         fake_azure_maa_jwt_with_times(
             hcl_var_data,
@@ -4953,7 +4970,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -4999,7 +5016,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -5036,7 +5053,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -5073,7 +5090,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -5125,7 +5142,7 @@ mod tests {
             amd_snp_collateral: None,
             measurement_policy: Some(measurement_policy_for_cloud(&pcr, "azure")),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key.clone()],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key.clone())],
                 ..TrustAnchors::default()
             },
         })
@@ -5149,7 +5166,7 @@ mod tests {
             amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -5571,7 +5588,7 @@ mod tests {
                 "n2d-standard-4",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key.clone()],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key.clone())],
                 ..TrustAnchors::default()
             },
         })
@@ -5605,7 +5622,7 @@ mod tests {
             amd_snp_collateral: None,
             measurement_policy: Some(policy),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -5768,7 +5785,7 @@ mod tests {
                 &mut report,
                 &mut errors,
                 &binding,
-                std::slice::from_ref(&trusted_key),
+                &[maa_cert(trusted_key.clone())],
                 "tdx",
                 UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
             );
@@ -5785,7 +5802,7 @@ mod tests {
                 &mut report,
                 &mut errors,
                 &binding,
-                std::slice::from_ref(&trusted_key),
+                &[maa_cert(trusted_key.clone())],
                 "tdx",
                 UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
             );
@@ -5820,7 +5837,7 @@ mod tests {
             &mut report,
             &mut errors,
             &binding,
-            std::slice::from_ref(&trusted_key),
+            &[maa_cert(trusted_key.clone())],
             "tdx",
             UNIX_EPOCH + std::time::Duration::from_secs(150),
         );
@@ -6158,7 +6175,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -6203,7 +6220,7 @@ mod tests {
                 "azure",
             )),
             trust_anchors: TrustAnchors {
-                azure_maa_keys: vec![bad_trusted_maa_key],
+                azure_maa_keys: vec![maa_cert(bad_trusted_maa_key)],
                 ..TrustAnchors::default()
             },
         })
@@ -6664,13 +6681,78 @@ mod tests {
         let quote = fake_tpm_quote(&[0u8; 32], &[(4, [0xaau8; 32])]);
         let (binding, _, trusted_key) = fake_azure_ak_binding_and_signature(&quote);
 
-        let selected = select_azure_maa_manual_trust_key(&binding, &[vec![0], trusted_key.clone()])
-            .expect("matching manual MAA key");
+        let selected = select_azure_maa_manual_trust_key(
+            &binding,
+            &[maa_cert(vec![0]), maa_cert(trusted_key.clone())],
+        )
+        .expect("matching manual MAA key");
 
         assert_eq!(selected.kid, "test-maa-key");
         assert_eq!(selected.issuer, "https://sharedeus.eus.attest.azure.net");
         assert_eq!(selected.not_after, u64::MAX);
         assert_eq!(selected.public_key, trusted_key);
-        assert!(select_azure_maa_manual_trust_key(&binding, &[vec![0]]).is_err());
+        assert!(select_azure_maa_manual_trust_key(&binding, &[maa_cert(vec![0])]).is_err());
+    }
+
+    /// A manually supplied Azure MAA certificate carries the expiry from its
+    /// own validity period, so the downstream expiry check in
+    /// `verify_azure_maa_session_binding` can actually fire. Before this, every
+    /// manually supplied key was assigned `u64::MAX` and that check was
+    /// unreachable for the manual path.
+    #[test]
+    fn manual_azure_maa_certificate_carries_its_own_expiry() {
+        let quote = fake_tpm_quote(&[0u8; 32], &[(4, [0xaau8; 32])]);
+        let (binding, _, trusted_key) = fake_azure_ak_binding_and_signature(&quote);
+
+        let selected = select_azure_maa_manual_trust_key(
+            &binding,
+            &[AzureMaaTrustCertificate {
+                public_key: trusted_key.clone(),
+                not_after: 1_700_000_000,
+            }],
+        )
+        .expect("matching manual MAA certificate");
+
+        assert_eq!(
+            selected.not_after, 1_700_000_000,
+            "expiry must come from the certificate, never u64::MAX"
+        );
+        assert_ne!(selected.not_after, u64::MAX);
+    }
+
+    /// The portal TLS attestation path enforces the expiry too. It previously
+    /// took bare key bytes and had no expiry check at all, so an expired Azure
+    /// MAA signing key stayed trusted there indefinitely.
+    #[test]
+    fn tls_path_rejects_expired_azure_maa_certificate() {
+        let quote = fake_tpm_quote(&[0u8; 32], &[(4, [0xaau8; 32])]);
+        let (binding, _, trusted_key) = fake_azure_ak_binding_and_signature(&quote);
+
+        let mut report = VerificationReport {
+            checks: Vec::new(),
+            evidence: EvidenceSummary::default(),
+        };
+        let mut errors = Vec::new();
+        verification_core::verify_azure_maa_jwt_binding(
+            &mut report,
+            &mut errors,
+            &binding,
+            &[AzureMaaTrustCertificate {
+                public_key: trusted_key,
+                // Expired well before the verification time below.
+                not_after: 1_000,
+            }],
+            "tdx",
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+
+        assert!(
+            !errors.is_empty(),
+            "an expired MAA signing certificate must fail the TLS attestation path"
+        );
+        assert!(
+            errors.iter().any(|error| error.detail.contains("expired")),
+            "failure must name expiry as the cause; got {errors:?}"
+        );
     }
 }

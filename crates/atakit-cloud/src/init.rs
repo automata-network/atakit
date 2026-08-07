@@ -10,9 +10,9 @@ use atakit_attestation::{
     parse_amd_snp_security_policy_file_json, select_azure_maa_manual_trust_key,
     verify_measurement_pack, verify_tls_attestation,
     verify_tls_attestation_with_workload_attributes, AkBinding, AmdSnpSigningKeyType,
-    AmdSnpVerificationCollateral, AzureMaaTrustKey, CheckResult, EvidenceSummary,
-    IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse, TrustAnchors,
-    VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+    AmdSnpVerificationCollateral, AzureMaaTrustCertificate, AzureMaaTrustKey, CheckResult,
+    EvidenceSummary, IntelTdxDcapCollateral, MeasurementPolicy, TlsAttestationResponse,
+    TrustAnchors, VerificationCheck, VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use atakit_attestation_client::{
     AttestationClient, AttestationClientConfig, PortalSessionVerificationContext,
@@ -657,7 +657,7 @@ pub fn load_tls_verification_trust(
     Ok(TlsVerificationTrust {
         trust_anchors: TrustAnchors {
             gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
-            azure_maa_keys: parse_hex_blobs(azure_maa_keys, "--azure-maa-key")?,
+            azure_maa_keys: parse_azure_maa_certificates(azure_maa_keys)?,
             amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
             amd_snp_security_policies,
             ..TrustAnchors::default()
@@ -671,6 +671,55 @@ pub fn load_tls_verification_trust(
 pub struct TlsVerificationTrust {
     pub trust_anchors: TrustAnchors,
     pub amd_snp_crls: Vec<Vec<u8>>,
+}
+
+/// Parse `--azure-maa-cert` values: hex-encoded X.509 DER certificates, matching
+/// the convention `--gcp-ak-root-cert` and `--amd-ark-root-cert` already use.
+///
+/// The public key comes from the certificate's `SubjectPublicKeyInfo` and the
+/// expiry from its validity period. A bare public key is rejected rather than
+/// defaulting to never-expires: that default is what previously made every
+/// manually trusted Azure MAA key immortal.
+fn parse_azure_maa_certificates(
+    values: &[String],
+) -> Result<Vec<AzureMaaTrustCertificate>, CloudError> {
+    use x509_cert::der::Decode;
+
+    values
+        .iter()
+        .map(|value| {
+            let raw = value.strip_prefix("0x").unwrap_or(value);
+            let der = hex::decode(raw).map_err(|e| CloudError::Config {
+                message: format!("invalid --azure-maa-cert hex: {e}"),
+            })?;
+            let certificate =
+                x509_cert::Certificate::from_der(&der).map_err(|e| CloudError::Config {
+                    message: format!(
+                        "--azure-maa-cert must be an X.509 DER certificate, not a bare public key: {e}"
+                    ),
+                })?;
+            let public_key = certificate
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .as_bytes()
+                .ok_or_else(|| CloudError::Config {
+                    message: "--azure-maa-cert SubjectPublicKeyInfo is not byte-aligned"
+                        .to_string(),
+                })?
+                .to_vec();
+            let not_after = certificate
+                .tbs_certificate
+                .validity
+                .not_after
+                .to_unix_duration()
+                .as_secs();
+            Ok(AzureMaaTrustCertificate {
+                public_key,
+                not_after,
+            })
+        })
+        .collect()
 }
 
 fn parse_hex_blobs(values: &[String], flag: &str) -> Result<Vec<Vec<u8>>, CloudError> {
@@ -1135,7 +1184,13 @@ async fn resolve_azure_maa_trust(
         .resolve_azure_maa_signing_key(&jwt.kid, &jwt.issuer)
         .await
         .map_err(|error| error.to_string())?;
-    trust_anchors.azure_maa_keys.push(key.public_key.clone());
+    // Carry the registry's notAfter into the TLS-path anchors. Previously only
+    // the key bytes were pushed, so the expiry the registry publishes was
+    // dropped before the portal TLS attestation check could apply it.
+    trust_anchors.azure_maa_keys.push(AzureMaaTrustCertificate {
+        public_key: key.public_key.clone(),
+        not_after: key.not_after,
+    });
     Ok(vec![key])
 }
 

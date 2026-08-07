@@ -1939,7 +1939,7 @@ pub(super) fn verify_azure_maa_jwt_binding(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    trusted_maa_keys: &[Vec<u8>],
+    trusted_maa_keys: &[AzureMaaTrustCertificate],
     tee: &str,
     verification_time: SystemTime,
 ) {
@@ -2062,9 +2062,23 @@ pub(super) fn verify_azure_maa_jwt_binding(
         return;
     }
 
+    let verification_timestamp = match verification_time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(error) => {
+            fail(
+                report,
+                errors,
+                "azure-maa-jwt",
+                format!("verification time is before Unix epoch: {error}"),
+            );
+            return;
+        }
+    };
+
     let mut key_errors = Vec::new();
-    for key_bytes in trusted_maa_keys {
-        let key = match parse_rsa_public_key(key_bytes) {
+    let mut expired_at = None;
+    for certificate in trusted_maa_keys {
+        let key = match parse_rsa_public_key(&certificate.public_key) {
             Ok(key) => key,
             Err(detail) => {
                 key_errors.push(detail);
@@ -2072,13 +2086,24 @@ pub(super) fn verify_azure_maa_jwt_binding(
             }
         };
         if key.verify_sig(signing_input.as_bytes(), &signature).is_ok() {
+            // Expiry is checked on the certificate that actually signed this
+            // token, not on one selected by the token's `kid` header. `kid` is
+            // attacker-supplied; the signature is what binds a key to a token.
+            if verification_timestamp > certificate.not_after {
+                expired_at.get_or_insert(certificate.not_after);
+                continue;
+            }
             pass(report, "azure-maa-jwt");
             return;
         }
     }
 
     let kid = header.kid.unwrap_or_else(|| "<missing>".to_string());
-    let detail = if key_errors.is_empty() {
+    let detail = if let Some(not_after) = expired_at {
+        format!(
+            "MAA JWT verified under a trusted Azure MAA signing certificate that expired at {not_after}; kid={kid}"
+        )
+    } else if key_errors.is_empty() {
         format!("MAA JWT signature did not verify under any trusted key; kid={kid}")
     } else {
         format!(
@@ -2172,11 +2197,17 @@ pub(super) fn verify_azure_maa_session_binding(
         return;
     }
     pass(report, "azure-maa-trust-selection");
+    // The chain path has already selected by kid and issuer and checked this
+    // key's expiry above, so hand the signature check a certificate whose
+    // expiry cannot fire again.
     verify_azure_maa_jwt_binding(
         report,
         errors,
         binding,
-        std::slice::from_ref(&key.public_key),
+        &[AzureMaaTrustCertificate {
+            public_key: key.public_key.clone(),
+            not_after: key.not_after,
+        }],
         tee,
         verification_time,
     );

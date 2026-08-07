@@ -5,11 +5,12 @@ use std::path::PathBuf;
 pub use crate::TrustedWorkloadSessionPolicy;
 use atakit_attestation::{
     azure_maa_binding_from_session_bundle, select_azure_maa_manual_trust_key,
-    verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustKey, BindingMode,
-    CertificateTrust, IntelTdxDcapCollateral, SessionAttribute, SessionEvidenceBundle,
-    SessionPcrPolicy, SessionPcrPolicy384, SessionPcrPolicyBlock, SessionPlatformTrust,
-    SessionRequestBinding, SessionTrust, SessionVerificationInputs, TrustedSessionBinding,
-    TrustedSessionPolicy, VerificationReport, VerifiedSession, VerifiedTlsIdentity,
+    verify_session_bundle, AmdSnpVerificationCollateral, AzureMaaTrustCertificate,
+    AzureMaaTrustKey, BindingMode, CertificateTrust, IntelTdxDcapCollateral, SessionAttribute,
+    SessionEvidenceBundle, SessionPcrPolicy, SessionPcrPolicy384, SessionPcrPolicyBlock,
+    SessionPlatformTrust, SessionRequestBinding, SessionTrust, SessionVerificationInputs,
+    TrustedSessionBinding, TrustedSessionPolicy, VerificationReport, VerifiedSession,
+    VerifiedTlsIdentity,
 };
 use atakit_attestation::{
     MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
@@ -28,7 +29,9 @@ pub struct PortalSessionVerificationContext {
     /// Verifier-selected chain client used for evidence-specific collateral.
     /// This is optional only when manual platform trust is supplied.
     pub chain_client: Option<AttestationClient>,
-    pub manual_azure_maa_keys: Vec<Vec<u8>>,
+    /// Verifier-supplied Azure MAA signing certificates, each carrying its own
+    /// expiry from the certificate validity period.
+    pub manual_azure_maa_keys: Vec<AzureMaaTrustCertificate>,
     /// Collateral resolved during this portal TLS bootstrap. Session
     /// verification rechecks its certificate and revocation validity against
     /// the session verification time. No process-wide cache stores this value.

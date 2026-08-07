@@ -343,9 +343,10 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
+    /// Trusted Azure MAA signing certificate, as hex X.509 DER. The public key
+    /// and its expiry are both taken from the certificate.
     #[arg(long, value_name = "HEX")]
-    pub azure_maa_key: Vec<String>,
+    pub azure_maa_cert: Vec<String>,
 
     /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
     #[arg(long, value_name = "HEX")]
