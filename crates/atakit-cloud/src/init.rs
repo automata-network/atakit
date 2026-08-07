@@ -634,10 +634,10 @@ fn parse_measurement_publisher_keys(values: &[String]) -> Result<Vec<Vec<u8>>, C
 }
 
 pub fn load_tls_verification_trust(
-    gcp_ak_root_certs: &[String],
-    azure_maa_keys: &[String],
-    amd_ark_root_certs: &[String],
-    amd_snp_crls: &[String],
+    gcp_ak_root_certs: &[PathBuf],
+    azure_maa_certs: &[PathBuf],
+    amd_ark_root_certs: &[PathBuf],
+    amd_snp_crls: &[PathBuf],
     amd_snp_security_policy: Option<&Path>,
 ) -> Result<TlsVerificationTrust, CloudError> {
     let amd_snp_security_policies = match amd_snp_security_policy {
@@ -656,13 +656,13 @@ pub fn load_tls_verification_trust(
     };
     Ok(TlsVerificationTrust {
         trust_anchors: TrustAnchors {
-            gcp_roots: parse_hex_blobs(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
-            azure_maa_keys: parse_azure_maa_certificates(azure_maa_keys)?,
-            amd_ark_roots: parse_hex_blobs(amd_ark_root_certs, "--amd-ark-root-cert")?,
+            gcp_roots: read_der_files(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
+            azure_maa_keys: parse_azure_maa_certificates(azure_maa_certs)?,
+            amd_ark_roots: read_der_files(amd_ark_root_certs, "--amd-ark-root-cert")?,
             amd_snp_security_policies,
             ..TrustAnchors::default()
         },
-        amd_snp_crls: parse_hex_blobs(amd_snp_crls, "--amd-snp-crl")?,
+        amd_snp_crls: read_der_files(amd_snp_crls, "--amd-snp-crl")?,
     })
 }
 
@@ -673,29 +673,59 @@ pub struct TlsVerificationTrust {
     pub amd_snp_crls: Vec<Vec<u8>>,
 }
 
-/// Parse `--azure-maa-cert` values: hex-encoded X.509 DER certificates, matching
-/// the convention `--gcp-ak-root-cert` and `--amd-ark-root-cert` already use.
+/// Read a certificate or revocation list from a file, accepting PEM or DER.
+///
+/// PEM is detected by its header rather than by file extension, so a `.crt`
+/// holding PEM and a `.pem` holding DER both work. A PEM file carrying more
+/// than one block contributes every block, which is what a certificate bundle
+/// is for.
+fn read_der_files(paths: &[PathBuf], flag: &str) -> Result<Vec<Vec<u8>>, CloudError> {
+    let mut out = Vec::new();
+    for path in paths {
+        let bytes = std::fs::read(path).map_err(|source| CloudError::IoPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if bytes.is_empty() {
+            return Err(CloudError::Config {
+                message: format!("{flag} {} is empty", path.display()),
+            });
+        }
+        if bytes.starts_with(b"-----BEGIN") {
+            let mut ders = parse_pem_certificates(&bytes).map_err(|error| CloudError::Config {
+                message: format!("{flag} {}: {error}", path.display()),
+            })?;
+            out.append(&mut ders);
+        } else {
+            out.push(bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// Read `--azure-maa-cert` files: X.509 certificates in PEM or DER.
 ///
 /// The public key comes from the certificate's `SubjectPublicKeyInfo` and the
 /// expiry from its validity period. A bare public key is rejected rather than
 /// defaulting to never-expires: that default is what previously made every
 /// manually trusted Azure MAA key immortal.
+///
+/// This takes a path rather than hex because Azure MAA signing certificates
+/// embed the attestation policy and run to tens of kilobytes — one observed
+/// certificate is 30531 bytes, which is 61062 hex characters. That does not
+/// belong on a command line.
 fn parse_azure_maa_certificates(
-    values: &[String],
+    paths: &[PathBuf],
 ) -> Result<Vec<AzureMaaTrustCertificate>, CloudError> {
     use x509_cert::der::Decode;
 
-    values
-        .iter()
-        .map(|value| {
-            let raw = value.strip_prefix("0x").unwrap_or(value);
-            let der = hex::decode(raw).map_err(|e| CloudError::Config {
-                message: format!("invalid --azure-maa-cert hex: {e}"),
-            })?;
+    read_der_files(paths, "--azure-maa-cert")?
+        .into_iter()
+        .map(|der| {
             let certificate =
                 x509_cert::Certificate::from_der(&der).map_err(|e| CloudError::Config {
                     message: format!(
-                        "--azure-maa-cert must be an X.509 DER certificate, not a bare public key: {e}"
+                        "--azure-maa-cert must be an X.509 certificate in PEM or DER, not a bare public key: {e}"
                     ),
                 })?;
             let public_key = certificate
@@ -2573,17 +2603,62 @@ mod tests {
 
     #[test]
     fn tls_verification_trust_keeps_amd_crls_separate_from_trust_anchors() {
-        let trust = load_tls_verification_trust(
-            &[],
-            &[],
-            &["aabb".to_string()],
-            &["ccdd".to_string()],
-            None,
-        )
-        .expect("TLS verification trust");
+        let directory = tempfile::tempdir().unwrap();
+        let ark = directory.path().join("ark.der");
+        let crl = directory.path().join("snp.crl");
+        std::fs::write(&ark, [0xaa, 0xbb]).unwrap();
+        std::fs::write(&crl, [0xcc, 0xdd]).unwrap();
+
+        let trust = load_tls_verification_trust(&[], &[], &[ark], &[crl], None)
+            .expect("TLS verification trust");
 
         assert_eq!(trust.trust_anchors.amd_ark_roots, vec![vec![0xaa, 0xbb]]);
         assert_eq!(trust.amd_snp_crls, vec![vec![0xcc, 0xdd]]);
+    }
+
+    /// A PEM file contributes every block it holds, so a bundle works. DER is
+    /// taken verbatim. Detection is by header, not file extension.
+    #[test]
+    fn certificate_files_accept_pem_bundles_and_raw_der() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let der = directory.path().join("root.pem");
+        std::fs::write(&der, [0x30, 0x82, 0x01]).unwrap();
+        assert_eq!(
+            read_der_files(&[der], "--gcp-ak-root-cert").unwrap(),
+            vec![vec![0x30, 0x82, 0x01]],
+            "a .pem holding DER must still be read as DER"
+        );
+
+        let bundle = directory.path().join("bundle.crt");
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(b"first"),
+            STANDARD.encode(b"second")
+        );
+        std::fs::write(&bundle, pem).unwrap();
+        assert_eq!(
+            read_der_files(&[bundle], "--amd-ark-root-cert").unwrap(),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+    }
+
+    #[test]
+    fn certificate_files_reject_missing_and_empty_files() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let absent = directory.path().join("absent.der");
+        assert!(read_der_files(&[absent], "--gcp-ak-root-cert").is_err());
+
+        let empty = directory.path().join("empty.der");
+        std::fs::write(&empty, b"").unwrap();
+        let error = read_der_files(&[empty], "--gcp-ak-root-cert")
+            .expect_err("an empty certificate file must be rejected");
+        assert!(
+            error.to_string().contains("--gcp-ak-root-cert"),
+            "the failure must name the flag; got {error}"
+        );
     }
 
     #[test]
@@ -3067,5 +3142,34 @@ mod tests {
             parse_pem_certificates(pem).unwrap(),
             vec![b"ask".to_vec(), b"ark".to_vec()]
         );
+    }
+}
+
+#[cfg(test)]
+mod real_azure_maa_certificate {
+    use super::*;
+
+    /// The certificate fetched from `https://sharedeus.eus.attest.azure.net/certs`
+    /// on 2026-08-08, whose public key was confirmed to verify a live MAA JWT
+    /// from the Azure Intel TDX target. 30531 bytes — the size is the point:
+    /// as hex on a command line it would be 61062 characters, which is why
+    /// these flags take a path.
+    const LIVE_MAA_CERTIFICATE: &[u8] = include_bytes!("testdata/azure-maa-sharedeus.der");
+
+    #[test]
+    fn extracts_public_key_and_expiry_from_a_real_maa_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maa.der");
+        std::fs::write(&path, LIVE_MAA_CERTIFICATE).unwrap();
+
+        let certificates =
+            parse_azure_maa_certificates(&[path]).expect("real Azure MAA certificate");
+
+        assert_eq!(certificates.len(), 1);
+        let certificate = &certificates[0];
+        assert!(!certificate.public_key.is_empty());
+        // notAfter is 2027-08-07T01:33:34Z; the value that replaces u64::MAX.
+        assert_eq!(certificate.not_after, 1_817_602_414);
+        assert_ne!(certificate.not_after, u64::MAX);
     }
 }
