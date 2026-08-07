@@ -343,22 +343,22 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA signing certificate, as hex X.509 DER. The public key
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
     /// and its expiry are both taken from the certificate.
-    #[arg(long, value_name = "HEX")]
-    pub azure_maa_cert: Vec<String>,
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
 
-    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub gcp_ak_root_cert: Vec<String>,
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_ark_root_cert: Vec<String>,
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
 
-    /// AMD SEV-SNP certificate revocation list, as hex DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_snp_crl: Vec<String>,
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
 
     /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
     #[arg(long, value_name = "PATH")]
