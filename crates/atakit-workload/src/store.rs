@@ -187,6 +187,19 @@ impl WorkloadStore {
         Ok(self.entry_dir(workload_id)?.join("archive.atawl"))
     }
 
+    /// Canonical location of this workload's measurement pack.
+    ///
+    /// Filed beside the entry it describes, which is already keyed on the
+    /// identifier, so lookup needs no path encoding and two publishers sharing a
+    /// name and version cannot overwrite one another.
+    pub fn measurement_pack_path(&self, workload_id: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(workload_id)?.join("measurement-pack.json"))
+    }
+
+    pub fn measurement_pack_sig_path(&self, workload_id: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(workload_id)?.join("measurement-pack.sig"))
+    }
+
     fn index_path(&self) -> PathBuf {
         self.base_dir.join("index.json")
     }

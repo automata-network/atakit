@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atakit_core::{ArchiveCompression, Env};
 use atakit_workload::cli::BuildArgs;
 use atakit_workload::{WorkloadMeta, WorkloadStore};
@@ -173,8 +173,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             Some(mut existing) => {
                 existing.workload_id = workload_id_hex.clone();
                 existing.publisher = publisher_hex.clone();
-                existing.sha256 = Some(inspect.sha256);
-                existing.pcr23 = Some(inspect.pcr23_sha256);
+                existing.sha256 = Some(inspect.sha256.clone());
+                existing.pcr23 = Some(inspect.pcr23_sha256.clone());
                 existing.archive_size = Some(size);
                 existing.added_at = now;
                 existing
@@ -185,8 +185,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
                 publisher: publisher_hex.clone(),
                 name: name.clone(),
                 version: version.clone(),
-                sha256: Some(inspect.sha256),
-                pcr23: Some(inspect.pcr23_sha256),
+                sha256: Some(inspect.sha256.clone()),
+                pcr23: Some(inspect.pcr23_sha256.clone()),
                 owner: None,
                 archive_size: Some(size),
                 on_chain_spec: None,
@@ -196,8 +196,100 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             },
         };
         store.save_meta(&meta)?;
+
+        // A workload's PCR23 was previously bound to its publisher only by
+        // on-chain registration, so an offline verifier had nothing to check.
+        // The pack is that binding, signed by the same key whose fingerprint is
+        // the publisher component of the identifier.
+        write_workload_measurement_pack(
+            &store,
+            &workload_id_hex,
+            &publisher_hex,
+            name,
+            version,
+            &inspect,
+            archive_hex,
+            &owner_key,
+        )?;
+
         println!("{}", "Added to local store.".green());
     }
 
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct WorkloadPack<'a> {
+    schema: &'a str,
+    revision: u64,
+    published_at: u64,
+    subject: PackSubject<'a>,
+    measurements: WorkloadMeasurements<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct PackSubject<'a> {
+    publisher: &'a str,
+    name: &'a str,
+    version: &'a str,
+    id: &'a str,
+    uri: Option<&'a str>,
+    archive_sha256: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkloadMeasurements<'a> {
+    pcr23_sha256: &'a str,
+    pcr23_sha384: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_workload_measurement_pack(
+    store: &WorkloadStore,
+    workload_id_hex: &str,
+    publisher_hex: &str,
+    name: &str,
+    version: &str,
+    inspect: &atakit_workload::InspectResult,
+    archive_hex: &str,
+    owner_key: &str,
+) -> Result<()> {
+    use k256::ecdsa::signature::Signer;
+    use k256::ecdsa::{Signature, SigningKey};
+
+    let pack = WorkloadPack {
+        schema: atakit_attestation::WORKLOAD_MEASUREMENT_PACK_SCHEMA,
+        revision: 1,
+        published_at: chrono::Utc::now().timestamp().max(0) as u64,
+        subject: PackSubject {
+            publisher: publisher_hex,
+            name,
+            version,
+            id: workload_id_hex,
+            uri: None,
+            archive_sha256: Some(format!("0x{archive_hex}")),
+        },
+        measurements: WorkloadMeasurements {
+            pcr23_sha256: &inspect.pcr23_sha256,
+            pcr23_sha384: &inspect.pcr23_sha384,
+        },
+    };
+
+    let value = serde_json::to_value(&pack)?;
+    let canonical = serde_json_canonicalizer::to_vec(&value)?;
+
+    let raw = owner_key.strip_prefix("0x").unwrap_or(owner_key);
+    let bytes = hex::decode(raw).context("owner key is not valid hex")?;
+    let signing_key =
+        SigningKey::from_slice(&bytes).context("owner key must be a 32-byte es256k key")?;
+    let signature: Signature = signing_key.sign(&canonical);
+
+    let json_path = store.measurement_pack_path(workload_id_hex)?;
+    let sig_path = store.measurement_pack_sig_path(workload_id_hex)?;
+    std::fs::write(&json_path, &canonical)
+        .with_context(|| format!("write {}", json_path.display()))?;
+    std::fs::write(&sig_path, signature.to_bytes())
+        .with_context(|| format!("write {}", sig_path.display()))?;
+    println!("Measurement pack: {}", json_path.display());
     Ok(())
 }

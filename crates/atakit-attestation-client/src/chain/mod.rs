@@ -10,7 +10,11 @@ use crate::portal::session::{self, VerifiedPortalTls};
 
 use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::{NetworkProvider, ProviderEx};
-use atakit_attestation::{Subject, AmdSnpSecurityPolicy, AzureMaaTrustKey, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, TrustedSessionBinding};
+use atakit_attestation::{
+    AmdSnpSecurityPolicy, AzureMaaTrustKey, MeasurementPack, MeasurementPolicy, MeasurementProfile,
+    MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384, SessionAttributeRequirement,
+    SessionPcrPolicy, SessionPcrPolicy384, Subject, TrustedSessionBinding,
+};
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
 };
@@ -289,11 +293,14 @@ impl AttestationClient {
         )?;
         let provider = connect_provider(&self.config.rpc_url).await?;
         let registry = BaseImageRegistry::new(registry_address, provider);
-        let hierarchy = registry.get_hierarchy(base_image_id).await.map_err(|error| {
-            AttestationClientError::Rpc(format!(
-                "fetch BaseImageRegistry hierarchy for {base_image}: {error}"
-            ))
-        })?;
+        let hierarchy = registry
+            .get_hierarchy(base_image_id)
+            .await
+            .map_err(|error| {
+                AttestationClientError::Rpc(format!(
+                    "fetch BaseImageRegistry hierarchy for {base_image}: {error}"
+                ))
+            })?;
         // The subject carries the publisher, and a verifier recomputes the id
         // from it. The hierarchy does not include the owner, so it is read
         // separately rather than left blank, which would fail that check.

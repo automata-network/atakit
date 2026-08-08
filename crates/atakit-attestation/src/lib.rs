@@ -1452,9 +1452,11 @@ fn verify_tls_attestation_internal(
         // does not match, and fails before any measurement is read.
         let subject = &policy.pack.subject;
         let expected_base_image_id = match decode_hex_32("subject.publisher", &subject.publisher) {
-            Ok(publisher) => {
-                Some(compute_base_image_id(&publisher, &subject.name, &subject.version))
-            }
+            Ok(publisher) => Some(compute_base_image_id(
+                &publisher,
+                &subject.name,
+                &subject.version,
+            )),
             Err(e) => {
                 fail(&mut report, &mut errors, "subject-publisher", e.to_string());
                 None
@@ -1486,13 +1488,16 @@ fn verify_tls_attestation_internal(
             (_, None) => {}
         }
 
-        let body: BaseImageMeasurements = match policy
-            .pack
-            .body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+        let body: BaseImageMeasurements = match policy.pack.body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
         {
             Ok(body) => body,
             Err(e) => {
-                fail(&mut report, &mut errors, "measurement-pack-body", e.to_string());
+                fail(
+                    &mut report,
+                    &mut errors,
+                    "measurement-pack-body",
+                    e.to_string(),
+                );
                 BaseImageMeasurements {
                     profiles: Vec::new(),
                 }
@@ -2476,20 +2481,6 @@ pub fn compute_variant_id(platform_profile_id: &[u8; 32], variant_name: &str) ->
         variant_name,
     ))
     .into()
-}
-
-fn abi_encode_bytes32_string_string(domain: &[u8; 32], first: &str, second: &str) -> Vec<u8> {
-    let first_bytes = first.as_bytes();
-    let second_bytes = second.as_bytes();
-    let first_offset = 96usize;
-    let second_offset = first_offset + abi_dynamic_string_len(first_bytes);
-    let mut out = Vec::with_capacity(second_offset + abi_dynamic_string_len(second_bytes));
-    out.extend_from_slice(domain);
-    out.extend_from_slice(&abi_word_usize(first_offset));
-    out.extend_from_slice(&abi_word_usize(second_offset));
-    write_abi_string(&mut out, first_bytes);
-    write_abi_string(&mut out, second_bytes);
-    out
 }
 
 fn abi_encode_bytes32_bytes32_string(domain: &[u8; 32], parent: &[u8; 32], value: &str) -> Vec<u8> {
@@ -4165,7 +4156,11 @@ mod tests {
     #[test]
     fn base_image_id_matches_existing_vector() {
         assert_eq!(
-            hex0x(&compute_base_image_id(&TEST_PUBLISHER, "test-image", "v1.0.0")),
+            hex0x(&compute_base_image_id(
+                &TEST_PUBLISHER,
+                "test-image",
+                "v1.0.0"
+            )),
             "0x7a66632ee498e2b70e9d9a39f6c42f2d3e044cbff702f43d0d18c4df69a63f39"
         );
     }
@@ -4695,8 +4690,10 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        let profile_id =
-            compute_platform_profile_id(&compute_base_image_id(&TEST_PUBLISHER, "base", "v1"), "gcp-tdx");
+        let profile_id = compute_platform_profile_id(
+            &compute_base_image_id(&TEST_PUBLISHER, "base", "v1"),
+            "gcp-tdx",
+        );
         let mut duplicate = policy.pack.profiles_mut()[0].variants[0].clone();
         duplicate.name = "c3-standard-4-duplicate".to_string();
         duplicate.id = hex0x(&compute_variant_id(&profile_id, &duplicate.name));
@@ -4725,7 +4722,9 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles_mut()[0].variants[0].machine_types.clear();
+        policy.pack.profiles_mut()[0].variants[0]
+            .machine_types
+            .clear();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
