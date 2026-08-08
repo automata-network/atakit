@@ -2463,53 +2463,32 @@ pub fn compute_base_image_id(publisher: &[u8; 32], name: &str, version: &str) ->
     BaseImageRegistry::get_image_id(&app_ref).into()
 }
 
+/// Delegates to the registry that defines the encoding, like the base-image id
+/// above. A local copy that drifted would derive profile identifiers that no
+/// registry holds.
 pub fn compute_platform_profile_id(base_image_id: &[u8; 32], profile_name: &str) -> [u8; 32] {
-    let domain: [u8; 32] = Keccak256::digest(b"CVM_PLATFORM_PROFILE_V1").into();
-    Keccak256::digest(abi_encode_bytes32_bytes32_string(
-        &domain,
-        base_image_id,
+    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
+
+    BaseImageRegistry::get_platform_profile_id(
+        alloy::primitives::B256::from(*base_image_id),
         profile_name,
-    ))
+    )
     .into()
 }
 
 pub fn compute_variant_id(platform_profile_id: &[u8; 32], variant_name: &str) -> [u8; 32] {
-    let domain: [u8; 32] = Keccak256::digest(b"CVM_PLATFORM_VARIANT_V1").into();
-    Keccak256::digest(abi_encode_bytes32_bytes32_string(
-        &domain,
-        platform_profile_id,
+    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
+
+    BaseImageRegistry::get_variant_id(
+        alloy::primitives::B256::from(*platform_profile_id),
         variant_name,
-    ))
+    )
     .into()
 }
 
-fn abi_encode_bytes32_bytes32_string(domain: &[u8; 32], parent: &[u8; 32], value: &str) -> Vec<u8> {
-    let value_bytes = value.as_bytes();
-    let value_offset = 96usize;
-    let mut out = Vec::with_capacity(value_offset + abi_dynamic_string_len(value_bytes));
-    out.extend_from_slice(domain);
-    out.extend_from_slice(parent);
-    out.extend_from_slice(&abi_word_usize(value_offset));
-    write_abi_string(&mut out, value_bytes);
-    out
-}
 
-fn abi_dynamic_string_len(bytes: &[u8]) -> usize {
-    32 + bytes.len().div_ceil(32) * 32
-}
 
-fn write_abi_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&abi_word_usize(bytes.len()));
-    out.extend_from_slice(bytes);
-    let padding = (32 - bytes.len() % 32) % 32;
-    out.resize(out.len() + padding, 0);
-}
 
-fn abi_word_usize(value: usize) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[24..32].copy_from_slice(&(value as u64).to_be_bytes());
-    out
-}
 
 fn verify_pcr_spec256(
     report: &mut VerificationReport,
