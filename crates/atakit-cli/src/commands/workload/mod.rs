@@ -386,17 +386,12 @@ pub fn configured_publisher(
 ///
 /// This is the publisher component of every identifier the key can register, so
 /// deriving it is how a command that holds a key learns which name space it is
-/// writing into. It is the same value `LibKey.computeKeyFingerprint` produces on
-/// chain, computed through the shared type rather than re-derived here.
+/// writing into. The derivation lives beside the fingerprint definition in the
+/// registry crate, so `atakit` and `atakit-imgbuild` cannot drift into giving
+/// one key two publishers.
 pub fn owner_fingerprint(private_key_hex: &str) -> anyhow::Result<B256> {
-    use alloy_ext::signers::local::PrivateKeySigner;
-    use automata_tee_workload_measurement::stubs::PublicIdentity;
-
-    let raw = private_key_hex
-        .strip_prefix("0x")
-        .unwrap_or(private_key_hex);
-    let signer: PrivateKeySigner = raw.parse().context("owner key is not a valid ES256K key")?;
-    Ok(PublicIdentity::secp256k1(&signer).fingerprint())
+    automata_tee_workload_measurement::stubs::es256k_fingerprint(private_key_hex)
+        .context("owner key is not a valid ES256K key")
 }
 
 #[cfg(test)]
