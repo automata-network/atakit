@@ -1393,6 +1393,7 @@ dependencies = [
  "hex",
  "serde",
  "sha3 0.10.8",
+ "tempfile",
 ]
 
 [[package]]

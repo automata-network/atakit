@@ -2042,15 +2042,13 @@ pub struct AliasConfig {
     pub apps: indexmap::IndexMap<String, String>,
 }
 
-/// How far an alias chain may be followed before it is treated as a loop.
-const MAX_ALIAS_DEPTH: usize = 8;
-
 impl AliasConfig {
     /// Resolve a publisher name to its fingerprint.
     ///
-    /// A value that is already a fingerprint is the answer; anything else names
-    /// another entry and is resolved again, so one fingerprint can be written
-    /// once and referred to by many application names.
+    /// A name that is already a fingerprint is the answer; otherwise it names an
+    /// entry in `publishers`, whose values are fingerprints by type. Resolution
+    /// therefore terminates in one step and cannot loop — a value that is not a
+    /// fingerprint is refused when the configuration loads, not here.
     ///
     /// An unresolved name is an error naming it. It is never a fallthrough to
     /// treating the name as literal, which would bind a reference to a
@@ -2059,28 +2057,18 @@ impl AliasConfig {
         if atakit_core::is_canonical_id(name) {
             return Ok(name.to_string());
         }
-        let mut current = name.to_string();
-        for _ in 0..MAX_ALIAS_DEPTH {
-            let Some(next) = self.publishers.get(&current) else {
-                let known: Vec<&str> = self.publishers.keys().map(String::as_str).collect();
-                let known = if known.is_empty() {
-                    "[alias.publishers] is empty".to_string()
-                } else {
-                    format!("known publishers: {}", known.join(", "))
-                };
-                return Err(ConfigError::Invalid(format!(
-                    "unknown publisher '{current}'; {known}"
-                )));
+        let Some(fingerprint) = self.publishers.get(name) else {
+            let known: Vec<&str> = self.publishers.keys().map(String::as_str).collect();
+            let known = if known.is_empty() {
+                "[alias.publishers] is empty".to_string()
+            } else {
+                format!("known publishers: {}", known.join(", "))
             };
-            if atakit_core::is_canonical_id(next.as_str()) {
-                return Ok(next.to_string());
-            }
-            current = next.to_string();
-        }
-        Err(ConfigError::Invalid(format!(
-            "publisher alias '{name}' does not resolve to a fingerprint within \
-             {MAX_ALIAS_DEPTH} steps; check [alias.publishers] for a loop"
-        )))
+            return Err(ConfigError::Invalid(format!(
+                "unknown publisher '{name}'; {known}"
+            )));
+        };
+        Ok(fingerprint.to_string())
     }
 
     /// Expand a reference into canonical `<publisher>/<name>:<version>` form.
