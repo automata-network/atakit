@@ -34,6 +34,9 @@ enum Command {
     /// Manage cloud deployments
     #[command(subcommand)]
     Cloud(Box<CloudCommand>),
+    /// Inspect the signing keys declared in `[keys]`
+    #[command(subcommand)]
+    Keys(commands::keys::KeysCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -176,6 +179,10 @@ async fn main() -> Result<()> {
                     commands::cloud::session::run_status(args, &env, &config).await
                 }
             },
+        },
+        Command::Keys(cmd) => match cmd {
+            commands::keys::KeysCommand::Ls(args) => commands::keys::ls(args, &config),
+            commands::keys::KeysCommand::Show(args) => commands::keys::show(args, &config),
         },
         Command::External(args) => {
             let subcmd = &args[0];
