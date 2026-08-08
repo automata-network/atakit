@@ -78,6 +78,11 @@ pub enum CloudProviderCommand {
 /// Arguments for `cloud deploy`.
 #[derive(Args, Clone)]
 pub struct DeployArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
 
@@ -404,6 +409,11 @@ pub struct CloudImageGcArgs {
 /// Arguments for `cloud init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 

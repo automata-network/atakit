@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,22 +10,28 @@ use crate::WorkloadError;
 ///
 /// The older PCR policy cache used unversioned `verify_type` and
 /// `match_data` fields. Format 1 starts with the opaque `comparison` field.
-pub const WORKLOAD_META_FORMAT_VERSION: u32 = 1;
+/// Format 2 keys entries by publisher-qualified workload identifier and
+/// records the publisher. Format 1 metadata cannot be upgraded in place — the
+/// identifier itself changed — so it is reported as unsupported rather than
+/// silently reinterpreted.
+pub const WORKLOAD_META_FORMAT_VERSION: u32 = 2;
 
-/// Validate that a name or version component is safe for use as a path segment.
-/// Rejects empty strings, path separators, `..`, and `.`.
-fn validate_path_component(s: &str, label: &str) -> Result<(), WorkloadError> {
-    if s.is_empty()
-        || s == "."
-        || s == ".."
-        || s.contains('/')
-        || s.contains('\\')
-        || Path::new(s)
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-    {
+/// Check that a workload identifier is the machine-generated form.
+///
+/// Entries are keyed by identifier rather than by name and version. The
+/// identifier is `0x` followed by 64 lowercase hexadecimal characters, so it is
+/// path-safe by construction: there is nothing to escape, no `.`, `..`, or
+/// separator to neutralise, and no encoding to keep reversible. It is also
+/// publisher-qualified, so two publishers holding the same name and version get
+/// separate entries instead of colliding.
+///
+/// Rejecting here is safe in a way that rejecting a *name* was not: this value
+/// is derived, never typed by an operator, so a legitimate published workload
+/// can never fail to map to a path.
+fn validate_workload_id(workload_id: &str) -> Result<(), WorkloadError> {
+    if !atakit_core::is_canonical_id(workload_id) {
         return Err(WorkloadError::StorePathTraversal {
-            path: PathBuf::from(format!("{label}: {s}")),
+            path: PathBuf::from(format!("workload id: {workload_id}")),
         });
     }
     Ok(())
@@ -56,6 +63,10 @@ pub struct WorkloadMeta {
     #[serde(default = "current_workload_meta_format")]
     pub metadata_format: u32,
     pub workload_id: String,
+    /// Owner fingerprint of the publisher, as `0x` plus 64 lowercase hex.
+    /// Required: the identifier is derived from it, so an entry without one
+    /// could not have produced its own key.
+    pub publisher: String,
     pub name: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +98,28 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+/// A rebuildable lookup from publisher-qualified reference to identifier.
+///
+/// Entries are keyed on disk by identifier, which answers "give me this exact
+/// workload" directly but not "what do I have" or "which identifier is
+/// `automata/app:v1`". The index answers those without opening every entry.
+///
+/// It is a cache, not the source of truth. Each entry's `meta.json` remains
+/// authoritative, and a missing, unreadable, or stale index is rebuilt by
+/// scanning rather than being an error — so losing it costs time, never data.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct WorkloadIndex {
+    #[serde(default)]
+    entries: BTreeMap<String, IndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexEntry {
+    publisher: String,
+    name: String,
+    version: String,
+}
+
 /// A workload entry with computed local state.
 pub struct WorkloadEntry {
     pub meta: WorkloadMeta,
@@ -109,9 +142,8 @@ impl WorkloadStore {
 
     // ── Paths ──────────────────────────────────────────
 
-    fn entry_dir(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
-        validate_path_component(name, "name")?;
-        validate_path_component(version, "version")?;
+    fn entry_dir(&self, workload_id: &str) -> Result<PathBuf, WorkloadError> {
+        validate_workload_id(workload_id)?;
 
         // Canonicalize base_dir for containment checks (must exist).
         let canon_base = if self.base_dir.exists() {
@@ -127,26 +159,9 @@ impl WorkloadStore {
             None
         };
 
-        // Check the parent <base>/<name> if it exists. A symlink here could
-        // redirect writes outside base_dir when <version> doesn't exist yet.
-        let parent = self.base_dir.join(name);
-        if let Some(ref canon_base) = canon_base {
-            if parent.exists() {
-                let canon_parent =
-                    parent
-                        .canonicalize()
-                        .map_err(|e| WorkloadError::ReadStoreDir {
-                            path: parent.clone(),
-                            reason: e.to_string(),
-                        })?;
-                if !canon_parent.starts_with(canon_base) {
-                    return Err(WorkloadError::StorePathTraversal { path: parent });
-                }
-            }
-        }
-
-        // Check the full path if it exists.
-        let path = parent.join(version);
+        // Containment stays as defence in depth: a symlink planted at the
+        // entry directory could still redirect writes outside the store.
+        let path = self.base_dir.join(workload_id);
         if let Some(ref canon_base) = canon_base {
             if path.exists() {
                 let canon = path
@@ -164,107 +179,134 @@ impl WorkloadStore {
         Ok(path)
     }
 
-    pub fn meta_path(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
-        Ok(self.entry_dir(name, version)?.join("meta.json"))
+    pub fn meta_path(&self, workload_id: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(workload_id)?.join("meta.json"))
     }
 
-    pub fn blob_path(&self, name: &str, version: &str) -> Result<PathBuf, WorkloadError> {
-        Ok(self.entry_dir(name, version)?.join("archive.atawl"))
+    pub fn blob_path(&self, workload_id: &str) -> Result<PathBuf, WorkloadError> {
+        Ok(self.entry_dir(workload_id)?.join("archive.atawl"))
     }
 
-    // ── Read ───────────────────────────────────────────
+    fn index_path(&self) -> PathBuf {
+        self.base_dir.join("index.json")
+    }
 
-    /// List all workload entries in the store.
-    /// Returns empty vec if the base directory doesn't exist.
-    pub fn list(&self) -> Result<Vec<WorkloadEntry>, WorkloadError> {
+    /// Read the index, rebuilding it from a scan when it is absent or
+    /// unreadable. The index is a cache; failing to read it must never fail an
+    /// operation the entries themselves can satisfy.
+    fn read_index(&self) -> Result<WorkloadIndex, WorkloadError> {
+        let path = self.index_path();
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(index) = serde_json::from_slice::<WorkloadIndex>(&bytes) {
+                return Ok(index);
+            }
+        }
+        self.rebuild_index()
+    }
+
+    /// Rebuild the index by scanning entries and reading their metadata.
+    fn rebuild_index(&self) -> Result<WorkloadIndex, WorkloadError> {
+        let mut index = WorkloadIndex::default();
+        for entry in self.scan_entries()? {
+            index.entries.insert(
+                entry.meta.workload_id.clone(),
+                IndexEntry {
+                    publisher: entry.meta.publisher.clone(),
+                    name: entry.meta.name.clone(),
+                    version: entry.meta.version.clone(),
+                },
+            );
+        }
+        self.write_index(&index)?;
+        Ok(index)
+    }
+
+    fn write_index(&self, index: &WorkloadIndex) -> Result<(), WorkloadError> {
+        if !self.base_dir.exists() {
+            return Ok(());
+        }
+        let encoded =
+            serde_json::to_vec_pretty(index).map_err(|e| WorkloadError::ReadStoreDir {
+                path: self.index_path(),
+                reason: e.to_string(),
+            })?;
+        fs::write(self.index_path(), encoded).map_err(|e| WorkloadError::ReadStoreDir {
+            path: self.index_path(),
+            reason: e.to_string(),
+        })
+    }
+
+    /// Read every entry directly, ignoring the index. This is the authority.
+    fn scan_entries(&self) -> Result<Vec<WorkloadEntry>, WorkloadError> {
         if !self.base_dir.exists() {
             return Ok(Vec::new());
         }
-
         let mut entries = Vec::new();
-        let name_dirs = fs::read_dir(&self.base_dir).map_err(|e| WorkloadError::ReadStoreDir {
+        let dirs = fs::read_dir(&self.base_dir).map_err(|e| WorkloadError::ReadStoreDir {
             path: self.base_dir.clone(),
             reason: e.to_string(),
         })?;
-
-        for name_entry in name_dirs {
-            let name_entry = name_entry.map_err(|e| WorkloadError::ReadStoreDir {
+        for dir in dirs {
+            let dir = dir.map_err(|e| WorkloadError::ReadStoreDir {
                 path: self.base_dir.clone(),
                 reason: e.to_string(),
             })?;
-            if !name_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-
-            let name_path = name_entry.path();
-            let version_dirs =
-                fs::read_dir(&name_path).map_err(|e| WorkloadError::ReadStoreDir {
-                    path: name_path.clone(),
-                    reason: e.to_string(),
-                })?;
-
-            for version_entry in version_dirs {
-                let version_entry = version_entry.map_err(|e| WorkloadError::ReadStoreDir {
-                    path: name_path.clone(),
-                    reason: e.to_string(),
-                })?;
-                if !version_entry
-                    .file_type()
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                let version_path = version_entry.path();
-                let meta_path = version_path.join("meta.json");
-                if !meta_path.exists() {
-                    continue;
-                }
-
-                let meta = self.read_meta(&meta_path)?;
-                let has_blob = version_path.join("archive.atawl").exists();
-                entries.push(WorkloadEntry { meta, has_blob });
+            let entry_path = dir.path();
+            let meta_path = entry_path.join("meta.json");
+            if !meta_path.exists() {
+                continue;
             }
+            let meta = self.read_meta(&meta_path)?;
+            let has_blob = entry_path.join("archive.atawl").exists();
+            entries.push(WorkloadEntry { meta, has_blob });
         }
-
-        // Sort by name, then version
         entries.sort_by(|a, b| {
             a.meta
                 .name
                 .cmp(&b.meta.name)
                 .then_with(|| a.meta.version.cmp(&b.meta.version))
         });
-
         Ok(entries)
     }
 
-    /// Get a specific workload entry by name and version.
-    pub fn get(&self, name: &str, version: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
-        let meta_path = self.meta_path(name, version)?;
+    pub fn list(&self) -> Result<Vec<WorkloadEntry>, WorkloadError> {
+        self.scan_entries()
+    }
+
+    /// Get a specific workload entry by identifier.
+    pub fn get(&self, workload_id: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
+        let meta_path = self.meta_path(workload_id)?;
         if !meta_path.exists() {
             return Ok(None);
         }
         let meta = self.read_meta(&meta_path)?;
-        let has_blob = self.blob_path(name, version)?.exists();
+        let has_blob = self.blob_path(workload_id)?.exists();
         Ok(Some(WorkloadEntry { meta, has_blob }))
     }
 
-    /// Find a workload entry by workload ID (hex string).
-    pub fn get_by_id(&self, workload_id: &str) -> Result<Option<WorkloadEntry>, WorkloadError> {
-        let entries = self.list()?;
-        Ok(entries
-            .into_iter()
-            .find(|e| e.meta.workload_id == workload_id))
+    /// Identifiers matching a name and version, across all publishers.
+    ///
+    /// Returns every match rather than one: with publisher-qualified
+    /// identifiers a bare name and version is genuinely ambiguous, and hiding
+    /// that by picking one would resolve to an arbitrary publisher.
+    pub fn resolve(&self, name: &str, version: &str) -> Result<Vec<String>, WorkloadError> {
+        let index = self.read_index()?;
+        let mut matches: Vec<String> = index
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.name == name && entry.version == version)
+            .map(|(id, _)| id.clone())
+            .collect();
+        matches.sort();
+        Ok(matches)
     }
 
     /// Load metadata for a workload, if it exists.
-    pub fn load_meta(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<WorkloadMeta>, WorkloadError> {
-        let path = self.meta_path(name, version)?;
+    pub fn load_meta(&self, workload_id: &str) -> Result<Option<WorkloadMeta>, WorkloadError> {
+        let path = self.meta_path(workload_id)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -276,7 +318,7 @@ impl WorkloadStore {
     /// Save metadata for a workload. Creates directories as needed.
     /// Uses temp-file + atomic rename to prevent corruption and symlink following.
     pub fn save_meta(&self, meta: &WorkloadMeta) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(&meta.name, &meta.version)?;
+        let dir = self.entry_dir(&meta.workload_id)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -295,13 +337,26 @@ impl WorkloadStore {
             source: e,
         })?;
 
+        // Keep the index current. It is a cache, so a failure here would be
+        // recoverable by a rebuild, but writing it now keeps lookups cheap.
+        let mut index = self.read_index()?;
+        index.entries.insert(
+            meta.workload_id.clone(),
+            IndexEntry {
+                publisher: meta.publisher.clone(),
+                name: meta.name.clone(),
+                version: meta.version.clone(),
+            },
+        );
+        self.write_index(&index)?;
+
         Ok(())
     }
 
     /// Copy an archive file into the store. Returns the file size.
     /// Uses temp-file + atomic rename to prevent corruption and symlink following.
-    pub fn import_blob(&self, name: &str, version: &str, src: &Path) -> Result<u64, WorkloadError> {
-        let dir = self.entry_dir(name, version)?;
+    pub fn import_blob(&self, workload_id: &str, src: &Path) -> Result<u64, WorkloadError> {
+        let dir = self.entry_dir(workload_id)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -323,8 +378,8 @@ impl WorkloadStore {
 
     /// Write raw bytes as an archive blob (for pull).
     /// Uses temp-file + atomic rename to prevent corruption and symlink following.
-    pub fn save_blob(&self, name: &str, version: &str, data: &[u8]) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(name, version)?;
+    pub fn save_blob(&self, workload_id: &str, data: &[u8]) -> Result<(), WorkloadError> {
+        let dir = self.entry_dir(workload_id)?;
         fs::create_dir_all(&dir).map_err(|e| WorkloadError::CreateDir {
             path: dir.clone(),
             source: e,
@@ -346,39 +401,31 @@ impl WorkloadStore {
 
     // ── Delete ─────────────────────────────────────────
 
-    /// Remove an entire workload entry (metadata + blob).
-    /// Cleans up the name directory if empty afterward.
-    pub fn remove(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
-        let dir = self.entry_dir(name, version)?;
+    /// Remove an entire workload entry (metadata + blob) and its index row.
+    pub fn remove(&self, workload_id: &str) -> Result<(), WorkloadError> {
+        let dir = self.entry_dir(workload_id)?;
         if !dir.exists() {
             return Err(WorkloadError::StoreNotFound {
-                name: name.to_string(),
-                version: version.to_string(),
+                workload_id: workload_id.to_string(),
             });
         }
 
         fs::remove_dir_all(&dir).map_err(WorkloadError::from)?;
 
-        // Clean up parent name dir if empty
-        let name_dir = self.base_dir.join(name);
-        if name_dir.exists() {
-            if let Ok(mut entries) = fs::read_dir(&name_dir) {
-                if entries.next().is_none() {
-                    let _ = fs::remove_dir(&name_dir);
-                }
-            }
-        }
+        // The layout is flat, so there is no parent directory to tidy up.
+        let mut index = self.read_index()?;
+        index.entries.remove(workload_id);
+        self.write_index(&index)?;
 
         Ok(())
     }
 
     /// Remove only the archive blob, keeping metadata.
-    pub fn remove_blob(&self, name: &str, version: &str) -> Result<(), WorkloadError> {
-        let blob = self.blob_path(name, version)?;
+    pub fn remove_blob(&self, workload_id: &str) -> Result<(), WorkloadError> {
+        let blob = self.blob_path(workload_id)?;
         if !blob.exists() {
             return Err(WorkloadError::NoBlobInStore {
-                name: name.to_string(),
-                version: version.to_string(),
+                workload_id: workload_id.to_string(),
             });
         }
         fs::remove_file(&blob).map_err(WorkloadError::from)?;
@@ -387,14 +434,14 @@ impl WorkloadStore {
 
     // ── Query ──────────────────────────────────────────
 
-    pub fn has_blob(&self, name: &str, version: &str) -> bool {
-        self.blob_path(name, version)
+    pub fn has_blob(&self, workload_id: &str) -> bool {
+        self.blob_path(workload_id)
             .map(|p| p.exists())
             .unwrap_or(false)
     }
 
-    pub fn exists(&self, name: &str, version: &str) -> bool {
-        self.meta_path(name, version)
+    pub fn exists(&self, workload_id: &str) -> bool {
+        self.meta_path(workload_id)
             .map(|p| p.exists())
             .unwrap_or(false)
     }
@@ -462,10 +509,15 @@ impl WorkloadStore {
             ));
         }
 
-        // The opaque-comparison implementation briefly wrote unversioned
-        // metadata. It already has the format-1 shape, so accept it. The next
-        // save writes `metadata_format: 1`.
-        Ok(())
+        // Unversioned metadata was briefly written by the opaque-comparison
+        // implementation. It predates publisher-qualified identifiers, so it
+        // cannot be accepted: the publisher is required and is not derivable
+        // from a name and version.
+        Err(self.unsupported_meta(
+            path,
+            "the unversioned metadata predates publisher-qualified workload identifiers"
+                .to_string(),
+        ))
     }
 
     fn unsupported_meta(&self, path: &Path, reason: String) -> WorkloadError {
@@ -476,20 +528,17 @@ impl WorkloadStore {
                 archive_path.display()
             )
         } else {
-            let version = path
+            // The entry directory is named by workload identifier, so the
+            // identifier is recoverable even when the metadata inside is not.
+            let workload_id = path
                 .parent()
                 .and_then(Path::file_name)
                 .and_then(|part| part.to_str());
-            let name = path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(|part| part.to_str());
-            match (name, version) {
-                (Some(name), Some(version)) => format!(
-                    "refresh the cached metadata from the configured chain with `atakit workload add --force --chain <chain> {name}:{version}`, or rebuild the workload from source with `atakit workload build <workload-directory>`"
+            match workload_id {
+                Some(workload_id) => format!(
+                    "refresh the cached metadata from the configured chain with `atakit workload add --force --chain <chain> {workload_id}`, or rebuild the workload from source with `atakit workload build <workload-directory>`"
                 ),
-                _ => "rebuild the workload from source with `atakit workload build <workload-directory>`"
+                None => "rebuild the workload from source with `atakit workload build <workload-directory>`"
                     .to_string(),
             }
         };
@@ -516,10 +565,21 @@ fn uses_retired_pcr_rule_fields(value: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
+    /// A distinct identifier per entry. Entries are keyed by identifier, so a
+    /// shared one would make every fixture the same entry.
+    fn test_id(name: &str, version: &str) -> String {
+        let mut digest = [0u8; 32];
+        for (index, byte) in format!("{name}:{version}").bytes().enumerate() {
+            digest[index % 32] ^= byte;
+        }
+        format!("0x{}", hex::encode(digest))
+    }
+
     fn test_meta(name: &str, version: &str) -> WorkloadMeta {
         WorkloadMeta {
             metadata_format: WORKLOAD_META_FORMAT_VERSION,
-            workload_id: "0xtest".to_string(),
+            workload_id: test_id(name, version),
+            publisher: PUBLISHER.to_string(),
             name: name.to_string(),
             version: version.to_string(),
             sha256: None,
@@ -533,72 +593,57 @@ mod tests {
         }
     }
 
+    const PUBLISHER: &str = "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+    const TEST_ID: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_ID: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Entries are keyed by identifier, which is path-safe by construction, so
+    /// there is nothing to escape and nothing that could escape the store.
     #[test]
-    fn rejects_dotdot_name() {
+    fn an_identifier_maps_to_one_segment_inside_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir("..", "v0.0.1"),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
+        let dir = store.entry_dir(TEST_ID).unwrap();
+        assert_eq!(dir, tmp.path().join(TEST_ID));
     }
 
+    /// Anything that is not the machine-generated form is refused. Rejecting is
+    /// safe here in a way that rejecting a name was not: the value is derived,
+    /// never typed, so a legitimate workload can never fail to map to a path.
     #[test]
-    fn rejects_dotdot_version() {
+    fn anything_but_an_identifier_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir("app", ".."),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
+        for bad in [
+            "my-app",
+            "..",
+            ".",
+            "",
+            "foo/bar",
+            "../../etc/passwd",
+            "0xshort",
+            &TEST_ID.to_uppercase(),
+        ] {
+            assert!(
+                matches!(
+                    store.entry_dir(bad),
+                    Err(WorkloadError::StorePathTraversal { .. })
+                ),
+                "must refuse {bad:?}"
+            );
+        }
     }
 
+    /// Two publishers holding the same name and version get separate entries,
+    /// which is the collision the identifier exists to remove.
     #[test]
-    fn rejects_slash_in_name() {
+    fn distinct_identifiers_get_distinct_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir("foo/bar", "v0.0.1"),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_slash_in_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir("app", "v0/../etc"),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_empty_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir("", "v0.0.1"),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_dot_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkloadStore::new(tmp.path());
-        assert!(matches!(
-            store.entry_dir(".", "v0.0.1"),
-            Err(WorkloadError::StorePathTraversal { .. })
-        ));
-    }
-
-    #[test]
-    fn accepts_valid_components() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkloadStore::new(tmp.path());
-        let dir = store.entry_dir("my-app", "v0.0.1").unwrap();
-        assert_eq!(dir, tmp.path().join("my-app").join("v0.0.1"));
+        assert_ne!(
+            store.entry_dir(TEST_ID).unwrap(),
+            store.entry_dir(OTHER_ID).unwrap()
+        );
     }
 
     #[test]
@@ -608,14 +653,17 @@ mod tests {
         let meta = test_meta("my-app", "v0.0.1");
         store.save_meta(&meta).unwrap();
 
-        let loaded = store.load_meta("my-app", "v0.0.1").unwrap().unwrap();
-        assert_eq!(loaded.workload_id, "0xtest");
+        let loaded = store
+            .load_meta(&test_id("my-app", "v0.0.1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.workload_id, test_id("my-app", "v0.0.1"));
         assert_eq!(loaded.name, "my-app");
         assert_eq!(loaded.version, "v0.0.1");
         assert_eq!(loaded.metadata_format, WORKLOAD_META_FORMAT_VERSION);
 
         let saved: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(store.meta_path("my-app", "v0.0.1").unwrap()).unwrap(),
+            &fs::read_to_string(store.meta_path(&test_id("my-app", "v0.0.1")).unwrap()).unwrap(),
         )
         .unwrap();
         assert_eq!(saved["metadata_format"], WORKLOAD_META_FORMAT_VERSION);
@@ -625,13 +673,14 @@ mod tests {
     fn retired_pcr_rule_metadata_reports_archive_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        let dir = store.entry_dir("old-app", "v1").unwrap();
+        let dir = store.entry_dir(TEST_ID).unwrap();
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("archive.atawl"), b"archive").unwrap();
         fs::write(
             dir.join("meta.json"),
             r#"{
                 "workload_id": "0xtest",
+                "publisher": "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
                 "name": "old-app",
                 "version": "v1",
                 "on_chain_spec": {
@@ -645,7 +694,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = store.load_meta("old-app", "v1").unwrap_err();
+        let error = store.load_meta(TEST_ID).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("retired verify_type and match_data"));
         assert!(message.contains("atakit workload import --force"));
@@ -656,12 +705,13 @@ mod tests {
     fn retired_pcr_rule_metadata_without_archive_reports_chain_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        let dir = store.entry_dir("old-app", "v1").unwrap();
+        let dir = store.entry_dir(TEST_ID).unwrap();
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("meta.json"),
             r#"{
                 "workload_id": "0xtest",
+                "publisher": "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
                 "name": "old-app",
                 "version": "v1",
                 "on_chain_spec": {
@@ -675,22 +725,25 @@ mod tests {
         )
         .unwrap();
 
-        let error = store.load_meta("old-app", "v1").unwrap_err();
+        let error = store.load_meta(TEST_ID).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("atakit workload add --force --chain <chain> old-app:v1"));
+        assert!(message.contains(&format!(
+            "atakit workload add --force --chain <chain> {TEST_ID}"
+        )));
     }
 
     #[test]
     fn newer_metadata_format_reports_atakit_upgrade() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        let dir = store.entry_dir("future-app", "v1").unwrap();
+        let dir = store.entry_dir(TEST_ID).unwrap();
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("meta.json"),
             r#"{
-                "metadata_format": 2,
+                "metadata_format": 99,
                 "workload_id": "0xtest",
+                "publisher": "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
                 "name": "future-app",
                 "version": "v1",
                 "added_at": "2025-01-01T00:00:00Z"
@@ -698,17 +751,20 @@ mod tests {
         )
         .unwrap();
 
-        let error = store.load_meta("future-app", "v1").unwrap_err();
+        let error = store.load_meta(TEST_ID).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("metadata format 2 is newer than supported format 1"));
+        assert!(
+            message.contains("newer than supported format 2"),
+            "{message}"
+        );
         assert!(message.contains("upgrade atakit"));
     }
 
     #[test]
-    fn unversioned_opaque_comparison_metadata_is_accepted() {
+    fn unversioned_metadata_is_refused_with_a_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        let dir = store.entry_dir("current-app", "v1").unwrap();
+        let dir = store.entry_dir(TEST_ID).unwrap();
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("meta.json"),
@@ -727,16 +783,19 @@ mod tests {
         )
         .unwrap();
 
-        let meta = store.load_meta("current-app", "v1").unwrap().unwrap();
-        assert_eq!(meta.metadata_format, WORKLOAD_META_FORMAT_VERSION);
-        assert_eq!(meta.on_chain_spec.unwrap().pcrs[0].comparison, "0x00");
+        let error = store.load_meta(TEST_ID).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("publisher-qualified"), "{message}");
     }
 
     #[test]
     fn load_meta_missing_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
-        assert!(store.load_meta("no-such", "v0.0.1").unwrap().is_none());
+        assert!(store
+            .load_meta(&test_id("my-app", "v0.0.1"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -744,14 +803,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
 
-        assert!(!store.exists("app", "v1"));
+        let id = test_id("app", "v1");
+        assert!(!store.exists(&id));
 
         store.save_meta(&test_meta("app", "v1")).unwrap();
-        assert!(store.exists("app", "v1"));
-        assert!(!store.has_blob("app", "v1"));
+        assert!(store.exists(&id));
+        assert!(!store.has_blob(&id));
 
-        store.save_blob("app", "v1", b"fake archive").unwrap();
-        assert!(store.has_blob("app", "v1"));
+        store.save_blob(&id, b"fake archive").unwrap();
+        assert!(store.has_blob(&id));
     }
 
     #[test]
@@ -759,14 +819,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
 
+        let id = test_id("app", "v1");
         store.save_meta(&test_meta("app", "v1")).unwrap();
-        store.save_blob("app", "v1", b"data").unwrap();
-        assert!(store.exists("app", "v1"));
+        store.save_blob(&id, b"data").unwrap();
+        assert!(store.exists(&id));
 
-        store.remove("app", "v1").unwrap();
-        assert!(!store.exists("app", "v1"));
-        // Parent name dir should be cleaned up too
-        assert!(!tmp.path().join("app").exists());
+        store.remove(&id).unwrap();
+        assert!(!store.exists(&id));
+        // The layout is flat, so the entry directory is all there is.
+        assert!(!tmp.path().join(&id).exists());
     }
 
     #[test]
@@ -774,13 +835,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkloadStore::new(tmp.path());
 
+        let id = test_id("app", "v1");
         store.save_meta(&test_meta("app", "v1")).unwrap();
-        store.save_blob("app", "v1", b"data").unwrap();
-        assert!(store.has_blob("app", "v1"));
+        store.save_blob(&id, b"data").unwrap();
+        assert!(store.has_blob(&id));
 
-        store.remove_blob("app", "v1").unwrap();
-        assert!(!store.has_blob("app", "v1"));
-        assert!(store.exists("app", "v1"));
+        store.remove_blob(&id).unwrap();
+        assert!(!store.has_blob(&id));
+        assert!(store.exists(&id));
     }
 
     #[test]
@@ -807,13 +869,15 @@ mod tests {
         fs::create_dir(&store_dir).unwrap();
         let store = WorkloadStore::new(&store_dir);
 
-        // Create a symlink <store>/evil -> /tmp (outside store)
+        // Plant the symlink at the escaped segment the store actually uses;
+        // containment is now defence in depth behind the encoding, so this is
+        // the path an attacker would have to target.
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, store_dir.join("evil")).unwrap();
+        std::os::unix::fs::symlink(&outside, store_dir.join(TEST_ID)).unwrap();
 
         // Trying to write via the symlink should fail containment check
-        let result = store.entry_dir("evil", "v1");
+        let result = store.entry_dir(TEST_ID);
         assert!(
             matches!(result, Err(WorkloadError::StorePathTraversal { .. })),
             "expected StorePathTraversal, got {result:?}"

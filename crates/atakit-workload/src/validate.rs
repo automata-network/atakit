@@ -290,24 +290,39 @@ pub fn validate_config_with_roots(
         )));
     }
 
-    // ── base-image entries (must be name:version, no / in name) ──
+    // ── base-image entries (canonical <publisher>/<name>:<version>) ──
+    //
+    // The compiled manifest is hashed into PCR23, so these strings are
+    // measured. They carry the canonical publisher-qualified form: a
+    // name-and-version pair alone names an identity anyone can claim to speak
+    // for, and an offline verifier reading a signed archive cannot consult the
+    // registry access control that closes that gap on chain.
     for entry in &w.base_image {
-        let Some((name, version)) = entry.split_once(':') else {
+        let Some((publisher, rest)) = entry.split_once('/') else {
             return Err(WorkloadError::Validation(format!(
-                "base-image entry must be name:version format, got {:?}",
-                entry,
+                "base-image entry must be <publisher>/<name>:<version>, got {entry:?}; \
+                 a reference without a publisher is no longer accepted"
+            )));
+        };
+        if !atakit_core::is_canonical_id(publisher) {
+            return Err(WorkloadError::Validation(format!(
+                "base-image publisher must be '0x' followed by 64 lowercase hexadecimal \
+                 characters, got {publisher:?} in {entry:?}"
+            )));
+        }
+        let Some((name, version)) = rest.split_once(':') else {
+            return Err(WorkloadError::Validation(format!(
+                "base-image entry must be <publisher>/<name>:<version>, got {entry:?}"
             )));
         };
         if name.is_empty() || version.is_empty() {
             return Err(WorkloadError::Validation(format!(
-                "base-image entry has empty name or version: {:?}",
-                entry,
+                "base-image entry has empty name or version: {entry:?}"
             )));
         }
         if name.contains('/') {
             return Err(WorkloadError::Validation(format!(
-                "base-image name must not contain '/': {:?}",
-                entry,
+                "base-image name must not contain '/': {entry:?}"
             )));
         }
     }

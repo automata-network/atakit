@@ -14,6 +14,13 @@ pub struct InspectOptions {
     pub archive: Option<PathBuf>,
     /// Path to a workload source directory.
     pub workload_dir: Option<PathBuf>,
+    /// Fingerprint of the publishing key, for dir mode only.
+    ///
+    /// Directory inspection builds the manifest to compute PCR23, and the
+    /// publisher is measured, so a PCR23 computed without it would not match
+    /// the one any build of the same directory produces. Archive mode ignores
+    /// this: the archive already carries its publisher.
+    pub publisher: Option<String>,
     /// Container engine override (for dir mode).
     pub engine: Option<ContainerEngine>,
     /// Show verbose output from container commands.
@@ -40,7 +47,7 @@ pub struct InspectResult {
     pub manifest_hash: String,
     /// Parsed manifest.
     pub manifest: Manifest,
-    /// Raw manifest string (JSON for v2, TOML for v1 archives).
+    /// Raw canonical manifest JSON, exactly as measured.
     pub manifest_raw: String,
 }
 
@@ -49,8 +56,16 @@ pub async fn inspect_workload(opts: &InspectOptions) -> Result<InspectResult, Wo
     if let Some(ref archive_path) = opts.archive {
         inspect_archive(archive_path)
     } else if let Some(ref workload_dir) = opts.workload_dir {
+        let publisher = opts.publisher.as_deref().ok_or_else(|| {
+            WorkloadError::Validation(
+                "inspecting a workload directory requires a publisher, because the \
+                 publisher is measured and PCR23 cannot be computed without it"
+                    .to_string(),
+            )
+        })?;
         inspect_dir(
             workload_dir,
+            publisher,
             opts.engine,
             opts.verbose,
             opts.measured_data_root.as_ref(),
@@ -65,7 +80,6 @@ pub async fn inspect_workload(opts: &InspectOptions) -> Result<InspectResult, Wo
 }
 
 /// Inspect from an `.atawl` archive: extract manifest, compute PCR23.
-/// Supports both v2 (manifest.json) and v1 (manifest.toml) archives.
 fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, WorkloadError> {
     let file = std::fs::File::open(archive_path).map_err(|e| WorkloadError::ReadFile {
         path: archive_path.to_path_buf(),
@@ -87,7 +101,7 @@ where
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest_json = None;
-    let mut manifest_toml = None;
+    let mut manifest_toml = false;
     for entry in archive.entries().map_err(WorkloadError::Io)? {
         let mut entry = entry.map_err(WorkloadError::Io)?;
         let path = entry.path().map_err(WorkloadError::Io)?;
@@ -98,24 +112,23 @@ where
                     .read_to_string(&mut content)
                     .map_err(WorkloadError::Io)?;
                 manifest_json = Some(content);
-                break; // v2 found, stop scanning
+                break;
             } else if filename == "manifest.toml" {
-                let mut content = String::new();
-                entry
-                    .read_to_string(&mut content)
-                    .map_err(WorkloadError::Io)?;
-                manifest_toml = Some(content);
-                // Don't break: keep scanning in case manifest.json appears
-                // later in the tar. For real v1 archives this scans the
-                // entire tar, but v1 is the legacy path.
+                // A `manifest.toml` archive is format 1, which records no
+                // publisher. Note it so the failure can name what was found,
+                // and keep scanning in case a manifest.json follows.
+                manifest_toml = true;
             }
         }
     }
 
     if let Some(raw) = manifest_json {
         build_result_json(raw)
-    } else if let Some(raw) = manifest_toml {
-        build_result_toml(raw)
+    } else if manifest_toml {
+        Err(WorkloadError::Validation(format!(
+            "archive contains a format-1 manifest.toml, which records no publisher and so cannot yield a publisher-qualified identifier; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+            crate::FORMAT_VERSION
+        )))
     } else {
         Err(WorkloadError::Validation(
             "neither manifest.json nor manifest.toml found in archive".into(),
@@ -126,6 +139,7 @@ where
 /// Inspect from a workload source directory: parse config, build manifest, compute PCR23.
 async fn inspect_dir(
     workload_dir: &std::path::Path,
+    publisher: &str,
     engine_override: Option<ContainerEngine>,
     verbose: bool,
     measured_data_root: Option<&PathBuf>,
@@ -228,6 +242,7 @@ async fn inspect_dir(
         crate::manifest::resolve_unmeasured_env_allowlists(&config, &data_roots.unmeasured)?;
     let manifest = crate::manifest::build_manifest(
         &config,
+        publisher,
         &resolved_image,
         environment,
         dep_environments,
@@ -310,7 +325,7 @@ fn build_result_json(manifest_raw: String) -> Result<InspectResult, WorkloadErro
     let mut value: serde_json::Value =
         serde_json::from_str(&manifest_raw).map_err(|e| WorkloadError::Json(e.to_string()))?;
     validate_json_manifest_format(&value)?;
-    normalize_legacy_service_disks(&mut value)?;
+    reject_legacy_service_disks(&mut value)?;
     let manifest: Manifest =
         serde_json::from_value(value).map_err(|e| WorkloadError::Json(e.to_string()))?;
     compute_pcr_result(manifest, manifest_raw)
@@ -322,13 +337,13 @@ fn validate_json_manifest_format(value: &serde_json::Value) -> Result<(), Worklo
         .and_then(|meta| meta.get("format"))
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
-            WorkloadError::Validation(
-                "workload archive manifest.json is missing integer meta.format; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format 6"
-                    .to_string(),
-            )
+            WorkloadError::Validation(format!(
+                "workload archive manifest.json is missing integer meta.format; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+                crate::FORMAT_VERSION
+            ))
         })?;
 
-    if (2..=u64::from(crate::FORMAT_VERSION)).contains(&format) {
+    if format == u64::from(crate::FORMAT_VERSION) {
         return Ok(());
     }
     if format > u64::from(crate::FORMAT_VERSION) {
@@ -337,48 +352,36 @@ fn validate_json_manifest_format(value: &serde_json::Value) -> Result<(), Worklo
             crate::FORMAT_VERSION
         )));
     }
+    // No older manifest records a publisher, and none allows one to be derived,
+    // so an older archive cannot produce the identifier its workload is
+    // registered under. Rebuilding is the only correct answer; converting would
+    // invent a publisher.
     Err(WorkloadError::Validation(format!(
-        "workload manifest format {format} is not supported in manifest.json; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+        "workload manifest format {format} predates the publisher-qualified identifier and cannot be converted, because it records no publisher; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
         crate::FORMAT_VERSION
     )))
 }
 
-fn normalize_legacy_service_disks(value: &mut serde_json::Value) -> Result<(), WorkloadError> {
-    let format = value
-        .get("meta")
-        .and_then(|meta| meta.get("format"))
-        .and_then(serde_json::Value::as_u64);
+/// Reject a legacy `config.disks` mapping on the service or any dependency.
+///
+/// `config.storage` replaced `config.disks` before the current manifest format.
+/// Only one format is accepted now, so a manifest still carrying `disks` is
+/// malformed rather than merely old, and converting it would be guesswork.
+fn reject_legacy_service_disks(value: &mut serde_json::Value) -> Result<(), WorkloadError> {
     let Some(config) = value
         .get_mut("config")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return Ok(());
     };
-    if format.is_some_and(|format| format >= 3) {
-        reject_v3_legacy_service_disks("config", config)?;
-        if let Some(dependencies) = config
-            .get_mut("dependencies")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for (name, dependency) in dependencies {
-                if let Some(dependency) = dependency.as_object_mut() {
-                    reject_v3_legacy_service_disks(
-                        &format!("config.dependencies.{name}"),
-                        dependency,
-                    )?;
-                }
-            }
-        }
-        return Ok(());
-    }
-    normalize_legacy_service_disks_for_service("config", config)?;
+    reject_legacy_disks_for_service("config", config)?;
     if let Some(dependencies) = config
         .get_mut("dependencies")
         .and_then(serde_json::Value::as_object_mut)
     {
         for (name, dependency) in dependencies {
             if let Some(dependency) = dependency.as_object_mut() {
-                normalize_legacy_service_disks_for_service(
+                reject_legacy_disks_for_service(
                     &format!("config.dependencies.{name}"),
                     dependency,
                 )?;
@@ -388,7 +391,7 @@ fn normalize_legacy_service_disks(value: &mut serde_json::Value) -> Result<(), W
     Ok(())
 }
 
-fn reject_v3_legacy_service_disks(
+fn reject_legacy_disks_for_service(
     context: &str,
     service: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), WorkloadError> {
@@ -404,62 +407,7 @@ fn reject_v3_legacy_service_disks(
     Ok(())
 }
 
-fn normalize_legacy_service_disks_for_service(
-    context: &str,
-    service: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<(), WorkloadError> {
-    if service.contains_key("storage") {
-        return Ok(());
-    }
-    let Some(disks) = service.get("disks").and_then(serde_json::Value::as_object) else {
-        return Ok(());
-    };
-    let mut storage = serde_json::Map::new();
-    for (disk, mount_path) in disks {
-        let mount_path = mount_path.as_str().ok_or_else(|| {
-            WorkloadError::Json(format!("{context}.disks.{disk} must be a string"))
-        })?;
-        storage.insert(
-            disk.clone(),
-            serde_json::json!({
-                "disk": disk,
-                "base_path": "/",
-                "mount_path": mount_path,
-                "read_only": false,
-            }),
-        );
-    }
-    service.insert("storage".to_string(), serde_json::Value::Object(storage));
-    Ok(())
-}
-
-/// Compute PCR23 and build InspectResult from raw manifest TOML (v1 compat).
-fn build_result_toml(manifest_raw: String) -> Result<InspectResult, WorkloadError> {
-    let v1: crate::manifest_v1::ManifestV1 =
-        toml::from_str(&manifest_raw).map_err(|e| WorkloadError::ParseConfig {
-            path: "manifest.toml".into(),
-            source: e,
-        })?;
-    if v1.meta.format != 1 {
-        let format = v1.meta.format;
-        let detail = if format > crate::FORMAT_VERSION {
-            format!(
-                "workload manifest format {format} is newer than supported format {}; upgrade atakit to a version that supports workload manifest format {format}",
-                crate::FORMAT_VERSION
-            )
-        } else {
-            format!(
-                "workload manifest format {format} is not supported in manifest.toml; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
-                crate::FORMAT_VERSION
-            )
-        };
-        return Err(WorkloadError::Validation(detail));
-    }
-    let manifest = crate::manifest_v1::convert_to_current(v1);
-    compute_pcr_result(manifest, manifest_raw)
-}
-
-/// Shared PCR23 computation from raw manifest bytes.
+/// Compute PCR23 from raw manifest bytes.
 fn compute_pcr_result(
     manifest: Manifest,
     manifest_raw: String,
@@ -500,7 +448,8 @@ mod tests {
     fn minimal_manifest_json() -> String {
         serde_json::json!({
             "meta": {
-                "format": 2,
+                "format": 7,
+                "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "name": "test",
                 "version": "v0.0.1"
             },
@@ -588,81 +537,16 @@ mod tests {
         assert_eq!(sha256_hex, manifest_hex);
     }
 
+    /// `config.storage` replaced `config.disks`. A manifest at the current
+    /// format carrying `disks` is malformed, and is refused rather than
+    /// converted.
     #[test]
-    fn legacy_json_disks_are_normalized_to_storage_for_inspect() {
+    fn legacy_disks_are_rejected_at_the_current_format() {
         let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
         value["config"].as_object_mut().unwrap().remove("storage");
         value["config"]["disks"] = serde_json::json!({ "data": "/data" });
-        value["config"]["dependencies"] = serde_json::json!({
-            "sidecar": {
-                "image": "sidecar:v0.1.0",
-                "ports": [],
-                "restart": "no",
-                "command": null,
-                "entrypoint": null,
-                "atakit-portal": false,
-                "gid-group": "test",
-                "environment": {},
-                "unmeasured-env-files": [],
-                "depends_on": [],
-                "measured-data": false,
-                "unmeasured-data": false,
-                "disks": { "data": "/cache" },
-                "cap-add": [],
-                "cap-drop": [],
-                "logging": {
-                    "driver": "k8s-file",
-                    "options": {"max-file": "5", "max-size": "50m"},
-                    "log-readers": []
-                },
-                "workload-logs": false
-            }
-        });
-        value["disks"] = serde_json::json!({
-            "data": {
-                "index": 10,
-                "size": "10GB",
-                "encryption": {"unlock_method": [], "bind": []}
-            }
-        });
-        let raw = value.to_string();
-        let result = build_result_json(raw.clone()).unwrap();
-
-        let storage = &result.manifest.config.storage["data"];
-        assert_eq!(storage.disk, "data");
-        assert_eq!(storage.base_path, "/");
-        assert_eq!(storage.mount_path, "/data");
-        assert!(!storage.read_only);
-
-        let dep_storage =
-            &result.manifest.config.dependencies.as_ref().unwrap()["sidecar"].storage["data"];
-        assert_eq!(dep_storage.mount_path, "/cache");
-
-        let mut h = Sha256::new();
-        h.update(raw.as_bytes());
-        assert_eq!(result.sha256, format!("0x{:x}", h.finalize()));
-    }
-
-    #[test]
-    fn legacy_json_disks_reject_non_string_mounts() {
-        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
-        value["config"].as_object_mut().unwrap().remove("storage");
-        value["config"]["disks"] = serde_json::json!({ "data": 123 });
         let err = match build_result_json(value.to_string()) {
-            Ok(_) => panic!("expected non-string legacy disk mount to fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("config.disks.data"));
-    }
-
-    #[test]
-    fn v3_json_rejects_legacy_disks() {
-        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
-        value["meta"]["format"] = serde_json::json!(3);
-        value["config"].as_object_mut().unwrap().remove("storage");
-        value["config"]["disks"] = serde_json::json!({ "data": "/data" });
-        let err = match build_result_json(value.to_string()) {
-            Ok(_) => panic!("expected v3 legacy disk mount to fail"),
+            Ok(_) => panic!("expected a legacy disk mount to fail"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("config.disks is not supported"));
@@ -678,22 +562,41 @@ mod tests {
             Err(err) => err,
         };
         let message = err.to_string();
-        assert!(message.contains("workload manifest format 1 is not supported"));
+        assert!(message.contains("workload manifest format 1"));
+        assert!(message.contains("records no publisher"));
         assert!(message.contains("atakit workload build <workload-directory>"));
-        assert!(message.contains("manifest format 6"));
+        assert!(message.contains("manifest format 7"));
+    }
+
+    /// Format 6 was the last format before `meta.publisher` and was accepted
+    /// until this change. It is refused now for the same reason as any older
+    /// one: it names no publisher, so it cannot produce the identifier its
+    /// workload is registered under.
+    #[test]
+    fn the_format_before_publisher_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
+        value["meta"]["format"] = serde_json::json!(6);
+
+        let err = match build_result_json(value.to_string()) {
+            Ok(_) => panic!("expected manifest format 6 to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("workload manifest format 6"), "{message}");
+        assert!(message.contains("records no publisher"), "{message}");
     }
 
     #[test]
     fn newer_json_format_reports_atakit_upgrade() {
         let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
-        value["meta"]["format"] = serde_json::json!(7);
+        value["meta"]["format"] = serde_json::json!(8);
 
         let err = match build_result_json(value.to_string()) {
-            Ok(_) => panic!("expected manifest format 7 to fail"),
+            Ok(_) => panic!("expected manifest format 8 to fail"),
             Err(err) => err,
         };
         let message = err.to_string();
-        assert!(message.contains("workload manifest format 7 is newer"));
+        assert!(message.contains("workload manifest format 8 is newer"));
         assert!(message.contains("upgrade atakit"));
     }
 
@@ -709,78 +612,5 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("manifest.json is missing integer meta.format"));
         assert!(message.contains("atakit workload build <workload-directory>"));
-    }
-
-    #[test]
-    fn v1_toml_compat() {
-        let toml = r#"
-[meta]
-format = 1
-name = "old-workload"
-version = "v0.1.0"
-
-[config]
-image = "old:v0.1.0"
-base-image-mode = "blacklist"
-cvm_agent = true
-
-[hashes]
-"images/old.tar" = "sha256:abcd"
-"#;
-        let result = build_result_toml(toml.to_string()).unwrap();
-        assert_eq!(result.manifest.meta.name, "old-workload");
-        assert!(result.manifest.config.atakit_portal);
-        assert_eq!(result.manifest.config.gid_group, "old-workload");
-        // Omitted restart in v1 must default to "no", not "".
-        assert_eq!(result.manifest.config.restart, "no");
-    }
-
-    #[test]
-    fn unsupported_toml_format_reports_rebuild_command() {
-        let toml = r#"
-[meta]
-format = 0
-name = "old-workload"
-version = "v0.1.0"
-
-[config]
-image = "old:v0.1.0"
-base-image-mode = "blacklist"
-
-[hashes]
-"images/old.tar" = "sha256:abcd"
-"#;
-        let err = match build_result_toml(toml.to_string()) {
-            Ok(_) => panic!("expected manifest format 0 to fail"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(message.contains("workload manifest format 0 is not supported"));
-        assert!(message.contains("atakit workload build <workload-directory>"));
-    }
-
-    #[test]
-    fn v1_dependency_restart_defaults_to_no() {
-        let toml = r#"
-[meta]
-format = 1
-name = "with-dep"
-version = "v0.1.0"
-
-[config]
-image = "main:v0.1.0"
-base-image-mode = "blacklist"
-
-[config.dependencies.sidecar]
-image = "sidecar:latest"
-
-[hashes]
-"images/main.tar" = "sha256:aaaa"
-"images/sidecar.tar" = "sha256:bbbb"
-"#;
-        let result = build_result_toml(toml.to_string()).unwrap();
-        let deps = result.manifest.config.dependencies.unwrap();
-        let sidecar = &deps["sidecar"];
-        assert_eq!(sidecar.restart, "no");
     }
 }

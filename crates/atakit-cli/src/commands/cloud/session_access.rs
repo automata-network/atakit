@@ -241,10 +241,19 @@ pub(crate) async fn resolve_verified_session_access(
         None if registration_is_off(portal.registration.as_deref()) => None,
         None => bail!("no chain config is available for verifier trust lookup"),
     };
-    let workload_id = crate::commands::workload::compute_workload_id(
-        &portal.state.workload_name,
-        &portal.state.workload_version,
+    // The deployment records its workload's publisher, so the identifier is
+    // recomputable from state rather than being stored opaquely.
+    let workload_publisher = portal
+        .state
+        .workload_publisher
+        .parse()
+        .context("deployment state has an invalid workload publisher")?;
+    let workload_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher,
+        portal.state.workload_name.clone(),
+        portal.state.workload_version.clone(),
     );
+    let workload_id = crate::commands::workload::compute_workload_id(&workload_ref);
     let workload_policy = resolve_trusted_workload_policy(
         &portal.state,
         verification,
@@ -388,6 +397,7 @@ async fn load_local_workload_policy(
         );
     }
     let inspection = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(archive_path.to_path_buf()),
         workload_dir: None,
         engine: None,
@@ -493,6 +503,8 @@ mod tests {
     fn deployed_state(archive_path: String, archive_hash: String) -> DeployState {
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".into(),
             workload_name: "test".into(),
             workload_version: "v0.0.1".into(),
             target_name: "gcp-tdx".into(),
@@ -518,7 +530,12 @@ mod tests {
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
         let manifest = serde_json::json!({
-            "meta": {"format": 6, "name": "test", "version": "v0.0.1"},
+            "meta": {
+                "format": 7,
+                "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "test",
+                "version": "v0.0.1"
+            },
             "config": {
                 "image": "test:v0.0.1",
                 "base-image-mode": "blacklist",

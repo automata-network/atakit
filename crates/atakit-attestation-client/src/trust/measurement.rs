@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use atakit_attestation::{verify_measurement_pack, MeasurementPolicy, VerificationReport};
-use atakit_core::encode_ref_path_segment;
+use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
+use automata_tee_workload_measurement::types::AppRef;
 
 use crate::error::PortalVerificationError;
 use crate::trust::files::parse_measurement_publisher_keys;
@@ -77,18 +78,19 @@ pub fn load_measurement_policy(
     data_dir: Option<&Path>,
 ) -> Result<Option<MeasurementPolicy>, PortalVerificationError> {
     let base_image_ref = base_image.map(parse_base_image_ref).transpose()?;
+    let base_image_ref = base_image_ref.as_ref();
     let (json_path, sig_path, source) = if let Some(path) = measurements {
         let (json_path, sig_path) = measurement_pack_paths(path);
         let source = json_path.display().to_string();
         (json_path, sig_path, source)
-    } else if let Some((name, version)) = base_image_ref {
+    } else if let Some(app_ref) = base_image_ref {
         let Some(data_dir) = data_dir else {
             return Err(PortalVerificationError::Config {
                 message: "--base-image local measurement lookup requires a data directory"
                     .to_string(),
             });
         };
-        let path = select_local_measurement_pack_dir(data_dir, name, version)?.path;
+        let path = select_local_measurement_pack_dir(data_dir, app_ref)?.path;
         let (json_path, sig_path) = measurement_pack_dir_paths(&path);
         (json_path, sig_path, format!("local:{}", path.display()))
     } else {
@@ -118,12 +120,12 @@ pub fn load_measurement_policy(
             message: e.to_string(),
         }
     })?;
-    if let Some((name, version)) = base_image_ref {
-        if pack.base_image.name != name || pack.base_image.version != version {
+    if let Some(app_ref) = base_image_ref {
+        if pack.base_image.name != app_ref.name || pack.base_image.version != app_ref.version {
             return Err(PortalVerificationError::Config {
                 message: format!(
-                    "measurement pack is for {}:{}, not {name}:{version}",
-                    pack.base_image.name, pack.base_image.version
+                    "measurement pack is for {}:{}, not {}:{}",
+                    pack.base_image.name, pack.base_image.version, app_ref.name, app_ref.version
                 ),
             });
         }
@@ -141,22 +143,17 @@ pub fn local_measurement_pack_exists(
     data_dir: &Path,
     base_image: &str,
 ) -> Result<bool, PortalVerificationError> {
-    let (name, version) = parse_base_image_ref(base_image)?;
-    Ok(select_local_measurement_pack_dir(data_dir, name, version)?.detected)
+    let app_ref = parse_base_image_ref(base_image)?;
+    Ok(select_local_measurement_pack_dir(data_dir, &app_ref)?.detected)
 }
 
-fn parse_base_image_ref(value: &str) -> Result<(&str, &str), PortalVerificationError> {
-    let Some((name, version)) = value.split_once(':') else {
-        return Err(PortalVerificationError::Config {
-            message: format!("expected --base-image NAME:VERSION, got {value:?}"),
-        });
-    };
-    if name.is_empty() || version.is_empty() {
-        return Err(PortalVerificationError::Config {
-            message: format!("expected --base-image NAME:VERSION, got {value:?}"),
-        });
-    }
-    Ok((name, version))
+/// Parse a canonical `<publisher>/<name>:<version>` base-image reference.
+fn parse_base_image_ref(value: &str) -> Result<AppRef, PortalVerificationError> {
+    value
+        .parse::<AppRef>()
+        .map_err(|error| PortalVerificationError::Config {
+            message: format!("invalid --base-image {value:?}: {error}"),
+        })
 }
 
 fn measurement_pack_paths(path: &Path) -> (PathBuf, PathBuf) {
@@ -178,12 +175,19 @@ fn measurement_pack_dir_paths(path: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-fn local_measurement_pack_dir(data_dir: &Path, name: &str, version: &str) -> PathBuf {
+/// Where a locally cached measurement pack for a base image lives.
+///
+/// Keyed by base-image identifier rather than by name and version. The
+/// identifier is `0x` plus 64 lowercase hexadecimal characters, so it is
+/// path-safe by construction — nothing to escape — and it is
+/// publisher-qualified, so two publishers holding the same name and version get
+/// separate directories instead of overwriting each other.
+fn local_measurement_pack_dir(data_dir: &Path, app_ref: &AppRef) -> PathBuf {
+    let base_image_id = BaseImageRegistry::get_image_id(app_ref);
     data_dir
         .join("baseimage")
         .join("measurements")
-        .join(encode_ref_path_segment(name))
-        .join(encode_ref_path_segment(version))
+        .join(format!("{base_image_id:#x}"))
 }
 
 struct LocalMeasurementPackSelection {
@@ -193,10 +197,9 @@ struct LocalMeasurementPackSelection {
 
 fn select_local_measurement_pack_dir(
     data_dir: &Path,
-    name: &str,
-    version: &str,
+    app_ref: &AppRef,
 ) -> Result<LocalMeasurementPackSelection, PortalVerificationError> {
-    let path = local_measurement_pack_dir(data_dir, name, version);
+    let path = local_measurement_pack_dir(data_dir, app_ref);
     let detected = measurement_pack_artifact_exists(&path)?;
     Ok(LocalMeasurementPackSelection { path, detected })
 }
@@ -220,6 +223,21 @@ fn path_exists(path: &Path) -> Result<bool, PortalVerificationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PUBLISHER: &str = "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+
+    /// A canonical reference for a test base image.
+    fn reference(name: &str, version: &str) -> String {
+        format!("{PUBLISHER}/{name}:{version}")
+    }
+
+    /// The directory a pack for that reference lives in.
+    fn pack_dir(data_dir: &Path, name: &str, version: &str) -> PathBuf {
+        let app_ref: AppRef = reference(name, version)
+            .parse()
+            .expect("canonical reference");
+        local_measurement_pack_dir(data_dir, &app_ref)
+    }
     use k256::ecdsa::signature::Signer;
     use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
 
@@ -252,10 +270,14 @@ mod tests {
         std::fs::write(&json_path, json).unwrap();
         std::fs::write(&sig_path, sig).unwrap();
 
-        let policy =
-            load_measurement_policy(Some(&json_path), Some("base:v1"), &publisher_keys, None)
-                .unwrap()
-                .expect("policy");
+        let policy = load_measurement_policy(
+            Some(&json_path),
+            Some(&reference("base", "v1")),
+            &publisher_keys,
+            None,
+        )
+        .unwrap()
+        .expect("policy");
 
         assert_eq!(policy.pack.base_image.name, "base");
         assert_eq!(policy.pack.base_image.version, "v1");
@@ -270,8 +292,13 @@ mod tests {
         std::fs::write(dir.path().join("measurement-pack.json"), json).unwrap();
         std::fs::write(dir.path().join("measurement-pack.sig"), sig).unwrap();
 
-        let err = load_measurement_policy(Some(dir.path()), Some("base:v2"), &publisher_keys, None)
-            .unwrap_err();
+        let err = load_measurement_policy(
+            Some(dir.path()),
+            Some(&reference("base", "v2")),
+            &publisher_keys,
+            None,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("measurement pack is for base:v1"),
             "got: {err}"
@@ -283,19 +310,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let json = measurement_pack_json("base/image", "v1");
         let (sig, publisher_keys) = signed_measurement_pack(&json);
-        let pack_dir = dir
-            .path()
-            .join("baseimage")
-            .join("measurements")
-            .join(encode_ref_path_segment("base/image"))
-            .join(encode_ref_path_segment("v1"));
+        let pack_dir = pack_dir(dir.path(), "base/image", "v1");
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), json).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.sig"), sig).unwrap();
 
         let policy = load_measurement_policy(
             None,
-            Some("base/image:v1"),
+            Some(&reference("base/image", "v1")),
             &publisher_keys,
             Some(dir.path()),
         )
@@ -310,10 +332,13 @@ mod tests {
     fn load_measurement_policy_reports_missing_local_baseimage_pack() {
         let dir = tempfile::tempdir().unwrap();
         let err =
-            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
+            load_measurement_policy(None, Some(&reference("base", "v1")), &[], Some(dir.path()))
+                .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("baseimage/measurements/ref~base/ref~v1/measurement-pack.json"),
+            err.to_string().contains("measurement-pack.json")
+                && err
+                    .to_string()
+                    .contains(&pack_dir(dir.path(), "base", "v1").display().to_string()),
             "got: {err}"
         );
     }
@@ -321,40 +346,44 @@ mod tests {
     #[test]
     fn local_measurement_pack_exists_when_either_file_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let pack_dir = dir
-            .path()
-            .join("baseimage")
-            .join("measurements")
-            .join(encode_ref_path_segment("base"))
-            .join(encode_ref_path_segment("v1"));
+        let pack_dir = pack_dir(dir.path(), "base", "v1");
         std::fs::create_dir_all(&pack_dir).unwrap();
-        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(!local_measurement_pack_exists(dir.path(), &reference("base", "v1")).unwrap());
 
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
-        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(local_measurement_pack_exists(dir.path(), &reference("base", "v1")).unwrap());
 
         std::fs::remove_file(pack_dir.join("measurement-pack.json")).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.sig"), b"signature").unwrap();
-        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(local_measurement_pack_exists(dir.path(), &reference("base", "v1")).unwrap());
 
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
-        assert!(local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(local_measurement_pack_exists(dir.path(), &reference("base", "v1")).unwrap());
     }
 
+    /// Distinct references get distinct directories, including references that
+    /// differ only by publisher — the collision the identifier removes.
     #[test]
-    fn local_measurement_pack_paths_do_not_collapse_distinct_refs() {
+    fn distinct_references_do_not_collapse() {
         let dir = tempfile::tempdir().unwrap();
-
         assert_ne!(
-            local_measurement_pack_dir(dir.path(), "foo@bar", "v1"),
-            local_measurement_pack_dir(dir.path(), "foo_bar", "v1")
+            pack_dir(dir.path(), "foo@bar", "v1"),
+            pack_dir(dir.path(), "foo_bar", "v1")
+        );
+
+        let other: AppRef = format!("{}/base:v1", "0x".to_string() + &"ab".repeat(32))
+            .parse()
+            .unwrap();
+        assert_ne!(
+            pack_dir(dir.path(), "base", "v1"),
+            local_measurement_pack_dir(dir.path(), &other)
         );
     }
 
     #[test]
     fn incomplete_pack_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let new_path = local_measurement_pack_dir(dir.path(), "base", "v1");
+        let new_path = pack_dir(dir.path(), "base", "v1");
         std::fs::create_dir_all(&new_path).unwrap();
         std::fs::write(
             new_path.join("measurement-pack.json"),
@@ -362,11 +391,10 @@ mod tests {
         )
         .unwrap();
         let error =
-            load_measurement_policy(None, Some("base:v1"), &[], Some(dir.path())).unwrap_err();
+            load_measurement_policy(None, Some(&reference("base", "v1")), &[], Some(dir.path()))
+                .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("ref~base/ref~v1/measurement-pack.sig"),
+            error.to_string().contains("measurement-pack.sig"),
             "got: {error}"
         );
     }
@@ -374,7 +402,7 @@ mod tests {
     #[test]
     fn no_local_pack_artifacts_remain_absent() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!local_measurement_pack_exists(dir.path(), "base:v1").unwrap());
+        assert!(!local_measurement_pack_exists(dir.path(), &reference("base", "v1")).unwrap());
     }
 
     #[test]
@@ -388,7 +416,8 @@ mod tests {
         std::fs::write(&sig_path, sig).unwrap();
 
         let err =
-            load_measurement_policy(Some(&json_path), Some("base:v1"), &[], None).unwrap_err();
+            load_measurement_policy(Some(&json_path), Some(&reference("base", "v1")), &[], None)
+                .unwrap_err();
 
         assert!(
             err.to_string()

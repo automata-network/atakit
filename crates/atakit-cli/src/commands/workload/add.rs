@@ -25,64 +25,84 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         None
     };
 
-    // If we have an archive, inspect it to get name+version+sha256+pcr23
-    let (name, version, archive_sha256, archive_pcr23, archive_size) =
-        if let Some(ref path) = archive_path {
-            let opts = atakit_workload::InspectOptions {
-                archive: Some(path.clone()),
-                workload_dir: None,
-                engine: None,
-                verbose: false,
-                measured_data_root: None,
-                unmeasured_data_root: None,
-            };
-            let result = atakit_workload::inspect_workload(&opts)
-                .await
-                .with_context(|| format!("failed to inspect {}", path.display()))?;
-            let size = std::fs::metadata(path)?.len();
-            (
-                result.manifest.meta.name.clone(),
-                result.manifest.meta.version.clone(),
-                Some(result.sha256),
-                Some(result.pcr23_sha256),
-                Some(size),
-            )
-        } else {
-            // Parse as name:version or 0x<id>
-            let wref = parse_workload_ref(&args.reference)?;
-            match wref {
-                WorkloadRef::NameVersion { name, version } => (name, version, None, None, None),
-                WorkloadRef::Id(_) => {
-                    // For 0x IDs without an archive, we need on-chain to resolve name+version.
-                    // We'll handle this below after the chain query.
-                    (String::new(), String::new(), None, None, None)
-                }
-            }
+    // Establish the identifier before anything else: it is what the store is
+    // keyed by and what the chain is queried with, and it is derivable only
+    // from a publisher-qualified reference.
+    let (
+        workload_id,
+        mut name,
+        mut version,
+        publisher,
+        archive_sha256,
+        archive_pcr23,
+        archive_size,
+    ) = if let Some(ref path) = archive_path {
+        let opts = atakit_workload::InspectOptions {
+            publisher: None,
+            archive: Some(path.clone()),
+            workload_dir: None,
+            engine: None,
+            verbose: false,
+            measured_data_root: None,
+            unmeasured_data_root: None,
         };
-
-    // Compute workload ID (or parse from 0x ref)
-    let (workload_id, is_id_ref) = if name.is_empty() {
-        // 0x<id> reference, no archive
-        let id_str = &args.reference;
-        let id_hex = id_str.strip_prefix("0x").unwrap_or(id_str);
-        let bytes: [u8; 32] = hex::decode(id_hex)
-            .context("invalid workload ID hex")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("workload ID must be 32 bytes"))?;
-        (alloy_ext::core::primitives::B256::from(bytes), true)
+        let result = atakit_workload::inspect_workload(&opts)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        let size = std::fs::metadata(path)?.len();
+        let name = result.manifest.meta.name.clone();
+        let version = result.manifest.meta.version.clone();
+        // A path records no publisher, so the identity comes from the
+        // configured signing key.
+        let publisher = super::configured_publisher(args.signing_key.as_deref(), config)?;
+        let app_ref = automata_tee_workload_measurement::types::AppRef::new(
+            publisher,
+            name.clone(),
+            version.clone(),
+        );
+        (
+            compute_workload_id(&app_ref),
+            name,
+            version,
+            Some(format!("{publisher:#x}")),
+            Some(result.sha256),
+            Some(result.pcr23_sha256),
+            Some(size),
+        )
     } else {
-        (compute_workload_id(&name, &version), false)
+        match parse_workload_ref(&args.reference, &config.alias)? {
+            WorkloadRef::Ref(app_ref) => (
+                compute_workload_id(&app_ref),
+                app_ref.name.clone(),
+                app_ref.version.clone(),
+                Some(format!("{:#x}", app_ref.publisher)),
+                None,
+                None,
+                None,
+            ),
+            // An identifier alone carries no name, version, or publisher.
+            // All three come from the registry record below.
+            WorkloadRef::Id(id) => (
+                id.parse().context("invalid workload identifier")?,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+            ),
+        }
     };
 
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    let workload_id_hex = format!("{workload_id:#x}");
 
     // Import archive blob if provided
     if let Some(ref path) = archive_path {
-        if store.has_blob(&name, &version) && !args.force {
+        if store.has_blob(&workload_id_hex) && !args.force {
             // Still continue to merge on-chain data, but skip blob import
             println!("Archive already in store (use --force to overwrite blob).");
         } else {
-            store.import_blob(&name, &version, path)?;
+            store.import_blob(&workload_id_hex, path)?;
         }
     }
 
@@ -125,12 +145,17 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         .await
         .unwrap_or(false);
 
-    // Resolve name+version from on-chain if we only had an ID
-    let (name, version) = if is_id_ref {
-        (spec.name.clone(), spec.version.clone())
-    } else {
-        (name, version)
-    };
+    // An identifier-only reference gets its name and version from the record.
+    if name.is_empty() {
+        name = spec.name.clone();
+        version = spec.version.clone();
+    }
+
+    // The registry owner is the publisher. For a reference we already derived
+    // it; for an identifier this is the only source.
+    let publisher = publisher
+        .or_else(|| owner.clone())
+        .ok_or_else(|| anyhow::anyhow!("workload {workload_id_hex} has no owner on chain"))?;
 
     // The on-chain STATIC `comparison` commits the final PCR23 value.
     let chain_pcr23 = spec
@@ -166,7 +191,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Check if entry exists - merge if so
     let now = chrono::Local::now().to_rfc3339();
-    let existing_entry = match store.get(&name, &version) {
+    let existing_entry = match store.get(&workload_id_hex) {
         Ok(entry) => entry,
         Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) if args.force => None,
         Err(error) => return Err(error.into()),
@@ -190,6 +215,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         }
         // Refresh identity and timestamp for consistency with other merge paths
         m.workload_id = workload_id_hex.clone();
+        m.publisher = publisher.clone();
         m.name = name.clone();
         m.version = version.clone();
         m.added_at = now.clone();
@@ -198,6 +224,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         WorkloadMeta {
             metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
             workload_id: workload_id_hex.clone(),
+            publisher: publisher.clone(),
             name: name.clone(),
             version: version.clone(),
             sha256: sha256.clone(),

@@ -6,6 +6,9 @@ use atakit_workload::{
 };
 use sha2::{Digest, Sha256};
 
+/// Fixed publisher for pipeline tests, which are not about publisher handling.
+const TEST_PUBLISHER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 /// Build a minimal but valid docker-archive tar containing a single image
 /// with a config blob made unique by `marker`. Returns the tar bytes.
 ///
@@ -177,6 +180,7 @@ async fn build_produces_valid_archive() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir.clone()),
             engine: None,
@@ -201,7 +205,8 @@ async fn build_produces_valid_archive() {
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
     let manifest = read_manifest_json(&result.archive_path);
-    assert_eq!(manifest["meta"]["format"], 6);
+    assert_eq!(manifest["meta"]["format"], 7);
+    assert_eq!(manifest["meta"]["publisher"], TEST_PUBLISHER);
     assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
     // Verify archive contents
@@ -268,6 +273,7 @@ async fn build_materializes_baby_container_slots_in_manifest() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
@@ -323,6 +329,7 @@ async fn build_defaults_output_to_workload_dir() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: None,
             engine: None,
@@ -351,6 +358,7 @@ async fn build_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
             engine: None,
@@ -366,6 +374,7 @@ async fn build_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
             engine: None,
@@ -398,6 +407,7 @@ async fn inspect_archive_matches_build() {
 
     let build_result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
@@ -412,6 +422,7 @@ async fn inspect_archive_matches_build() {
     .unwrap();
 
     let inspect_result = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(build_result.archive_path.clone()),
         workload_dir: None,
         engine: None,
@@ -449,6 +460,7 @@ async fn inspect_dir_matches_archive() {
 
     let build_result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out_dir),
             engine: None,
@@ -463,6 +475,7 @@ async fn inspect_dir_matches_archive() {
     .unwrap();
 
     let archive_result = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(build_result.archive_path),
         workload_dir: None,
         engine: None,
@@ -474,6 +487,7 @@ async fn inspect_dir_matches_archive() {
     .unwrap();
 
     let dir_result = inspect_workload(&InspectOptions {
+        publisher: Some(TEST_PUBLISHER.to_string()),
         archive: None,
         workload_dir: Some(wl_dir),
         engine: None,
@@ -534,6 +548,7 @@ async fn build_with_dependency() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
@@ -574,6 +589,7 @@ async fn build_with_dependency() {
 
     // Verify manifest has dependency populated
     let inspect_result = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(result.archive_path),
         workload_dir: None,
         engine: None,
@@ -625,6 +641,7 @@ async fn build_with_dependency_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
             engine: None,
@@ -640,6 +657,7 @@ async fn build_with_dependency_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
             engine: None,

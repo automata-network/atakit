@@ -29,9 +29,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let (portal_host, status_port, init_port) = portal_endpoints(&state)?;
 
     // 3. Resolve workload.
-    let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+    let resolved = resolve_workload(
+        &args.source,
+        &args.dir,
+        env,
+        config,
+        args.signing_key.as_deref(),
+        args.skip_freshness_check,
+    )?;
     let archive_path = resolved.archive_path;
     let archive_sha256 = resolved.archive_sha256;
+    let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
     let workload_ports = resolved.ports;
@@ -416,13 +424,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         ))
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
     init_config.pcr_policy = super::resolve_init_pcr_policy(
         args.pcr_policy.as_deref(),
         &init_config,
         registration_off,
         verified_tls.as_ref(),
-        &workload_name,
-        &workload_version,
+        &workload_app_ref,
     )
     .await?;
 
@@ -548,6 +562,8 @@ mod tests {
     fn deployed_state() -> DeployState {
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "test-instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".into(),
             workload_name: "updated-workload".into(),
             workload_version: "v2".into(),
             target_name: "gcp-tdx".into(),

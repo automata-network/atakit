@@ -280,16 +280,11 @@ pub(crate) async fn resolve_init_pcr_policy(
     config: &InitConfig,
     registration_off: bool,
     verified_tls: Option<&atakit_cloud::init::VerifiedPortalTls>,
-    workload_name: &str,
-    workload_version: &str,
+    workload_ref: &AppRef,
 ) -> Result<Option<ResolvedPcrPolicyConfig>> {
     let identifiers = verified_tls.and_then(|verified| {
         Some(PcrPolicyIdentifiers {
-            workload_id: crate::commands::workload::compute_workload_id(
-                workload_name,
-                workload_version,
-            )
-            .0,
+            workload_id: crate::commands::workload::compute_workload_id(workload_ref).0,
             base_image_id: verified.identity.base_image_id?,
             platform_profile_id: verified.identity.platform_profile_id?,
             measurement_variant_id: verified.identity.variant_id?,
@@ -972,6 +967,9 @@ pub(crate) struct ResolvedWorkload {
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
+    /// Owner fingerprint of the workload's publisher. A store reference names
+    /// it; a path or directory takes it from the configured signing key.
+    pub publisher: alloy_ext::core::primitives::B256,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -979,19 +977,28 @@ pub(crate) fn resolve_workload(
     source: &Option<String>,
     dir: &Option<PathBuf>,
     env: &Env,
+    config: &Config,
+    signing_key: Option<&str>,
     skip_freshness_check: bool,
 ) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
-        // Store reference: name:version
+        // Store reference: <publisher>/<name>:<version>
         if crate::commands::workload::looks_like_store_ref(src) {
-            let (name, version) = src
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
+            let workload_ref = crate::commands::workload::parse_workload_ref(src, &config.alias)?;
             let store = WorkloadStore::new(&env.workload_dir);
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = workload_ref.workload_id();
+            let entry = store
+                .get(&workload_id)?
+                .ok_or_else(|| anyhow::anyhow!("workload not found in store: {src}"))?;
+            let (name, version) = (entry.meta.name.clone(), entry.meta.version.clone());
+            let publisher = entry
+                .meta
+                .publisher
+                .parse()
+                .context("store entry has an invalid publisher")?;
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
+                bail!("no archive blob for {src} in store");
             }
             let (result, archive_sha256) = inspect_workload_archive_snapshot(&blob)
                 .context("failed to inspect store archive")?;
@@ -1011,6 +1018,7 @@ pub(crate) fn resolve_workload(
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 archive_sha256,
+                publisher,
                 name,
                 version,
                 ports,
@@ -1044,9 +1052,12 @@ pub(crate) fn resolve_workload(
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+        // A path records no publisher; the identity comes from the signing key.
+        let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
         return Ok(ResolvedWorkload {
             archive_path: path,
             archive_sha256,
+            publisher,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
             ports,
@@ -1104,7 +1115,10 @@ pub(crate) fn resolve_workload(
     // The declared unmeasured-data set comes from the manifest (committed to
     // PCR23), not the source TOML, so every deploy mode resolves the same set.
     let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+    // A workload directory records no publisher either.
+    let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
     Ok(ResolvedWorkload {
+        publisher,
         archive_path,
         archive_sha256,
         name: result.manifest.meta.name,
@@ -1855,8 +1869,10 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
-            format: 1,
+            format: 3,
             instance_name: "test-instance".to_string(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "test-workload".to_string(),
             workload_version: "v0.0.1".to_string(),
             target_name: "test-target".to_string(),
@@ -2000,8 +2016,7 @@ mod tls_measurement_policy_tests {
             .path()
             .join("baseimage")
             .join("measurements")
-            .join(atakit_image::encode_image_ref_path_segment("base"))
-            .join(atakit_image::encode_image_ref_path_segment("v1"));
+            .join("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
 
@@ -2035,7 +2050,7 @@ mod tls_measurement_policy_tests {
 
         let error = resolve_tls_measurement_policy(
             None,
-            Some("base:v1"),
+            Some("0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/base:v1"),
             Some([0x11; 32]),
             &[],
             data_dir.path(),

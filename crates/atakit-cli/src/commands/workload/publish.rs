@@ -46,13 +46,10 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         let archive_str = archive_arg.to_string_lossy();
         if looks_like_store_ref(&archive_str) {
             let store = WorkloadStore::new(&env.workload_dir);
-            let (name, version) = archive_str
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = super::parse_workload_ref(&archive_str, &config.alias)?.workload_id();
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
+                bail!("no archive blob for {archive_str} in store");
             }
             blob
         } else {
@@ -67,6 +64,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     };
 
     let opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive),
         workload_dir: None,
         engine,
@@ -115,13 +113,14 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             .base_image
             .iter()
             .map(|entry| {
-                let (name, version) = entry.split_once(':').ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid base-image entry '{}': expected name:version format",
-                        entry,
-                    )
-                })?;
-                Ok(super::compute_base_image_id(name, version))
+                // Manifest base-image entries are canonical, publisher-qualified
+                // references: the manifest is measured, so an alias can never
+                // appear here.
+                let app_ref: automata_tee_workload_measurement::types::AppRef =
+                    entry.parse().map_err(|error| {
+                        anyhow::anyhow!("invalid base-image entry '{entry}': {error}")
+                    })?;
+                Ok(super::compute_base_image_id(&app_ref))
             })
             .collect::<Result<Vec<_>>>()?
     };
@@ -215,9 +214,18 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     let registry = measurement.workload_registry();
 
-    // Compute workload ID and display summary before publishing.
-    let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    // The workload is published as whoever signs the registration, so the
+    // owner key's fingerprint is its publisher and therefore part of its
+    // identifier.
+    let publisher = super::owner_fingerprint(&private_key_raw)?;
+    let publisher_hex = format!("{publisher:#x}");
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        publisher,
+        manifest.meta.name.clone(),
+        manifest.meta.version.clone(),
+    );
+    let workload_id = super::compute_workload_id(&workload_app_ref);
+    let workload_id_hex = format!("{workload_id:#x}");
     let base_image_mode_str = &manifest.config.base_image_mode;
 
     println!(
@@ -385,7 +393,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         {
             let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
-            let existing_meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version) {
+            let existing_meta = match store.load_meta(&workload_id_hex) {
                 Ok(meta) => meta,
                 Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
                 Err(error) => return Err(error.into()),
@@ -393,6 +401,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
             let meta = match existing_meta {
                 Some(mut m) => {
                     m.workload_id = workload_id_hex.clone();
+                    m.publisher = publisher_hex.clone();
+                    m.publisher = publisher_hex.clone();
                     m.sha256 = Some(result.sha256.clone());
                     m.pcr23 = Some(result.pcr23_sha256.clone());
                     apply_chain_data_to_meta(&mut m, &chain_data);
@@ -403,6 +413,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                     let mut m = WorkloadMeta {
                         metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                         workload_id: workload_id_hex.clone(),
+                        publisher: publisher_hex.clone(),
                         name: manifest.meta.name.clone(),
                         version: manifest.meta.version.clone(),
                         sha256: Some(result.sha256.clone()),
@@ -451,7 +462,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
         let store = WorkloadStore::new(&env.workload_dir);
         let now = chrono::Local::now().to_rfc3339();
-        let existing_meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version) {
+        let existing_meta = match store.load_meta(&workload_id_hex) {
             Ok(meta) => meta,
             Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
             Err(error) => return Err(error.into()),
@@ -459,6 +470,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         let meta = match existing_meta {
             Some(mut m) => {
                 m.workload_id = workload_id_hex.clone();
+                m.publisher = publisher_hex.clone();
                 m.sha256 = Some(result.sha256.clone());
                 m.pcr23 = Some(result.pcr23_sha256.clone());
                 apply_chain_data_to_meta(&mut m, &chain_data);
@@ -469,6 +481,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
                 let mut m = WorkloadMeta {
                     metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                     workload_id: workload_id_hex.clone(),
+                    publisher: publisher_hex.clone(),
                     name: manifest.meta.name.clone(),
                     version: manifest.meta.version.clone(),
                     sha256: Some(result.sha256.clone()),

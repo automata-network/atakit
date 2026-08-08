@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::PlatformKind;
 use crate::error::CloudError;
 
-const FORMAT_VERSION: u32 = 2;
-const LEGACY_FORMAT_VERSION: u32 = 1;
+/// Format 3 records the workload publisher. Format 2 cannot be migrated: the
+/// publisher is not derivable from a name and version, and it is now an input
+/// to the workload identifier, so a format 2 deployment cannot be resolved to a
+/// registered workload at all.
+const FORMAT_VERSION: u32 = 3;
 pub const DEFAULT_PORTAL_INIT_PORT: u16 = 1024;
 pub const DEFAULT_PORTAL_STATUS_PORT: u16 = 2024;
 
@@ -44,6 +47,11 @@ impl Default for PortalPorts {
 pub struct DeployState {
     pub format: u32,
     pub instance_name: String,
+    /// Owner fingerprint of the workload's publisher. Stored rather than the
+    /// derived identifier so the state still shows a readable reference and can
+    /// recompute the identifier, instead of holding an opaque hash whose
+    /// provenance cannot be checked.
+    pub workload_publisher: String,
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
@@ -235,6 +243,11 @@ fn state_path(data_dir: &Path, target: &str, instance: &str) -> PathBuf {
 /// Parameters for creating a new deployment state.
 pub struct NewDeployParams {
     pub instance_name: String,
+    /// Owner fingerprint of the workload's publisher. Stored rather than the
+    /// derived identifier so the state still shows a readable reference and can
+    /// recompute the identifier, instead of holding an opaque hash whose
+    /// provenance cannot be checked.
+    pub workload_publisher: String,
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
@@ -257,6 +270,7 @@ impl DeployState {
         Self {
             format: FORMAT_VERSION,
             instance_name: params.instance_name,
+            workload_publisher: params.workload_publisher,
             workload_name: params.workload_name,
             workload_version: params.workload_version,
             target_name: params.target_name,
@@ -293,11 +307,7 @@ impl DeployState {
                 }
             }
         })?;
-        let (state, migrated) = decode_deploy_state(&content, &path)?;
-        if migrated {
-            write_state_file(&path, &state)?;
-        }
-        Ok(state)
+        decode_deploy_state(&content, &path)
     }
 
     /// Save state to disk (atomic via temp file + rename).
@@ -486,8 +496,8 @@ impl DeployState {
     }
 }
 
-fn decode_deploy_state(content: &str, path: &Path) -> Result<(DeployState, bool), CloudError> {
-    let mut value: serde_json::Value =
+fn decode_deploy_state(content: &str, path: &Path) -> Result<DeployState, CloudError> {
+    let value: serde_json::Value =
         serde_json::from_str(content).map_err(|e| CloudError::State {
             message: format!("failed to parse {}: {e}", path.display()),
         })?;
@@ -507,47 +517,25 @@ fn decode_deploy_state(content: &str, path: &Path) -> Result<(DeployState, bool)
         ),
     })?;
 
-    let migrated = match format {
-        LEGACY_FORMAT_VERSION => {
-            let init_env = value
-                .get_mut("init_env")
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| CloudError::State {
-                    message: format!(
-                        "failed to migrate {}: format 1 init_env is missing or is not an object",
-                        path.display()
-                    ),
-                })?;
-            if init_env.contains_key("sp1_payer") && init_env.contains_key("prover_credential") {
-                return Err(CloudError::State {
-                    message: format!(
-                        "failed to migrate {}: format 1 init_env contains both sp1_payer and prover_credential",
-                        path.display()
-                    ),
-                });
-            }
-            if let Some(value) = init_env.remove("sp1_payer") {
-                init_env.insert("prover_credential".into(), value);
-            }
-            value["base_image_ref"] = serde_json::Value::Null;
-            value["format"] = serde_json::json!(FORMAT_VERSION);
-            true
-        }
-        FORMAT_VERSION => false,
-        other => {
-            return Err(CloudError::State {
-                message: format!(
-                    "failed to parse {}: unsupported format {other}",
-                    path.display()
-                ),
-            });
-        }
-    };
+    // No format below the current one can be migrated. The publisher is an
+    // input to the workload identifier and is not derivable from a name and
+    // version, so an older deployment cannot be resolved to a registered
+    // workload at all. Migration would have to invent the value it is missing.
+    if format != FORMAT_VERSION {
+        return Err(CloudError::State {
+            message: format!(
+                "failed to parse {}: format {format} predates publisher-qualified workload \
+                 identifiers and cannot be migrated, because the publisher is not derivable from \
+                 a name and version. Redeploy the instance.",
+                path.display()
+            ),
+        });
+    }
 
     let state: DeployState = serde_json::from_value(value).map_err(|e| CloudError::State {
         message: format!("failed to parse {}: {e}", path.display()),
     })?;
-    Ok((state, migrated))
+    Ok(state)
 }
 
 fn write_state_file(path: &Path, state: &DeployState) -> Result<(), CloudError> {
@@ -664,6 +652,8 @@ mod tests {
     fn test_state() -> DeployState {
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "test-instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "my-workload".into(),
             workload_version: "v0.0.1".into(),
             target_name: "prod-gcp".into(),
@@ -691,7 +681,7 @@ mod tests {
 
     fn format_1_value(sp1_payer: serde_json::Value) -> serde_json::Value {
         let mut value = serde_json::to_value(test_state()).unwrap();
-        value["format"] = serde_json::json!(LEGACY_FORMAT_VERSION);
+        value["format"] = serde_json::json!(1);
         let init_env = value["init_env"].as_object_mut().unwrap();
         init_env.remove("prover_credential");
         init_env.insert("sp1_payer".into(), sp1_payer);
@@ -740,74 +730,38 @@ mod tests {
         assert!(error.to_string().contains("sp1_payer"));
     }
 
+    /// Formats below the current one are refused, not migrated.
+    ///
+    /// The publisher is an input to the workload identifier and is not
+    /// derivable from a name and version, so an older deployment cannot be
+    /// resolved to a registered workload. Migration would have to invent the
+    /// value it lacks, and a deployment silently pointing at the wrong
+    /// workload is worse than one that refuses to load.
     #[test]
-    fn format_1_null_sp1_payer_loads_and_rewrites_as_format_2() {
-        let dir = TempDir::new().unwrap();
-        let path = write_state_value(dir.path(), &format_1_value(serde_json::Value::Null));
+    fn older_formats_are_refused_with_a_reason_and_a_remedy() {
+        for older in [1, 2] {
+            let dir = TempDir::new().unwrap();
+            let mut value = format_1_value(serde_json::Value::Null);
+            value["format"] = serde_json::json!(older);
+            let path = write_state_value(dir.path(), &value);
 
-        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
-        assert_eq!(loaded.format, FORMAT_VERSION);
-        assert_eq!(loaded.init_env.prover_credential, None);
-        assert_eq!(loaded.base_image_ref, None);
-
-        let rewritten: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(rewritten["format"], FORMAT_VERSION);
-        assert_eq!(
-            rewritten["init_env"]["prover_credential"],
-            serde_json::Value::Null
-        );
-        assert!(rewritten["init_env"].get("sp1_payer").is_none());
-    }
-
-    #[test]
-    fn format_1_sp1_payer_reference_becomes_prover_credential() {
-        let dir = TempDir::new().unwrap();
-        write_state_value(dir.path(), &format_1_value(serde_json::json!("prover-key")));
-
-        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
-        assert_eq!(
-            loaded.init_env.prover_credential.as_deref(),
-            Some("prover-key")
-        );
-    }
-
-    #[test]
-    fn format_1_rejects_conflicting_prover_fields() {
-        let dir = TempDir::new().unwrap();
-        let mut value = format_1_value(serde_json::Value::Null);
-        value["init_env"]["prover_credential"] = serde_json::json!("new-key");
-        write_state_value(dir.path(), &value);
-
-        let error = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap_err();
-        let detail = error.to_string();
-        assert!(detail.contains("both sp1_payer and prover_credential"));
-    }
-
-    #[test]
-    fn format_2_rejects_sp1_payer() {
-        let dir = TempDir::new().unwrap();
-        let mut value = serde_json::to_value(test_state()).unwrap();
-        value["init_env"]["sp1_payer"] = serde_json::Value::Null;
-        write_state_value(dir.path(), &value);
-
-        let error = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap_err();
-        assert!(error.to_string().contains("sp1_payer"));
-    }
-
-    #[test]
-    fn format_1_migration_preserves_status_and_destroy_resource_identifiers() {
-        let dir = TempDir::new().unwrap();
-        write_state_value(dir.path(), &format_1_value(serde_json::Value::Null));
-
-        let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
-        let gcp = loaded.resources.gcp.unwrap();
-        assert_eq!(gcp.project, "my-project");
-        assert_eq!(gcp.zone, "us-central1-a");
-        assert_eq!(gcp.instance.as_deref(), Some("test-instance"));
-        assert_eq!(gcp.firewall_rule.as_deref(), Some("test-instance-ingress"));
-        assert_eq!(gcp.disks, ["test-instance-data"]);
-        assert_eq!(gcp.external_ip.as_deref(), Some("192.0.2.10"));
+            let error = DeployState::load(dir.path(), "prod-gcp", "test-instance")
+                .expect_err("an older format must not load");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("format {older}")),
+                "the failure must name the format; got {message}"
+            );
+            assert!(
+                message.contains("publisher"),
+                "the failure must say why it cannot be migrated; got {message}"
+            );
+            assert!(
+                message.contains("Redeploy"),
+                "the failure must say what to do; got {message}"
+            );
+            assert!(path.exists(), "a refused load must not remove the file");
+        }
     }
 
     #[test]
@@ -822,6 +776,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "web".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "my-app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
@@ -848,6 +804,8 @@ mod tests {
         for target in &["staging", "prod"] {
             let mut state = DeployState::new(NewDeployParams {
                 instance_name: "web".into(),
+                workload_publisher:
+                    "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
@@ -874,6 +832,8 @@ mod tests {
         for target in &["staging", "prod"] {
             let mut state = DeployState::new(NewDeployParams {
                 instance_name: "web".into(),
+                workload_publisher:
+                    "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
@@ -899,6 +859,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "del-me".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
