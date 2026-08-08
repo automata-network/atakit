@@ -469,33 +469,90 @@ pub struct AkBinding {
     pub data: String,
 }
 
+/// `schema` of a base-image measurement pack body.
+pub const BASE_IMAGE_MEASUREMENT_PACK_SCHEMA: &str = "atakit.base_image_measurement_pack.v4";
+/// `schema` of a workload measurement pack body.
+pub const WORKLOAD_MEASUREMENT_PACK_SCHEMA: &str = "atakit.workload_measurement_pack.v1";
+
+/// The envelope shared by every measurement pack, of either kind.
+///
+/// One implementation, because two copies of signature and subject verification
+/// are two chances to differ. `measurements` stays unparsed until the caller has
+/// checked the envelope and asserted which kind it asked for: a pack whose
+/// `schema` is the wrong kind must be rejected before its body is read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeasurementPack {
     pub schema: String,
     pub revision: u64,
-    #[serde(rename = "publishedAt")]
-    pub published_at: String,
-    #[serde(rename = "baseImage")]
-    pub base_image: BaseImage,
+    /// Publication time, Unix seconds.
+    ///
+    /// Not an RFC 3339 string: RFC 8785 canonicalizes JSON structure, not string
+    /// semantics, so three spellings of one instant are three distinct signed
+    /// byte strings. An integer admits exactly one encoding.
+    pub published_at: u64,
+    pub subject: Subject,
+    pub measurements: serde_json::Value,
+}
+
+impl MeasurementPack {
+    /// Interpret `measurements` as the requested kind.
+    ///
+    /// The schema is checked before the body is deserialized, so a workload pack
+    /// can never be read as a base-image pack or the reverse.
+    pub fn body<T: serde::de::DeserializeOwned>(&self, expected_schema: &str) -> Result<T> {
+        if self.schema != expected_schema {
+            return Err(AttestationError::MeasurementPack(format!(
+                "expected schema {expected_schema}, got {}",
+                self.schema
+            )));
+        }
+        serde_json::from_value(self.measurements.clone())
+            .map_err(|e| AttestationError::MeasurementPack(format!("measurements: {e}")))
+    }
+}
+
+/// What a pack makes a statement about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subject {
+    /// Owner fingerprint of the publisher, and an input to `id`.
+    pub publisher: String,
+    pub name: String,
+    pub version: String,
+    /// Expected derived id. The verifier recomputes it from `publisher`, `name`,
+    /// and `version` and rejects a mismatch, which is what makes the publisher
+    /// binding enforceable rather than advisory.
+    pub id: String,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub archive_sha256: Option<String>,
+}
+
+/// Body of a base-image measurement pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaseImageMeasurements {
     #[serde(default)]
     pub profiles: Vec<MeasurementProfile>,
 }
 
+/// Body of a workload measurement pack.
+///
+/// PCR23 is the hash of the compiled `manifest.json`, so these two values are
+/// the workload's complete measured identity. Both banks are required: a pack
+/// carrying only one would silently constrain nothing on a target attesting in
+/// the other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BaseImage {
-    pub name: String,
-    pub version: String,
-    pub id: String,
-    #[serde(default)]
-    pub uri: Option<String>,
-    #[serde(rename = "archiveSha256", default)]
-    pub archive_sha256: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct WorkloadMeasurements {
+    pub pcr23_sha256: String,
+    pub pcr23_sha384: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementProfile {
     pub name: String,
     pub id: String,
@@ -513,11 +570,11 @@ pub struct MeasurementProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementVariant {
     pub name: String,
     pub id: String,
-    #[serde(rename = "machineTypes", default)]
+    #[serde(default)]
     pub machine_types: Vec<String>,
     #[serde(default)]
     pub variant_pcrs256: Vec<PcrSpec256>,
@@ -777,7 +834,9 @@ struct AzureJwk {
 pub fn parse_measurement_pack(bytes: &[u8]) -> Result<MeasurementPack> {
     let pack: MeasurementPack = serde_json::from_slice(bytes)
         .map_err(|e| AttestationError::MeasurementPack(e.to_string()))?;
-    if pack.schema != "atakit.measurement-pack.v3" {
+    if pack.schema != BASE_IMAGE_MEASUREMENT_PACK_SCHEMA
+        && pack.schema != WORKLOAD_MEASUREMENT_PACK_SCHEMA
+    {
         return Err(AttestationError::MeasurementPack(format!(
             "unsupported schema {}",
             pack.schema
@@ -1380,37 +1439,66 @@ fn verify_tls_attestation_internal(
             &mut report,
             &mut errors,
             "measurement-pack-schema",
-            policy.pack.schema == "atakit.measurement-pack.v3",
-            format!("unsupported schema {}", policy.pack.schema),
+            policy.pack.schema == BASE_IMAGE_MEASUREMENT_PACK_SCHEMA,
+            format!(
+                "expected schema {BASE_IMAGE_MEASUREMENT_PACK_SCHEMA}, got {}",
+                policy.pack.schema
+            ),
         );
 
-        let expected_base_image_id = compute_base_image_id(
-            &policy.pack.base_image.name,
-            &policy.pack.base_image.version,
-        );
-        match decode_hex_32("baseImage.id", &policy.pack.base_image.id) {
-            Ok(id) => {
+        // Recomputing the id from the publisher is what makes the publisher
+        // binding enforceable rather than advisory: a pack claiming one
+        // publisher while carrying another's measurements derives an id that
+        // does not match, and fails before any measurement is read.
+        let subject = &policy.pack.subject;
+        let expected_base_image_id = match decode_hex_32("subject.publisher", &subject.publisher) {
+            Ok(publisher) => {
+                Some(compute_base_image_id(&publisher, &subject.name, &subject.version))
+            }
+            Err(e) => {
+                fail(&mut report, &mut errors, "subject-publisher", e.to_string());
+                None
+            }
+        };
+        match (
+            decode_hex_32("subject.id", &subject.id),
+            expected_base_image_id,
+        ) {
+            (Ok(id), Some(expected)) => {
                 check(
                     &mut report,
                     &mut errors,
                     "base-image-id",
-                    id == expected_base_image_id,
+                    id == expected,
                     format!(
-                        "baseImage.id does not match derived id for {}:{}; expected {}",
-                        policy.pack.base_image.name,
-                        policy.pack.base_image.version,
-                        hex0x(&expected_base_image_id)
+                        "subject.id does not match the id derived from {}/{}:{}; expected {}",
+                        subject.publisher,
+                        subject.name,
+                        subject.version,
+                        hex0x(&expected)
                     ),
                 );
-                if id == expected_base_image_id {
+                if id == expected {
                     verified_base_image_id = Some(id);
                 }
             }
-            Err(e) => fail(&mut report, &mut errors, "base-image-id", e.to_string()),
+            (Err(e), _) => fail(&mut report, &mut errors, "base-image-id", e.to_string()),
+            (_, None) => {}
         }
 
-        let matching_profiles = policy
+        let body: BaseImageMeasurements = match policy
             .pack
+            .body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+        {
+            Ok(body) => body,
+            Err(e) => {
+                fail(&mut report, &mut errors, "measurement-pack-body", e.to_string());
+                BaseImageMeasurements {
+                    profiles: Vec::new(),
+                }
+            }
+        };
+        let matching_profiles = body
             .profiles
             .iter()
             .filter(|profile| {
@@ -1477,8 +1565,21 @@ fn verify_tls_attestation_internal(
             _ => pass(&mut report, "pcr-bank-selection"),
         }
 
-        let expected_profile_id =
-            compute_platform_profile_id(&expected_base_image_id, &profile.name);
+        // The spec derives the profile id from subject.id, so this only means
+        // anything once subject.id has been verified against the publisher.
+        let Some(subject_id) = verified_base_image_id else {
+            fail(
+                &mut report,
+                &mut errors,
+                "platform-profile-id",
+                "cannot derive the profile id because subject.id did not verify".to_string(),
+            );
+            return Err(VerificationFailure {
+                report: Box::new(report),
+                errors,
+            });
+        };
+        let expected_profile_id = compute_platform_profile_id(&subject_id, &profile.name);
         match decode_hex_32("profile.id", &profile.id) {
             Ok(id) => {
                 check(
@@ -2345,9 +2446,16 @@ pub fn compute_tls_bootstrap_qualifying_data(
     Keccak256::digest(encoded).into()
 }
 
-pub fn compute_base_image_id(name: &str, version: &str) -> [u8; 32] {
-    let domain: [u8; 32] = Keccak256::digest(b"CVM_BASEIMAGE_V1").into();
-    Keccak256::digest(abi_encode_bytes32_string_string(&domain, name, version)).into()
+/// The on-chain base-image identifier.
+///
+/// Delegates to the registry crate that defines the encoding. A local copy that
+/// drifted would derive identifiers registered to nobody.
+pub fn compute_base_image_id(publisher: &[u8; 32], name: &str, version: &str) -> [u8; 32] {
+    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
+    use automata_tee_workload_measurement::types::AppRef;
+
+    let app_ref = AppRef::new(alloy::primitives::B256::from(*publisher), name, version);
+    BaseImageRegistry::get_image_id(&app_ref).into()
 }
 
 pub fn compute_platform_profile_id(base_image_id: &[u8; 32], profile_name: &str) -> [u8; 32] {
@@ -3553,24 +3661,22 @@ mod tests {
     ) -> MeasurementPolicy {
         let expected_pcr = decode_hex_32("expected_pcr", expected_pcr)
             .expect("test PCR policy must contain one SHA-256 value");
-        let base_image_id = compute_base_image_id("base", "v1");
+        let base_image_id = compute_base_image_id(&TEST_PUBLISHER, "base", "v1");
         let profile_name = format!("{cloud}-{tee}");
         let profile_id = compute_platform_profile_id(&base_image_id, &profile_name);
         let variant_id = compute_variant_id(&profile_id, machine_type);
         MeasurementPolicy {
             source: "test-pack".to_string(),
-            pack: MeasurementPack {
-                schema: "atakit.measurement-pack.v3".to_string(),
-                revision: 1,
-                published_at: "2026-07-07T00:00:00Z".to_string(),
-                base_image: BaseImage {
+            pack: base_image_pack(
+                Subject {
+                    publisher: hex0x(&TEST_PUBLISHER),
                     name: "base".to_string(),
                     version: "v1".to_string(),
                     id: hex0x(&base_image_id),
                     uri: None,
                     archive_sha256: None,
                 },
-                profiles: vec![MeasurementProfile {
+                vec![MeasurementProfile {
                     name: profile_name,
                     id: hex0x(&profile_id),
                     cloud: cloud.to_string(),
@@ -3591,7 +3697,71 @@ mod tests {
                     invariant_pcrs384: Vec::new(),
                     attributes: Vec::new(),
                 }],
-            },
+            ),
+        }
+    }
+
+    /// Fixed publisher for tests that are not about publisher handling.
+    const TEST_PUBLISHER: [u8; 32] = [0xaa; 32];
+
+    /// Borrow the profiles inside a base-image pack body, writing them back on
+    /// drop. Tests mutate profiles constantly; the production type keeps the
+    /// body unparsed so the schema is checked before it is read.
+    struct ProfilesGuard<'a> {
+        pack: &'a mut MeasurementPack,
+        profiles: Vec<MeasurementProfile>,
+    }
+
+    impl std::ops::Deref for ProfilesGuard<'_> {
+        type Target = Vec<MeasurementProfile>;
+        fn deref(&self) -> &Self::Target {
+            &self.profiles
+        }
+    }
+
+    impl std::ops::DerefMut for ProfilesGuard<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.profiles
+        }
+    }
+
+    impl Drop for ProfilesGuard<'_> {
+        fn drop(&mut self) {
+            self.pack.measurements = serde_json::to_value(BaseImageMeasurements {
+                profiles: std::mem::take(&mut self.profiles),
+            })
+            .expect("serialize test measurements");
+        }
+    }
+
+    impl MeasurementPack {
+        fn profiles_mut(&mut self) -> ProfilesGuard<'_> {
+            let body: BaseImageMeasurements = self
+                .body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+                .expect("test pack must be a base-image pack");
+            ProfilesGuard {
+                pack: self,
+                profiles: body.profiles,
+            }
+        }
+
+        fn profiles(&self) -> Vec<MeasurementProfile> {
+            let body: BaseImageMeasurements = self
+                .body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+                .expect("test pack must be a base-image pack");
+            body.profiles
+        }
+    }
+
+    /// Build a base-image pack envelope around a profile list.
+    fn base_image_pack(subject: Subject, profiles: Vec<MeasurementProfile>) -> MeasurementPack {
+        MeasurementPack {
+            schema: BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
+            revision: 1,
+            published_at: 1_786_000_000,
+            subject,
+            measurements: serde_json::to_value(BaseImageMeasurements { profiles })
+                .expect("serialize test measurements"),
         }
     }
 
@@ -3995,8 +4165,8 @@ mod tests {
     #[test]
     fn base_image_id_matches_existing_vector() {
         assert_eq!(
-            hex0x(&compute_base_image_id("test-image", "v1.0.0")),
-            "0xe1a0a8f3eb93a84d2c524e46e6604d6dea9f5254e5b2eefb07134fa47f7173a5"
+            hex0x(&compute_base_image_id(&TEST_PUBLISHER, "test-image", "v1.0.0")),
+            "0x7a66632ee498e2b70e9d9a39f6c42f2d3e044cbff702f43d0d18c4df69a63f39"
         );
     }
 
@@ -4083,11 +4253,11 @@ mod tests {
         assert!(failure.errors.iter().any(|error| error.check == check_name));
 
         let mut policy = measurement_policy(&pcr);
-        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+        policy.pack.profiles_mut()[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
             "value": false,
         })];
-        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+        policy.pack.profiles_mut()[0].variants[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
             "value": true,
         })];
@@ -4234,10 +4404,10 @@ mod tests {
             atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
             atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
         ] {
-            policy.pack.profiles[0]
+            policy.pack.profiles_mut()[0]
                 .attributes
                 .push(serde_json::json!({"name": name, "value": false}));
-            policy.pack.profiles[0].variants[0]
+            policy.pack.profiles_mut()[0].variants[0]
                 .attributes
                 .push(serde_json::json!({"name": name, "value": true}));
         }
@@ -4375,7 +4545,7 @@ mod tests {
         // Invariant PCR4 is deliberately wrong; the variant tries to relax it to the value the
         // machine actually reports. Previously the override won and `pcr-4-static` passed.
         let mut policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
-        policy.pack.profiles[0].variants[0]
+        policy.pack.profiles_mut()[0].variants[0]
             .variant_pcrs256
             .push(PcrSpec256 {
                 pcr_index: 4,
@@ -4421,7 +4591,8 @@ mod tests {
     #[test]
     fn effective_pcr_specs_rejects_variant_pinning_an_invariant() {
         let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
-        let profile = &policy.pack.profiles[0];
+        let profiles = policy.pack.profiles();
+        let profile = &profiles[0];
         let mut variant = profile.variants[0].clone();
         variant.variant_pcrs256.push(PcrSpec256 {
             pcr_index: 4,
@@ -4436,7 +4607,8 @@ mod tests {
     #[test]
     fn effective_pcr_specs_allows_disjoint_variant() {
         let policy = measurement_policy(&format!("0x{}", "bb".repeat(32)));
-        let profile = &policy.pack.profiles[0];
+        let profiles = policy.pack.profiles();
+        let profile = &profiles[0];
         let mut variant = profile.variants[0].clone();
         variant.variant_pcrs256.push(PcrSpec256 {
             pcr_index: 10,
@@ -4454,7 +4626,7 @@ mod tests {
         let cert = b"cert";
         let (response, gcp_roots) = gcp_response_and_roots(nonce, cert);
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariant_pcrs256[0]
+        policy.pack.profiles_mut()[0].invariant_pcrs256[0]
             .comparison
             .push_str("00");
 
@@ -4492,13 +4664,13 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        let mut duplicate = policy.pack.profiles[0].clone();
+        let mut duplicate = policy.pack.profiles_mut()[0].clone();
         duplicate.name = "gcp-tdx-duplicate".to_string();
         duplicate.id = hex0x(&compute_platform_profile_id(
-            &compute_base_image_id("base", "v1"),
+            &compute_base_image_id(&TEST_PUBLISHER, "base", "v1"),
             &duplicate.name,
         ));
-        policy.pack.profiles.push(duplicate);
+        policy.pack.profiles_mut().push(duplicate);
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4524,11 +4696,11 @@ mod tests {
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
         let profile_id =
-            compute_platform_profile_id(&compute_base_image_id("base", "v1"), "gcp-tdx");
-        let mut duplicate = policy.pack.profiles[0].variants[0].clone();
+            compute_platform_profile_id(&compute_base_image_id(&TEST_PUBLISHER, "base", "v1"), "gcp-tdx");
+        let mut duplicate = policy.pack.profiles_mut()[0].variants[0].clone();
         duplicate.name = "c3-standard-4-duplicate".to_string();
         duplicate.id = hex0x(&compute_variant_id(&profile_id, &duplicate.name));
-        policy.pack.profiles[0].variants.push(duplicate);
+        policy.pack.profiles_mut()[0].variants.push(duplicate);
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4553,7 +4725,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].variants[0].machine_types.clear();
+        policy.pack.profiles_mut()[0].variants[0].machine_types.clear();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4578,7 +4750,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariant_pcrs256.clear();
+        policy.pack.profiles_mut()[0].invariant_pcrs256.clear();
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -4603,7 +4775,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariant_pcrs256[0].comparison =
+        policy.pack.profiles_mut()[0].invariant_pcrs256[0].comparison =
             dynamic_comparison256(DYNAMIC_SUBSET, vec![[0xaa; 32]]);
 
         let failure = verify_tls_attestation(VerificationInputs {
@@ -4630,7 +4802,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].invariant_pcrs256[0].comparison =
+        policy.pack.profiles_mut()[0].invariant_pcrs256[0].comparison =
             dynamic_comparison256(DYNAMIC_SUBSEQUENCE, vec![[0xaa; 32]]);
 
         let failure = verify_tls_attestation(VerificationInputs {
@@ -4679,7 +4851,7 @@ mod tests {
         let cert = b"cert";
         let response = response_for(nonce, cert, "gcp");
         let mut policy = measurement_policy(&format!("0x{}", "aa".repeat(32)));
-        policy.pack.profiles[0].variants[0].id = format!("0x{}", "44".repeat(32));
+        policy.pack.profiles_mut()[0].variants[0].id = format!("0x{}", "44".repeat(32));
 
         let failure = verify_tls_attestation(VerificationInputs {
             nonce,
@@ -5150,11 +5322,11 @@ mod tests {
         assert!(failure.errors.iter().any(|error| error.check == check_name));
 
         let mut policy = measurement_policy_for_cloud(&pcr, "azure");
-        policy.pack.profiles[0].attributes = vec![serde_json::json!({
+        policy.pack.profiles_mut()[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
             "value": false,
         })];
-        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
+        policy.pack.profiles_mut()[0].variants[0].attributes = vec![serde_json::json!({
             "name": atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME,
             "value": true,
         })];
@@ -5181,7 +5353,8 @@ mod tests {
         let response = response_for(nonce, b"cert", "gcp");
         let evidence = response.tee_evidence.as_ref().expect("GCP TDX evidence");
         let mut policy = measurement_policy_for_cloud(&format!("0x{}", "aa".repeat(32)), "gcp");
-        let profile = &policy.pack.profiles[0];
+        let snapshot = policy.pack.profiles();
+        let profile = &snapshot[0];
         let variant = &profile.variants[0];
         let mut report = VerificationReport {
             checks: Vec::new(),
@@ -5206,14 +5379,17 @@ mod tests {
             .iter()
             .any(|error| { error.check == "tee-attribute-workload-intel-tdx-tcb-status" }));
 
-        policy.pack.profiles[0].attributes = vec![serde_json::json!({
-            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
-            "value": ["ok"],
-        })];
-        policy.pack.profiles[0].variants[0].attributes = vec![serde_json::json!({
-            "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
-            "value": ["ok", "configuration-needed"],
-        })];
+        {
+            let mut profiles = policy.pack.profiles_mut();
+            profiles[0].attributes = vec![serde_json::json!({
+                "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+                "value": ["ok"],
+            })];
+            profiles[0].variants[0].attributes = vec![serde_json::json!({
+                "name": atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME,
+                "value": ["ok", "configuration-needed"],
+            })];
+        }
         let requirements = BTreeMap::from([(
             atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_NAME.to_string(),
             vec![
@@ -5227,12 +5403,13 @@ mod tests {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "tdx",
             Some(evidence),
             Some(0x8),
@@ -5342,7 +5519,7 @@ mod tests {
             required_launch_mitigation_vector: 0,
             required_current_mitigation_vector: 0,
         };
-        policy.pack.profiles[0].attributes = vec![
+        policy.pack.profiles_mut()[0].attributes = vec![
             serde_json::json!({
                 "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
                 "value": "0x00000000df1e000500000000de1d000400000000de1d000400000000de1d0004",
@@ -5352,7 +5529,7 @@ mod tests {
                 "value": "0x0000000000000000000000000000000000000000000000200000000000000000",
             }),
         ];
-        policy.pack.profiles[0].variants[0].attributes = vec![
+        policy.pack.profiles_mut()[0].variants[0].attributes = vec![
             serde_json::json!({
                 "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
                 "value": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
@@ -5367,12 +5544,13 @@ mod tests {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5385,12 +5563,13 @@ mod tests {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5430,7 +5609,7 @@ mod tests {
             "sev-snp",
             "n2d-standard-4",
         );
-        policy.pack.profiles[0].variants[0].attributes = vec![
+        policy.pack.profiles_mut()[0].variants[0].attributes = vec![
             serde_json::json!({
                 "name": atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_NAME,
                 "value": lower_tcb,
@@ -5458,12 +5637,13 @@ mod tests {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5481,8 +5661,8 @@ mod tests {
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5514,12 +5694,13 @@ mod tests {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5528,17 +5709,18 @@ mod tests {
         );
         assert!(errors.is_empty(), "{errors:?}");
 
-        policy.pack.profiles[0].variants[0].attributes.clear();
+        policy.pack.profiles_mut()[0].variants[0].attributes.clear();
         let mut report = VerificationReport {
             checks: Vec::new(),
             evidence: EvidenceSummary::default(),
         };
+        let profiles_snapshot = policy.pack.profiles();
         let mut errors = Vec::new();
         verify_measurement_attributes(
             &mut report,
             &mut errors,
-            &policy.pack.profiles[0],
-            &policy.pack.profiles[0].variants[0],
+            &profiles_snapshot[0],
+            &profiles_snapshot[0].variants[0],
             "sev-snp",
             Some(&evidence),
             None,
@@ -5607,10 +5789,10 @@ mod tests {
             atakit_core::tee_attributes::AMD_SEV_SNP_DEBUG_NAME,
             atakit_core::tee_attributes::AMD_SEV_SNP_MIGRATE_MA_NAME,
         ] {
-            policy.pack.profiles[0]
+            policy.pack.profiles_mut()[0]
                 .attributes
                 .push(serde_json::json!({"name": name, "value": false}));
-            policy.pack.profiles[0].variants[0]
+            policy.pack.profiles_mut()[0].variants[0]
                 .attributes
                 .push(serde_json::json!({"name": name, "value": true}));
         }
@@ -6324,20 +6506,20 @@ mod tests {
     #[test]
     fn parse_measurement_pack_json() {
         let bytes = br#"{
-          "schema":"atakit.measurement-pack.v3",
+          "schema":"atakit.base_image_measurement_pack.v4",
           "revision":1,
-          "publishedAt":"2026-07-07T00:00:00Z",
-          "baseImage":{"name":"automata-linux","version":"v0.5.0","id":"0x00"},
-          "profiles":[]
+          "published_at":1786000000,
+          "subject":{"name":"automata-linux","version":"v0.5.0","id":"0x00","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+          "measurements":{"profiles":[]}
         }"#;
         let pack = parse_measurement_pack(bytes).unwrap();
-        assert_eq!(pack.schema, "atakit.measurement-pack.v3");
-        assert_eq!(pack.base_image.name, "automata-linux");
+        assert_eq!(pack.schema, BASE_IMAGE_MEASUREMENT_PACK_SCHEMA);
+        assert_eq!(pack.subject.name, "automata-linux");
     }
 
     #[test]
     fn parse_measurement_pack_rejects_version_1() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v1"}"#;
+        let bytes = br#"{"measurements":{"profiles":[]},"published_at":1786000000,"revision":1,"schema":"atakit.measurement-pack.v1","subject":{"id":"0x00","name":"base","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"v1"}}"#;
 
         let err = parse_measurement_pack(bytes).unwrap_err();
 
@@ -6348,7 +6530,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_accepts_trusted_es256k_signature() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v3"}"#;
+        let bytes = br#"{"measurements":{"profiles":[]},"published_at":1786000000,"revision":1,"schema":"atakit.base_image_measurement_pack.v4","subject":{"id":"0x00","name":"base","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"v1"}}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
         let trusted_key = signing_key
@@ -6359,12 +6541,12 @@ mod tests {
 
         let pack = verify_measurement_pack(bytes, &signature.to_bytes(), &[trusted_key]).unwrap();
 
-        assert_eq!(pack.base_image.name, "base");
+        assert_eq!(pack.subject.name, "base");
     }
 
     #[test]
     fn verify_measurement_pack_rejects_missing_trusted_key() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v3"}"#;
+        let bytes = br#"{"measurements":{"profiles":[]},"published_at":1786000000,"revision":1,"schema":"atakit.base_image_measurement_pack.v4","subject":{"id":"0x00","name":"base","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"v1"}}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
 
@@ -6377,7 +6559,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_rejects_untrusted_signature() {
-        let bytes = br#"{"baseImage":{"id":"0x00","name":"base","version":"v1"},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v3"}"#;
+        let bytes = br#"{"measurements":{"profiles":[]},"published_at":1786000000,"revision":1,"schema":"atakit.base_image_measurement_pack.v4","subject":{"id":"0x00","name":"base","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"v1"}}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let other_key = K256SigningKey::from_slice(&[8u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
@@ -6395,7 +6577,7 @@ mod tests {
 
     #[test]
     fn verify_measurement_pack_rejects_noncanonical_json() {
-        let bytes = br#"{"schema":"atakit.measurement-pack.v3","revision":1,"publishedAt":"2026-07-07T00:00:00Z","baseImage":{"name":"base","version":"v1","id":"0x00"},"profiles":[]}"#;
+        let bytes = br#"{"schema":"atakit.base_image_measurement_pack.v4","revision":1,"published_at":1786000000,"subject":{"name":"base","version":"v1","id":"0x00","publisher":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"measurements":{"profiles":[]}}"#;
         let signing_key = K256SigningKey::from_slice(&[9u8; 32]).expect("test publisher key");
         let signature: K256Signature = signing_key.sign(bytes);
         let trusted_key = signing_key

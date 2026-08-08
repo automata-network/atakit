@@ -10,11 +10,7 @@ use crate::portal::session::{self, VerifiedPortalTls};
 
 use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::{NetworkProvider, ProviderEx};
-use atakit_attestation::{
-    AmdSnpSecurityPolicy, AzureMaaTrustKey, BaseImage, MeasurementPack, MeasurementPolicy,
-    MeasurementProfile, MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384,
-    SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, TrustedSessionBinding,
-};
+use atakit_attestation::{Subject, AmdSnpSecurityPolicy, AzureMaaTrustKey, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384, TrustedSessionBinding};
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
 };
@@ -292,15 +288,24 @@ impl AttestationClient {
             &self.context.base_image_registry,
         )?;
         let provider = connect_provider(&self.config.rpc_url).await?;
-        let hierarchy = BaseImageRegistry::new(registry_address, provider)
-            .get_hierarchy(base_image_id)
+        let registry = BaseImageRegistry::new(registry_address, provider);
+        let hierarchy = registry.get_hierarchy(base_image_id).await.map_err(|error| {
+            AttestationClientError::Rpc(format!(
+                "fetch BaseImageRegistry hierarchy for {base_image}: {error}"
+            ))
+        })?;
+        // The subject carries the publisher, and a verifier recomputes the id
+        // from it. The hierarchy does not include the owner, so it is read
+        // separately rather than left blank, which would fail that check.
+        let owner = registry
+            .get_base_image_owner(base_image_id)
             .await
             .map_err(|error| {
                 AttestationClientError::Rpc(format!(
-                    "fetch BaseImageRegistry hierarchy for {base_image}: {error}"
+                    "fetch BaseImageRegistry owner for {base_image}: {error}"
                 ))
             })?;
-        hierarchy_to_measurement_policy(&hierarchy, &self.context.base_image_registry)
+        hierarchy_to_measurement_policy(&hierarchy, owner, &self.context.base_image_registry)
     }
 
     /// Fetch and validate the exact registered workload policy.
@@ -792,6 +797,7 @@ fn validate_expected_address(
 
 fn hierarchy_to_measurement_policy(
     hierarchy: &BaseImageHierarchy,
+    owner: alloy_ext::core::primitives::B256,
     registry: &str,
 ) -> Result<MeasurementPolicy, AttestationClientError> {
     let profiles = hierarchy
@@ -869,17 +875,23 @@ fn hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v3".to_string(),
+            schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
             revision: 1,
-            published_at: chrono::Utc::now().to_rfc3339(),
-            base_image: BaseImage {
+            published_at: chrono::Utc::now().timestamp().max(0) as u64,
+            subject: Subject {
+                publisher: hex0x(owner),
                 name: hierarchy.spec.name.clone(),
                 version: hierarchy.spec.version.clone(),
                 id: hex0x(hierarchy.base_image_id),
                 uri: (!hierarchy.spec.uri.is_empty()).then(|| hierarchy.spec.uri.clone()),
                 archive_sha256: None,
             },
-            profiles,
+            measurements: serde_json::to_value(atakit_attestation::BaseImageMeasurements {
+                profiles,
+            })
+            .map_err(|error| {
+                AttestationClientError::Rpc(format!("serialize measurements: {error}"))
+            })?,
         },
     })
 }

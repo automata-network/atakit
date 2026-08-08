@@ -121,11 +121,11 @@ pub fn load_measurement_policy(
         }
     })?;
     if let Some(app_ref) = base_image_ref {
-        if pack.base_image.name != app_ref.name || pack.base_image.version != app_ref.version {
+        if pack.subject.name != app_ref.name || pack.subject.version != app_ref.version {
             return Err(PortalVerificationError::Config {
                 message: format!(
                     "measurement pack is for {}:{}, not {}:{}",
-                    pack.base_image.name, pack.base_image.version, app_ref.name, app_ref.version
+                    pack.subject.name, pack.subject.version, app_ref.name, app_ref.version
                 ),
             });
         }
@@ -243,8 +243,10 @@ mod tests {
 
     fn measurement_pack_json(name: &str, version: &str) -> String {
         format!(
-            r#"{{"baseImage":{{"id":"0x{}","name":"{name}","version":"{version}"}},"profiles":[],"publishedAt":"2026-07-07T00:00:00Z","revision":1,"schema":"atakit.measurement-pack.v3"}}"#,
-            "00".repeat(32)
+            // Canonical key order, because the signature covers these exact bytes.
+            r#"{{"measurements":{{"profiles":[]}},"published_at":1786000000,"revision":1,"schema":"atakit.base_image_measurement_pack.v4","subject":{{"id":"0x{}","name":"{name}","publisher":"0x{}","version":"{version}"}}}}"#,
+            "00".repeat(32),
+            "aa".repeat(32)
         )
     }
 
@@ -279,8 +281,8 @@ mod tests {
         .unwrap()
         .expect("policy");
 
-        assert_eq!(policy.pack.base_image.name, "base");
-        assert_eq!(policy.pack.base_image.version, "v1");
+        assert_eq!(policy.pack.subject.name, "base");
+        assert_eq!(policy.pack.subject.version, "v1");
         assert_eq!(policy.source, json_path.display().to_string());
     }
 
@@ -324,7 +326,7 @@ mod tests {
         .unwrap()
         .expect("policy");
 
-        assert_eq!(policy.pack.base_image.name, "base/image");
+        assert_eq!(policy.pack.subject.name, "base/image");
         assert_eq!(policy.source, format!("local:{}", pack_dir.display()));
     }
 

@@ -20,8 +20,8 @@ use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
-    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant,
-    PcrBankSelection, PcrSpec256, PcrSpec384,
+    MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrBankSelection,
+    PcrSpec256, PcrSpec384, Subject,
 };
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
@@ -465,7 +465,8 @@ async fn load_measurement_policy_from_chain_id(
             init_chain.rpc_url
         )
     })?;
-    let hierarchy = BaseImageRegistry::new(registry_addr, provider)
+    let registry_client = BaseImageRegistry::new(registry_addr, provider);
+    let hierarchy = registry_client
         .get_hierarchy(base_image_id)
         .await
         .with_context(|| {
@@ -482,11 +483,23 @@ async fn load_measurement_policy_from_chain_id(
         );
     }
 
-    chain_hierarchy_to_measurement_policy(&hierarchy, base_image_registry)
+    // subject.publisher must reproduce subject.id, and the hierarchy does not
+    // carry the owner, so it is read separately.
+    let owner = registry_client
+        .get_base_image_owner(base_image_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch BaseImageRegistry owner for base_image_id {}",
+                hex0x(base_image_id)
+            )
+        })?;
+    chain_hierarchy_to_measurement_policy(&hierarchy, owner, base_image_registry)
 }
 
 fn chain_hierarchy_to_measurement_policy(
     hierarchy: &BaseImageHierarchy,
+    owner: alloy_ext::core::primitives::B256,
     registry: &str,
 ) -> Result<MeasurementPolicy> {
     let profiles = hierarchy
@@ -564,10 +577,11 @@ fn chain_hierarchy_to_measurement_policy(
     Ok(MeasurementPolicy {
         source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
         pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v3".to_string(),
+            schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
             revision: 1,
-            published_at: chrono::Utc::now().to_rfc3339(),
-            base_image: BaseImage {
+            published_at: chrono::Utc::now().timestamp().max(0) as u64,
+            subject: Subject {
+                publisher: hex0x(owner),
                 name: hierarchy.spec.name.clone(),
                 version: hierarchy.spec.version.clone(),
                 id: hex0x(hierarchy.base_image_id),
@@ -578,7 +592,9 @@ fn chain_hierarchy_to_measurement_policy(
                 },
                 archive_sha256: None,
             },
-            profiles,
+            measurements: serde_json::to_value(atakit_attestation::BaseImageMeasurements {
+                profiles,
+            })?,
         },
     })
 }

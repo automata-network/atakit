@@ -323,6 +323,7 @@ fn trusted_policy(
         required_identity_id(identity.platform_profile_id, "platform profile")?;
     let measurement_variant_id = required_identity_id(identity.variant_id, "measurement variant")?;
     let profile = select_profile(&context.measurement_policy, platform_profile_id)?;
+    let profile = &profile;
     let variant = select_variant(
         profile,
         measurement_variant_id,
@@ -407,19 +408,24 @@ fn required_identity_id(
     value.ok_or_else(|| session_error(format!("TLS verification did not select a {label} ID")))
 }
 
+/// The pack body is owned, so the selected profile is returned by value rather
+/// than borrowed from a temporary.
 fn select_profile(
     policy: &MeasurementPolicy,
     expected_id: [u8; 32],
-) -> Result<&MeasurementProfile, AttestationClientError> {
-    let matches = policy
+) -> Result<MeasurementProfile, AttestationClientError> {
+    let body: atakit_attestation::BaseImageMeasurements = policy
         .pack
+        .body(atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+        .map_err(|e| AttestationClientError::Rpc(e.to_string()))?;
+    let mut matches = body
         .profiles
-        .iter()
+        .into_iter()
         .filter(|profile| decode_hex_32(&profile.id).ok() == Some(expected_id))
         .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [profile] => Ok(*profile),
-        [] => Err(session_error(
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(session_error(
             "signed measurement policy has no TLS-selected profile",
         )),
         _ => Err(session_error(
@@ -763,7 +769,7 @@ fn random_challenge() -> Result<[u8; 32], AttestationClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atakit_attestation::{BaseImage, MeasurementPack, PcrBankSelection, PcrSpec256};
+    use atakit_attestation::{MeasurementPack, PcrBankSelection, PcrSpec256, Subject};
     use automata_tee_workload_measurement::pcr_comparison::{
         encode_dynamic256, encode_static256, DYNAMIC_SUBSEQUENCE,
     };
@@ -809,20 +815,25 @@ mod tests {
         let policy = MeasurementPolicy {
             source: "test".into(),
             pack: MeasurementPack {
-                schema: "atakit.measurement-pack.v3".into(),
+                schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.into(),
                 revision: 1,
-                published_at: "2026-07-17T00:00:00Z".into(),
-                base_image: BaseImage {
+                published_at: 1_786_000_000,
+                subject: Subject {
+                    publisher: format!("0x{}", "aa".repeat(32)),
                     name: "automata-linux".into(),
                     version: "v0.2.7-debug".into(),
                     id: format!("0x{}", "33".repeat(32)),
                     uri: None,
                     archive_sha256: None,
                 },
-                profiles: vec![profile],
+                measurements: serde_json::to_value(atakit_attestation::BaseImageMeasurements {
+                    profiles: vec![profile],
+                })
+                .unwrap(),
             },
         };
         let selected = select_profile(&policy, [0x11; 32]).unwrap();
+        let selected = &selected;
         let variant = select_variant(selected, [0x22; 32], "c3-standard-4").unwrap();
         let pcrs = effective_pcr_specs256(selected, variant).unwrap();
         assert_eq!(pcrs.len(), 1);
