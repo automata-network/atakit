@@ -288,6 +288,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Inspect downloaded archive using the shared library inspector.
     let inspect_opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(tmp_path.clone()),
         workload_dir: None,
         engine: None,

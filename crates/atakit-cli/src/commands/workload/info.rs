@@ -35,6 +35,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
                 anyhow::bail!("no archive blob for {archive_str} in store");
             }
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(blob),
                 workload_dir: None,
                 engine,
@@ -44,6 +45,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(archive_arg.clone()),
                 workload_dir: None,
                 engine,
@@ -62,6 +64,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
         let archive = find_archive(&dir);
         if archive.is_some() {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive,
                 workload_dir: None,
                 engine,
@@ -71,6 +74,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: None,
                 workload_dir: Some(dir),
                 engine,

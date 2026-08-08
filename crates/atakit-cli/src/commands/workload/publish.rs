@@ -64,6 +64,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     };
 
     let opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive),
         workload_dir: None,
         engine,

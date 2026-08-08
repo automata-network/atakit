@@ -186,6 +186,7 @@ async fn resolve_from_archive(
     };
 
     let opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive.to_path_buf()),
         workload_dir: None,
         engine,

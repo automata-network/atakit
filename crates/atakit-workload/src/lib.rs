@@ -10,7 +10,6 @@ pub mod image;
 pub mod image_meta;
 pub mod inspect;
 pub mod manifest;
-pub mod manifest_v1;
 pub mod repository;
 mod scaffold;
 pub mod store;
@@ -30,4 +29,9 @@ pub use scaffold::create_workload;
 pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
 
 /// Current format version for `atakit-workload.toml` and `manifest.json`.
-pub const FORMAT_VERSION: u32 = 6;
+///
+/// Format 7 added `meta.publisher`. It is the only supported format: a
+/// workload's identifier is publisher-qualified, and no earlier manifest
+/// records a publisher or allows one to be derived, so an older manifest cannot
+/// yield the identifier its workload is registered under.
+pub const FORMAT_VERSION: u32 = 7;

@@ -91,6 +91,13 @@ pub struct InfoArgs {
     /// Root for logical unmeasured-data declarations in --dir mode
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_root: Option<PathBuf>,
+    /// Key whose fingerprint is the publisher, for --dir mode
+    ///
+    /// The publisher is measured, so PCR23 cannot be computed for a directory
+    /// without it. Defaults to `[publish] owner_key`. Ignored when inspecting
+    /// an archive, which already records its publisher.
+    #[arg(long, value_name = "KEY")]
+    pub signing_key: Option<String>,
 }
 
 /// Arguments for `workload deactivate`.

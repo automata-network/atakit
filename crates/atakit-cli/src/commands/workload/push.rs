@@ -52,6 +52,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
 
     // Inspect archive.
     let inspect_opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive_path.clone()),
         workload_dir: None,
         engine: None,

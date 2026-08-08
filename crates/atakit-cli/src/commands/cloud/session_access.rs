@@ -397,6 +397,7 @@ async fn load_local_workload_policy(
         );
     }
     let inspection = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(archive_path.to_path_buf()),
         workload_dir: None,
         engine: None,
@@ -529,7 +530,12 @@ mod tests {
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
         let manifest = serde_json::json!({
-            "meta": {"format": 6, "name": "test", "version": "v0.0.1"},
+            "meta": {
+                "format": 7,
+                "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "test",
+                "version": "v0.0.1"
+            },
             "config": {
                 "image": "test:v0.0.1",
                 "base-image-mode": "blacklist",

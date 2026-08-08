@@ -12,6 +12,7 @@ pub async fn run(args: ImportArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Inspect archive to get name, version, SHA256
     let opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(args.archive.clone()),
         workload_dir: None,
         engine: None,

@@ -29,8 +29,17 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         ArchiveCompression::Zstd
     };
 
+    // The publisher is written into the measured manifest, so it has to be
+    // known before the build rather than at store-import time: it is part of
+    // what PCR23 covers, and the workload's identifier derives from it. This is
+    // why a build requires a key even with --no-store.
+    let owner_key = super::resolve_owner_key(args.signing_key.as_deref(), config)?;
+    let publisher = super::owner_fingerprint(&owner_key)?;
+    let publisher_hex = format!("{publisher:#x}");
+
     let opts = atakit_workload::BuildOptions {
         workload_dir,
+        publisher: publisher_hex.clone(),
         output_dir: args.output,
         engine,
         verbose,
@@ -44,10 +53,11 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
 
     // Inspect the built archive once: we need it to surface the manifest
     // event hash alongside the file hash, and (below) to populate store
-    // metadata. Cheap -- just extracts manifest.toml from the archive.
+    // metadata. Cheap -- just extracts manifest.json from the archive.
     let inspect_opts = atakit_workload::InspectOptions {
         archive: Some(result.archive_path.clone()),
         workload_dir: None,
+        publisher: None,
         engine: None,
         verbose: false,
         measured_data_root: None,
@@ -95,12 +105,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         let name = &inspect.manifest.meta.name;
         let version = &inspect.manifest.meta.version;
 
-        // The identifier is publisher-qualified, so a build has to know which
-        // publisher it is building for. The signing key's owner fingerprint is
-        // that publisher: the key that will register this workload is the key
-        // that determines its identity.
-        let owner_key = super::resolve_owner_key(args.signing_key.as_deref(), config)?;
-        let publisher = super::owner_fingerprint(&owner_key)?;
+        // The publisher resolved above is the one measured into the manifest,
+        // so the stored identifier and the archive agree by construction.
         let app_ref = automata_tee_workload_measurement::types::AppRef::new(
             publisher,
             name.clone(),
@@ -108,7 +114,6 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         );
         let workload_id = super::compute_workload_id(&app_ref);
         let workload_id_hex = format!("{workload_id:#x}");
-        let publisher_hex = format!("{publisher:#x}");
 
         // Check if an existing entry has a different PCR23 and confirm before overwriting
         let existing_meta = match store.load_meta(&workload_id_hex) {

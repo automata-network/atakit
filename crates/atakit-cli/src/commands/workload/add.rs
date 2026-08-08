@@ -38,6 +38,7 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
         archive_size,
     ) = if let Some(ref path) = archive_path {
         let opts = atakit_workload::InspectOptions {
+            publisher: None,
             archive: Some(path.clone()),
             workload_dir: None,
             engine: None,
