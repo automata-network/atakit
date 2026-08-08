@@ -367,10 +367,10 @@ fn reject_overlap(
     left_name: &str,
     left: impl Iterator<Item = u8>,
     right_name: &str,
-    right: impl Iterator<Item = u8>,
+    mut right: impl Iterator<Item = u8>,
 ) -> Result<(), CloudError> {
     let left = left.collect::<BTreeSet<_>>();
-    if let Some(index) = right.filter(|index| left.contains(index)).next() {
+    if let Some(index) = right.find(|index| left.contains(index)) {
         return Err(policy_error(format!(
             "{left_name} and {right_name} both contain PCR{index}"
         )));

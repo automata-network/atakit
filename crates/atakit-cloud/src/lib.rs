@@ -14,7 +14,6 @@ pub mod qemu;
 pub mod session;
 pub mod session_lifecycle;
 pub mod state;
-mod tdx_dcap;
 
 #[cfg(feature = "cli")]
 pub mod cli;

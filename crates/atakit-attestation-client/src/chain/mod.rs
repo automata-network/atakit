@@ -4,6 +4,8 @@
 //! selects the RPC endpoint and `SessionRegistry`; portal evidence cannot
 //! select either value.
 
+pub mod trust;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::portal::session::{self, VerifiedPortalTls};

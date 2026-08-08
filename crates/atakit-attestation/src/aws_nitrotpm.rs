@@ -542,6 +542,46 @@ fn encode_byte_string(bytes: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(bytes);
 }
 
+fn decode_one(bytes: &[u8]) -> std::result::Result<Value, String> {
+    let mut cursor = Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|error| format!("CBOR decode failed: {error}"))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err("CBOR value has trailing bytes".to_string());
+    }
+    Ok(value)
+}
+
+fn take_required(
+    values: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> std::result::Result<Value, String> {
+    values
+        .remove(name)
+        .ok_or_else(|| format!("NitroTPM payload lacks {name}"))
+}
+
+fn expect_bytes(value: Value, name: &str) -> std::result::Result<Vec<u8>, String> {
+    let Value::Bytes(bytes) = value else {
+        return Err(format!("{name} must be a byte string"));
+    };
+    Ok(bytes)
+}
+
+fn expect_text(value: Value, name: &str) -> std::result::Result<String, String> {
+    let Value::Text(text) = value else {
+        return Err(format!("{name} must be a text string"));
+    };
+    Ok(text)
+}
+
+fn expect_u64(value: Value, name: &str) -> std::result::Result<u64, String> {
+    let Value::Integer(integer) = value else {
+        return Err(format!("{name} must be an integer"));
+    };
+    u64::try_from(integer).map_err(|_| format!("{name} is outside uint64"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,44 +670,4 @@ mod tests {
         output.extend_from_slice(&pcr_digest);
         output
     }
-}
-
-fn decode_one(bytes: &[u8]) -> std::result::Result<Value, String> {
-    let mut cursor = Cursor::new(bytes);
-    let value: Value = ciborium::de::from_reader(&mut cursor)
-        .map_err(|error| format!("CBOR decode failed: {error}"))?;
-    if cursor.position() != bytes.len() as u64 {
-        return Err("CBOR value has trailing bytes".to_string());
-    }
-    Ok(value)
-}
-
-fn take_required(
-    values: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> std::result::Result<Value, String> {
-    values
-        .remove(name)
-        .ok_or_else(|| format!("NitroTPM payload lacks {name}"))
-}
-
-fn expect_bytes(value: Value, name: &str) -> std::result::Result<Vec<u8>, String> {
-    let Value::Bytes(bytes) = value else {
-        return Err(format!("{name} must be a byte string"));
-    };
-    Ok(bytes)
-}
-
-fn expect_text(value: Value, name: &str) -> std::result::Result<String, String> {
-    let Value::Text(text) = value else {
-        return Err(format!("{name} must be a text string"));
-    };
-    Ok(text)
-}
-
-fn expect_u64(value: Value, name: &str) -> std::result::Result<u64, String> {
-    let Value::Integer(integer) = value else {
-        return Err(format!("{name} must be an integer"));
-    };
-    u64::try_from(integer).map_err(|_| format!("{name} is outside uint64"))
 }
