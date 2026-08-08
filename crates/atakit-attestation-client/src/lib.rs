@@ -23,6 +23,8 @@ pub mod collateral;
 pub mod error;
 mod http;
 pub mod portal;
+#[cfg(test)]
+mod test_support;
 pub mod trust;
 pub mod workflow;
 

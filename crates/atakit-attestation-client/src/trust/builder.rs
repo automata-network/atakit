@@ -183,7 +183,7 @@ mod tests {
     use crate::trust::request::AzureMaaJwtInfo;
     use atakit_attestation::AmdSnpSecurityPolicy;
 
-    const SUPPORTED_PLATFORMS: &[(&str, &str)] = &[
+    pub(super) const SUPPORTED_PLATFORMS: &[(&str, &str)] = &[
         ("gcp", "tdx"),
         ("gcp", "sev-snp"),
         ("azure", "tdx"),
@@ -193,7 +193,7 @@ mod tests {
 
     const REPORT_CPUID: u32 = 0x0019_1101;
 
-    fn request(cloud: &str, tee: &str) -> CollateralRequest {
+    pub(super) fn request(cloud: &str, tee: &str) -> CollateralRequest {
         let is_snp = tee == "sev-snp";
         CollateralRequest {
             cloud: cloud.to_string(),
@@ -211,7 +211,7 @@ mod tests {
     }
 
     /// Anchors satisfying exactly what this request requires, and nothing more.
-    fn complete_anchors(request: &CollateralRequest) -> TrustAnchors {
+    pub(super) fn complete_anchors(request: &CollateralRequest) -> TrustAnchors {
         let mut anchors = TrustAnchors::default();
         for input in required_trust_inputs_for_request(request) {
             match input {
@@ -244,7 +244,7 @@ mod tests {
         anchors
     }
 
-    fn explicit(anchors: TrustAnchors) -> TrustAnchorsBuilder {
+    pub(super) fn explicit(anchors: TrustAnchors) -> TrustAnchorsBuilder {
         let trust = TlsVerificationTrust {
             trust_anchors: anchors,
             ..TlsVerificationTrust::default()
@@ -364,5 +364,98 @@ mod tests {
             .await
             .expect("no inputs are required");
         assert!(provenance.inputs.is_empty());
+    }
+}
+
+/// Transport-level proof that explicit mode never reads a chain.
+///
+/// These assert on what reached the network, not on what a verification
+/// returned. A verification that wrongly consulted a chain and then succeeded
+/// is indistinguishable from one that never consulted it by return value alone,
+/// which is why the exclusive-mode test list calls for a call counter.
+#[cfg(test)]
+mod no_chain_read_outside_chain_mode {
+    use super::tests::{complete_anchors, explicit, request, SUPPORTED_PLATFORMS};
+    use crate::chain::{AttestationClient, AttestationClientConfig};
+    use crate::test_support::CountingRpcEndpoint;
+
+    const SESSION_REGISTRY: &str = "0x1111111111111111111111111111111111111111";
+
+    async fn connect(endpoint: &CountingRpcEndpoint) -> AttestationClient {
+        AttestationClient::connect(AttestationClientConfig {
+            rpc_url: endpoint.url().to_string(),
+            session_registry: SESSION_REGISTRY.to_string(),
+            expected_chain_id: None,
+            expected_base_image_registry: None,
+            expected_workload_registry: None,
+        })
+        .await
+        .expect("connect against the counting endpoint")
+    }
+
+    /// Positive control. Without it the two zero-count assertions below could
+    /// pass because the endpoint never worked, rather than because nothing
+    /// reached it.
+    #[tokio::test]
+    async fn the_counting_endpoint_records_chain_reads() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        connect(&endpoint).await;
+        assert!(
+            endpoint.requests() > 0,
+            "connecting must reach the endpoint, or the zero-count tests prove nothing"
+        );
+    }
+
+    /// Test 8. A complete explicit resolution, for every supported platform,
+    /// performs no chain read at all.
+    #[tokio::test]
+    async fn explicit_mode_performs_no_chain_rpc() {
+        let endpoint = CountingRpcEndpoint::start().await;
+
+        for (cloud, tee) in SUPPORTED_PLATFORMS {
+            let request = request(cloud, tee);
+            explicit(complete_anchors(&request))
+                .resolve(&request)
+                .await
+                .unwrap_or_else(|error| panic!("{cloud}/{tee}: {error}"));
+        }
+
+        assert_eq!(
+            endpoint.requests(),
+            0,
+            "explicit resolution reached a chain endpoint"
+        );
+    }
+
+    /// Test 10. A chain client reachable in the same process must be left
+    /// untouched by an explicit verification.
+    ///
+    /// The type change makes a mixed binding unrepresentable, so this is not
+    /// proving that `None` was assigned — it is proving that nothing reaches
+    /// for a chain client by another route. The type stops one path; this
+    /// covers the rest.
+    #[tokio::test]
+    async fn a_reachable_chain_client_is_untouched_by_an_explicit_verification() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let client = connect(&endpoint).await;
+        let after_connect = endpoint.requests();
+        assert!(after_connect > 0, "the client must be genuinely connected");
+
+        for (cloud, tee) in SUPPORTED_PLATFORMS {
+            let request = request(cloud, tee);
+            explicit(complete_anchors(&request))
+                .resolve(&request)
+                .await
+                .unwrap_or_else(|error| panic!("{cloud}/{tee}: {error}"));
+        }
+
+        assert_eq!(
+            endpoint.requests(),
+            after_connect,
+            "an explicit verification reached the chain client's endpoint"
+        );
+        // The client is still usable, so the count above is not zero because
+        // the endpoint died partway through.
+        assert_eq!(client.context().session_registry, SESSION_REGISTRY);
     }
 }
