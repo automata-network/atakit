@@ -983,14 +983,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         automata_read_strategy,
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
+                    let trust_source = init::trust_source_for_init_chain(
+                        &init_config.chain,
+                        tls_verification_trust,
+                        tdx_dcap_collateral,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let verified_tls = init::bootstrap_portal_tls(
                         &ip,
                         status_port,
                         Some(measurement_policy),
                         Some(workload_attributes.clone()),
-                        tls_verification_trust,
-                        init::azure_maa_trust_config_from_init_chain(&init_config.chain),
-                        tdx_dcap_collateral,
+                        &trust_source,
                         args.trust_tls_cert_sha256.as_deref(),
                         Some(&init::cloud_tls_attestation_report_path(
                             &env.data_dir,

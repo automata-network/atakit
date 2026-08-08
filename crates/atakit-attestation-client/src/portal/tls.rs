@@ -8,76 +8,47 @@ use std::time::Duration;
 
 use atakit_attestation::{
     verify_tls_attestation, verify_tls_attestation_with_workload_attributes, CheckResult,
-    EvidenceSummary, MeasurementPolicy, TlsAttestationResponse, TrustAnchors, VerificationCheck,
+    EvidenceSummary, MeasurementPolicy, TlsAttestationResponse, VerificationCheck,
     VerificationInputs, VerificationReport, VerifiedTlsIdentity,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-use crate::chain::trust::{
-    resolve_azure_maa_trust, resolve_chain_trust_anchors, session_attestation_client,
-};
 use crate::collateral::amd_snp::resolve_amd_snp_collateral;
-use crate::collateral::intel_tdx::{resolve_tdx_dcap_collateral, IntelTdxDcapCollateralConfig};
+use crate::collateral::intel_tdx::resolve_tdx_dcap_collateral;
 use crate::error::PortalVerificationError;
 use crate::http::read_response_bytes_limited;
 use crate::portal::session::{
     PortalSessionVerificationContext, TlsManualOverride, VerifiedPortalTls,
 };
-use crate::trust::files::{AzureMaaTrustConfig, TlsVerificationTrust};
+use crate::trust::builder::TrustAnchorsBuilder;
 use crate::trust::measurement::write_tls_attestation_report;
+use crate::trust::request::CollateralRequest;
+use crate::trust::source::TrustSource;
 
 const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Fetch and verify the portal's TLS attestation, then return a client pinned
-/// to the attested self-signed certificate.
+/// Fetch and verify the portal's TLS attestation, resolving every trust input
+/// from one selected source, then return a client pinned to the attested
+/// self-signed certificate.
+// Keep the request inputs explicit at this protocol boundary.
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_portal_tls(
     host: &str,
     status_port: u16,
     measurement_policy: Option<MeasurementPolicy>,
-    trust_anchors: TrustAnchors,
-    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
-    trust_tls_cert_sha256: Option<&str>,
-    report_path: Option<&Path>,
-) -> Result<VerifiedPortalTls, PortalVerificationError> {
-    bootstrap_portal_tls_with_trust_config(
-        host,
-        status_port,
-        measurement_policy,
-        None,
-        TlsVerificationTrust {
-            trust_anchors,
-            amd_snp_crls: Vec::new(),
-        },
-        AzureMaaTrustConfig::default(),
-        tdx_dcap_collateral,
-        trust_tls_cert_sha256,
-        report_path,
-    )
-    .await
-}
-
-/// Fetch and verify the portal's TLS attestation with verifier-side trust
-/// material resolved from configured sources before the attestation checks run.
-// Keep the independently sourced trust inputs explicit at this protocol boundary.
-#[allow(clippy::too_many_arguments)]
-pub async fn bootstrap_portal_tls_with_trust_config(
-    host: &str,
-    status_port: u16,
-    measurement_policy: Option<MeasurementPolicy>,
     workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
-    tls_verification_trust: TlsVerificationTrust,
-    azure_maa_trust: AzureMaaTrustConfig,
-    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+    trust_source: &TrustSource,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
-    let TlsVerificationTrust {
-        mut trust_anchors,
-        amd_snp_crls,
-    } = tls_verification_trust;
+    let amd_snp_crls = match trust_source {
+        TrustSource::Explicit(source) => source.amd_snp_crls().to_vec(),
+        TrustSource::Chain(_) => Vec::new(),
+    };
+    let tdx_dcap_collateral = trust_source.tdx_dcap_collateral().clone();
     let nonce = random_nonce()?;
     let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
     let url = format!("https://{host}:{status_port}/tls-attestation?nonce={nonce_b64}");
@@ -126,6 +97,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                     platform_profile_id: None,
                     variant_id: None,
                 },
+                trust_provenance: Default::default(),
                 manual_override: Some(TlsManualOverride {
                     live_cert_sha256: live_hash,
                     report,
@@ -158,11 +130,6 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 message: format!("invalid response JSON: {e}"),
             }
         })?;
-    // Manual keys remain available until the committed session evidence is
-    // fetched. The key that verifies fresh TLS evidence may differ from the
-    // key that signed the retained session MAA JWT.
-    let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
-
     let intel_tdx_dcap_collateral =
         match resolve_tdx_dcap_collateral(&response, &tdx_dcap_collateral).await {
             Ok(collateral) => collateral,
@@ -184,21 +151,6 @@ pub async fn bootstrap_portal_tls_with_trust_config(
             }
         };
 
-    if let Err(detail) =
-        resolve_azure_maa_trust(&response, &azure_maa_trust, &mut trust_anchors).await
-    {
-        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-        let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report =
-            tls_preverification_failure_report(&response, &live_hash, "azure-maa-trust", detail);
-        return handle_tls_attestation_failure(
-            report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-        );
-    }
-
     let amd_snp_collateral = match resolve_amd_snp_collateral(&response, amd_snp_crls).await {
         Ok(collateral) => collateral,
         Err(detail) => {
@@ -219,31 +171,54 @@ pub async fn bootstrap_portal_tls_with_trust_config(
         }
     };
 
-    if let Err(detail) = resolve_chain_trust_anchors(
-        &response,
-        &azure_maa_trust,
-        &mut trust_anchors,
-        amd_snp_collateral.as_ref(),
-    )
-    .await
-    {
-        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-        let live_hash = format!("0x{}", hex::encode(live_sha));
-        let report = tls_preverification_failure_report(
-            &response,
-            &live_hash,
-            "automata-onchain-trust",
-            detail,
-        );
-        return handle_tls_attestation_failure(
-            report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-        );
-    }
+    let request = match CollateralRequest::from_response(&response, amd_snp_collateral.as_ref()) {
+        Ok(request) => request,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "collateral-request",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+            );
+        }
+    };
 
-    let session_chain_client = session_attestation_client(&azure_maa_trust).await?;
+    // One source resolves everything. A required input the source cannot
+    // supply fails closed naming the input; it never falls through.
+    let builder = TrustAnchorsBuilder::new(trust_source.clone());
+    let (trust_anchors, trust_provenance) = match builder.resolve(&request).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "trust-anchors",
+                error.to_string(),
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+            );
+        }
+    };
+    let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
+
+    let session_chain_client = match trust_source {
+        TrustSource::Chain(source) => Some(source.client().clone()),
+        TrustSource::Explicit(_) => None,
+    };
     let session_verification =
         measurement_policy
             .clone()
@@ -279,6 +254,7 @@ pub async fn bootstrap_portal_tls_with_trust_config(
                 identity,
                 manual_override: None,
                 session_verification,
+                trust_provenance,
             })
         }
         Err(failure) => handle_tls_attestation_failure(
@@ -367,6 +343,7 @@ fn handle_tls_attestation_failure(
                 platform_profile_id: None,
                 variant_id: None,
             },
+            trust_provenance: Default::default(),
             manual_override: Some(TlsManualOverride {
                 live_cert_sha256: live_hash,
                 report,

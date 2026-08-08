@@ -1,6 +1,7 @@
 //! Verifier-supplied trust inputs read from files, and the PEM/DER decoding
 //! every certificate flag shares.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use atakit_attestation::{
@@ -59,6 +60,12 @@ pub fn azure_maa_trust_config_from_chain(
     }
 }
 
+/// Whether a chain is actually selected, rather than a placeholder left in a
+/// configuration that has registration turned off.
+pub fn chain_coordinates_configured(rpc_url: &str, session_registry: &str) -> bool {
+    !rpc_url.trim().is_empty() && !is_zero_eth_address(session_registry)
+}
+
 fn is_zero_eth_address(value: &str) -> bool {
     let raw = value.trim().strip_prefix("0x").unwrap_or(value.trim());
     raw.len() == 40 && raw.bytes().all(|byte| byte == b'0')
@@ -92,6 +99,18 @@ pub fn load_tls_verification_trust(
         }
         None => Vec::new(),
     };
+    let mut sources = BTreeMap::new();
+    record_sources(&mut sources, "--gcp-ak-root-cert", gcp_ak_root_certs);
+    record_sources(&mut sources, "--azure-maa-cert", azure_maa_certs);
+    record_sources(&mut sources, "--amd-ark-root-cert", amd_ark_root_certs);
+    record_sources(&mut sources, "--amd-snp-crl", amd_snp_crls);
+    if let Some(path) = amd_snp_security_policy {
+        record_sources(
+            &mut sources,
+            "--amd-snp-security-policy",
+            std::slice::from_ref(&path.to_path_buf()),
+        );
+    }
     Ok(TlsVerificationTrust {
         trust_anchors: TrustAnchors {
             gcp_roots: read_der_files(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
@@ -101,6 +120,7 @@ pub fn load_tls_verification_trust(
             ..TrustAnchors::default()
         },
         amd_snp_crls: read_der_files(amd_snp_crls, "--amd-snp-crl")?,
+        sources,
     })
 }
 
@@ -109,6 +129,23 @@ pub fn load_tls_verification_trust(
 pub struct TlsVerificationTrust {
     pub trust_anchors: TrustAnchors,
     pub amd_snp_crls: Vec<Vec<u8>>,
+    /// Which files fed which flag, keyed by flag name. Retained so explicit
+    /// mode can report per-input provenance rather than leaving each caller to
+    /// reconstruct it from its own configuration.
+    pub sources: BTreeMap<String, Vec<String>>,
+}
+
+fn record_sources(sources: &mut BTreeMap<String, Vec<String>>, flag: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    sources.insert(
+        flag.to_string(),
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    );
 }
 
 /// Read a certificate or revocation list from a file, accepting PEM or DER.

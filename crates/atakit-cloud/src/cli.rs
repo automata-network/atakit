@@ -226,7 +226,8 @@ pub struct DeployArgs {
     #[arg(long, value_name = "PATH")]
     pub amd_snp_crl: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -494,7 +495,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "PATH")]
     pub amd_snp_crl: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -620,7 +622,8 @@ pub struct SessionVerificationArgs {
     #[arg(long, value_name = "PATH")]
     pub amd_snp_crl: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP policy file; a matching entry overrides the on-chain policy.
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 

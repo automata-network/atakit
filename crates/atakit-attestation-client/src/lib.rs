@@ -44,19 +44,23 @@ pub use collateral::intel_tdx::{
     IntelTdxDcapCollateralSource, TdxDcapAutomataReadStrategy,
 };
 pub use portal::status::read_untrusted_portal_base_image_id;
-pub use portal::tls::{
-    bootstrap_portal_tls, bootstrap_portal_tls_with_trust_config, tls_manual_override_message,
-};
+pub use portal::tls::{bootstrap_portal_tls, tls_manual_override_message};
+pub use trust::builder::TrustAnchorsBuilder;
 pub use trust::files::{
-    azure_maa_trust_config_from_chain, load_tls_verification_trust, AzureMaaTrustConfig,
-    AzureMaaTrustSource, TlsVerificationTrust,
+    azure_maa_trust_config_from_chain, chain_coordinates_configured, load_tls_verification_trust,
+    AzureMaaTrustConfig, AzureMaaTrustSource, TlsVerificationTrust,
 };
 pub use trust::measurement::{
     cloud_tls_attestation_report_path, load_measurement_policy, local_measurement_pack_exists,
     workload_tls_attestation_report_path, write_tls_attestation_report,
 };
+pub use trust::request::{AzureMaaJwtInfo, CollateralRequest};
 pub use trust::requirements::{
-    required_trust_inputs, unsatisfied_trust_inputs, RequiredTrustInput,
+    required_trust_inputs, required_trust_inputs_for_request, unsatisfied_trust_inputs,
+    RequiredTrustInput,
+};
+pub use trust::source::{
+    ChainTrustSource, ExplicitTrustSource, TrustInputSource, TrustProvenance, TrustSource,
 };
 pub use workflow::{
     verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
