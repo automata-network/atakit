@@ -74,36 +74,45 @@ pub struct TrustedWorkloadSessionPolicy {
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
 }
 
+/// Parse a canonical `<publisher>/<name>:<version>` workload reference.
+///
+/// This carries stricter grammar rules than `AppRef::from_str` and keeps them,
+/// gaining a publisher rule alongside. A two-part `name:version` reference is
+/// rejected outright rather than accepted with a defaulted publisher: tolerating
+/// the old form would leave references parsing while nothing was bound.
 fn parse_canonical_workload_ref(workload: &str) -> Result<AppRef, AttestationClientError> {
-    let Some((name, version)) = workload.split_once(':') else {
+    let Some((publisher, rest)) = workload.split_once('/') else {
         return Err(AttestationClientError::WorkloadPolicy(format!(
-            "canonical workload reference must use name:version, got {workload:?}"
+            "canonical workload reference must use <publisher>/<name>:<version>, got {workload:?}; \
+             a reference without a publisher is no longer accepted"
         )));
     };
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        || name.starts_with('-')
-    {
+    if !atakit_core::is_canonical_id(publisher) {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload publisher must be '0x' followed by 64 lowercase hexadecimal characters, got {publisher:?}"
+        )));
+    }
+    let publisher: alloy_ext::core::primitives::B256 = publisher.parse().map_err(|error| {
+        AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload publisher {publisher:?} is not a valid fingerprint: {error}"
+        ))
+    })?;
+    let Some((name, version)) = rest.split_once(':') else {
+        return Err(AttestationClientError::WorkloadPolicy(format!(
+            "canonical workload reference must use <publisher>/<name>:<version>, got {workload:?}"
+        )));
+    };
+    if !atakit_core::is_valid_ref_name(name) {
         return Err(AttestationClientError::WorkloadPolicy(format!(
             "canonical workload name must be nonempty, must not start with '-', and must contain only ASCII alphanumeric characters or '-', got {name:?}"
         )));
     }
-    if version.len() < 2 || !version.starts_with('v') {
+    if !atakit_core::is_valid_ref_version(version) {
         return Err(AttestationClientError::WorkloadPolicy(format!(
-            "canonical workload version must start with 'v' and contain at least one following character, got {version:?}"
+            "canonical workload version must start with 'v' and may contain only ASCII alphanumeric characters, '.', '-', or '_' after it, got {version:?}"
         )));
     }
-    if !version[1..]
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
-    {
-        return Err(AttestationClientError::WorkloadPolicy(format!(
-            "canonical workload version may contain only ASCII alphanumeric characters, '.', '-', or '_' after 'v', got {version:?}"
-        )));
-    }
-    Ok(AppRef::new(name, version))
+    Ok(AppRef::new(publisher, name, version))
 }
 
 impl TrustedWorkloadSessionPolicy {
@@ -1247,7 +1256,7 @@ mod tests {
     #[test]
     fn explicit_manifest_pcr23_policy_uses_canonical_workload_reference() {
         let policy = TrustedWorkloadSessionPolicy::from_manifest_pcr23(
-            "storage-service:v0.1.0",
+            "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/storage-service:v0.1.0",
             [0x55; 32],
             [0x66; 48],
         )
@@ -1337,7 +1346,10 @@ mod tests {
                 }],
             },
         };
-        let app_ref: AppRef = "test:v0.0.1".parse().unwrap();
+        let app_ref: AppRef =
+            "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/test:v0.0.1"
+                .parse()
+                .unwrap();
 
         let policy =
             trusted_workload_policy(&app_ref, [0x11; 32], selected_base_image.0, &spec).unwrap();

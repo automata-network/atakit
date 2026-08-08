@@ -217,6 +217,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     let archive_sha256: Option<[u8; 32]>;
     let (
         archive_path,
+        workload_publisher,
         workload_name,
         workload_version,
         archive_hash,
@@ -235,6 +236,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         _,
         _,
         _,
+        _,
         Option<String>,
         _,
         _,
@@ -244,6 +246,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     );
     if image_only {
         archive_path = String::new();
+        workload_publisher = String::new();
         workload_name = String::new();
         workload_version = String::new();
         archive_hash = String::new();
@@ -259,7 +262,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         // No workload in image-only mode; reject any stray --disk-passphrase.
         disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &BTreeMap::new())?;
     } else {
-        let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+        let resolved = resolve_workload(
+            &args.source,
+            &args.dir,
+            env,
+            config,
+            args.signing_key.as_deref(),
+            args.skip_freshness_check,
+        )?;
+        workload_publisher = format!("{:#x}", resolved.publisher);
         workload_name = resolved.name;
         workload_version = resolved.version;
         archive_sha256 = Some(resolved.archive_sha256);
@@ -767,6 +778,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // 13. Create initial state.
     let mut state = DeployState::new(atakit_cloud::NewDeployParams {
         instance_name: instance_name.clone(),
+        workload_publisher: workload_publisher.clone(),
         workload_name: workload_name.clone(),
         workload_version: workload_version.clone(),
         target_name: target_name.to_string(),
@@ -1017,13 +1029,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     ))
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
+                let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+                    workload_publisher
+                        .parse()
+                        .context("invalid workload publisher")?,
+                    workload_name.clone(),
+                    workload_version.clone(),
+                );
                 init_config.pcr_policy = super::resolve_init_pcr_policy(
                     args.pcr_policy.as_deref(),
                     &init_config,
                     registration_off,
                     verified_tls.as_ref(),
-                    &workload_name,
-                    &workload_version,
+                    &workload_app_ref,
                 )
                 .await?;
 

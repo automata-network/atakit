@@ -1378,6 +1378,7 @@ dependencies = [
 name = "atakit-config"
 version = "0.5.5"
 dependencies = [
+ "atakit-core",
  "indexmap 2.13.0",
  "libc",
  "serde",

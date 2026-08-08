@@ -1985,3 +1985,217 @@ mod tests {
         assert!("dockr".parse::<ContainerEngine>().is_err());
     }
 }
+
+// ── [alias] ──────────────────────────────────────────────────────
+
+/// A publisher's owner fingerprint, as `0x` followed by 64 lowercase
+/// hexadecimal characters.
+///
+/// Validated on the way in so a malformed entry fails while reading
+/// configuration rather than at the point a reference is parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct PublisherFingerprint(String);
+
+impl PublisherFingerprint {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PublisherFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for PublisherFingerprint {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !atakit_core::is_canonical_id(&value) {
+            return Err(format!(
+                "publisher fingerprint must be '0x' followed by 64 lowercase hexadecimal \
+                 characters, got '{value}'"
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Operator-facing aliases, so a command line need not carry 66 hexadecimal
+/// characters.
+///
+/// Two tables, because the two positions in a reference mean different things:
+/// `publishers` names a fingerprint, and `apps` says which publisher owns a
+/// bare application name. Splitting them means a key's meaning follows from
+/// where it appears rather than from guessing at the name.
+///
+/// `apps` covers base images and workloads together. A name that is both, under
+/// different publishers, has to be written in full — that case resolves to one
+/// of them and fails closed against the registry rather than silently binding
+/// to the wrong one.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AliasConfig {
+    pub publishers: indexmap::IndexMap<String, PublisherFingerprint>,
+    pub apps: indexmap::IndexMap<String, String>,
+}
+
+/// How far an alias chain may be followed before it is treated as a loop.
+const MAX_ALIAS_DEPTH: usize = 8;
+
+impl AliasConfig {
+    /// Resolve a publisher name to its fingerprint.
+    ///
+    /// A value that is already a fingerprint is the answer; anything else names
+    /// another entry and is resolved again, so one fingerprint can be written
+    /// once and referred to by many application names.
+    ///
+    /// An unresolved name is an error naming it. It is never a fallthrough to
+    /// treating the name as literal, which would bind a reference to a
+    /// publisher the operator never named.
+    pub fn resolve_publisher(&self, name: &str) -> Result<String, ConfigError> {
+        if atakit_core::is_canonical_id(name) {
+            return Ok(name.to_string());
+        }
+        let mut current = name.to_string();
+        for _ in 0..MAX_ALIAS_DEPTH {
+            let Some(next) = self.publishers.get(&current) else {
+                let known: Vec<&str> = self.publishers.keys().map(String::as_str).collect();
+                let known = if known.is_empty() {
+                    "[alias.publishers] is empty".to_string()
+                } else {
+                    format!("known publishers: {}", known.join(", "))
+                };
+                return Err(ConfigError::Invalid(format!(
+                    "unknown publisher '{current}'; {known}"
+                )));
+            };
+            if atakit_core::is_canonical_id(next.as_str()) {
+                return Ok(next.to_string());
+            }
+            current = next.to_string();
+        }
+        Err(ConfigError::Invalid(format!(
+            "publisher alias '{name}' does not resolve to a fingerprint within \
+             {MAX_ALIAS_DEPTH} steps; check [alias.publishers] for a loop"
+        )))
+    }
+
+    /// Expand a reference into canonical `<publisher>/<name>:<version>` form.
+    ///
+    /// A reference already naming a publisher resolves that publisher; a bare
+    /// `name:version` is looked up in `apps` first. Expansion happens here, in
+    /// the configuration layer, and never inside `AppRef::from_str`: that type
+    /// has no business reading operator configuration, and it has no
+    /// representation for an unresolved name, so an alias cannot reach anything
+    /// measured or persisted.
+    pub fn expand(&self, reference: &str) -> Result<String, ConfigError> {
+        if let Some((publisher, rest)) = reference.split_once('/') {
+            let fingerprint = self.resolve_publisher(publisher)?;
+            return Ok(format!("{fingerprint}/{rest}"));
+        }
+        let Some((name, _)) = reference.split_once(':') else {
+            return Err(ConfigError::Invalid(format!(
+                "reference '{reference}' is not '<publisher>/<name>:<version>' or 'name:version'"
+            )));
+        };
+        let Some(publisher) = self.apps.get(name) else {
+            let known: Vec<&str> = self.apps.keys().map(String::as_str).collect();
+            let known = if known.is_empty() {
+                "[alias.apps] is empty".to_string()
+            } else {
+                format!("known applications: {}", known.join(", "))
+            };
+            return Err(ConfigError::Invalid(format!(
+                "'{reference}' does not name a publisher and '{name}' is not in [alias.apps]; \
+                 write '<publisher>/{reference}' or add an entry. {known}"
+            )));
+        };
+        let fingerprint = self.resolve_publisher(publisher)?;
+        Ok(format!("{fingerprint}/{reference}"))
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    const FINGERPRINT: &str = "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+
+    fn aliases() -> AliasConfig {
+        let mut config = AliasConfig::default();
+        config.publishers.insert(
+            "automata".to_string(),
+            PublisherFingerprint::try_from(FINGERPRINT.to_string()).unwrap(),
+        );
+        config
+            .apps
+            .insert("fedora-oci".to_string(), "automata".to_string());
+        config
+    }
+
+    #[test]
+    fn a_named_publisher_expands_to_its_fingerprint() {
+        assert_eq!(
+            aliases().expand("automata/fedora-oci:v0.0.16").unwrap(),
+            format!("{FINGERPRINT}/fedora-oci:v0.0.16")
+        );
+    }
+
+    /// One fingerprint written once, referred to by any number of application
+    /// names.
+    #[test]
+    fn a_bare_name_resolves_through_its_application_entry() {
+        assert_eq!(
+            aliases().expand("fedora-oci:v0.0.16").unwrap(),
+            format!("{FINGERPRINT}/fedora-oci:v0.0.16")
+        );
+    }
+
+    #[test]
+    fn a_canonical_reference_passes_through_unchanged() {
+        let canonical = format!("{FINGERPRINT}/fedora-oci:v0.0.16");
+        assert_eq!(aliases().expand(&canonical).unwrap(), canonical);
+    }
+
+    /// Never a fallthrough to literal: that would bind the reference to a
+    /// publisher the operator did not name.
+    #[test]
+    fn an_unknown_name_is_an_error_naming_it() {
+        let error = aliases()
+            .expand("typo:v1")
+            .expect_err("an unknown application must not fall through");
+        let message = error.to_string();
+        assert!(message.contains("typo"), "{message}");
+        assert!(message.contains("[alias.apps]"), "{message}");
+
+        let error = aliases()
+            .expand("nobody/thing:v1")
+            .expect_err("an unknown publisher must not fall through");
+        assert!(error.to_string().contains("nobody"));
+    }
+
+    #[test]
+    fn an_alias_loop_is_reported_rather_than_hanging() {
+        let mut config = AliasConfig::default();
+        config
+            .apps
+            .insert("looping".to_string(), "circular".to_string());
+        // `circular` is absent, so the chain terminates with an unknown name
+        // rather than spinning.
+        let error = config.expand("looping:v1").expect_err("must not hang");
+        assert!(error.to_string().contains("circular"));
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_is_rejected_while_reading_configuration() {
+        for bad in ["0x9f2c", FINGERPRINT.to_uppercase().as_str(), "9f2c1d3e"] {
+            assert!(
+                PublisherFingerprint::try_from(bad.to_string()).is_err(),
+                "must reject {bad}"
+            );
+        }
+    }
+}

@@ -22,9 +22,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("init port {init_port} + 1000 overflows u16"))?;
 
     // 2. Resolve workload.
-    let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+    let resolved = resolve_workload(
+        &args.source,
+        &args.dir,
+        env,
+        config,
+        args.signing_key.as_deref(),
+        args.skip_freshness_check,
+    )?;
     let archive_path = resolved.archive_path;
     let archive_sha256 = resolved.archive_sha256;
+    let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
     let workload_attributes = resolved.attributes;
@@ -273,13 +281,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         ))
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
     init_config.pcr_policy = resolve_init_pcr_policy(
         args.pcr_policy.as_deref(),
         &init_config,
         registration_off,
         verified_tls.as_ref(),
-        &workload_name,
-        &workload_version,
+        &workload_app_ref,
     )
     .await?;
 

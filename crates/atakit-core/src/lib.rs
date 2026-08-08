@@ -5,7 +5,7 @@ pub mod tee_attributes;
 
 pub use env::{Env, LegacyImageStore};
 pub use progress::{NullReporter, ProgressHandle, ProgressReporter};
-pub use refs::encode_ref_path_segment;
+pub use refs::{is_canonical_id, is_valid_ref_name, is_valid_ref_version};
 
 /// Archive compression format for `.atawl` and `.atabi` files.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

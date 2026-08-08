@@ -91,7 +91,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     // Parse the user's reference. We need it up front so we know whether
     // to do name-based lookups (cheap) or id-based scans (more expensive
     // for github backends).
-    let wref = parse_workload_ref(&args.reference)?;
+    let wref = parse_workload_ref(&args.reference, &config.alias)?;
 
     // Filter out repos whose credential resolution failed (discovery
     // mode only -- pinned/single-target mode would have already
@@ -159,15 +159,12 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
         async move {
             let display = repo.display_uri();
             let result = match wref {
-                WorkloadRef::NameVersion {
-                    name: wname,
-                    version: wversion,
-                } => {
-                    let id = compute_workload_id(&wname, &wversion);
+                WorkloadRef::Ref(app_ref) => {
+                    let id = compute_workload_id(&app_ref);
                     let coords = WorkloadCoords {
-                        workload_id: format!("0x{}", hex::encode(id)),
-                        name: wname,
-                        version: wversion,
+                        workload_id: format!("{id:#x}"),
+                        name: app_ref.name.clone(),
+                        version: app_ref.version.clone(),
                     };
                     match repo.get_meta(&coords).await {
                         Ok(Some(meta)) => ProbeResult::Hit(coords, meta),
@@ -265,7 +262,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
 
     // Check if blob already in store (metadata-only entries from `add`
     // should still pull).
-    if store.has_blob(&coords.name, &coords.version) && !args.force {
+    if store.has_blob(&coords.workload_id) && !args.force {
         println!(
             "Workload {}:{} already in store (use --force to overwrite).",
             coords.name, coords.version
@@ -307,21 +304,21 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let archive_version = &inspection.manifest.meta.version;
 
     // Verify the archive's manifest matches the requested identity.
-    // Use hex_equal so harmless prefix / case differences between what
-    // the repository stored and what we compute locally don't trigger
-    // a false mismatch.
-    let expected_id = compute_workload_id(archive_name, archive_version);
-    let expected_id_hex = format!("0x{}", hex::encode(expected_id));
-    if !hex_equal(&expected_id_hex, &coords.workload_id) {
+    //
+    // The archive records a name and version but not a publisher, so the
+    // identifier cannot be recomputed from it. The name and version are
+    // compared directly instead, and the identifier the repository served is
+    // what binds the publisher — a repository returning a different one is
+    // caught by the `IdMismatch` check at probe time.
+    if archive_name != &coords.name || archive_version != &coords.version {
         anyhow::bail!(
             "archive identity mismatch: requested {}:{} ({}), \
-             but archive contains {}:{} ({})",
+             but archive contains {}:{}",
             coords.name,
             coords.version,
             &coords.workload_id[..10],
             archive_name,
             archive_version,
-            &expected_id_hex[..10],
         );
     }
 
@@ -409,10 +406,23 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     verify_pcr23(&coords.workload_id, pcr23, config, args.verify).await?;
 
     // Import blob from temp file into store.
-    store.import_blob(&coords.name, &coords.version, &tmp_path)?;
+    store.import_blob(&coords.workload_id, &tmp_path)?;
+
+    // The publisher: from the reference when it named one, otherwise from the
+    // owner the repository reports. A pull by bare identifier against a
+    // repository that reports no owner has neither, and the entry cannot record
+    // who published it.
+    let publisher = match &wref {
+        WorkloadRef::Ref(app_ref) => format!("{:#x}", app_ref.publisher),
+        WorkloadRef::Id(_) if !probe_meta.owner.is_empty() => probe_meta.owner.clone(),
+        WorkloadRef::Id(id) => anyhow::bail!(
+            "cannot record a publisher for {id}: the reference names none and repository \
+             {repo_name} reports no owner. Pull by <publisher>/<name>:<version> instead."
+        ),
+    };
 
     let now = chrono::Local::now().to_rfc3339();
-    let existing_meta = match store.load_meta(&coords.name, &coords.version) {
+    let existing_meta = match store.load_meta(&coords.workload_id) {
         Ok(meta) => meta,
         Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) if args.force => None,
         Err(error) => return Err(error.into()),
@@ -420,6 +430,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
     let meta = match existing_meta {
         Some(mut existing) => {
             existing.workload_id = coords.workload_id.clone();
+            existing.publisher = publisher.clone();
             existing.sha256 = Some(sha256.clone());
             existing.pcr23 = Some(pcr23.clone());
             existing.archive_size = Some(archive_size);
@@ -430,6 +441,7 @@ pub async fn run(args: PullArgs, env: &Env, config: &Config) -> Result<()> {
             existing
         }
         None => WorkloadMeta {
+            publisher: publisher.clone(),
             metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
             workload_id: coords.workload_id.clone(),
             name: coords.name.clone(),

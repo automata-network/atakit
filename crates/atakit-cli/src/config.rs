@@ -7,8 +7,8 @@ use atakit_cloud::CloudConfig;
 #[cfg(test)]
 use atakit_config::CredentialSpec;
 pub use atakit_config::{
-    repo_local_name, BuildConfig, ChainConfig, ContainerEngine, GithubConfig, ImageConfig,
-    ImageRepositorySpec, KeyMode, KeySpec, KeyType, OwnerOperationsConfig, ProverSpec,
+    repo_local_name, AliasConfig, BuildConfig, ChainConfig, ContainerEngine, GithubConfig,
+    ImageConfig, ImageRepositorySpec, KeyMode, KeySpec, KeyType, OwnerOperationsConfig, ProverSpec,
     PublishConfig,
 };
 use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
@@ -23,6 +23,11 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub chains: IndexMap<String, ChainConfig>,
+    /// Operator-facing aliases, so a command line can say
+    /// `automata/name:version` or `name:version` instead of 66 hexadecimal
+    /// characters. Expanded before a reference is parsed; an alias can never
+    /// reach anything measured or persisted.
+    pub alias: AliasConfig,
     pub owner_operations: OwnerOperationsConfig,
     pub provers: IndexMap<String, ProverSpec>,
     pub keys: IndexMap<String, KeySpec>,

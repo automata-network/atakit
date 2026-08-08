@@ -95,8 +95,23 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         let name = &inspect.manifest.meta.name;
         let version = &inspect.manifest.meta.version;
 
+        // The identifier is publisher-qualified, so a build has to know which
+        // publisher it is building for. The signing key's owner fingerprint is
+        // that publisher: the key that will register this workload is the key
+        // that determines its identity.
+        let owner_key = super::resolve_owner_key(args.signing_key.as_deref(), config)?;
+        let publisher = super::owner_fingerprint(&owner_key)?;
+        let app_ref = automata_tee_workload_measurement::types::AppRef::new(
+            publisher,
+            name.clone(),
+            version.clone(),
+        );
+        let workload_id = super::compute_workload_id(&app_ref);
+        let workload_id_hex = format!("{workload_id:#x}");
+        let publisher_hex = format!("{publisher:#x}");
+
         // Check if an existing entry has a different PCR23 and confirm before overwriting
-        let existing_meta = match store.load_meta(name, version) {
+        let existing_meta = match store.load_meta(&workload_id_hex) {
             Ok(meta) => meta,
             Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => {
                 println!(
@@ -145,14 +160,14 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             }
         }
 
-        let size = store.import_blob(name, version, &result.archive_path)?;
+        let size = store.import_blob(&workload_id_hex, &result.archive_path)?;
 
         // Merge into existing meta to preserve chain data from `workload add`
-        let workload_id = super::compute_workload_id(name, version);
         let now = chrono::Local::now().to_rfc3339();
         let meta = match existing_meta {
             Some(mut existing) => {
-                existing.workload_id = format!("0x{}", hex::encode(workload_id));
+                existing.workload_id = workload_id_hex.clone();
+                existing.publisher = publisher_hex.clone();
                 existing.sha256 = Some(inspect.sha256);
                 existing.pcr23 = Some(inspect.pcr23_sha256);
                 existing.archive_size = Some(size);
@@ -161,7 +176,8 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
             }
             None => WorkloadMeta {
                 metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
-                workload_id: format!("0x{}", hex::encode(workload_id)),
+                workload_id: workload_id_hex.clone(),
+                publisher: publisher_hex.clone(),
                 name: name.clone(),
                 version: version.clone(),
                 sha256: Some(inspect.sha256),

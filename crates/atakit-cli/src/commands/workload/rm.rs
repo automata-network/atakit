@@ -5,26 +5,26 @@ use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
 use super::parse_workload_ref;
+use crate::config::Config;
 
-pub fn run(args: RmArgs, env: &Env) -> Result<()> {
+pub fn run(args: RmArgs, env: &Env, config: &Config) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
-    let wref = parse_workload_ref(&args.reference)?;
-    let (name, version) = super::resolve_ref(&wref, &store)?;
-
-    if !store.exists(&name, &version) {
-        anyhow::bail!("workload not found in store: {name}:{version}");
-    }
+    let workload_id = parse_workload_ref(&args.reference, &config.alias)?.workload_id();
+    let entry = store
+        .get(&workload_id)?
+        .ok_or_else(|| anyhow::anyhow!("workload not found in store: {workload_id}"))?;
+    let (name, version) = (entry.meta.name.clone(), entry.meta.version.clone());
 
     if args.blob_only {
-        store.remove_blob(&name, &version)?;
+        store.remove_blob(&workload_id)?;
         println!(
             "Removed archive blob for {}:{}.",
             name.green().bold(),
             version
         );
     } else {
-        store.remove(&name, &version)?;
+        store.remove(&workload_id)?;
         println!("Removed {}:{}.", name.green().bold(), version);
     }
 

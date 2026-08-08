@@ -49,6 +49,11 @@ pub struct BuildArgs {
     /// Workload directory (default: current directory)
     #[arg(short, long)]
     pub dir: Option<PathBuf>,
+    /// Named ES256K key whose owner fingerprint is the publisher. The workload
+    /// identifier is derived from it, so it cannot be computed without one.
+    /// Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Output directory for .atawl file (default: workload directory)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -209,6 +214,11 @@ pub struct PullArgs {
 /// Arguments for `workload push`.
 #[derive(Args)]
 pub struct PushArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the source is
+    /// a file path rather than a publisher-qualified store reference. Defaults
+    /// to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Workload reference (name:version) or path to .atawl file
     pub source: Option<String>,
     /// Workload directory (for auto-detect)
@@ -225,6 +235,11 @@ pub struct PushArgs {
 /// Arguments for `workload import`.
 #[derive(Args)]
 pub struct ImportArgs {
+    /// Named ES256K key whose fingerprint is the publisher. An archive records
+    /// its name and version but not who published it, and the identifier is
+    /// derived from the publisher. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Path to .atawl file
     pub archive: PathBuf,
     /// Force overwrite if already in store
@@ -245,8 +260,14 @@ pub struct ExportArgs {
 /// Arguments for `workload add`.
 #[derive(Args)]
 pub struct AddArgs {
-    /// Workload reference (name:version or 0x<workload_id>), or path to .atawl file
+    /// Workload reference (<publisher>/<name>:<version> or 0x<workload_id>), or
+    /// path to a .atawl file
     pub reference: String,
+    /// Named ES256K key whose fingerprint is the publisher, when the reference
+    /// is a file path rather than a publisher-qualified reference. Defaults to
+    /// [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
@@ -271,6 +292,12 @@ pub struct InitArgs {
     /// Portal address: "host" or "host:port" (default port 1024;
     /// status port = init port + 1000).
     pub address: String,
+
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
 
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
