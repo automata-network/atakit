@@ -1,12 +1,18 @@
 # atakit-attestation-client
 
-`atakit-attestation-client` is the read-only network client for atakit
-attestation verification. The caller selects an RPC endpoint and a
+`atakit-attestation-client` implements the complete atakit attestation
+verification workflow. The caller selects an RPC endpoint and a
 `SessionRegistry` address. Portal evidence cannot select or replace either
 value.
 
 The client:
 
+- collects and verifies portal TLS attestation, returning a pinned client;
+- loads verifier-supplied trust inputs from certificate, revocation-list, and
+  policy files;
+- resolves Intel TDX DCAP collateral and AMD SEV-SNP collateral for the
+  presented evidence;
+- states which trust inputs each `(cloud, tee)` pair requires;
 - checks the RPC-reported chain ID;
 - derives `BaseImageRegistry`, `WorkloadRegistry`, and
   `AmdSnpSecurityPolicyRegistry` from `SessionRegistry`;
@@ -92,10 +98,34 @@ fetches `GET /session/evidence-bundle`, resolves the committed Azure MAA key
 when required, constructs `SessionVerificationInputs`, and calls
 `atakit_attestation::verify_session_bundle`.
 
-The concrete portal TLS plus current-session workflow lives in
-`atakit_cloud::session::verify_portal_session`. This client starts from
-`VerifiedPortalTls`, so platform-specific portal TLS collection remains
-outside this crate.
+The complete portal TLS plus current-session workflow is
+`atakit_attestation_client::workflow::verify_portal_session`.
 
 Use `atakit_attestation::verify_session_bundle` directly when all typed inputs
 are already available and no network access is required.
+
+## Boundary decision, 2026-08-08
+
+Portal TLS collection lives in this crate. This reverses the boundary set on
+2026-08-03 in `atakit-ng` pull request 58 (merge
+`0dafb670dbca18920b1e143ca7a2d2d87c0a0a0c`, topic
+`e68c0245cba0d3c418d3be38d7dd4b20780b2abd`), which stated that
+`atakit_cloud::session::verify_portal_session` owned the complete order and
+that platform-specific portal TLS collection remained outside this crate.
+
+This is a recorded change of mind, not the old rule failing to apply. The
+operator authored both the topic commit and the merge, and directed the
+reversal five days later.
+
+The reason: a consumer that wants the complete verification workflow needed
+exactly one function from `atakit-cloud` and received `aws/`, `azure/`, `gcp/`,
+`qemu/`, disk-image handling, and their dependencies with it. The platform
+branching involved is not cloud deployment code — it reads
+`response.platform.cloud` and `response.platform.tee` to decide which
+collateral a given piece of evidence requires, and uses no cloud provider SDK,
+no credentials, and no deployment module.
+
+`atakit-cloud` keeps deployment — the `POST /init` upload and portal lifecycle
+waiting — and re-exports every moved name, so `atakit cloud verify-session`,
+`atakit cloud deploy`, and `atakit cloud session status` are unchanged.
+`atakit-attestation` remains free of network access.

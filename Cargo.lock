@@ -1279,20 +1279,31 @@ dependencies = [
 name = "atakit-attestation-client"
 version = "0.5.5"
 dependencies = [
+ "alloy",
  "alloy-ext",
  "atakit-attestation",
  "atakit-core",
+ "automata-dcap-network-registry",
  "automata-tee-workload-measurement",
  "base64",
  "chrono",
+ "dcap-rs",
+ "futures-util",
  "hex",
+ "k256",
+ "pccs-reader-rs",
+ "pem",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "sha3 0.10.8",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "urlencoding",
+ "x509-cert",
 ]
 
 [[package]]
@@ -1343,17 +1354,12 @@ dependencies = [
  "atakit-attestation-client",
  "atakit-config",
  "atakit-core",
- "atakit-image",
- "automata-dcap-network-registry",
  "base64",
  "chrono",
  "clap",
- "dcap-rs",
  "futures-util",
  "hex",
  "k256",
- "pccs-reader-rs",
- "pem",
  "rcgen",
  "reqwest",
  "serde",
@@ -1365,8 +1371,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "urlencoding",
- "x509-cert",
  "zstd",
 ]
 

@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use pccs_reader_rs::tcb_pem::generate_tcb_issuer_chain_pem;
 use pccs_reader_rs::{Collaterals, PccsReadStrategy, PccsReader};
 
-use crate::init::TdxDcapAutomataReadStrategy;
+use super::TdxDcapAutomataReadStrategy;
 
 const INTEL_PCS_URL: &str = "https://api.trustedservices.intel.com";
 const INTEL_ROOT_CA_CRL_URL: &str =
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn extracts_material_from_the_upstream_tdx_quote_sample() {
-        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
             .expect("decode quote");
         let material = quote_material(&quote).expect("extract quote material");
         assert_eq!(material.fmspc.len(), 12);
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn version_one_file_round_trip_preserves_collateral_and_exact_selector() {
-        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
             .expect("decode TDX quote");
         let collateral = synthetic_collateral_for_quote(&quote);
         let clone = collateral.clone();
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn exact_evaluation_number_must_match_signed_tcb_info() {
-        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
             .expect("decode TDX quote");
         let collateral = synthetic_collateral_for_quote_with_selection(
             &quote,
@@ -509,14 +509,15 @@ mod tests {
 
     #[test]
     fn rejects_non_tdx_quotes_and_nonzero_trailing_bytes() {
-        let sgx_quote = hex::decode(include_str!("../testdata/automata-dcap/quotev3.hex").trim())
-            .expect("decode SGX quote");
+        let sgx_quote =
+            hex::decode(include_str!("../../../testdata/automata-dcap/quotev3.hex").trim())
+                .expect("decode SGX quote");
         assert!(quote_material(&sgx_quote)
             .expect_err("SGX quote must not be accepted as TDX")
             .contains("expected a TDX quote"));
 
         let mut padded_tdx_quote =
-            hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+            hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
                 .expect("decode TDX quote");
         padded_tdx_quote.push(1);
         assert!(quote_material(&padded_tdx_quote)
@@ -527,7 +528,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live Hoodi RPC endpoint"]
     async fn live_automata_collateral_verifies_the_tdx_sample() {
-        let quote = hex::decode(include_str!("../testdata/automata-dcap/quotev4.hex").trim())
+        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
             .expect("decode TDX quote");
         let collateral = fetch_automata_collateral(
             "https://ethereum-hoodi-rpc.publicnode.com",
@@ -565,7 +566,7 @@ mod capture_fixture_collateral {
     /// Provisioning Certification Service over the network; the committed
     /// artifact it produces is what the offline fixture actually uses.
     ///
-    ///     cargo test -p atakit-cloud capture_azure_tdx_collateral -- --ignored --nocapture
+    ///     cargo test -p atakit-attestation-client capture_azure_tdx_collateral -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
     async fn capture_azure_tdx_collateral() {
