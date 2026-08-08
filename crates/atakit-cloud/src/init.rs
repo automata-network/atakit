@@ -19,16 +19,58 @@ use crate::error::CloudError;
 use crate::pcr_policy::ResolvedPcrPolicyConfig;
 
 pub use atakit_attestation_client::{
-    bootstrap_portal_tls, bootstrap_portal_tls_with_trust_config,
-    cloud_tls_attestation_report_path, load_measurement_policy, load_tls_verification_trust,
-    local_measurement_pack_exists, read_untrusted_portal_base_image_id, required_trust_inputs,
-    tdx_dcap_automata_read_strategy, tdx_dcap_collateral_config,
-    tdx_dcap_collateral_config_with_read_strategy, tls_manual_override_message,
-    unsatisfied_trust_inputs, workload_tls_attestation_report_path, write_tls_attestation_report,
-    AzureMaaTrustConfig, AzureMaaTrustSource, IntelTdxDcapCollateralConfig,
+    bootstrap_portal_tls, cloud_tls_attestation_report_path, load_measurement_policy,
+    load_tls_verification_trust, local_measurement_pack_exists,
+    read_untrusted_portal_base_image_id, required_trust_inputs, tdx_dcap_automata_read_strategy,
+    tdx_dcap_collateral_config, tdx_dcap_collateral_config_with_read_strategy,
+    tls_manual_override_message, unsatisfied_trust_inputs, workload_tls_attestation_report_path,
+    write_tls_attestation_report, AzureMaaTrustConfig, AzureMaaTrustSource, ChainTrustSource,
+    CollateralRequest, ExplicitTrustSource, IntelTdxDcapCollateralConfig,
     IntelTdxDcapCollateralSource, PortalVerificationError, RequiredTrustInput,
-    TdxDcapAutomataReadStrategy, TlsManualOverride, TlsVerificationTrust, VerifiedPortalTls,
+    TdxDcapAutomataReadStrategy, TlsManualOverride, TlsVerificationTrust, TrustAnchorsBuilder,
+    TrustInputSource, TrustProvenance, TrustSource, VerifiedPortalTls,
 };
+
+/// Select the trust source for a deployment command from the chain section of
+/// the `/init` payload.
+///
+/// A deployment always carries a chain, because the portal needs one, so a
+/// configured chain means chain mode. Pinned trust files cannot be combined
+/// with it: the exclusive-source rule withdrew per-field precedence, and
+/// silently ignoring a pin the operator supplied is exactly the outcome that
+/// rule exists to prevent. The refusal names the flags so the operator can
+/// either drop them or verify explicitly with `atakit cloud verify-session`,
+/// where `--chain` is optional.
+pub async fn trust_source_for_init_chain(
+    chain: &InitChainConfig,
+    trust: TlsVerificationTrust,
+    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+) -> Result<TrustSource, CloudError> {
+    if atakit_attestation_client::chain_coordinates_configured(
+        &chain.rpc_url,
+        &chain.session_registry,
+    ) {
+        if !trust.sources.is_empty() {
+            let flags: Vec<&str> = trust.sources.keys().map(String::as_str).collect();
+            return Err(CloudError::Config {
+                message: format!(
+                    "a configured chain resolves every trust anchor from the registry, so {} \
+                     cannot also be supplied; drop the pinned files, or verify explicitly with \
+                     `atakit cloud verify-session` without --chain",
+                    flags.join(", ")
+                ),
+            });
+        }
+        return Ok(TrustSource::Chain(
+            ChainTrustSource::connect(&chain.rpc_url, &chain.session_registry, tdx_dcap_collateral)
+                .await?,
+        ));
+    }
+    Ok(TrustSource::Explicit(ExplicitTrustSource::new(
+        trust,
+        tdx_dcap_collateral,
+    )?))
+}
 
 /// Build verifier-side Automata on-chain trust config from the chain section of
 /// the `/init` payload.

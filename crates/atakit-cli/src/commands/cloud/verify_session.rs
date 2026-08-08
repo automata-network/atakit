@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use atakit_attestation_client::{AttestationClient, TrustedWorkloadSessionPolicy};
+use atakit_attestation_client::TrustedWorkloadSessionPolicy;
 use atakit_cloud::cli::VerifySessionArgs;
 use atakit_cloud::init;
+use atakit_cloud::init::{ChainTrustSource, ExplicitTrustSource, TrustSource};
 use atakit_cloud::session::{
     verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
 };
@@ -13,7 +14,7 @@ use atakit_core::Env;
 use owo_colors::OwoColorize;
 
 use super::session_access::{connect_attestation_client, decode_hex_32, decode_hex_48};
-use super::{resolve_instance, resolve_verifier_tls_measurement_policy, synthesize_off_init_chain};
+use super::{resolve_instance, resolve_verifier_tls_measurement_policy};
 use crate::config::Config;
 
 struct VerificationSubject {
@@ -26,7 +27,10 @@ struct VerificationSubject {
 
 pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<()> {
     let subject = resolve_subject(&args, env)?;
-    let (init_chain, chain_client) = match args.verification.chain.as_deref() {
+    // `verify-session` no longer needs an `InitChainConfig`: the trust source
+    // carries the chain client directly, and nothing here builds an `/init`
+    // payload.
+    let chain_client = match args.verification.chain.as_deref() {
         Some(chain_name) => {
             let chain = config
                 .chains
@@ -34,19 +38,10 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
                 .ok_or_else(|| anyhow::anyhow!("chain '{chain_name}' not found in config"))?;
             let client = connect_attestation_client(chain_name, chain).await?;
             let context = client.context();
-            let init_chain = init::InitChainConfig {
-                rpc_url: chain.rpc_url.clone(),
-                session_registry: context.session_registry.clone(),
-                workload_registry: context.workload_registry.clone(),
-                base_image_registry: context.base_image_registry.clone(),
-                registration: Some("required".to_string()),
-                chain_id: Some(context.chain_id),
-                tee_backend: chain.tee_backend.clone(),
-                prover: None,
-            };
-            (init_chain, Some(client))
+            let _ = context;
+            Some(client)
         }
-        None => (synthesize_off_init_chain(), None),
+        None => None,
     };
 
     let measurement_policy = resolve_verifier_tls_measurement_policy(
@@ -83,6 +78,30 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
+    // One authority per verification. Selecting a chain means the registry
+    // supplies every trust anchor, so a pinned file alongside it is refused
+    // rather than silently unused.
+    let trust_source = match &chain_client {
+        Some(client) => {
+            if !tls_verification_trust.sources.is_empty() {
+                let flags: Vec<&str> = tls_verification_trust
+                    .sources
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                bail!(
+                    "--chain resolves every trust anchor from the registry, so {} cannot also be supplied; drop the pinned files, or drop --chain to verify explicitly",
+                    flags.join(", ")
+                );
+            }
+            TrustSource::Chain(ChainTrustSource::from_client(client.clone(), tdx_dcap))
+        }
+        None => TrustSource::Explicit(
+            ExplicitTrustSource::new(tls_verification_trust, tdx_dcap)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        ),
+    };
+
     let workload_policy = match (
         args.verification.trusted_workload_pcr23_sha256.as_deref(),
         args.verification.trusted_workload_pcr23_sha384.as_deref(),
@@ -93,18 +112,14 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
                 decode_hex_32(sha256, "--trusted-workload-pcr23-sha256")?,
                 decode_hex_48(sha384, "--trusted-workload-pcr23-sha384")?,
             )?,
-            trusted_binding: chain_client
-                .as_ref()
-                .map(AttestationClient::trusted_session_binding),
         },
         (None, None) => {
-            let client = chain_client.ok_or_else(|| {
-                anyhow::anyhow!(
+            if chain_client.is_none() {
+                bail!(
                     "no trusted workload collateral is available; select a verifier chain with --chain or provide both --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384"
-                )
-            })?;
+                );
+            }
             SessionWorkloadPolicySource::Registry {
-                client,
                 workload: subject.workload_ref.clone(),
             }
         }
@@ -114,27 +129,38 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     };
 
     eprint!("Verify portal TLS and current session... ");
-    let verified = verify_portal_session(PortalSessionVerificationRequest {
+    let outcome = verify_portal_session(PortalSessionVerificationRequest {
         host: subject.host.clone(),
         status_port: subject.status_port,
         measurement_policy,
-        tls_verification_trust,
-        azure_maa_trust: init::azure_maa_trust_config_from_init_chain(&init_chain),
-        tdx_dcap_collateral: tdx_dcap,
+        trust_source,
         report_path: None,
         workload_policy,
         required_binding: None,
     })
     .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?
-    .session;
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verified = outcome.session;
     eprintln!("{}", "done".green());
 
     if let Some(parent) = subject.report_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create report directory {}", parent.display()))?;
     }
-    std::fs::write(&subject.report_path, serde_json::to_vec_pretty(&verified)?)
+    // Provenance is reported alongside the verified session so an operator can
+    // see which authority supplied each trust input. `flatten` keeps every
+    // field the report already carried at the top level.
+    #[derive(serde::Serialize)]
+    struct SessionVerificationReport<'a> {
+        #[serde(flatten)]
+        session: &'a atakit_attestation::VerifiedSession,
+        trust_provenance: &'a atakit_cloud::init::TrustProvenance,
+    }
+    let report = SessionVerificationReport {
+        session: &verified,
+        trust_provenance: &outcome.portal_tls.trust_provenance,
+    };
+    std::fs::write(&subject.report_path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write session report {}", subject.report_path.display()))?;
 
     println!();

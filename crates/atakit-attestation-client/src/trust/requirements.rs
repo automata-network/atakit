@@ -2,6 +2,8 @@
 
 use atakit_attestation::TrustAnchors;
 
+use crate::trust::request::CollateralRequest;
+
 /// A trust input a verification requires for a given platform.
 ///
 /// Which inputs are required is decided by `platform.cloud` and `platform.tee`
@@ -38,35 +40,88 @@ impl RequiredTrustInput {
             Self::AwsDocumentLimits => "--aws-document-limits",
         }
     }
+
+    /// Stable name used in failures and in reported provenance.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GcpAkRoot => "gcp-ak-root",
+            Self::AzureMaaSigningCertificate => "azure-maa-signing-certificate",
+            Self::AmdArkRoot => "amd-ark-root",
+            Self::AmdSnpSecurityPolicy => "amd-snp-security-policy",
+            Self::AwsNitroRoot => "aws-nitro-root",
+            Self::AwsDocumentLimits => "aws-document-limits",
+        }
+    }
+
+    /// Whether the supplied anchors satisfy this input for this exact request.
+    ///
+    /// This is stricter than the platform-pair form: the AMD SEV-SNP policy
+    /// must match the exact family-model-stepping value in the signed report,
+    /// which the platform pair cannot see.
+    pub fn is_satisfied_by(self, anchors: &TrustAnchors, request: &CollateralRequest) -> bool {
+        match self {
+            Self::GcpAkRoot => !anchors.gcp_roots.is_empty() || !anchors.gcp_root_hashes.is_empty(),
+            Self::AzureMaaSigningCertificate => !anchors.azure_maa_keys.is_empty(),
+            Self::AmdArkRoot => {
+                !anchors.amd_ark_roots.is_empty() || !anchors.amd_ark_root_hashes.is_empty()
+            }
+            Self::AmdSnpSecurityPolicy => match request.amd_snp_cpuid {
+                Some(cpuid) => anchors
+                    .amd_snp_security_policies
+                    .iter()
+                    .any(|policy| policy.cpuid == cpuid),
+                None => !anchors.amd_snp_security_policies.is_empty(),
+            },
+            Self::AwsNitroRoot => {
+                !anchors.aws_nitro_roots.is_empty() || !anchors.aws_nitro_root_hashes.is_empty()
+            }
+            Self::AwsDocumentLimits => {
+                anchors.aws_document_maximum_age_seconds.is_some()
+                    && anchors
+                        .aws_document_allowed_future_clock_difference_seconds
+                        .is_some()
+            }
+        }
+    }
+}
+
+/// The trust inputs one specific request requires.
+///
+/// This is the precise form. It closes both gaps the platform-pair matrix
+/// documents: an Azure response is only required to carry a MAA signing
+/// certificate when its `akBinding` actually is an Azure MAA token, and the
+/// AMD SEV-SNP policy is matched against the exact CPUID in the signed report
+/// rather than accepting any policy at all.
+pub fn required_trust_inputs_for_request(request: &CollateralRequest) -> Vec<RequiredTrustInput> {
+    let mut required = required_trust_inputs(&request.cloud, &request.tee);
+    if request.azure_maa_jwt.is_none() {
+        required.retain(|input| *input != RequiredTrustInput::AzureMaaSigningCertificate);
+    }
+    required
 }
 
 /// The trust inputs a `(cloud, tee)` pair requires.
 ///
-/// This is the declarative form of the platform branching in
-/// [`resolve_chain_trust_anchors`]. Keeping it separate means the requirement
-/// set can be asserted per platform without a live portal, a chain, or a
-/// network, which is what makes explicit-mode verification testable.
+/// The coarse form, keyed on the platform pair alone. It can be asserted per
+/// platform without a live portal, a chain, or a network, which is what makes
+/// explicit-mode verification testable.
 ///
 /// # Two requirements this cannot express
 ///
-/// `(cloud, tee)` is not enough to reproduce the resolution code exactly. Both
-/// gaps err toward **over**-requiring, so a caller may be told an input is
-/// missing that the resolution code would not have asked for. Neither can
-/// under-require, so neither can cause an input to be silently skipped.
+/// `(cloud, tee)` is not enough to reproduce resolution exactly. Both gaps err
+/// toward **over**-requiring, so a caller may be told an input is missing that
+/// resolution would not have asked for. Neither can under-require, so neither
+/// can cause an input to be silently skipped.
 ///
-/// - **Azure MAA** is gated by `is_azure_maa_response`, which additionally
-///   requires `akBinding.kind == "azure-maa-jwt"`. An Azure response carrying
-///   a different binding kind needs no MAA signing certificate, but is listed
-///   here as needing one.
-/// - **AMD SEV-SNP security policy** is matched per CPUID by
-///   `resolve_chain_trust_anchors`, which looks for a policy whose `cpuid`
-///   equals the one in the signed report. That value exists only after
-///   decoding the report, so this can say a policy is needed but not which.
+/// - **Azure MAA** additionally depends on `akBinding.kind` being
+///   `azure-maa-jwt`. An Azure response carrying a different binding kind needs
+///   no MAA signing certificate, but is listed here as needing one.
+/// - **AMD SEV-SNP security policy** is matched against the exact CPUID in the
+///   signed report. That value exists only after decoding the report, so this
+///   can say a policy is needed but not which.
 ///
-/// Closing both gaps needs the whole `TlsAttestationResponse` rather than the
-/// platform triple — the same conclusion the consolidation proposal reached
-/// for `TrustAnchorsBuilder`, arrived at here from the opposite direction.
-/// That typed request is `CollateralRequest`, and it does not exist yet.
+/// [`required_trust_inputs_for_request`] closes both gaps and is what
+/// resolution actually uses.
 ///
 /// An unrecognised pair yields an empty set rather than an error: the caller
 /// decides whether an unknown platform is fatal, and every current caller
@@ -343,34 +398,30 @@ mod explicit_trust_fixtures {
         }
     }
 
-    /// Known gap, pinned deliberately. `resolve_azure_maa_trust` is gated by
-    /// `is_azure_maa_response`, which also requires
-    /// `akBinding.kind == "azure-maa-jwt"`. This matrix sees only
-    /// `(cloud, tee)`, so it requires a MAA certificate for every Azure
-    /// response. Over-requiring, never under-requiring.
-    ///
-    /// Delete this test when `CollateralRequest` carries the binding kind.
+    /// The platform-pair matrix is deliberately coarser than the request form:
+    /// it requires a MAA certificate for every Azure response, because it
+    /// cannot see the binding kind. Over-requiring, never under-requiring.
+    /// `required_trust_inputs_for_request` is the precise form and is what
+    /// resolution uses; this pins the difference so the coarse form is not
+    /// mistaken for it.
     #[test]
-    fn azure_requirement_is_coarser_than_the_resolution_code() {
+    fn azure_requirement_is_coarser_than_the_request_form() {
         assert!(required_trust_inputs("azure", "tdx")
             .contains(&RequiredTrustInput::AzureMaaSigningCertificate));
     }
 
-    /// Known gap, pinned deliberately. `resolve_chain_trust_anchors` matches an
-    /// AMD SEV-SNP policy against the exact CPUID in the signed report; this
-    /// matrix cannot decode the report, so any policy satisfies the
-    /// requirement. A policy for the wrong CPUID would pass here and be
-    /// rejected by the real resolution path.
-    ///
-    /// Delete this test when `CollateralRequest` carries the report CPUID.
+    /// The coarse form cannot decode the signed report, so any AMD SEV-SNP
+    /// policy satisfies it. Resolution matches the exact CPUID through
+    /// `RequiredTrustInput::is_satisfied_by`, which
+    /// `a_policy_for_another_cpuid_does_not_satisfy_the_requirement` covers.
     #[test]
-    fn snp_policy_requirement_ignores_cpuid() {
+    fn the_coarse_snp_policy_requirement_ignores_cpuid() {
         let mut anchors = complete_anchors("aws", "sev-snp");
         anchors.amd_snp_security_policies = vec![snp_security_policy(0xdead_beef)];
         assert!(
             unsatisfied_trust_inputs("aws", "sev-snp", &anchors).is_empty(),
-            "a wrong-CPUID policy currently satisfies this matrix; \
-             resolve_chain_trust_anchors would still reject it"
+            "a wrong-CPUID policy satisfies the coarse matrix; the request \
+             form is what rejects it"
         );
     }
 }

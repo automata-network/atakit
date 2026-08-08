@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use atakit_attestation::{
     BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384,
-    TrustedSessionBinding, VerifiedSession,
+    VerifiedSession,
 };
 use atakit_attestation_client::{
     verify_current_session, AttestationClient, AttestationClientConfig,
@@ -58,20 +58,37 @@ pub(crate) struct VerifiedCloudSessionAccess {
     pub required_binding: Option<BindingMode>,
     pub verified_tls: VerifiedPortalTls,
     workload_policy: TrustedWorkloadSessionPolicy,
-    trusted_binding: Option<TrustedSessionBinding>,
+    /// Present exactly when the registered policy came from a chain. The
+    /// session binding is derived from this client and nowhere else, so an
+    /// explicit verification cannot acquire one.
+    chain_client: Option<AttestationClient>,
 }
 
 impl VerifiedCloudSessionAccess {
     pub async fn verify_current_session(&self) -> Result<VerifiedSession> {
-        verify_current_session(
-            &self.verified_tls,
-            &self.host,
-            self.status_port,
-            self.workload_policy.clone(),
-            self.required_binding,
-            self.trusted_binding,
-        )
-        .await
+        match &self.chain_client {
+            Some(client) => {
+                client
+                    .verify_current_session_with_policy(
+                        &self.verified_tls,
+                        &self.host,
+                        self.status_port,
+                        self.workload_policy.clone(),
+                        self.required_binding,
+                    )
+                    .await
+            }
+            None => {
+                verify_current_session(
+                    &self.verified_tls,
+                    &self.host,
+                    self.status_port,
+                    self.workload_policy.clone(),
+                    self.required_binding,
+                )
+                .await
+            }
+        }
         .map_err(|error| anyhow::anyhow!("{error}"))
     }
 }
@@ -171,14 +188,16 @@ pub(crate) async fn resolve_verified_portal_access(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
+    let trust_source =
+        init::trust_source_for_init_chain(&init_chain, tls_verification_trust, tdx_dcap)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verified_tls = init::bootstrap_portal_tls(
         &host,
         status_port,
         Some(measurement_policy),
         None,
-        tls_verification_trust,
-        init::azure_maa_trust_config_from_init_chain(&init_chain),
-        tdx_dcap,
+        &trust_source,
         None,
         Some(&init::cloud_tls_attestation_report_path(
             &env.data_dir,
@@ -222,9 +241,6 @@ pub(crate) async fn resolve_verified_session_access(
         None if registration_is_off(portal.registration.as_deref()) => None,
         None => bail!("no chain config is available for verifier trust lookup"),
     };
-    let trusted_binding = chain_client
-        .as_ref()
-        .map(AttestationClient::trusted_session_binding);
     let workload_id = crate::commands::workload::compute_workload_id(
         &portal.state.workload_name,
         &portal.state.workload_version,
@@ -249,7 +265,7 @@ pub(crate) async fn resolve_verified_session_access(
         required_binding,
         verified_tls: portal.verified_tls,
         workload_policy,
-        trusted_binding,
+        chain_client,
     })
 }
 

@@ -4,8 +4,6 @@
 //! selects the RPC endpoint and `SessionRegistry`; portal evidence cannot
 //! select either value.
 
-pub mod trust;
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::portal::session::{self, VerifiedPortalTls};
@@ -243,6 +241,31 @@ impl AttestationClient {
         }
     }
 
+    /// Verify a current session against a caller-supplied typed workload
+    /// policy, binding it to this client's own chain context.
+    ///
+    /// The binding comes from the same client, so it is chain-mode evidence
+    /// bound to chain-mode coordinates. Explicit verification uses the free
+    /// `session::verify_current_session`, which has no binding parameter at all.
+    pub async fn verify_current_session_with_policy(
+        &self,
+        verified_tls: &session::VerifiedPortalTls,
+        host: &str,
+        status_port: u16,
+        workload: TrustedWorkloadSessionPolicy,
+        required_binding: Option<atakit_attestation::BindingMode>,
+    ) -> Result<atakit_attestation::VerifiedSession, AttestationClientError> {
+        session::verify_current_session_bound(
+            verified_tls,
+            host,
+            status_port,
+            workload,
+            required_binding,
+            Some(self.trusted_session_binding()),
+        )
+        .await
+    }
+
     /// Fetch the complete registered base-image hierarchy and convert it to
     /// the policy type consumed by atakit attestation verification.
     pub async fn resolve_base_image_measurement_policy(
@@ -319,7 +342,7 @@ impl AttestationClient {
             )
         })?;
         context.chain_client = Some(self.clone());
-        session::verify_current_session(
+        session::verify_current_session_bound(
             &verified_tls,
             host,
             status_port,

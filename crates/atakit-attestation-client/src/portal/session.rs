@@ -46,6 +46,8 @@ pub struct VerifiedPortalTls {
     pub identity: VerifiedTlsIdentity,
     pub manual_override: Option<TlsManualOverride>,
     pub session_verification: Option<PortalSessionVerificationContext>,
+    /// Where each trust input for this verification came from.
+    pub trust_provenance: crate::trust::source::TrustProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,29 @@ struct EvidenceBundleResponse {
 /// policy and trust material. Registry state is not read and no transaction is
 /// created or submitted.
 pub async fn verify_current_session(
+    verified_tls: &VerifiedPortalTls,
+    host: &str,
+    status_port: u16,
+    workload: TrustedWorkloadSessionPolicy,
+    required_binding: Option<BindingMode>,
+) -> Result<VerifiedSession, AttestationClientError> {
+    // No binding parameter: an explicit verification has no chain context and
+    // must not be handed one. Chain mode reaches the binding through
+    // `ChainTrustSource`, which is the only place it exists.
+    verify_current_session_bound(
+        verified_tls,
+        host,
+        status_port,
+        workload,
+        required_binding,
+        None,
+    )
+    .await
+}
+
+/// Chain-mode verification, which binds the session to the client's own chain
+/// context. Crate-private so no caller outside chain mode can supply one.
+pub(crate) async fn verify_current_session_bound(
     verified_tls: &VerifiedPortalTls,
     host: &str,
     status_port: u16,
