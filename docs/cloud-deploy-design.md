@@ -232,9 +232,11 @@ appended to the effective base-image profile and variant rules, including when
 both policies constrain the same PCR. Deployment-management verification with
 `registration = "off"` and no `WorkloadRegistry` hashes and inspects the saved
 `.atawl` and uses its PCR23. For `atakit cloud verify-session`,
-`--trusted-workload-pcr23` is an explicit verifier-owned alternative to
-`WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
-collateral.
+`--trusted-workload-pcr23-sha256` and `--trusted-workload-pcr23-sha384` select
+explicit trust mode, in which the verifier owns the workload policy and
+`WorkloadRegistry` is not read at all; the command never reads a saved `.atawl`
+as trusted collateral. A verification resolves every trust input from one
+source, so those flags cannot be combined with `--chain`.
 
 TLS bootstrap applies the same verified TEE attribute policy before any
 `POST /init` data is sent. The verifier extracts the Intel TDX debug state and
