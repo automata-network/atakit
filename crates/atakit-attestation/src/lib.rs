@@ -599,14 +599,14 @@ pub enum PcrBankSelection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct PcrSpec256 {
     pub pcr_index: u8,
     pub comparison: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct PcrSpec384 {
     pub pcr_index: u8,
     pub comparison: String,
@@ -2731,6 +2731,21 @@ mod tests {
     use p256::pkcs8::DecodePrivateKey;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
     use signature::{hazmat::PrehashSigner, Signer};
+
+    #[test]
+    fn measurement_pcr_specs_use_the_specified_snake_case_field() {
+        let parsed: PcrSpec256 = serde_json::from_str(r#"{"pcr_index":4,"comparison":"0x00"}"#)
+            .expect("specification field name");
+        assert_eq!(parsed.pcr_index, 4);
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("serialized PCR specification"),
+            serde_json::json!({"pcr_index": 4, "comparison": "0x00"})
+        );
+        assert!(
+            serde_json::from_str::<PcrSpec256>(r#"{"pcrIndex":4,"comparison":"0x00"}"#,).is_err(),
+            "the removed camelCase spelling must not become a second wire format"
+        );
+    }
 
     fn static_comparison256(value: [u8; 32]) -> String {
         hex0x(&encode_static256(value))
