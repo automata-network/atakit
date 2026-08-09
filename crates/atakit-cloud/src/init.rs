@@ -1134,3 +1134,109 @@ mod tests {
         assert!(error.contains("4-byte limit"), "{error}");
     }
 }
+
+#[cfg(test)]
+mod portal_tls_mode_tests {
+    use super::*;
+
+    const ZERO: &str = "0x0000000000000000000000000000000000000000";
+
+    fn init_chain(rpc_url: &str, session_registry: &str) -> InitChainConfig {
+        InitChainConfig {
+            rpc_url: rpc_url.to_string(),
+            session_registry: session_registry.to_string(),
+            workload_registry: ZERO.to_string(),
+            base_image_registry: ZERO.to_string(),
+            registration: None,
+            chain_id: None,
+            tee_backend: "auto".to_string(),
+            prover: None,
+        }
+    }
+
+    fn chain() -> InitChainConfig {
+        init_chain(
+            "https://rpc.example.invalid",
+            "0x1111111111111111111111111111111111111111",
+        )
+    }
+
+    /// A configured chain is the authority for the measurement policy too, so
+    /// an operator-supplied one alongside it is refused rather than ignored.
+    ///
+    /// This is checked before any connection, so the unreachable RPC endpoint
+    /// above never matters — if it did, the check would be running too late.
+    #[tokio::test]
+    async fn a_chain_refuses_an_operator_supplied_measurement_policy() {
+        let policy = MeasurementPolicy {
+            source: "test".to_string(),
+            pack: atakit_attestation::MeasurementPack {
+                schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
+                revision: 1,
+                published_at: 0,
+                subject: atakit_attestation::Subject {
+                    publisher: "0x00".to_string(),
+                    name: "n".to_string(),
+                    version: "v".to_string(),
+                    id: "0x00".to_string(),
+                    uri: None,
+                    archive_sha256: None,
+                },
+                measurements: serde_json::json!({ "profiles": [] }),
+            },
+        };
+
+        let error = portal_tls_mode_for_init_chain(
+            &chain(),
+            TlsVerificationTrust::default(),
+            IntelTdxDcapCollateralConfig::default(),
+            Some(policy),
+            Some([0x11; 32]),
+        )
+        .await
+        .expect_err("--measurements alongside a chain must be refused");
+        let message = error.to_string();
+        assert!(message.contains("--measurements"), "got {message}");
+    }
+
+    /// Pinned trust files are refused for the same reason, and both are named
+    /// together so an operator fixes one invocation rather than two.
+    #[tokio::test]
+    async fn a_chain_refuses_pinned_trust_files() {
+        let mut trust = TlsVerificationTrust::default();
+        trust.sources.insert(
+            "--gcp-ak-root-cert".to_string(),
+            vec!["/tmp/root.pem".to_string()],
+        );
+
+        let error = portal_tls_mode_for_init_chain(
+            &chain(),
+            trust,
+            IntelTdxDcapCollateralConfig::default(),
+            None,
+            Some([0x11; 32]),
+        )
+        .await
+        .expect_err("pinned files alongside a chain must be refused");
+        assert!(
+            error.to_string().contains("--gcp-ak-root-cert"),
+            "got {error}"
+        );
+    }
+
+    /// Without a chain the operator is the authority, so a measurement policy
+    /// is required rather than optional.
+    #[tokio::test]
+    async fn explicit_mode_requires_a_measurement_policy() {
+        let error = portal_tls_mode_for_init_chain(
+            &init_chain("", ZERO),
+            TlsVerificationTrust::default(),
+            IntelTdxDcapCollateralConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("explicit verification needs a policy");
+        assert!(error.to_string().contains("--measurements"), "got {error}");
+    }
+}

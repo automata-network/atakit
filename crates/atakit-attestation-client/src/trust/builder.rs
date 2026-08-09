@@ -346,6 +346,65 @@ mod tests {
         request
     }
 
+    /// An expired pack must not supply trust anchors through the public
+    /// resolver either. `TrustAnchorsBuilder::resolve` is its own consuming
+    /// boundary: a daemon holding a source past `not_after` reaches anchors
+    /// here without going near `bootstrap_portal_tls`.
+    #[tokio::test]
+    async fn resolve_refuses_packs_that_are_outside_their_validity_window() {
+        use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+        use crate::pack::fixture::Publisher;
+        use crate::pack::read::{read_trust_pack, TrustPackReadOptions};
+        use crate::pack::TrustPackKind;
+        use crate::trust::source::PackTrustSource;
+
+        // A window that closed in 2020, read inside itself so the source is one
+        // that became invalid rather than one that never verified.
+        let publisher = Publisher::new(0x61);
+        let mut builder = crate::pack::write::TrustPackBuilder::new(
+            TrustPackKind::CollateralTrust,
+            "example-publisher",
+            1,
+            1_600_000_000,
+            1_600_100_000,
+        );
+        builder
+            .insert(
+                "payload/roots/gcp-ak-root.pem",
+                crate::pack::fixture::certificate_pem("gcp-ak"),
+            )
+            .unwrap();
+        let archive = builder
+            .build(|bytes| Ok::<_, std::convert::Infallible>(publisher.sign(bytes)))
+            .unwrap();
+        let pack = read_trust_pack(
+            &archive,
+            &TrustPackReadOptions::new(
+                TrustPackKind::CollateralTrust,
+                publisher.public_key.clone(),
+                1_600_000_001,
+            ),
+        )
+        .expect("the pack verifies inside its own window");
+
+        let source = PackTrustSource::new(
+            vec![pack],
+            Vec::new(),
+            IntelTdxDcapCollateralConfig::default(),
+        )
+        .expect("pack source");
+        let builder = TrustAnchorsBuilder::new(TrustSource::Packs(source));
+
+        let error = builder
+            .resolve(&request("gcp", "tdx"))
+            .await
+            .expect_err("an expired pack must not supply anchors");
+        assert!(
+            error.to_string().contains("validity"),
+            "the failure must be the window, not a missing input; got {error}"
+        );
+    }
+
     /// Trust-pack mode resolves from the packs and reports their publishers as
     /// the authority — not the operator, and not a registry.
     #[tokio::test]
