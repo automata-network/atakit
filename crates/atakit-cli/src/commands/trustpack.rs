@@ -25,7 +25,7 @@ use crate::config::Config;
 #[derive(Subcommand)]
 pub enum TrustPackCommand {
     /// Build a signed `.atatp` trust pack
-    Build(BuildArgs),
+    Build(Box<BuildArgs>),
     /// Verify a `.atatp` trust pack and print what it contains
     Inspect(InspectArgs),
 }
@@ -48,18 +48,147 @@ pub struct BuildArgs {
     /// among the contents, so the emitted value may be earlier than this.
     #[arg(long)]
     pub not_after: u64,
-    /// A payload entry, as `<payload path>=<file>`. Repeatable.
-    ///
-    /// For example
-    /// `--entry payload/roots/gcp-ak-root.pem=/tmp/gcp-ak-root.pem`.
+
+    // collateral-trust inputs. The flag names match `atakit cloud
+    // verify-session`, because these are the same trust inputs an operator
+    // already supplies there — a pack is those inputs, signed.
+    /// GCP vTPM attestation key root certificate, PEM.
+    #[arg(long)]
+    pub gcp_ak_root_cert: Option<PathBuf>,
+    /// AWS Nitro root certificate, PEM.
+    #[arg(long)]
+    pub aws_nitro_root_cert: Option<PathBuf>,
+    /// AMD ARK root certificate, PEM. Repeatable; the file stem names the
+    /// product line, so `milan.pem` becomes `payload/roots/amd-ark-milan.pem`.
+    #[arg(long)]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+    /// Azure MAA signing certificate, PEM. Repeatable.
+    #[arg(long)]
+    pub azure_maa_cert: Vec<PathBuf>,
+    /// `atakit.amd-sev-snp-security-policy` version 1 document. Repeatable.
+    #[arg(long)]
+    pub amd_snp_security_policy: Vec<PathBuf>,
+    /// AMD SEV-SNP certificate revocation list, DER. Repeatable.
+    #[arg(long)]
+    pub amd_snp_crl: Vec<PathBuf>,
+    /// Intel TDX DCAP collateral document. Repeatable.
+    #[arg(long)]
+    pub tdx_dcap_collateral: Vec<PathBuf>,
+    /// AWS attestation document freshness limits, JSON.
+    #[arg(long)]
+    pub aws_document_limits: Option<PathBuf>,
+
+    // workload-trust inputs.
+    /// Serialized `WorkloadSpec`, JSON.
+    #[arg(long)]
+    pub workload_spec: Option<PathBuf>,
+    /// Base-image measurement pack, JSON. Repeatable. Its `.sig` and `.pubkey`
+    /// are taken from beside it, matching how a measurement pack is already
+    /// distributed.
+    #[arg(long)]
+    pub measurement_pack: Vec<PathBuf>,
+
+    /// Escape hatch: place a file at an exact payload path, as
+    /// `<payload path>=<file>`. Repeatable. Only needed for a namespace entry
+    /// the typed flags above do not cover.
     #[arg(long = "entry", value_name = "PATH=FILE")]
     pub entries: Vec<String>,
+
     /// Name of an es256k key in `[keys]` to sign with.
     #[arg(long)]
     pub signing_key: Option<String>,
     /// Where to write the archive.
     #[arg(long)]
     pub out: PathBuf,
+}
+
+/// The payload path each typed flag places its file at.
+///
+/// The flag decides what the file *is*; the file name only supplies an
+/// addressing stem within that class, which the specification says is
+/// addressing only. Deriving the class from a file name would be the thing the
+/// format forbids — deriving a stem from one is not.
+fn collect_entries(args: &BuildArgs) -> Result<Vec<(String, PathBuf)>> {
+    fn stem(path: &std::path::Path) -> Result<String> {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty() && !stem.contains('/'))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("{} has no usable file name", path.display()))
+    }
+
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    if let Some(path) = &args.gcp_ak_root_cert {
+        entries.push(("payload/roots/gcp-ak-root.pem".to_string(), path.clone()));
+    }
+    if let Some(path) = &args.aws_nitro_root_cert {
+        entries.push(("payload/roots/aws-nitro-root.pem".to_string(), path.clone()));
+    }
+    if let Some(path) = &args.aws_document_limits {
+        entries.push(("payload/aws-document-limits.json".to_string(), path.clone()));
+    }
+    if let Some(path) = &args.workload_spec {
+        entries.push(("payload/workload-spec.json".to_string(), path.clone()));
+    }
+    for path in &args.amd_ark_root_cert {
+        entries.push((
+            format!("payload/roots/amd-ark-{}.pem", stem(path)?),
+            path.clone(),
+        ));
+    }
+    for path in &args.azure_maa_cert {
+        entries.push((
+            format!("payload/azure-maa/{}.pem", stem(path)?),
+            path.clone(),
+        ));
+    }
+    for path in &args.amd_snp_security_policy {
+        entries.push((
+            format!("payload/amd-snp-security-policy/{}.json", stem(path)?),
+            path.clone(),
+        ));
+    }
+    for path in &args.amd_snp_crl {
+        entries.push((
+            format!("payload/amd-snp-crl/{}.der", stem(path)?),
+            path.clone(),
+        ));
+    }
+    for path in &args.tdx_dcap_collateral {
+        entries.push((
+            format!("payload/tdx-dcap/{}.json", stem(path)?),
+            path.clone(),
+        ));
+    }
+    // A measurement pack travels as a triple. Taking the `.sig` and `.pubkey`
+    // from beside the `.json` matches how one is already distributed, and
+    // means an operator names the pack once rather than three times.
+    for path in &args.measurement_pack {
+        let stem = stem(path)?;
+        entries.push((
+            format!("payload/measurement-packs/{stem}.json"),
+            path.clone(),
+        ));
+        for suffix in ["sig", "pubkey"] {
+            let beside = path.with_extension(suffix);
+            if !beside.exists() {
+                bail!(
+                    "{} needs {} beside it; a measurement pack travels as a .json, .sig and \
+                     .pubkey triple",
+                    path.display(),
+                    beside.display()
+                );
+            }
+            entries.push((format!("payload/measurement-packs/{stem}.{suffix}"), beside));
+        }
+    }
+    for entry in &args.entries {
+        let (path, file) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--entry must be '<payload path>=<file>', got {entry:?}")
+        })?;
+        entries.push((path.to_string(), PathBuf::from(file)));
+    }
+    Ok(entries)
 }
 
 #[derive(Args)]
@@ -84,7 +213,7 @@ pub struct InspectArgs {
     pub pin: Option<String>,
 }
 
-pub fn build(args: BuildArgs, config: &Config) -> Result<()> {
+pub fn build(args: Box<BuildArgs>, config: &Config) -> Result<()> {
     let kind = parse_kind(&args.kind)?;
     let mut builder = TrustPackBuilder::new(
         kind,
@@ -94,16 +223,14 @@ pub fn build(args: BuildArgs, config: &Config) -> Result<()> {
         args.not_after,
     );
 
-    if args.entries.is_empty() {
-        bail!("a trust pack needs at least one --entry");
+    let entries = collect_entries(&args)?;
+    if entries.is_empty() {
+        bail!("a trust pack needs at least one input; see `atakit trust-pack build --help`");
     }
-    for entry in &args.entries {
-        let (path, file) = entry.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--entry must be '<payload path>=<file>', got {entry:?}")
-        })?;
-        let bytes = std::fs::read(file).with_context(|| format!("read {file}"))?;
+    for (path, file) in &entries {
+        let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
         builder
-            .insert(path, bytes)
+            .insert(path.clone(), bytes)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
 
