@@ -223,14 +223,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             &init_config.chain,
         )
         .await?;
-        let tls_verification_trust = init::load_tls_verification_trust(
-            &args.gcp_ak_root_cert,
-            &args.azure_maa_cert,
-            &args.amd_ark_root_cert,
-            &args.amd_snp_crl,
-            args.amd_snp_security_policy.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tls_verification_trust =
+            init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+                gcp_ak_root_certs: &args.gcp_ak_root_cert,
+                azure_maa_certs: &args.azure_maa_cert,
+                aws_nitro_root_certs: &args.aws_nitro_root_cert,
+                amd_ark_root_certs: &args.amd_ark_root_cert,
+                amd_snp_crls: &args.amd_snp_crl,
+                amd_snp_security_policy: args.amd_snp_security_policy.as_deref(),
+                aws_document_maximum_age_seconds: args.aws_document_maximum_age_seconds,
+                aws_document_allowed_future_clock_difference_seconds: args
+                    .aws_document_allowed_future_clock_difference_seconds,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
             &args.tdx_dcap_automata_read_strategy,
             args.tdx_dcap_automata_multicall3_address.clone(),

@@ -223,6 +223,26 @@ pub struct DeployArgs {
     #[arg(long, value_name = "PATH")]
     pub gcp_ak_root_cert: Vec<PathBuf>,
 
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
     /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
     pub amd_ark_root_cert: Vec<PathBuf>,
@@ -497,6 +517,26 @@ pub struct InitArgs {
     #[arg(long, value_name = "PATH")]
     pub gcp_ak_root_cert: Vec<PathBuf>,
 
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
     /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
     pub amd_ark_root_cert: Vec<PathBuf>,
@@ -623,6 +663,26 @@ pub struct SessionVerificationArgs {
     /// Trusted GCP vTPM AK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
     pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
 
     /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
@@ -773,6 +833,41 @@ mod tests {
         assert_eq!(args.instance, "aws-vm");
         assert_eq!(args.target.as_deref(), Some("aws-m6a-large"));
         assert!(args.yes);
+    }
+
+    #[test]
+    fn cloud_init_accepts_complete_aws_explicit_trust_inputs() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-nitro-root-cert",
+            "root.pem",
+            "--aws-document-maximum-age-seconds",
+            "300",
+            "--aws-document-allowed-future-clock-difference-seconds",
+            "60",
+        ])
+        .expect("AWS explicit trust arguments");
+
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected cloud init command");
+        };
+        assert_eq!(args.aws_nitro_root_cert, [PathBuf::from("root.pem")]);
+        assert_eq!(args.aws_document_maximum_age_seconds, Some(300));
+        assert_eq!(
+            args.aws_document_allowed_future_clock_difference_seconds,
+            Some(60)
+        );
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-document-maximum-age-seconds",
+            "300",
+        ])
+        .is_err());
     }
 
     #[test]

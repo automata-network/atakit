@@ -314,7 +314,11 @@ pub struct InitArgs {
     pub dir: Option<PathBuf>,
 
     /// Platform string sent as `platform.declared` in the init payload
-    #[arg(long, value_parser = ["gcp", "azure", "qemu"], default_value = "qemu")]
+    #[arg(
+        long,
+        value_parser = ["gcp", "azure", "aws", "qemu"],
+        default_value = "qemu"
+    )]
     pub platform: String,
 
     /// Chain config name override (references [chains.<name>])
@@ -385,6 +389,26 @@ pub struct InitArgs {
     /// Trusted GCP vTPM AK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
     pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
 
     /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
     #[arg(long, value_name = "PATH")]
@@ -466,5 +490,15 @@ mod tests {
         assert!(
             TestCli::try_parse_from(["test", "init", "127.0.0.1", "--timeout", "1400",]).is_err()
         );
+    }
+
+    #[test]
+    fn workload_init_accepts_aws_as_the_declared_platform() {
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--platform", "aws"])
+            .expect("AWS workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.platform, "aws");
     }
 }

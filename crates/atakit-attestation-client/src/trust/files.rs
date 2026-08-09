@@ -77,13 +77,31 @@ pub(crate) fn parse_measurement_publisher_keys(
     parse_hex_blobs(values, "--measurement-publisher-key")
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TlsVerificationTrustFiles<'a> {
+    pub gcp_ak_root_certs: &'a [PathBuf],
+    pub azure_maa_certs: &'a [PathBuf],
+    pub aws_nitro_root_certs: &'a [PathBuf],
+    pub amd_ark_root_certs: &'a [PathBuf],
+    pub amd_snp_crls: &'a [PathBuf],
+    pub amd_snp_security_policy: Option<&'a Path>,
+    pub aws_document_maximum_age_seconds: Option<u64>,
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+}
+
 pub fn load_tls_verification_trust(
-    gcp_ak_root_certs: &[PathBuf],
-    azure_maa_certs: &[PathBuf],
-    amd_ark_root_certs: &[PathBuf],
-    amd_snp_crls: &[PathBuf],
-    amd_snp_security_policy: Option<&Path>,
+    files: TlsVerificationTrustFiles<'_>,
 ) -> Result<TlsVerificationTrust, PortalVerificationError> {
+    let TlsVerificationTrustFiles {
+        gcp_ak_root_certs,
+        azure_maa_certs,
+        aws_nitro_root_certs,
+        amd_ark_root_certs,
+        amd_snp_crls,
+        amd_snp_security_policy,
+        aws_document_maximum_age_seconds,
+        aws_document_allowed_future_clock_difference_seconds,
+    } = files;
     let amd_snp_security_policies = match amd_snp_security_policy {
         Some(path) => {
             let document =
@@ -102,6 +120,7 @@ pub fn load_tls_verification_trust(
     let mut sources = BTreeMap::new();
     record_sources(&mut sources, "--gcp-ak-root-cert", gcp_ak_root_certs);
     record_sources(&mut sources, "--azure-maa-cert", azure_maa_certs);
+    record_sources(&mut sources, "--aws-nitro-root-cert", aws_nitro_root_certs);
     record_sources(&mut sources, "--amd-ark-root-cert", amd_ark_root_certs);
     record_sources(&mut sources, "--amd-snp-crl", amd_snp_crls);
     if let Some(path) = amd_snp_security_policy {
@@ -111,10 +130,37 @@ pub fn load_tls_verification_trust(
             std::slice::from_ref(&path.to_path_buf()),
         );
     }
+    let (aws_document_maximum_age_seconds, aws_document_allowed_future_clock_difference_seconds) =
+        match (
+            aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds,
+        ) {
+            (Some(maximum_age), Some(allowed_future)) if maximum_age > 0 => {
+                (Some(maximum_age), Some(allowed_future))
+            }
+            (Some(0), Some(_)) => {
+                return Err(PortalVerificationError::Config {
+                    message: "--aws-document-maximum-age-seconds must be greater than zero"
+                        .to_string(),
+                });
+            }
+            (None, None) => (None, None),
+            _ => {
+                return Err(PortalVerificationError::Config {
+                    message: "--aws-document-maximum-age-seconds and \
+                              --aws-document-allowed-future-clock-difference-seconds must be \
+                              supplied together"
+                        .to_string(),
+                });
+            }
+        };
     Ok(TlsVerificationTrust {
         trust_anchors: TrustAnchors {
             gcp_roots: read_der_files(gcp_ak_root_certs, "--gcp-ak-root-cert")?,
             azure_maa_keys: parse_azure_maa_certificates(azure_maa_certs)?,
+            aws_nitro_roots: read_der_files(aws_nitro_root_certs, "--aws-nitro-root-cert")?,
+            aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds,
             amd_ark_roots: read_der_files(amd_ark_root_certs, "--amd-ark-root-cert")?,
             amd_snp_security_policies,
             ..TrustAnchors::default()
@@ -283,8 +329,12 @@ mod tests {
         std::fs::write(&ark, [0xaa, 0xbb]).unwrap();
         std::fs::write(&crl, [0xcc, 0xdd]).unwrap();
 
-        let trust = load_tls_verification_trust(&[], &[], &[ark], &[crl], None)
-            .expect("TLS verification trust");
+        let trust = load_tls_verification_trust(TlsVerificationTrustFiles {
+            amd_ark_root_certs: &[ark],
+            amd_snp_crls: &[crl],
+            ..TlsVerificationTrustFiles::default()
+        })
+        .expect("TLS verification trust");
 
         assert_eq!(trust.trust_anchors.amd_ark_roots, vec![vec![0xaa, 0xbb]]);
         assert_eq!(trust.amd_snp_crls, vec![vec![0xcc, 0xdd]]);
@@ -355,14 +405,61 @@ mod tests {
         )
         .unwrap();
 
-        let trust = load_tls_verification_trust(&[], &[], &[], &[], Some(&policy_path))
-            .expect("explicit AMD SEV-SNP security policy");
+        let trust = load_tls_verification_trust(TlsVerificationTrustFiles {
+            amd_snp_security_policy: Some(&policy_path),
+            ..TlsVerificationTrustFiles::default()
+        })
+        .expect("explicit AMD SEV-SNP security policy");
 
         assert_eq!(trust.trust_anchors.amd_snp_security_policies.len(), 1);
         assert_eq!(
             trust.trust_anchors.amd_snp_security_policies[0].cpuid,
             0x191101
         );
+    }
+
+    #[test]
+    fn tls_verification_trust_loads_aws_root_and_freshness_limits_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("aws-nitro-root.der");
+        std::fs::write(&root, [0x30, 0x82, 0x01]).unwrap();
+
+        let trust = load_tls_verification_trust(TlsVerificationTrustFiles {
+            aws_nitro_root_certs: &[root],
+            aws_document_maximum_age_seconds: Some(300),
+            aws_document_allowed_future_clock_difference_seconds: Some(60),
+            ..TlsVerificationTrustFiles::default()
+        })
+        .expect("AWS trust inputs");
+
+        assert_eq!(
+            trust.trust_anchors.aws_nitro_roots,
+            vec![vec![0x30, 0x82, 0x01]]
+        );
+        assert_eq!(
+            trust.trust_anchors.aws_document_maximum_age_seconds,
+            Some(300)
+        );
+        assert_eq!(
+            trust
+                .trust_anchors
+                .aws_document_allowed_future_clock_difference_seconds,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn tls_verification_trust_rejects_one_aws_freshness_limit() {
+        let error = load_tls_verification_trust(TlsVerificationTrustFiles {
+            aws_document_maximum_age_seconds: Some(300),
+            ..TlsVerificationTrustFiles::default()
+        })
+        .expect_err("both AWS document limits are required together");
+
+        assert!(error.to_string().contains(
+            "--aws-document-maximum-age-seconds and \
+             --aws-document-allowed-future-clock-difference-seconds"
+        ));
     }
 
     #[test]

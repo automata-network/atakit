@@ -55,14 +55,20 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         None => None,
     };
 
-    let tls_verification_trust = init::load_tls_verification_trust(
-        &args.verification.gcp_ak_root_cert,
-        &args.verification.azure_maa_cert,
-        &args.verification.amd_ark_root_cert,
-        &args.verification.amd_snp_crl,
-        args.verification.amd_snp_security_policy.as_deref(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tls_verification_trust =
+        init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+            gcp_ak_root_certs: &args.verification.gcp_ak_root_cert,
+            azure_maa_certs: &args.verification.azure_maa_cert,
+            aws_nitro_root_certs: &args.verification.aws_nitro_root_cert,
+            amd_ark_root_certs: &args.verification.amd_ark_root_cert,
+            amd_snp_crls: &args.verification.amd_snp_crl,
+            amd_snp_security_policy: args.verification.amd_snp_security_policy.as_deref(),
+            aws_document_maximum_age_seconds: args.verification.aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds: args
+                .verification
+                .aws_document_allowed_future_clock_difference_seconds,
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
         &args.verification.tdx_dcap_automata_read_strategy,
         args.verification

@@ -67,7 +67,7 @@ pub use portal::tls::{
 pub use trust::builder::TrustAnchorsBuilder;
 pub use trust::files::{
     azure_maa_trust_config_from_chain, chain_coordinates_configured, load_tls_verification_trust,
-    AzureMaaTrustConfig, AzureMaaTrustSource, TlsVerificationTrust,
+    AzureMaaTrustConfig, AzureMaaTrustSource, TlsVerificationTrust, TlsVerificationTrustFiles,
 };
 pub use trust::measurement::{
     cloud_tls_attestation_report_path, load_measurement_policy, local_measurement_pack_exists,

@@ -12,8 +12,8 @@ use atakit_attestation::MeasurementPolicy;
 use atakit_attestation_client::{
     load_measurement_policy, load_tls_verification_trust, read_trust_pack_file,
     tdx_dcap_collateral_config, AttestationClientConfig, ExplicitTrustSource,
-    IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource, PackTrustSource, TrustPack,
-    TrustPackError, TrustPackKind, TrustPackReadOptions,
+    IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource, PackTrustSource,
+    TlsVerificationTrustFiles, TrustPack, TrustPackError, TrustPackKind, TrustPackReadOptions,
 };
 use atakit_cvm_types::AppRef;
 use axum::http::uri::Authority;
@@ -114,6 +114,7 @@ const EXPLICIT_ONLY: &[&str] = &[
     "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
     "VERIFIED_GCP_AK_ROOT_CERTS",
     "VERIFIED_AZURE_MAA_CERTS",
+    "VERIFIED_AWS_NITRO_ROOT_CERTS",
     "VERIFIED_AMD_ARK_ROOT_CERTS",
     "VERIFIED_AMD_SNP_CRLS",
     "VERIFIED_AMD_SNP_SECURITY_POLICY",
@@ -342,37 +343,44 @@ fn load_explicit_mode(
 
     let gcp_roots = path_list(env, "VERIFIED_GCP_AK_ROOT_CERTS")?;
     let azure_maa = path_list(env, "VERIFIED_AZURE_MAA_CERTS")?;
+    let aws_nitro_roots = path_list(env, "VERIFIED_AWS_NITRO_ROOT_CERTS")?;
     let amd_ark = path_list(env, "VERIFIED_AMD_ARK_ROOT_CERTS")?;
     let amd_crls = path_list(env, "VERIFIED_AMD_SNP_CRLS")?;
     let amd_policy = optional_path(env, "VERIFIED_AMD_SNP_SECURITY_POLICY")?;
-    let mut trust = load_tls_verification_trust(
-        &gcp_roots,
-        &azure_maa,
-        &amd_ark,
-        &amd_crls,
-        amd_policy.as_deref(),
-    )
-    .map_err(|error| invalid(error.to_string()))?;
+    let aws_document_maximum_age_seconds =
+        optional_u64(env, "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS")?;
+    let aws_document_allowed_future_clock_difference_seconds = optional_u64(
+        env,
+        "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
+    )?;
     match (
-        optional_u64(env, "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS")?,
-        optional_u64(
-            env,
-            "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
-        )?,
+        aws_document_maximum_age_seconds,
+        aws_document_allowed_future_clock_difference_seconds,
     ) {
-        (Some(maximum_age), Some(allowed_future)) => {
-            trust.trust_anchors.aws_document_maximum_age_seconds = Some(maximum_age);
-            trust
-                .trust_anchors
-                .aws_document_allowed_future_clock_difference_seconds = Some(allowed_future);
+        (Some(0), Some(_)) => {
+            return Err(invalid(
+                "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS must be greater than zero",
+            ));
         }
-        (None, None) => {}
+        (Some(_), Some(_)) | (None, None) => {}
         _ => {
             return Err(invalid(
-                "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS and VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS must be supplied together",
-            ))
+                "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS and \
+                 VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS must be supplied together",
+            ));
         }
     }
+    let trust = load_tls_verification_trust(TlsVerificationTrustFiles {
+        gcp_ak_root_certs: &gcp_roots,
+        azure_maa_certs: &azure_maa,
+        aws_nitro_root_certs: &aws_nitro_roots,
+        amd_ark_root_certs: &amd_ark,
+        amd_snp_crls: &amd_crls,
+        amd_snp_security_policy: amd_policy.as_deref(),
+        aws_document_maximum_age_seconds,
+        aws_document_allowed_future_clock_difference_seconds,
+    })
+    .map_err(|error| invalid(error.to_string()))?;
 
     let collateral_file = optional_path(env, "VERIFIED_TDX_DCAP_COLLATERAL")?;
     if collateral_file.is_some() && pccs_url.is_some() {
@@ -904,6 +912,76 @@ mod tests {
         };
         assert_eq!(base_image.name, "automata-linux");
         assert_eq!(base_image.version, "v1");
+    }
+
+    #[test]
+    fn explicit_mode_consumes_aws_root_and_document_limits() {
+        let dir = empty_dir();
+        let (measurement_path, measurement_public_key) = write_measurement_pack(dir.path());
+        let aws_root = dir.path().join("aws-root.der");
+        let amd_ark = dir.path().join("amd-ark.der");
+        let amd_policy = dir.path().join("amd-policy.json");
+        std::fs::write(&aws_root, [0x30, 0x82, 0x01]).expect("AWS root");
+        std::fs::write(&amd_ark, [0x30, 0x82, 0x02]).expect("AMD ARK");
+        std::fs::write(
+            &amd_policy,
+            br#"{
+                "schema": "atakit.amd-sev-snp-security-policy",
+                "version": 1,
+                "policies": [{
+                    "cpuid": "0x191101",
+                    "minimumTcb": "0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004",
+                    "platformInfoPolicy": "0x0000000000000000000000000000000000000000000000000000000000000020",
+                    "requiredLaunchMitigationVector": "0x0000000000000000",
+                    "requiredCurrentMitigationVector": "0x0000000000000000"
+                }]
+            }"#,
+        )
+        .expect("AMD policy");
+
+        let loaded = load(
+            &env(&[
+                ("VERIFIED_TRUST_MODE", "explicit"),
+                ("VERIFIED_MEASUREMENTS", &measurement_path),
+                (
+                    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
+                    &format!(r#"["{measurement_public_key}"]"#),
+                ),
+                (
+                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
+                    &format!("0x{}", "11".repeat(32)),
+                ),
+                (
+                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
+                    &format!("0x{}", "22".repeat(48)),
+                ),
+                (
+                    "VERIFIED_AWS_NITRO_ROOT_CERTS",
+                    &format!(r#"["{}"]"#, aws_root.display()),
+                ),
+                (
+                    "VERIFIED_AMD_ARK_ROOT_CERTS",
+                    &format!(r#"["{}"]"#, amd_ark.display()),
+                ),
+                (
+                    "VERIFIED_AMD_SNP_SECURITY_POLICY",
+                    &amd_policy.display().to_string(),
+                ),
+                ("VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS", "300"),
+                (
+                    "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
+                    "60",
+                ),
+            ]),
+            dir.path(),
+            NOW,
+        )
+        .expect("explicit AWS configuration");
+
+        let TrustModeConfig::Explicit { source, .. } = loaded.mode else {
+            panic!("expected explicit mode");
+        };
+        assert_eq!(source.supported_platforms(), ["aws-sev-snp"]);
     }
 
     #[test]

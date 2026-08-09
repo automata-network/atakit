@@ -29,7 +29,8 @@ pub use atakit_attestation_client::{
     ChainTrustSource, CollateralRequest, ExplicitTrustSource, IntelTdxDcapCollateralConfig,
     IntelTdxDcapCollateralSource, PortalTlsVerificationMode, PortalVerificationError,
     RequiredTrustInput, TdxDcapAutomataReadStrategy, TlsManualOverride, TlsVerificationTrust,
-    TrustAnchorsBuilder, TrustInputSource, TrustProvenance, TrustSource, VerifiedPortalTls,
+    TlsVerificationTrustFiles, TrustAnchorsBuilder, TrustInputSource, TrustProvenance, TrustSource,
+    VerifiedPortalTls,
 };
 
 /// Choose one authority for portal TLS verification.

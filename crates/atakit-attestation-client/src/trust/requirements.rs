@@ -37,7 +37,10 @@ impl RequiredTrustInput {
             Self::AmdArkRoot => "--amd-ark-root-cert",
             Self::AmdSnpSecurityPolicy => "--amd-snp-security-policy",
             Self::AwsNitroRoot => "--aws-nitro-root-cert",
-            Self::AwsDocumentLimits => "--aws-document-limits",
+            Self::AwsDocumentLimits => {
+                "--aws-document-maximum-age-seconds and \
+                 --aws-document-allowed-future-clock-difference-seconds"
+            }
         }
     }
 

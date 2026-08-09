@@ -152,14 +152,19 @@ pub(crate) async fn resolve_verified_portal_access(
         &init_chain,
     )
     .await?;
-    let tls_verification_trust = init::load_tls_verification_trust(
-        &verification.gcp_ak_root_cert,
-        &verification.azure_maa_cert,
-        &verification.amd_ark_root_cert,
-        &verification.amd_snp_crl,
-        verification.amd_snp_security_policy.as_deref(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tls_verification_trust =
+        init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+            gcp_ak_root_certs: &verification.gcp_ak_root_cert,
+            azure_maa_certs: &verification.azure_maa_cert,
+            aws_nitro_root_certs: &verification.aws_nitro_root_cert,
+            amd_ark_root_certs: &verification.amd_ark_root_cert,
+            amd_snp_crls: &verification.amd_snp_crl,
+            amd_snp_security_policy: verification.amd_snp_security_policy.as_deref(),
+            aws_document_maximum_age_seconds: verification.aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds: verification
+                .aws_document_allowed_future_clock_difference_seconds,
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
         &verification.tdx_dcap_automata_read_strategy,
         verification.tdx_dcap_automata_multicall3_address.clone(),
