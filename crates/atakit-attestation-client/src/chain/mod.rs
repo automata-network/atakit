@@ -1539,3 +1539,59 @@ mod tests {
         assert_eq!(identity.1, "https://maa.example.test");
     }
 }
+
+/// Tests for the chain-derived measurement policy conversion.
+///
+/// These moved here from `atakit-cli` on 2026-08-09. The CLI carried a second
+/// copy of this conversion and the tests exercised that copy, so the
+/// implementation the commands actually run had none — precisely the drift the
+/// consolidation exists to remove. The CLI copy is deleted; this is the only
+/// implementation left, and these are its tests.
+#[cfg(test)]
+mod chain_measurement_policy_conversion {
+    use super::*;
+
+    #[test]
+    fn infers_cloud_and_tee_from_supported_profile_names() {
+        for (name, expected) in [
+            ("gcp-tdx", ("gcp", "tdx")),
+            ("gcp-sev-snp", ("gcp", "sev-snp")),
+            ("azure_snp_westus", ("azure", "sev-snp")),
+            ("aws-nitro", ("aws", "nitro")),
+        ] {
+            assert_eq!(
+                infer_cloud_tee_from_profile_name(name).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// An unmappable name fails closed rather than guessing. The chain does not
+    /// store cloud and TEE as first-class fields, so the profile name is the
+    /// only thing that carries them.
+    #[test]
+    fn rejects_unmappable_chain_profile_names() {
+        let error = infer_cloud_tee_from_profile_name("production-profile").unwrap_err();
+        assert!(error.to_string().contains("cannot infer cloud"), "{error}");
+
+        let error = infer_cloud_tee_from_profile_name("gcp-production").unwrap_err();
+        assert!(error.to_string().contains("cannot infer TEE"), "{error}");
+    }
+
+    /// The opaque comparison bytes pass through unchanged. Re-encoding them
+    /// here would be a second encoder to keep in step with the TPM verifier.
+    #[test]
+    fn converts_chain_pcr_spec_to_measurement_pack_shape() {
+        let comparison = atakit_cvm_encoding::pcr_comparison::encode_static256([0xaa; 32]);
+        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256 {
+            pcrIndex: 4,
+            comparison: comparison.clone().into(),
+        };
+
+        let got = chain_pcr_spec256_to_measurement(&spec);
+
+        assert_eq!(got.pcr_index, 4);
+        assert_eq!(got.comparison, hex0x(comparison));
+    }
+}
