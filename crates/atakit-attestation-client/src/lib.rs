@@ -76,6 +76,6 @@ pub use trust::source::{
     TrustSource,
 };
 pub use workflow::{
-    verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
+    verify_portal_session, PortalSessionVerificationRequest, SessionVerificationMode,
     VerifiedPortalSession,
 };

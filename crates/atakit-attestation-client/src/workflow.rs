@@ -10,53 +10,103 @@ use crate::error::PortalVerificationError;
 use crate::pack::workload::{packed_measurement_policy, packed_workload_policy};
 use crate::portal::session::{verify_current_session, VerifiedPortalTls};
 use crate::portal::tls::bootstrap_portal_tls;
-use crate::trust::source::TrustSource;
+use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
 
-/// Where the trusted session policy comes from.
+/// One complete verification: its trust authority, and every policy that
+/// authority supplies.
 ///
-/// The `Explicit` variant no longer carries a `trusted_binding`. Operator
-/// supplied policy combined with a chain-derived `chain_id` and
-/// `SessionRegistry` address is mixed trust even though both values are
-/// well-formed, so the field is gone and the binding lives only on
-/// `ChainTrustSource`, reachable only in chain mode.
+/// This replaced three independent choices — trust source, workload policy
+/// source, measurement policy source — whose legal combinations had to be
+/// checked at run time. Three enums meant most combinations were constructible
+/// and wrong, so the workflow's first job was rejecting states its own types
+/// had allowed. Worse, one variant meant two different things: a "supplied"
+/// measurement policy covered both a chain-resolved policy and an
+/// operator-supplied one, so `chain` mode paired with an operator's
+/// `--measurements` still compiled and the exclusive-source rule was enforced
+/// for exactly one of the three modes.
+///
+/// Here each variant carries only what its own authority provides, and the
+/// policies each mode owns are resolved through that mode. An invalid
+/// combination has no representation, so there is nothing left to validate.
 #[derive(Debug, Clone)]
-pub enum SessionWorkloadPolicySource {
-    /// Resolve the registered `WorkloadSpec` through the chain source's own
-    /// client, after verified portal TLS selects the base-image ID.
-    Registry { workload: String },
-    /// Use an operator-supplied typed workload policy.
-    Explicit {
-        policy: TrustedWorkloadSessionPolicy,
-    },
-    /// Resolve the workload policy from the configured `workload-trust` pack,
-    /// after verified portal TLS selects the base-image ID.
+pub enum SessionVerificationMode {
+    /// The registry graph rooted at the verifier-selected `SessionRegistry` is
+    /// the authority, and supplies both policies.
     ///
-    /// Carries the reference rather than a resolved policy because the pack
-    /// must be shown to answer for the workload the caller asked about. Handing
-    /// in a policy would have made that the caller's job, and a caller that
-    /// skipped it would get a pack answering for a workload nobody requested.
-    Pack { workload: AppRef },
+    /// References rather than resolved policies: resolving them here is what
+    /// makes "chain mode reads its policy from the chain" a property of the
+    /// type instead of a convention the caller has to honour.
+    Chain {
+        source: ChainTrustSource,
+        base_image: AppRef,
+        workload: AppRef,
+    },
+    /// The operator is the authority and supplies both policies directly.
+    Explicit {
+        source: ExplicitTrustSource,
+        measurement_policy: Box<MeasurementPolicy>,
+        workload_policy: TrustedWorkloadSessionPolicy,
+    },
+    /// The configured `.atatp` publishers are the authority, and the
+    /// `workload-trust` pack supplies both policies.
+    Packs {
+        source: PackTrustSource,
+        base_image_id: [u8; 32],
+        workload: AppRef,
+    },
 }
 
-/// Where the base-image measurement policy comes from.
-///
-/// A bare `MeasurementPolicy` used to sit on the request, which let a caller
-/// pair `TrustSource::Packs` with a policy from anywhere — mixed trust that the
-/// mode pairing below could not see, because it only ever compared the trust
-/// source against the *workload* policy source. Measurement policy is a trust
-/// input like any other, so its origin belongs in the same exclusive decision.
-#[derive(Debug, Clone)]
-pub enum SessionMeasurementPolicySource {
-    /// Already resolved by the caller from the selected mode's own authority:
-    /// the registry in chain mode, `--measurements` in explicit mode.
+impl SessionVerificationMode {
+    /// The trust-anchor source for this mode.
     ///
-    /// Boxed because a `MeasurementPolicy` carries a whole measurement pack and
-    /// would otherwise set the size of every value of this type, including the
-    /// variant that holds only an identifier.
-    Supplied(Box<MeasurementPolicy>),
-    /// Resolved here from the configured `workload-trust` pack, for the base
-    /// image named by the caller.
-    Pack { base_image_id: [u8; 32] },
+    /// Anchor resolution stays a separate concern with its own type: it runs
+    /// against the presented platform, which is not known until the attestation
+    /// response arrives.
+    pub fn trust_source(&self) -> TrustSource {
+        match self {
+            Self::Chain { source, .. } => TrustSource::Chain(source.clone()),
+            Self::Explicit { source, .. } => TrustSource::Explicit(source.clone()),
+            Self::Packs { source, .. } => TrustSource::Packs(source.clone()),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Chain { .. } => "chain",
+            Self::Explicit { .. } => "explicit",
+            Self::Packs { .. } => "trust-pack",
+        }
+    }
+
+    /// The base-image measurement policy, from this mode's own authority.
+    ///
+    /// Resolved before the portal is contacted, because portal TLS consumes it
+    /// in order to produce the verified base-image identity that the workload
+    /// policy is then checked against.
+    pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
+        match self {
+            Self::Chain {
+                source, base_image, ..
+            } => source
+                .client()
+                .resolve_base_image_measurement_policy(&base_image.to_string())
+                .await
+                .map_err(|error| PortalVerificationError::Config {
+                    message: error.to_string(),
+                }),
+            Self::Explicit {
+                measurement_policy, ..
+            } => Ok((**measurement_policy).clone()),
+            Self::Packs {
+                source,
+                base_image_id,
+                ..
+            } => Ok(packed_measurement_policy(
+                source.workload_pack()?,
+                *base_image_id,
+            )?),
+        }
+    }
 }
 
 /// Complete inputs for portal TLS and current-session verification.
@@ -64,25 +114,9 @@ pub enum SessionMeasurementPolicySource {
 pub struct PortalSessionVerificationRequest {
     pub host: String,
     pub status_port: u16,
-    pub measurement_policy: SessionMeasurementPolicySource,
-    pub trust_source: TrustSource,
-    pub workload_policy: SessionWorkloadPolicySource,
+    pub mode: SessionVerificationMode,
     pub report_path: Option<PathBuf>,
     pub required_binding: Option<BindingMode>,
-}
-
-/// Wall-clock seconds, for re-checking a pack's validity window per
-/// verification.
-///
-/// A pack that was valid when it was read is not necessarily valid now, and a
-/// daemon holds its packs for as long as it runs.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        // Before the epoch there is no verification time that can satisfy any
-        // pack, so refuse them all rather than treating the clock as valid.
-        .unwrap_or(0)
 }
 
 /// Verified portal TLS identity and the current session verified through that
@@ -101,81 +135,13 @@ pub async fn verify_portal_session(
     let PortalSessionVerificationRequest {
         host,
         status_port,
-        measurement_policy,
-        trust_source,
-        workload_policy,
+        mode,
         report_path,
         required_binding,
     } = request;
 
-    // One authority per verification. A policy from one source paired with
-    // anchors from another is the mixed trust the exclusive rule forbids, so
-    // the mismatch is refused before the portal is contacted.
-    match (&trust_source, &workload_policy) {
-        (TrustSource::Chain(_), SessionWorkloadPolicySource::Registry { .. })
-        | (TrustSource::Explicit(_), SessionWorkloadPolicySource::Explicit { .. })
-        | (TrustSource::Packs(_), SessionWorkloadPolicySource::Pack { .. }) => {}
-        (TrustSource::Chain(_), SessionWorkloadPolicySource::Explicit { .. }) => {
-            return Err(PortalVerificationError::Config {
-                message: "chain trust mode resolves the registered workload policy from the \
-                          chain; remove --trusted-workload-pcr23-sha256 and \
-                          --trusted-workload-pcr23-sha384, or drop --chain to verify explicitly"
-                    .to_string(),
-            })
-        }
-        (TrustSource::Explicit(_), SessionWorkloadPolicySource::Registry { .. }) => {
-            return Err(PortalVerificationError::Config {
-                message: "explicit trust mode has no chain to resolve a registered workload \
-                          policy from; supply --trusted-workload-pcr23-sha256 and \
-                          --trusted-workload-pcr23-sha384"
-                    .to_string(),
-            })
-        }
-        (TrustSource::Packs(_), _) => {
-            return Err(PortalVerificationError::Config {
-                message: "trust-pack mode resolves the workload policy from the configured \
-                          workload-trust pack; name the workload instead of supplying a policy \
-                          or a registry lookup"
-                    .to_string(),
-            })
-        }
-        (_, SessionWorkloadPolicySource::Pack { .. }) => {
-            return Err(PortalVerificationError::Config {
-                message: "a workload-trust pack supplies the workload policy only in trust-pack \
-                          mode; taking policy from a pack while resolving anchors elsewhere is \
-                          the mixed trust the exclusive-source rule forbids"
-                    .to_string(),
-            })
-        }
-    }
-
-    // The measurement policy is a trust input too, so its origin is decided by
-    // the same mode rather than accepted from the caller alongside it.
-    let measurement_policy = match (&trust_source, measurement_policy) {
-        (TrustSource::Packs(source), SessionMeasurementPolicySource::Pack { base_image_id }) => {
-            source.ensure_valid_at(now_unix())?;
-            packed_measurement_policy(source.workload_pack()?, base_image_id)?
-        }
-        (
-            TrustSource::Chain(_) | TrustSource::Explicit(_),
-            SessionMeasurementPolicySource::Supplied(policy),
-        ) => *policy,
-        (TrustSource::Packs(_), SessionMeasurementPolicySource::Supplied(_)) => {
-            return Err(PortalVerificationError::Config {
-                message: "trust-pack mode resolves the base-image measurement policy from the \
-                          configured workload-trust pack; supplying one alongside would take \
-                          measurements from one authority and anchors from another"
-                    .to_string(),
-            })
-        }
-        (_, SessionMeasurementPolicySource::Pack { .. }) => {
-            return Err(PortalVerificationError::Config {
-                message: "a workload-trust pack supplies the base-image measurement policy only \
-                          in trust-pack mode"
-                    .to_string(),
-            })
-        }
-    };
+    let trust_source = mode.trust_source();
+    let measurement_policy = mode.measurement_policy().await?;
 
     let portal_tls = bootstrap_portal_tls(
         &host,
@@ -188,27 +154,38 @@ pub async fn verify_portal_session(
     )
     .await?;
 
-    let session = match (&trust_source, &workload_policy) {
-        (TrustSource::Chain(source), SessionWorkloadPolicySource::Registry { workload }) => {
+    // The workload policy is resolved after portal TLS, against the base image
+    // TLS actually selected rather than one the caller declared.
+    let session = match &mode {
+        SessionVerificationMode::Chain {
+            source, workload, ..
+        } => {
             source
                 .client()
-                .verify_current_session(&portal_tls, &host, status_port, workload, required_binding)
+                .verify_current_session(
+                    &portal_tls,
+                    &host,
+                    status_port,
+                    &workload.to_string(),
+                    required_binding,
+                )
                 .await
         }
-        (TrustSource::Explicit(_), SessionWorkloadPolicySource::Explicit { policy }) => {
+        SessionVerificationMode::Explicit {
+            workload_policy, ..
+        } => {
             verify_current_session(
                 &portal_tls,
                 &host,
                 status_port,
-                policy.clone(),
+                workload_policy.clone(),
                 required_binding,
             )
             .await
         }
-        (TrustSource::Packs(source), SessionWorkloadPolicySource::Pack { workload }) => {
-            // Resolved after portal TLS, because the pack's workload spec is
-            // checked against the base image TLS actually selected rather than
-            // one the caller declared.
+        SessionVerificationMode::Packs {
+            source, workload, ..
+        } => {
             let base_image_id = portal_tls.identity.base_image_id.ok_or_else(|| {
                 PortalVerificationError::PortalTlsAttestationFailed {
                     message: "verified portal TLS identity has no base-image ID".to_string(),
@@ -217,7 +194,6 @@ pub async fn verify_portal_session(
             let policy = packed_workload_policy(source.workload_pack()?, workload, base_image_id)?;
             verify_current_session(&portal_tls, &host, status_port, policy, required_binding).await
         }
-        _ => unreachable!("the mode pairing is checked above"),
     }
     .map_err(
         |error| PortalVerificationError::PortalSessionVerificationFailed {
@@ -229,4 +205,205 @@ pub async fn verify_portal_session(
         portal_tls,
         session,
     })
+}
+
+/// Tests over the paths a verification actually takes, rather than over the
+/// helpers those paths call.
+///
+/// An earlier round of tests asserted on helper return values — that a selector
+/// matched, that `ensure_valid_at` rejected a time — which said nothing about
+/// whether any verification reached them. Two of the defects that review found
+/// were exactly that: a value produced and asserted on, never consumed.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::pack::fixture::Publisher;
+    use crate::pack::TrustPackKind;
+    use crate::portal::tls::bootstrap_portal_tls;
+
+    /// A port nothing listens on. Reaching a connection attempt at all means
+    /// the check under test did not run first.
+    const CLOSED_PORT: u16 = 1;
+
+    /// A window that ended in 2020, so the wall clock is outside it however
+    /// long this code lives.
+    const EXPIRED_NOT_BEFORE: u64 = 1_600_000_000;
+    const EXPIRED_NOT_AFTER: u64 = 1_600_100_000;
+
+    fn packs_mode(expired: bool) -> SessionVerificationMode {
+        let workload_publisher = Publisher::new(0x31);
+        let base_publisher = Publisher::new(0x32);
+        let (not_before, not_after, read_at) = if expired {
+            (
+                EXPIRED_NOT_BEFORE,
+                EXPIRED_NOT_AFTER,
+                EXPIRED_NOT_BEFORE + 1,
+            )
+        } else {
+            (
+                crate::pack::fixture::NOT_BEFORE,
+                crate::pack::fixture::NOT_AFTER,
+                crate::pack::fixture::NOW,
+            )
+        };
+        let (builder, base_image_id) = crate::pack::fixture::workload_builder_in_window(
+            &workload_publisher,
+            &base_publisher,
+            "peer-attestation-demo",
+            "v1.0.0",
+            not_before,
+            not_after,
+        );
+
+        // Read inside the window, so an expired source is one that *became*
+        // invalid rather than one that never verified.
+        let archive = builder
+            .build(|bytes| Ok::<_, std::convert::Infallible>(workload_publisher.sign(bytes)))
+            .expect("build archive");
+        let options = crate::pack::read::TrustPackReadOptions::new(
+            TrustPackKind::WorkloadTrust,
+            workload_publisher.public_key.clone(),
+            read_at,
+        );
+        let pack = crate::pack::read::read_trust_pack(&archive, &options)
+            .expect("the pack verifies inside its own window");
+
+        let source = PackTrustSource::new(
+            Vec::new(),
+            vec![pack],
+            IntelTdxDcapCollateralConfig::default(),
+        )
+        .expect("pack source");
+        SessionVerificationMode::Packs {
+            source,
+            base_image_id,
+            workload: AppRef::new(
+                workload_publisher.fingerprint(),
+                "peer-attestation-demo",
+                "v1.0.0",
+            ),
+        }
+    }
+
+    /// Trust-pack mode resolves its measurement policy from the pack, through
+    /// the same call `verify_portal_session` makes.
+    #[tokio::test]
+    async fn trust_pack_mode_resolves_its_measurement_policy_from_the_pack() {
+        let mode = packs_mode(false);
+        let policy = mode
+            .measurement_policy()
+            .await
+            .expect("the pack supplies the policy");
+        assert!(
+            policy.source.starts_with("trust pack "),
+            "the policy must come from the pack, got {}",
+            policy.source
+        );
+        assert_eq!(mode.name(), "trust-pack");
+        assert_eq!(mode.trust_source().mode(), "trust-pack");
+    }
+
+    /// Explicit mode returns the operator's policy unchanged, and chain mode is
+    /// the only variant that can reach a registry — there is no variant that
+    /// pairs one authority's anchors with another's policy, which is what
+    /// collapsing the three enums into one bought.
+    #[tokio::test]
+    async fn each_mode_supplies_its_own_measurement_policy() {
+        let mode = packs_mode(false);
+        let SessionVerificationMode::Packs { source, .. } = &mode else {
+            unreachable!()
+        };
+        let packed = mode.measurement_policy().await.unwrap();
+
+        let explicit = SessionVerificationMode::Explicit {
+            source: crate::trust::source::ExplicitTrustSource::new(
+                Default::default(),
+                IntelTdxDcapCollateralConfig::default(),
+            )
+            .unwrap(),
+            measurement_policy: Box::new(packed.clone()),
+            workload_policy: TrustedWorkloadSessionPolicy {
+                workload_id: [0u8; 32],
+                pcr_specs256: Vec::new(),
+                pcr_specs384: Vec::new(),
+                attribute_requirements: Vec::new(),
+            },
+        };
+        assert_eq!(explicit.name(), "explicit");
+        assert_eq!(
+            explicit.measurement_policy().await.unwrap().pack.subject.id,
+            packed.pack.subject.id
+        );
+        let _ = source;
+    }
+
+    /// `bootstrap_portal_tls` is public and takes a `TrustSource` directly, so
+    /// it is its own pack-consuming boundary. An expired pack must stop it
+    /// before it contacts anything — proven by pointing it at a closed port and
+    /// requiring the validity error rather than a connection error.
+    #[tokio::test]
+    async fn expired_packs_stop_portal_tls_before_it_connects() {
+        let SessionVerificationMode::Packs { source, .. } = packs_mode(true) else {
+            unreachable!()
+        };
+
+        let error = bootstrap_portal_tls(
+            "127.0.0.1",
+            CLOSED_PORT,
+            None,
+            None,
+            &TrustSource::Packs(source),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an expired pack must refuse before connecting");
+        let message = error.to_string();
+        assert!(
+            message.contains("validity") && message.contains("verification time"),
+            "the failure must be the validity window, not a connection error; got {message}"
+        );
+    }
+
+    /// The control for the test above: an unexpired pack reaches the network,
+    /// so the refusal there is the window and not something that refuses
+    /// always.
+    #[tokio::test]
+    async fn an_unexpired_pack_gets_past_the_validity_check() {
+        let SessionVerificationMode::Packs { source, .. } = packs_mode(false) else {
+            unreachable!()
+        };
+
+        let error = bootstrap_portal_tls(
+            "127.0.0.1",
+            CLOSED_PORT,
+            None,
+            None,
+            &TrustSource::Packs(source),
+            None,
+            None,
+        )
+        .await
+        .expect_err("nothing is listening on the closed port");
+        let message = error.to_string();
+        assert!(
+            !message.contains("validity"),
+            "a valid pack must not fail the window check; got {message}"
+        );
+    }
+
+    /// A pack that expires while a source is held stops working, which is what
+    /// separates bounding the verification from bounding the process.
+    #[tokio::test]
+    async fn a_held_source_stops_being_usable_when_its_packs_expire() {
+        let SessionVerificationMode::Packs { source, .. } = packs_mode(false) else {
+            unreachable!()
+        };
+        assert!(source.ensure_valid_at(crate::pack::fixture::NOW).is_ok());
+        let error = source
+            .ensure_valid_at(crate::pack::fixture::NOT_AFTER)
+            .expect_err("the same held source must refuse once the window closes");
+        assert!(error.to_string().contains("validity"), "got {error}");
+    }
 }

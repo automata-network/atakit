@@ -14,14 +14,14 @@
 //! changed nothing about the exclusivity above, which never depended on how
 //! many variants exist.
 
-use atakit_attestation::{TrustAnchors, TrustedSessionBinding};
+use atakit_attestation::{IntelTdxQuoteCollateralIdentity, TrustAnchors, TrustedSessionBinding};
 
 use crate::chain::{AttestationClient, AttestationClientConfig};
 use crate::collateral::intel_tdx::{IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource};
 use crate::error::PortalVerificationError;
 use crate::pack::collateral::{collateral_trust_inputs_from_all, CollateralTrustInputs};
 use crate::pack::read::TrustPack;
-use crate::pack::{TrustPackError, TrustPackKind};
+use crate::pack::{now_unix, TrustPackError, TrustPackKind};
 use crate::trust::files::TlsVerificationTrust;
 use crate::trust::requirements::RequiredTrustInput;
 
@@ -62,12 +62,37 @@ impl TrustSource {
 /// signature, validity window, namespace, and hashes already passed. A pack
 /// that exists but cannot be used is fatal rather than a fallback, which is why
 /// construction fails rather than leaving an unusable source in place.
+/// Everything behind one `Arc`, so a mode value can be cloned per verification
+/// without copying pack payloads. A daemon holds one source and serves many
+/// verifications from it.
 #[derive(Debug, Clone)]
 pub struct PackTrustSource {
+    inner: std::sync::Arc<PackTrustSourceInner>,
+    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+}
+
+#[derive(Debug)]
+struct PackTrustSourceInner {
     collateral: CollateralTrustInputs,
     collateral_packs: Vec<TrustPack>,
     workload_packs: Vec<TrustPack>,
-    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+    /// Packed Intel TDX DCAP collateral, indexed by the identity its own
+    /// selector declares.
+    ///
+    /// Built and validated at construction rather than searched per
+    /// verification. Scanning at verification time had to treat a malformed
+    /// selector as "does not claim this identity", which is indistinguishable
+    /// from a genuine miss — and a miss is allowed to fetch, so a corrupt entry
+    /// silently became a fetch. Indexing up front turns that into a
+    /// construction failure, and leaves the verification-time question as a
+    /// map lookup with only two answers.
+    tdx_dcap_by_identity: std::collections::HashMap<IntelTdxQuoteCollateralIdentity, PackedEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct PackedEntry {
+    path: String,
+    document: Vec<u8>,
 }
 
 impl PackTrustSource {
@@ -102,20 +127,54 @@ impl PackTrustSource {
                 .into());
             }
         }
+        let collateral = collateral_trust_inputs_from_all(&collateral_packs)?;
+
+        // Index and validate every packed Intel TDX selector now. A malformed
+        // selector or two entries claiming one identity are configuration
+        // errors, and a configuration error must stop the verifier starting
+        // rather than surface as a per-quote surprise.
+        let mut tdx_dcap_by_identity = std::collections::HashMap::new();
+        for (path, document) in &collateral.tdx_dcap_documents {
+            let identity = crate::pack::collateral::parse_collateral_selector(document).map_err(
+                |message| PortalVerificationError::Config {
+                    message: format!("trust pack entry {path}: {message}"),
+                },
+            )?;
+            if let Some(existing) = tdx_dcap_by_identity.insert(
+                identity,
+                PackedEntry {
+                    path: path.clone(),
+                    document: document.clone(),
+                },
+            ) {
+                return Err(PortalVerificationError::Config {
+                    message: format!(
+                        "trust pack entries {} and {path} both claim the same Intel TDX \
+                         collateral identity; duplicate claims are fatal, because silently \
+                         choosing one would make the winner invisible",
+                        existing.path
+                    ),
+                });
+            }
+        }
+
         Ok(Self {
-            collateral: collateral_trust_inputs_from_all(&collateral_packs)?,
-            collateral_packs,
-            workload_packs,
+            inner: std::sync::Arc::new(PackTrustSourceInner {
+                collateral,
+                collateral_packs,
+                workload_packs,
+                tdx_dcap_by_identity,
+            }),
             tdx_dcap_collateral,
         })
     }
 
     pub(crate) fn anchors(&self) -> &TrustAnchors {
-        &self.collateral.trust_anchors
+        &self.inner.collateral.trust_anchors
     }
 
     pub(crate) fn amd_snp_crls(&self) -> &[Vec<u8>] {
-        &self.collateral.amd_snp_crls
+        &self.inner.collateral.amd_snp_crls
     }
 
     /// Re-check every configured pack's validity window.
@@ -125,10 +184,25 @@ impl PackTrustSource {
     /// past `not_after`, making the derived expiry bound the process instead of
     /// the verification it was derived for.
     pub fn ensure_valid_at(&self, now_unix: u64) -> Result<(), PortalVerificationError> {
-        for pack in self.collateral_packs.iter().chain(&self.workload_packs) {
+        for pack in self
+            .inner
+            .collateral_packs
+            .iter()
+            .chain(&self.inner.workload_packs)
+        {
             pack.ensure_valid_at(now_unix)?;
         }
         Ok(())
+    }
+
+    /// The same check against the wall clock.
+    ///
+    /// Every public path that consumes a pack calls this, rather than one
+    /// workflow calling it once. A pack validated only where the caller
+    /// remembered to ask would leave `bootstrap_portal_tls` — which is public
+    /// and takes a `TrustSource` directly — using expired packs.
+    pub(crate) fn ensure_valid_now(&self) -> Result<(), PortalVerificationError> {
+        self.ensure_valid_at(now_unix())
     }
 
     /// Select the packed Intel TDX DCAP collateral covering this quote.
@@ -151,25 +225,27 @@ impl PackTrustSource {
                 }
             })?;
 
-        for (path, document) in &self.collateral.tdx_dcap_documents {
-            if !crate::pack::collateral::claims_collateral_identity(document, &identity) {
-                continue;
+        // A lookup, with exactly two answers. Every entry's selector was parsed
+        // at construction, so "not in the map" means no pack covers this
+        // hardware — never that some entry was too malformed to read.
+        let Some(entry) = self.inner.tdx_dcap_by_identity.get(&identity) else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(&entry.document).map_err(|error| {
+            PortalVerificationError::Config {
+                message: format!("trust pack entry {} is not UTF-8: {error}", entry.path),
             }
-            let text =
-                std::str::from_utf8(document).map_err(|error| PortalVerificationError::Config {
-                    message: format!("trust pack entry {path} is not UTF-8: {error}"),
-                })?;
-            return atakit_attestation::IntelTdxDcapCollateral::from_file_json(text, quote)
-                .map(Some)
-                .map_err(|error| PortalVerificationError::Config {
-                    message: format!(
-                        "trust pack entry {path} covers this quote's collateral identity but \
-                         cannot be used: {error}; a packed entry that is present and unusable \
-                         fails the verification rather than falling through to a vendor endpoint"
-                    ),
-                });
-        }
-        Ok(None)
+        })?;
+        atakit_attestation::IntelTdxDcapCollateral::from_file_json(text, quote)
+            .map(Some)
+            .map_err(|error| PortalVerificationError::Config {
+                message: format!(
+                    "trust pack entry {} covers this quote's collateral identity but cannot be \
+                     used: {error}; a packed entry that is present and unusable fails the \
+                     verification rather than falling through to a vendor endpoint",
+                    entry.path
+                ),
+            })
     }
 
     /// Whether any pack carries Intel TDX DCAP collateral at all.
@@ -177,7 +253,7 @@ impl PackTrustSource {
     /// Distinguishes "this pack set does not cover Intel TDX" from "it covers
     /// Intel TDX but not this stepping", which need different operator action.
     pub(crate) fn carries_tdx_dcap_collateral(&self) -> bool {
-        !self.collateral.tdx_dcap_documents.is_empty()
+        !self.inner.tdx_dcap_by_identity.is_empty()
     }
 
     /// The one workload-trust pack, or a failure naming why there is not
@@ -186,8 +262,11 @@ impl PackTrustSource {
     /// Two packs could each answer for the same workload with different policy,
     /// and choosing between them silently would make the winner invisible —
     /// the rule duplicate claims follow everywhere else in this format.
+    /// Validity is re-checked here because this is the accessor every workload
+    /// and measurement policy path goes through.
     pub fn workload_pack(&self) -> Result<&TrustPack, PortalVerificationError> {
-        match self.workload_packs.as_slice() {
+        self.ensure_valid_now()?;
+        match self.inner.workload_packs.as_slice() {
             [pack] => Ok(pack),
             [] => Err(PortalVerificationError::Config {
                 message: "trust-pack mode has no workload-trust pack, so there is no workload \
@@ -213,12 +292,14 @@ impl PackTrustSource {
     pub(crate) fn provenance(&self) -> TrustInputSource {
         TrustInputSource::Pack {
             issuers: self
+                .inner
                 .collateral
                 .issuers
                 .iter()
                 .map(|provenance| provenance.issuer.clone())
                 .collect(),
             digests: self
+                .inner
                 .collateral
                 .issuers
                 .iter()

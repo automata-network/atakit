@@ -88,6 +88,14 @@ pub async fn bootstrap_portal_tls(
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
+    // This function is public and takes a `TrustSource` directly, so it is a
+    // pack-consuming boundary in its own right — a caller that never goes
+    // through `verify_portal_session` reaches packs through here. The window is
+    // therefore checked before anything else, including before the portal is
+    // contacted.
+    if let TrustSource::Packs(source) = trust_source {
+        source.ensure_valid_now()?;
+    }
     let amd_snp_crls = match trust_source {
         TrustSource::Explicit(source) => source.amd_snp_crls().to_vec(),
         TrustSource::Packs(source) => source.amd_snp_crls().to_vec(),

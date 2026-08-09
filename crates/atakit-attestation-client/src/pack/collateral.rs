@@ -283,43 +283,69 @@ fn parse_amd_snp_policies(
     })
 }
 
-/// Whether a packed Intel TDX DCAP collateral document claims this quote's
-/// `(fmspc, pceId, pckCa)`.
+/// The `(fmspc, pceId, pckCa)` a packed Intel TDX DCAP collateral document
+/// declares.
 ///
-/// Read from the document's own `selector` so that a miss and a broken entry
-/// can be told apart *before* parsing. A parse failure alone cannot distinguish
-/// "this entry is for other hardware" from "this entry is for this hardware and
-/// is corrupt", and the two have opposite consequences: the first may fall
-/// through to a configured off-chain source, the second must fail the
-/// verification, because fetching past a broken pinned entry would make pinning
-/// advisory.
-///
-/// A document whose selector cannot be read counts as not claiming the
-/// identity. It cannot thereby be used, and if nothing else covers the quote
-/// the verification fails closed anyway.
-pub(crate) fn claims_collateral_identity(
+/// Strict, and called at construction rather than per verification. An earlier
+/// version answered the weaker question "does this document claim this
+/// identity?" and returned `false` when the selector was unreadable — which is
+/// indistinguishable from a genuine miss, and a miss is permitted to fetch from
+/// a configured off-chain source. A corrupt entry therefore became a silent
+/// fetch. Parsing up front makes it a configuration error instead, and leaves
+/// verification-time selection as a lookup that cannot be ambiguous.
+pub(crate) fn parse_collateral_selector(
     document: &[u8],
-    identity: &atakit_attestation::IntelTdxQuoteCollateralIdentity,
-) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(document) else {
-        return false;
-    };
-    let Some(selector) = value.get("selector") else {
-        return false;
-    };
-    let field = |name: &str| {
+) -> Result<atakit_attestation::IntelTdxQuoteCollateralIdentity, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(document).map_err(|error| format!("not JSON: {error}"))?;
+    let selector = value
+        .get("selector")
+        .ok_or_else(|| "no selector object".to_string())?;
+    let field = |name: &str| -> Result<&str, String> {
         selector
             .get(name)
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
+            .ok_or_else(|| format!("selector.{name} is missing or not a string"))
     };
-    let pck_ca = match identity.pck_ca {
-        atakit_attestation::IntelTdxPckCa::Platform => "platform",
-        atakit_attestation::IntelTdxPckCa::Processor => "processor",
+
+    let fmspc = decode_selector_bytes::<6>("selector.fmspc", field("fmspc")?)?;
+    let pce_id = decode_selector_bytes::<2>("selector.pceId", field("pceId")?)?;
+    let pck_ca = match field("pckCa")? {
+        "platform" => atakit_attestation::IntelTdxPckCa::Platform,
+        "processor" => atakit_attestation::IntelTdxPckCa::Processor,
+        other => {
+            return Err(format!(
+                "selector.pckCa is {other:?}, not platform or processor"
+            ))
+        }
     };
-    field("fmspc") == hex::encode(identity.fmspc)
-        && field("pceId") == hex::encode(identity.pce_id)
-        && field("pckCa") == pck_ca
+
+    Ok(atakit_attestation::IntelTdxQuoteCollateralIdentity {
+        fmspc,
+        pce_id,
+        pck_ca,
+    })
+}
+
+/// Lowercase hexadecimal of an exact length.
+///
+/// Case-strict because the selector is compared against a value derived from
+/// the quote; accepting either case would let one identity be spelled two ways
+/// and defeat the duplicate-entry check that runs beside it.
+fn decode_selector_bytes<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{field} must be {} lowercase hexadecimal characters, got {value:?}",
+            N * 2
+        ));
+    }
+    let mut out = [0u8; N];
+    hex::decode_to_slice(value, &mut out).map_err(|error| format!("{field}: {error}"))?;
+    Ok(out)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -353,7 +379,7 @@ mod tests {
     use super::*;
     use crate::pack::fixture::{
         amd_snp_policy_document, certificate_pem, collateral_builder, crl_der, round_trip,
-        tdx_dcap_document, unchecked_archive, Publisher,
+        tdx_dcap_document, tdx_dcap_document_with_fmspc, unchecked_archive, Publisher,
     };
     use crate::pack::write::TrustPackBuilder;
     use crate::trust::request::CollateralRequest;
@@ -589,62 +615,84 @@ mod tests {
         );
     }
 
-    /// Packed Intel TDX DCAP collateral is selected by the quote's own
-    /// `(fmspc, pceId, pckCa)`, not merely stored.
+    /// Every packed Intel TDX selector is parsed and indexed when the source
+    /// is constructed, so a malformed one is a configuration error rather than
+    /// a per-quote surprise.
     ///
-    /// Asserting that `tdx_dcap_documents` is non-empty — which this test file
-    /// previously did, and which was all it did — proves the entry survived the
-    /// archive, not that any verification can reach it. The identity match is
-    /// what makes it reachable, and it is what tells a genuine miss apart from
-    /// a present-but-broken entry.
+    /// This replaced a test that called a helper and asserted on its boolean.
+    /// That proved the helper matched, not that a verification could reach the
+    /// entry or that a corrupt entry stopped a fetch — and a corrupt entry
+    /// silently becoming a fetch was the actual defect.
     #[test]
-    fn packed_collateral_is_selected_by_the_quote_identity() {
+    fn packed_collateral_selectors_are_validated_when_the_source_is_built() {
+        use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+        use crate::trust::source::PackTrustSource;
         use atakit_attestation::{IntelTdxPckCa, IntelTdxQuoteCollateralIdentity};
 
-        let document = tdx_dcap_document();
-        let covered = IntelTdxQuoteCollateralIdentity {
-            fmspc: [0x00, 0x80, 0x6f, 0x05, 0x00, 0x00],
-            pce_id: [0x00, 0x00],
-            pck_ca: IntelTdxPckCa::Platform,
+        let publisher = Publisher::new(0x11);
+        let build = |entries: Vec<(&str, Vec<u8>)>| {
+            let mut builder = collateral_builder("example-publisher");
+            for (path, bytes) in entries {
+                builder.insert(path, bytes).expect("entry");
+            }
+            PackTrustSource::new(
+                vec![pack(&builder, &publisher)],
+                Vec::new(),
+                IntelTdxDcapCollateralConfig::default(),
+            )
         };
-        assert!(
-            claims_collateral_identity(&document, &covered),
-            "the fixture's own selector must match"
+
+        // The fixture's selector parses to exactly the identity it names.
+        let identity = parse_collateral_selector(&tdx_dcap_document())
+            .expect("the fixture selector must parse");
+        assert_eq!(
+            identity,
+            IntelTdxQuoteCollateralIdentity {
+                fmspc: [0x00, 0x80, 0x6f, 0x05, 0x00, 0x00],
+                pce_id: [0x00, 0x00],
+                pck_ca: IntelTdxPckCa::Platform,
+            }
         );
 
-        // Each field on its own decides coverage, so a near-miss is a miss.
-        for (label, identity) in [
+        assert!(build(vec![("payload/tdx-dcap/a.json", tdx_dcap_document())]).is_ok());
+
+        // A selector that cannot be read stops construction. Previously it was
+        // treated as "claims no identity", which a caller could not tell from a
+        // genuine miss, and a miss is allowed to fetch.
+        for (label, document) in [
+            ("no selector", {
+                // Built from the valid document so it still carries the payload
+                // the writer derives an expiry from; otherwise it would be
+                // refused before the selector is ever looked at.
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&tdx_dcap_document()).unwrap();
+                value.as_object_mut().unwrap().remove("selector");
+                serde_json::to_vec(&value).unwrap()
+            }),
             (
-                "another fmspc",
-                IntelTdxQuoteCollateralIdentity {
-                    fmspc: [0x00, 0x80, 0x6f, 0x05, 0x00, 0x01],
-                    ..covered
-                },
+                "an uppercase fmspc",
+                tdx_dcap_document_with_fmspc("00806F050000"),
             ),
-            (
-                "another pceId",
-                IntelTdxQuoteCollateralIdentity {
-                    pce_id: [0x00, 0x01],
-                    ..covered
-                },
-            ),
-            (
-                "the other PCK CA",
-                IntelTdxQuoteCollateralIdentity {
-                    pck_ca: IntelTdxPckCa::Processor,
-                    ..covered
-                },
-            ),
+            ("a short fmspc", tdx_dcap_document_with_fmspc("00806f05")),
         ] {
+            let error = build(vec![("payload/tdx-dcap/bad.json", document)])
+                .expect_err(&format!("{label} must stop construction"));
             assert!(
-                !claims_collateral_identity(&document, &identity),
-                "{label} must not be treated as covered"
+                error.to_string().contains("payload/tdx-dcap/bad.json"),
+                "{label}: the failure must name the entry; got {error}"
             );
         }
 
+        // Two entries claiming one identity is fatal, for the reason every
+        // other duplicate claim is.
+        let error = build(vec![
+            ("payload/tdx-dcap/a.json", tdx_dcap_document()),
+            ("payload/tdx-dcap/b.json", tdx_dcap_document()),
+        ])
+        .expect_err("two entries claiming one identity must be refused");
         assert!(
-            !claims_collateral_identity(b"not json", &covered),
-            "an unreadable entry claims nothing"
+            error.to_string().contains("duplicate claims are fatal"),
+            "got {error}"
         );
     }
 

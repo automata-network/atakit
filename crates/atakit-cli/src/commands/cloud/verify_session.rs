@@ -4,19 +4,29 @@ use anyhow::{bail, Context, Result};
 use atakit_attestation_client::TrustedWorkloadSessionPolicy;
 use atakit_cloud::cli::VerifySessionArgs;
 use atakit_cloud::init;
-use atakit_cloud::init::{ChainTrustSource, ExplicitTrustSource, TrustSource};
+use atakit_cloud::init::{ChainTrustSource, ExplicitTrustSource};
 use atakit_cloud::session::{
-    verify_portal_session, PortalSessionVerificationRequest, SessionMeasurementPolicySource,
-    SessionWorkloadPolicySource,
+    verify_portal_session, PortalSessionVerificationRequest, SessionVerificationMode,
 };
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::DEFAULT_PORTAL_STATUS_PORT;
 use atakit_core::Env;
+use atakit_cvm_types::AppRef;
 use owo_colors::OwoColorize;
 
 use super::session_access::{connect_attestation_client, decode_hex_32, decode_hex_48};
 use super::{resolve_instance, resolve_verifier_tls_measurement_policy};
 use crate::config::Config;
+
+/// Parse a canonical `<publisher>/<name>:<version>` reference.
+///
+/// Chain mode carries typed references rather than strings so an unparseable
+/// one cannot reach the registry lookup.
+fn parse_ref(value: &str, what: &str) -> Result<AppRef> {
+    value
+        .parse()
+        .with_context(|| format!("invalid {what} reference '{value}'"))
+}
 
 struct VerificationSubject {
     host: String,
@@ -45,14 +55,6 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
         None => None,
     };
 
-    let measurement_policy = resolve_verifier_tls_measurement_policy(
-        args.verification.measurements.as_deref(),
-        &subject.base_image_ref,
-        &args.verification.measurement_publisher_key,
-        &env.data_dir,
-        chain_client.as_ref(),
-    )
-    .await?;
     let tls_verification_trust = init::load_tls_verification_trust(
         &args.verification.gcp_ak_root_cert,
         &args.verification.azure_maa_cert,
@@ -79,67 +81,82 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    // One authority per verification. Selecting a chain means the registry
-    // supplies every trust anchor, so a pinned file alongside it is refused
-    // rather than silently unused.
-    let trust_source = match &chain_client {
+    // One authority per verification, chosen once. Each mode carries only the
+    // policies its own authority supplies, so there is no combination left to
+    // validate afterwards.
+    let mode = match &chain_client {
         Some(client) => {
-            if !tls_verification_trust.sources.is_empty() {
-                let flags: Vec<&str> = tls_verification_trust
-                    .sources
-                    .keys()
-                    .map(String::as_str)
-                    .collect();
+            let mut conflicting: Vec<&str> = tls_verification_trust
+                .sources
+                .keys()
+                .map(String::as_str)
+                .collect();
+            // `--measurements` is an operator-supplied base-image policy, which
+            // belongs to explicit mode. Chain mode reads that policy from the
+            // registry, so accepting both would be the mixed trust the
+            // exclusive-source rule forbids.
+            if args.verification.measurements.is_some() {
+                conflicting.push("--measurements");
+            }
+            if !conflicting.is_empty() {
                 bail!(
-                    "--chain resolves every trust anchor from the registry, so {} cannot also be supplied; drop the pinned files, or drop --chain to verify explicitly",
-                    flags.join(", ")
+                    "--chain resolves every trust input from the registry, so {} cannot also be supplied; drop them, or drop --chain to verify explicitly",
+                    conflicting.join(", ")
                 );
             }
-            TrustSource::Chain(ChainTrustSource::from_client(client.clone(), tdx_dcap))
-        }
-        None => TrustSource::Explicit(
-            ExplicitTrustSource::new(tls_verification_trust, tdx_dcap)
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-        ),
-    };
-
-    let workload_policy = match (
-        args.verification.trusted_workload_pcr23_sha256.as_deref(),
-        args.verification.trusted_workload_pcr23_sha384.as_deref(),
-    ) {
-        (Some(sha256), Some(sha384)) => SessionWorkloadPolicySource::Explicit {
-            policy: TrustedWorkloadSessionPolicy::from_manifest_pcr23(
-                &subject.workload_ref,
-                decode_hex_32(sha256, "--trusted-workload-pcr23-sha256")?,
-                decode_hex_48(sha384, "--trusted-workload-pcr23-sha384")?,
-            )?,
-        },
-        (None, None) => {
-            if chain_client.is_none() {
+            if args.verification.trusted_workload_pcr23_sha256.is_some()
+                || args.verification.trusted_workload_pcr23_sha384.is_some()
+            {
                 bail!(
+                    "--chain resolves the registered workload policy from the registry, so --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 cannot also be supplied"
+                );
+            }
+            SessionVerificationMode::Chain {
+                source: ChainTrustSource::from_client(client.clone(), tdx_dcap),
+                base_image: parse_ref(&subject.base_image_ref, "base image")?,
+                workload: parse_ref(&subject.workload_ref, "workload")?,
+            }
+        }
+        None => {
+            let workload_policy = match (
+                args.verification.trusted_workload_pcr23_sha256.as_deref(),
+                args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            ) {
+                (Some(sha256), Some(sha384)) => TrustedWorkloadSessionPolicy::from_manifest_pcr23(
+                    &subject.workload_ref,
+                    decode_hex_32(sha256, "--trusted-workload-pcr23-sha256")?,
+                    decode_hex_48(sha384, "--trusted-workload-pcr23-sha384")?,
+                )?,
+                (None, None) => bail!(
                     "no trusted workload collateral is available; select a verifier chain with --chain or provide both --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384"
-                );
-            }
-            SessionWorkloadPolicySource::Registry {
-                workload: subject.workload_ref.clone(),
+                ),
+                _ => bail!(
+                    "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
+                ),
+            };
+            let measurement_policy = resolve_verifier_tls_measurement_policy(
+                args.verification.measurements.as_deref(),
+                &subject.base_image_ref,
+                &args.verification.measurement_publisher_key,
+                &env.data_dir,
+                None,
+            )
+            .await?;
+            SessionVerificationMode::Explicit {
+                source: ExplicitTrustSource::new(tls_verification_trust, tdx_dcap)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+                measurement_policy: Box::new(measurement_policy),
+                workload_policy,
             }
         }
-        _ => bail!(
-            "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
-        ),
     };
 
     eprint!("Verify portal TLS and current session... ");
     let outcome = verify_portal_session(PortalSessionVerificationRequest {
         host: subject.host.clone(),
         status_port: subject.status_port,
-        // This command resolves the policy itself, from the chain or from
-        // `--measurements`. `SessionMeasurementPolicySource::Pack` belongs to
-        // trust-pack mode, which has no command-line surface yet.
-        measurement_policy: SessionMeasurementPolicySource::Supplied(Box::new(measurement_policy)),
-        trust_source,
+        mode,
         report_path: None,
-        workload_policy,
         required_binding: None,
     })
     .await

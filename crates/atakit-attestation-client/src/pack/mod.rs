@@ -34,6 +34,19 @@ use crate::error::PortalVerificationError;
 /// and no migration path.
 pub const TRUST_PACK_FORMAT: u32 = 1;
 
+/// Wall-clock seconds, for re-checking a pack's validity window.
+///
+/// A pack that was valid when it was read is not necessarily valid now, and a
+/// daemon holds its packs for as long as it runs.
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        // Before the epoch no pack can be valid, so refuse them all rather than
+        // treat a broken clock as a verification time.
+        .unwrap_or(0)
+}
+
 /// Which payload namespace a pack occupies, and therefore which configured
 /// publisher key must have signed it.
 ///

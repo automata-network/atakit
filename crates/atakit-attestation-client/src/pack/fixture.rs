@@ -312,14 +312,37 @@ pub fn workload_builder(
     workload_name: &str,
     workload_version: &str,
 ) -> (TrustPackBuilder, [u8; 32]) {
+    workload_builder_in_window(
+        workload_publisher,
+        base_image_publisher,
+        workload_name,
+        workload_version,
+        NOT_BEFORE,
+        NOT_AFTER,
+    )
+}
+
+/// The same, with a caller-chosen validity window.
+///
+/// Needed to build a pack that is genuinely expired against the wall clock:
+/// the default window brackets `NOW`, which real time currently falls inside,
+/// so a test that assumed otherwise would pass for the wrong reason.
+pub fn workload_builder_in_window(
+    workload_publisher: &Publisher,
+    base_image_publisher: &Publisher,
+    workload_name: &str,
+    workload_version: &str,
+    not_before: u64,
+    not_after: u64,
+) -> (TrustPackBuilder, [u8; 32]) {
     let (pack_json, base_image_id) =
         consistent_measurement_pack(base_image_publisher, "automata-linux", "v0.2.8-debug");
     let mut builder = TrustPackBuilder::new(
         TrustPackKind::WorkloadTrust,
         "example-workload-publisher",
         1,
-        NOT_BEFORE,
-        NOT_AFTER,
+        not_before,
+        not_after,
     );
     builder
         .insert(
@@ -376,11 +399,17 @@ pub fn insert_measurement_triple(
 /// a verification supplies that quote. `nextUpdate` is far future so carrying
 /// one does not shorten a pack under test.
 pub fn tdx_dcap_document() -> Vec<u8> {
+    tdx_dcap_document_with_fmspc("00806f050000")
+}
+
+/// The same document with a caller-chosen `selector.fmspc`, for exercising
+/// selector validation and duplicate detection.
+pub fn tdx_dcap_document_with_fmspc(fmspc: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "schema": "atakit.intel-tdx-dcap-collateral",
         "version": 1,
         "selector": {
-            "fmspc": "00806f050000",
+            "fmspc": fmspc,
             "pceId": "0000",
             "pckCa": "platform",
             "tcbEvaluationDataNumber": 17,
