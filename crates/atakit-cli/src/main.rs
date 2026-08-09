@@ -37,6 +37,9 @@ enum Command {
     /// Inspect the signing keys declared in `[keys]`
     #[command(subcommand)]
     Keys(commands::keys::KeysCommand),
+    /// Produce and inspect `.atatp` trust packs
+    #[command(subcommand)]
+    TrustPack(commands::trustpack::TrustPackCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -183,6 +186,14 @@ async fn main() -> Result<()> {
         Command::Keys(cmd) => match cmd {
             commands::keys::KeysCommand::Ls(args) => commands::keys::ls(args, &config),
             commands::keys::KeysCommand::Show(args) => commands::keys::show(args, &config),
+        },
+        Command::TrustPack(cmd) => match cmd {
+            commands::trustpack::TrustPackCommand::Build(args) => {
+                commands::trustpack::build(args, &config)
+            }
+            commands::trustpack::TrustPackCommand::Inspect(args) => {
+                commands::trustpack::inspect(args)
+            }
         },
         Command::External(args) => {
             let subcmd = &args[0];

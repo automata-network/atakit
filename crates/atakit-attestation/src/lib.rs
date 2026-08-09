@@ -40,6 +40,12 @@ pub enum AttestationError {
     MeasurementPack(String),
     #[error("measurement pack signature verification failed: {0}")]
     MeasurementPackSignature(String),
+    /// Raised by [`verify_es256k_detached`], which both measurement packs and
+    /// `.atatp` trust packs use. Neutral wording, because a trust pack failure
+    /// reporting itself as a measurement pack failure sends an operator to the
+    /// wrong artifact.
+    #[error("ES256K signature verification failed: {0}")]
+    Es256kSignature(String),
 }
 
 pub type Result<T> = std::result::Result<T, AttestationError>;
@@ -907,13 +913,11 @@ pub fn verify_measurement_pack(
 pub fn verify_es256k_detached(message: &[u8], sig: &[u8], public_key: &[u8]) -> Result<()> {
     let signature = parse_es256k_signature(sig)?;
     let verifying_key = K256VerifyingKey::from_sec1_bytes(public_key).map_err(|e| {
-        AttestationError::MeasurementPackSignature(format!(
-            "trusted key did not parse as SEC1 ES256K: {e}"
-        ))
+        AttestationError::Es256kSignature(format!("trusted key did not parse as SEC1 ES256K: {e}"))
     })?;
-    verifying_key.verify(message, &signature).map_err(|e| {
-        AttestationError::MeasurementPackSignature(format!("signature did not verify: {e}"))
-    })
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|e| AttestationError::Es256kSignature(format!("signature did not verify: {e}")))
 }
 
 fn parse_es256k_signature(sig: &[u8]) -> Result<K256Signature> {
