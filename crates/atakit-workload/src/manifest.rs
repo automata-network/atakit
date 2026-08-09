@@ -395,7 +395,7 @@ pub fn parse_unmeasured_env_file_names(
                 message: format!("invalid environment variable name {key:?}"),
             });
         }
-        if key.starts_with("ATAKIT_") {
+        if key.starts_with("ATAKIT_") || key.starts_with("VERIFIED_") {
             return Err(WorkloadError::EnvFileParse {
                 path: path.to_path_buf(),
                 line: i + 1,
@@ -1087,6 +1087,7 @@ mod tests {
             "TOKEN=one\nTOKEN=two\n",
             "BAD-NAME=value\n",
             "ATAKIT_PUBLIC_IP=value\n",
+            "VERIFIED_PEER_BETA=203.0.113.10:2024\n",
         ] {
             assert!(parse_unmeasured_env_file_names(path, content).is_err());
         }

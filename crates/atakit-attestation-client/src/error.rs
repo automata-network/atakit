@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use atakit_attestation::SessionVerificationFailure;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PortalVerificationError {
     #[error("config error: {message}")]
@@ -22,6 +24,11 @@ pub enum PortalVerificationError {
 
     #[error("portal session verification failed: {message}")]
     PortalSessionVerificationFailed { message: String },
+
+    #[error("portal session verification failed: {failure:?}")]
+    SessionVerification {
+        failure: Box<SessionVerificationFailure>,
+    },
 
     #[error("I/O error: {path}")]
     IoPath {

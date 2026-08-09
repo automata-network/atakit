@@ -283,6 +283,13 @@ impl PackTrustSource {
         }
     }
 
+    /// Platform pairs for which this source currently carries every coarse
+    /// trust input. Exact AMD CPUID and Azure token-key selection still occur
+    /// per verification.
+    pub fn supported_platforms(&self) -> Vec<String> {
+        supported_platforms_for_anchors(&self.inner.collateral.trust_anchors)
+    }
+
     /// Which packs supplied the collateral inputs.
     ///
     /// Uniform within a run by construction, which is the point of an
@@ -432,6 +439,13 @@ impl ExplicitTrustSource {
         &self.amd_snp_crls
     }
 
+    /// Platform pairs for which the configured files currently carry every
+    /// coarse trust input. Exact AMD CPUID and Azure token-key selection still
+    /// occur per verification.
+    pub fn supported_platforms(&self) -> Vec<String> {
+        supported_platforms_for_anchors(&self.anchors)
+    }
+
     /// Where an explicitly supplied input came from.
     ///
     /// The flag is always known; the paths are known when the input was read
@@ -444,6 +458,23 @@ impl ExplicitTrustSource {
             paths: self.sources.get(flag).cloned().unwrap_or_default(),
         }
     }
+}
+
+fn supported_platforms_for_anchors(anchors: &TrustAnchors) -> Vec<String> {
+    const PAIRS: &[(&str, &str)] = &[
+        ("gcp", "tdx"),
+        ("gcp", "sev-snp"),
+        ("azure", "tdx"),
+        ("azure", "sev-snp"),
+        ("aws", "sev-snp"),
+    ];
+    PAIRS
+        .iter()
+        .filter(|(cloud, tee)| {
+            crate::trust::requirements::unsatisfied_trust_inputs(cloud, tee, anchors).is_empty()
+        })
+        .map(|(cloud, tee)| format!("{cloud}-{tee}"))
+        .collect()
 }
 
 /// Where one resolved trust input came from.

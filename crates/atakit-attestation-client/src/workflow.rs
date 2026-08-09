@@ -157,11 +157,14 @@ pub async fn verify_portal_session(
     let session =
         verify_current_session(&portal_tls, &host, status_port, &selector, required_binding)
             .await
-            .map_err(
-                |error| PortalVerificationError::PortalSessionVerificationFailed {
+            .map_err(|error| match error {
+                crate::AttestationClientError::SessionVerification(failure) => {
+                    PortalVerificationError::SessionVerification { failure }
+                }
+                error => PortalVerificationError::PortalSessionVerificationFailed {
                     message: error.to_string(),
                 },
-            )?;
+            })?;
 
     Ok(VerifiedPortalSession {
         portal_tls,

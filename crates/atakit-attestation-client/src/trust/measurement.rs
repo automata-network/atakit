@@ -120,11 +120,15 @@ pub fn load_measurement_policy(
         }
     })?;
     if let Some(app_ref) = base_image_ref {
-        if pack.subject.name != app_ref.name || pack.subject.version != app_ref.version {
+        let expected_publisher = format!("0x{}", hex::encode(app_ref.publisher));
+        if pack.subject.publisher != expected_publisher
+            || pack.subject.name != app_ref.name
+            || pack.subject.version != app_ref.version
+        {
             return Err(PortalVerificationError::Config {
                 message: format!(
-                    "measurement pack is for {}:{}, not {}:{}",
-                    pack.subject.name, pack.subject.version, app_ref.name, app_ref.version
+                    "measurement pack is for {}/{}:{}, not {}",
+                    pack.subject.publisher, pack.subject.name, pack.subject.version, app_ref,
                 ),
             });
         }
@@ -223,7 +227,9 @@ fn path_exists(path: &Path) -> Result<bool, PortalVerificationError> {
 mod tests {
     use super::*;
 
-    const PUBLISHER: &str = "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+    const PUBLISHER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_PUBLISHER: &str =
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     /// A canonical reference for a test base image.
     fn reference(name: &str, version: &str) -> String {
@@ -301,8 +307,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("measurement pack is for base:v1"),
+            err.to_string()
+                .contains(&format!("measurement pack is for {PUBLISHER}/base:v1")),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_measurement_policy_rejects_a_publisher_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = measurement_pack_json("base", "v1");
+        let (sig, publisher_keys) = signed_measurement_pack(&json);
+        std::fs::write(dir.path().join("measurement-pack.json"), json).unwrap();
+        std::fs::write(dir.path().join("measurement-pack.sig"), sig).unwrap();
+
+        let reference = format!("{OTHER_PUBLISHER}/base:v1");
+        let error =
+            load_measurement_policy(Some(dir.path()), Some(&reference), &publisher_keys, None)
+                .expect_err("matching name and version from another publisher must fail");
+        assert!(
+            error.to_string().contains(PUBLISHER) && error.to_string().contains(OTHER_PUBLISHER),
+            "got: {error}"
         );
     }
 

@@ -127,6 +127,11 @@ impl From<atakit_attestation_client::PortalVerificationError> for CloudError {
             Source::PortalSessionVerificationFailed { message } => {
                 CloudError::PortalSessionVerificationFailed { message }
             }
+            Source::SessionVerification { failure } => {
+                let message = serde_json::to_string_pretty(&failure)
+                    .unwrap_or_else(|_| failure.errors.join("; "));
+                CloudError::PortalSessionVerificationFailed { message }
+            }
             Source::IoPath { path, source } => CloudError::IoPath { path, source },
             Source::Json(source) => CloudError::Json(source),
         }

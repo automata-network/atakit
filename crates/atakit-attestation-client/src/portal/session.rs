@@ -358,11 +358,7 @@ pub(crate) async fn verify_current_session_bound(
         expected_challenge: challenge,
         trust,
     })
-    .map_err(|failure| {
-        session_error(
-            serde_json::to_string_pretty(&failure).unwrap_or_else(|_| failure.errors.join("; ")),
-        )
-    })?;
+    .map_err(|failure| AttestationClientError::SessionVerification(Box::new(failure)))?;
     enforce_required_binding(verified.binding_mode, required_binding)?;
     Ok(verified)
 }

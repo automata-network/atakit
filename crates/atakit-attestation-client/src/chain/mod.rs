@@ -11,7 +11,8 @@ use alloy_ext::ext::{NetworkProvider, ProviderEx};
 use atakit_attestation::{
     AmdSnpSecurityPolicy, AzureMaaTrustKey, MeasurementPack, MeasurementPolicy, MeasurementProfile,
     MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384, SessionAttributeRequirement,
-    SessionPcrPolicy, SessionPcrPolicy384, Subject, TrustedSessionBinding,
+    SessionPcrPolicy, SessionPcrPolicy384, SessionVerificationFailure, Subject,
+    TrustedSessionBinding,
 };
 use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
 use atakit_cvm_types::AppRef;
@@ -170,6 +171,8 @@ pub enum AttestationClientError {
     Portal(String),
     #[error("session verification failed: {0}")]
     Verification(String),
+    #[error("session verification failed: {0:?}")]
+    SessionVerification(Box<SessionVerificationFailure>),
     #[error("generate request challenge: {0}")]
     Challenge(String),
 }

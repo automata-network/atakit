@@ -6,7 +6,7 @@
 //! another trust source.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use crate::pack::write::{canonical_json, check_measurement_pack_triples, sha256, sha256_hex};
@@ -115,10 +115,24 @@ pub fn read_trust_pack_file(
     path: &Path,
     options: &TrustPackReadOptions,
 ) -> Result<TrustPack, TrustPackError> {
-    let bytes = std::fs::read(path).map_err(|error| TrustPackError::Archive {
+    let file = std::fs::File::open(path).map_err(|error| TrustPackError::Archive {
         message: format!("read {}: {error}", path.display()),
     })?;
-    read_trust_pack(&bytes, options).map_err(|error| match error {
+    let compressed_bytes = file
+        .metadata()
+        .map_err(|error| TrustPackError::Archive {
+            message: format!("read metadata for {}: {error}", path.display()),
+        })?
+        .len();
+    let tar = decompress_reader(BufReader::new(file), compressed_bytes, &options.limits).map_err(
+        |error| match error {
+            TrustPackError::Archive { message } => TrustPackError::Archive {
+                message: format!("{}: {message}", path.display()),
+            },
+            other => other,
+        },
+    )?;
+    read_trust_pack_tar(&tar, options).map_err(|error| match error {
         // Keep the archive that failed identifiable when several are
         // configured; every other variant already names an entry.
         TrustPackError::Archive { message } => TrustPackError::Archive {
@@ -135,9 +149,16 @@ pub fn read_trust_pack(
     // Step 1: decompress within limits.
     let tar = decompress(archive, &options.limits)?;
 
+    read_trust_pack_tar(&tar, options)
+}
+
+fn read_trust_pack_tar(
+    tar: &[u8],
+    options: &TrustPackReadOptions,
+) -> Result<TrustPack, TrustPackError> {
     // Step 2: accept only regular files with relative, non-traversing, unique
     // paths.
-    let mut entries = read_tar_entries(&tar, &options.limits)?;
+    let mut entries = read_tar_entries(tar, &options.limits)?;
 
     let index_bytes =
         entries
@@ -305,8 +326,21 @@ fn decompress(archive: &[u8], limits: &ArchiveLimits) -> Result<Vec<u8>, TrustPa
             message: "archive is empty".to_string(),
         });
     }
+    decompress_reader(archive, archive.len() as u64, limits)
+}
+
+fn decompress_reader(
+    reader: impl Read,
+    compressed_bytes: u64,
+    limits: &ArchiveLimits,
+) -> Result<Vec<u8>, TrustPackError> {
+    if compressed_bytes == 0 {
+        return Err(TrustPackError::Archive {
+            message: "archive is empty".to_string(),
+        });
+    }
     let mut decoder =
-        zstd::stream::Decoder::new(archive).map_err(|error| TrustPackError::Archive {
+        zstd::stream::Decoder::new(reader).map_err(|error| TrustPackError::Archive {
             message: format!("not a zstd stream: {error}"),
         })?;
     let mut out = Vec::new();
@@ -326,7 +360,7 @@ fn decompress(archive: &[u8], limits: &ArchiveLimits) -> Result<Vec<u8>, TrustPa
             actual: out.len() as u64,
         });
     }
-    let ratio = out.len() as u64 / archive.len().max(1) as u64;
+    let ratio = out.len() as u64 / compressed_bytes.max(1);
     if ratio > limits.max_compression_ratio {
         return Err(TrustPackError::LimitExceeded {
             limit: "compression ratio",
@@ -989,6 +1023,30 @@ mod tests {
                 error,
                 TrustPackError::LimitExceeded {
                     limit: "compression ratio",
+                    ..
+                }
+            ),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn file_reader_enforces_the_decompression_bound_while_streaming() {
+        let publisher = Publisher::new(0x11);
+        let archive = pack_from(signed_entries(&publisher));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("pack.atatp");
+        std::fs::write(&path, archive).expect("write pack");
+        let mut read = options(TrustPackKind::CollateralTrust, &publisher);
+        read.limits.max_total_bytes = 512;
+
+        let error = read_trust_pack_file(&path, &read)
+            .expect_err("the file reader must stop after the decompression bound");
+        assert!(
+            matches!(
+                error,
+                TrustPackError::LimitExceeded {
+                    limit: "total decompressed size",
                     ..
                 }
             ),

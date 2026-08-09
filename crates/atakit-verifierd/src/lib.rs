@@ -12,3 +12,4 @@
 //! service rather than a party anyone else trusts.
 
 pub mod config;
+pub mod server;
