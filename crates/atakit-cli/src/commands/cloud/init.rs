@@ -420,7 +420,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     };
     step += 1;
     let portal_client = match &verified_tls {
-        Some(verified) => verified.client.clone(),
+        Some(verified) => verified.client().clone(),
         None => init::unsafe_portal_client(std::time::Duration::from_secs(
             init::PORTAL_READINESS_TIMEOUT_SECONDS,
         ))

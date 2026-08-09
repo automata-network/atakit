@@ -185,7 +185,7 @@ impl<'a> LifecycleClient<'a> {
         let signature = hex0x(signature);
         let response = if let Some(old_session_id) = old_session_id {
             self.verified_tls
-                .client
+                .client()
                 .post(format!("{}/session/{}", self.base_url, operation.path()))
                 .json(&ExistingRequest {
                     op_expires_at,
@@ -196,7 +196,7 @@ impl<'a> LifecycleClient<'a> {
                 .await
         } else {
             self.verified_tls
-                .client
+                .client()
                 .post(format!("{}/session/{}", self.base_url, operation.path()))
                 .json(&NewRequest {
                     op_expires_at,
@@ -246,7 +246,7 @@ impl<'a> LifecycleClient<'a> {
         let signature = hex0x(sign_digest(owner_key, digest)?);
         let response = self
             .verified_tls
-            .client
+            .client()
             .post(format!("{}/challenge/authorize", self.base_url))
             .json(&AuthorizeRequest {
                 request_hash: &prepared.request_hash,
@@ -280,7 +280,7 @@ impl<'a> LifecycleClient<'a> {
         let expected = decode_hex_32(request_hash, "request_hash")?;
         let response = self
             .verified_tls
-            .client
+            .client()
             .get(format!("{}/requests/{request_hash}", self.base_url))
             .send()
             .await
@@ -294,7 +294,7 @@ impl<'a> LifecycleClient<'a> {
     pub async fn selected_status(&self) -> Result<LifecycleStatus, CloudError> {
         let response = self
             .verified_tls
-            .client
+            .client()
             .get(format!("{}/session/status", self.base_url))
             .send()
             .await
@@ -308,7 +308,7 @@ impl<'a> LifecycleClient<'a> {
     pub async fn portal_status(&self) -> Result<PortalStatus, CloudError> {
         let response = self
             .verified_tls
-            .client
+            .client()
             .get(format!("{}/status", self.base_url))
             .send()
             .await

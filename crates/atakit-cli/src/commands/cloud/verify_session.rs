@@ -179,7 +179,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     }
     let report = SessionVerificationReport {
         session: &verified,
-        trust_provenance: &outcome.portal_tls.trust_provenance,
+        trust_provenance: outcome.portal_tls.trust_provenance(),
     };
     std::fs::write(&subject.report_path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write session report {}", subject.report_path.display()))?;

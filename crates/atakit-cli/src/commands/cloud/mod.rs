@@ -279,9 +279,9 @@ pub(crate) async fn resolve_init_pcr_policy(
     let identifiers = verified_tls.and_then(|verified| {
         Some(PcrPolicyIdentifiers {
             workload_id: crate::commands::workload::compute_workload_id(workload_ref).0,
-            base_image_id: verified.identity.base_image_id?,
-            platform_profile_id: verified.identity.platform_profile_id?,
-            measurement_variant_id: verified.identity.variant_id?,
+            base_image_id: verified.identity().base_image_id?,
+            platform_profile_id: verified.identity().platform_profile_id?,
+            measurement_variant_id: verified.identity().variant_id?,
         })
     });
     resolve_pcr_policy_for_init(

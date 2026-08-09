@@ -35,7 +35,7 @@ use crate::{AttestationClient, AttestationClientError};
 /// never stand in for it. A committed session signed by a different valid key
 /// failed, and a key revoked between the two checks was never re-examined.
 #[derive(Debug, Clone)]
-pub enum SessionAuthority {
+pub(crate) enum SessionAuthority {
     /// Chain mode: resolve the committed token's own `kid` and `iss` against
     /// the registry, at session verification time.
     Chain(AttestationClient),
@@ -59,14 +59,6 @@ pub enum SessionAuthority {
 }
 
 impl SessionAuthority {
-    /// The chain client, when this session is under chain authority.
-    pub fn chain(&self) -> Option<&AttestationClient> {
-        match self {
-            Self::Chain(client) => Some(client),
-            Self::Explicit { .. } | Self::Packs { .. } => None,
-        }
-    }
-
     fn azure_maa_keys(&self) -> &[AzureMaaTrustCertificate] {
         match self {
             Self::Chain(_) => &[],
@@ -135,7 +127,7 @@ pub enum SessionWorkloadSelector {
 /// after the fact — swapping `Chain` for `Explicit` and then supplying an
 /// operator policy passes every check downstream, which is the crossing this
 /// design exists to prevent. Read-only accessors expose what callers need.
-pub struct PortalSessionVerificationContext {
+pub(crate) struct PortalSessionVerificationContext {
     pub(crate) platform: PlatformEvidence,
     pub(crate) measurement_policy: MeasurementPolicy,
     pub(crate) trust_anchors: TrustAnchors,
@@ -151,18 +143,43 @@ pub struct PortalSessionVerificationContext {
 
 /// Portal TLS connection and the independently verified identity bound to it.
 #[derive(Debug, Clone)]
+/// Every field is crate-private. None of these is only a result: session
+/// verification consumes all of them afterwards, so a writable field here is a
+/// security input in disguise. Replacing `client` would fetch session evidence
+/// outside the certificate-pinned connection portal TLS established, and
+/// replacing `identity` would select a different workload and measurement
+/// policy than the one that was verified.
 pub struct VerifiedPortalTls {
-    pub client: reqwest::Client,
-    pub identity: VerifiedTlsIdentity,
-    pub manual_override: Option<TlsManualOverride>,
+    pub(crate) client: reqwest::Client,
+    pub(crate) identity: VerifiedTlsIdentity,
+    pub(crate) manual_override: Option<TlsManualOverride>,
     /// Crate-private: this is the record of what was verified, not an input.
     /// See [`VerifiedPortalTls::authority_kind`] for the read-only view.
     pub(crate) session_verification: Option<PortalSessionVerificationContext>,
     /// Where each trust input for this verification came from.
-    pub trust_provenance: crate::trust::source::TrustProvenance,
+    pub(crate) trust_provenance: crate::trust::source::TrustProvenance,
 }
 
 impl VerifiedPortalTls {
+    /// The connection pinned to the attested certificate.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// The independently verified TLS identity.
+    pub fn identity(&self) -> &VerifiedTlsIdentity {
+        &self.identity
+    }
+
+    pub fn manual_override(&self) -> Option<&TlsManualOverride> {
+        self.manual_override.as_ref()
+    }
+
+    /// Where each trust input for this verification came from.
+    pub fn trust_provenance(&self) -> &crate::trust::source::TrustProvenance {
+        &self.trust_provenance
+    }
+
     /// Which authority verified this connection, if session verification
     /// inputs were collected.
     ///

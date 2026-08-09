@@ -1024,7 +1024,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     Some(verified_tls)
                 };
                 let portal_client = match &verified_tls {
-                    Some(verified) => verified.client.clone(),
+                    Some(verified) => verified.client().clone(),
                     None => init::unsafe_portal_client(std::time::Duration::from_secs(
                         init::PORTAL_READINESS_TIMEOUT_SECONDS,
                     ))
