@@ -256,6 +256,27 @@ impl AttestationClient {
     /// The binding comes from the same client, so it is chain-mode evidence
     /// bound to chain-mode coordinates. Explicit verification uses the free
     /// `session::verify_current_session`, which has no binding parameter at all.
+    /// Require that portal TLS ran under *this* chain.
+    ///
+    /// The authority is chosen once, before the portal is contacted, and these
+    /// methods add a chain-resolved workload policy and a chain session
+    /// binding on top of it. Overwriting the recorded authority — which this
+    /// used to do — let a caller pair explicit or trust-pack portal TLS with a
+    /// chain binding, or pair portal TLS verified against chain A with a policy
+    /// and binding from chain B. Both are the mixed trust the exclusive-source
+    /// rule forbids, and neither was detectable from the returned value.
+    fn require_same_chain_authority(
+        &self,
+        verified_tls: &VerifiedPortalTls,
+    ) -> Result<(), AttestationClientError> {
+        let context = verified_tls.session_verification.as_ref().ok_or_else(|| {
+            AttestationClientError::Verification(
+                "verified portal TLS context has no session verification inputs".to_string(),
+            )
+        })?;
+        same_chain_authority(&context.authority, self.context())
+    }
+
     pub async fn verify_current_session_with_policy(
         &self,
         verified_tls: &session::VerifiedPortalTls,
@@ -264,6 +285,7 @@ impl AttestationClient {
         workload: TrustedWorkloadSessionPolicy,
         required_binding: Option<atakit_attestation::BindingMode>,
     ) -> Result<atakit_attestation::VerifiedSession, AttestationClientError> {
+        self.require_same_chain_authority(verified_tls)?;
         session::verify_current_session_bound(
             verified_tls,
             host,
@@ -358,7 +380,34 @@ impl AttestationClient {
             })?;
         trusted_workload_policy(&app_ref, workload_id.0, selected_base_image_id, &spec)
     }
+}
 
+/// The decision [`AttestationClient::require_same_chain_authority`] makes,
+/// separated so its tests drive it without building a whole verified TLS value.
+pub(crate) fn same_chain_authority(
+    authority: &crate::portal::session::SessionAuthority,
+    expected: &ChainVerificationContext,
+) -> Result<(), AttestationClientError> {
+    match authority.chain() {
+        Some(client) if client.context() == expected => Ok(()),
+        Some(other) => Err(AttestationClientError::Verification(format!(
+            "portal TLS was verified against SessionRegistry {} on chain {}, but this client is \
+             {} on chain {}; a session cannot take its policy and binding from a chain other \
+             than the one that verified it",
+            other.context().session_registry,
+            other.context().chain_id,
+            expected.session_registry,
+            expected.chain_id
+        ))),
+        None => Err(AttestationClientError::Verification(
+            "portal TLS was verified without a chain, so a chain-resolved workload policy and \
+             session binding cannot be added to it"
+                .to_string(),
+        )),
+    }
+}
+
+impl AttestationClient {
     /// Fetch and verify the current evidence bundle after portal TLS has been
     /// independently verified. This method resolves the registered workload
     /// policy and binds chain-mode evidence to this client's chain context.
@@ -370,6 +419,7 @@ impl AttestationClient {
         workload: &str,
         required_binding: Option<atakit_attestation::BindingMode>,
     ) -> Result<atakit_attestation::VerifiedSession, AttestationClientError> {
+        self.require_same_chain_authority(verified_tls)?;
         let base_image_id = verified_tls.identity.base_image_id.ok_or_else(|| {
             AttestationClientError::Verification(
                 "verified portal TLS identity has no base-image ID".to_string(),
@@ -378,15 +428,8 @@ impl AttestationClient {
         let workload_policy = self
             .resolve_workload_policy(workload, base_image_id)
             .await?;
-        let mut verified_tls = verified_tls.clone();
-        let context = verified_tls.session_verification.as_mut().ok_or_else(|| {
-            AttestationClientError::Verification(
-                "verified portal TLS context has no session verification inputs".to_string(),
-            )
-        })?;
-        context.azure_maa_trust = crate::portal::session::SessionAzureMaaTrust::Chain(self.clone());
         session::verify_current_session_bound(
-            &verified_tls,
+            verified_tls,
             host,
             status_port,
             workload_policy,

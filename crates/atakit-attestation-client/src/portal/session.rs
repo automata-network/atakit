@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::{AttestationClient, AttestationClientError};
 
-/// How the committed session's Azure MAA signing key is trusted.
+/// The authority a session verification runs under, carried from portal TLS.
 ///
 /// One choice, rather than an optional chain client beside a list of keys.
 /// With both, the key list was populated in every mode from the TLS-resolved
@@ -35,13 +35,32 @@ use crate::{AttestationClient, AttestationClientError};
 /// never stand in for it. A committed session signed by a different valid key
 /// failed, and a key revoked between the two checks was never re-examined.
 #[derive(Debug, Clone)]
-pub enum SessionAzureMaaTrust {
+pub enum SessionAuthority {
     /// Chain mode: resolve the committed token's own `kid` and `iss` against
     /// the registry, at session verification time.
     Chain(AttestationClient),
     /// Explicit and trust-pack modes: select from the keys that authority
     /// supplied. There is no registry to ask.
-    Offline(Vec<AzureMaaTrustCertificate>),
+    Offline {
+        azure_maa_keys: Vec<AzureMaaTrustCertificate>,
+    },
+}
+
+impl SessionAuthority {
+    /// The chain client, when this session is under chain authority.
+    pub fn chain(&self) -> Option<&AttestationClient> {
+        match self {
+            Self::Chain(client) => Some(client),
+            Self::Offline { .. } => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Chain(_) => "chain",
+            Self::Offline { .. } => "offline",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +68,9 @@ pub struct PortalSessionVerificationContext {
     pub platform: PlatformEvidence,
     pub measurement_policy: MeasurementPolicy,
     pub trust_anchors: TrustAnchors,
-    /// How the committed session's Azure MAA signing key is trusted.
-    pub azure_maa_trust: SessionAzureMaaTrust,
+    /// The authority portal TLS ran under. Session verification must run
+    /// under the same one.
+    pub authority: SessionAuthority,
     /// Collateral resolved during this portal TLS bootstrap. Session
     /// verification rechecks its certificate and revocation validity against
     /// the session verification time. No process-wide cache stores this value.
@@ -92,6 +112,15 @@ pub async fn verify_current_session(
     workload: TrustedWorkloadSessionPolicy,
     required_binding: Option<BindingMode>,
 ) -> Result<VerifiedSession, AttestationClientError> {
+    // Portal TLS verified under a chain must not have an operator policy
+    // attached to it here. The authority is decided once, before the portal is
+    // contacted, and this is the offline entry point.
+    reject_chain_authority(
+        verified_tls
+            .session_verification
+            .as_ref()
+            .map(|c| &c.authority),
+    )?;
     // No binding parameter: an explicit verification has no chain context and
     // must not be handed one. Chain mode reaches the binding through
     // `ChainTrustSource`, which is the only place it exists.
@@ -104,6 +133,25 @@ pub async fn verify_current_session(
         None,
     )
     .await
+}
+
+/// Refuse an operator-supplied policy on portal TLS that a chain verified.
+///
+/// Separated so its test drives it directly. Without it this function was the
+/// mirror of the chain methods' bypass: they could take offline-verified TLS,
+/// and this could take chain-verified TLS.
+pub(crate) fn reject_chain_authority(
+    authority: Option<&SessionAuthority>,
+) -> Result<(), AttestationClientError> {
+    if authority.and_then(SessionAuthority::chain).is_some() {
+        return Err(AttestationClientError::Verification(
+            "portal TLS was verified under a chain, so the registry must also supply the \
+             workload policy and the session binding; use the chain client's \
+             verify_current_session instead of supplying a policy here"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Chain-mode verification, which binds the session to the client's own chain
@@ -185,17 +233,19 @@ async fn committed_session_maa_keys(
     // The binding here is the *committed session's* token, not the TLS one, so
     // chain mode resolves that token's own kid and issuer rather than reusing
     // anything established during the TLS handshake.
-    match &context.azure_maa_trust {
-        SessionAzureMaaTrust::Chain(client) => client
+    match &context.authority {
+        SessionAuthority::Chain(client) => client
             .resolve_azure_maa_signing_key_from_binding(&binding)
             .await
             .map(|key| vec![key])
             .map_err(committed_session_maa_error),
-        SessionAzureMaaTrust::Offline(keys) => select_azure_maa_manual_trust_key(&binding, keys)
-            .map(|key| vec![key])
-            .map_err(|detail| {
-                session_error(format!("committed_session_maa_signature_invalid: {detail}"))
-            }),
+        SessionAuthority::Offline { azure_maa_keys } => {
+            { select_azure_maa_manual_trust_key(&binding, azure_maa_keys) }
+                .map(|key| vec![key])
+                .map_err(|detail| {
+                    session_error(format!("committed_session_maa_signature_invalid: {detail}"))
+                })
+        }
     }
 }
 

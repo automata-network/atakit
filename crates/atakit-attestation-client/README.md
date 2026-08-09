@@ -79,7 +79,17 @@ floor.
 
 ## Verify a current session
 
-After obtaining `VerifiedPortalTls`, call:
+`verified_portal_tls` must have been verified under **this same chain**. The
+authority is chosen once, before the portal is contacted, and a session cannot
+take its workload policy and binding from a chain other than the one that
+verified the connection; passing portal TLS from another chain, or from
+explicit or trust-pack verification, is refused. Offline verification uses the
+free `session::verify_current_session`, which correspondingly refuses
+chain-verified portal TLS.
+
+References are publisher-qualified: `<publisher>/<name>:<version>`, where the
+publisher is the owner fingerprint as `0x` and 64 lowercase hexadecimal
+characters. A two-part `name:version` reference is rejected.
 
 ```rust,ignore
 let result = client
@@ -87,7 +97,7 @@ let result = client
         &verified_portal_tls,
         "203.0.113.10",
         2024,
-        "storage-service:v0.1.0",
+        "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/storage-service:v0.1.0",
         None,
     )
     .await?;

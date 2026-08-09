@@ -23,7 +23,7 @@ use crate::collateral::intel_tdx::{
 use crate::error::PortalVerificationError;
 use crate::http::read_response_bytes_limited;
 use crate::portal::session::{
-    PortalSessionVerificationContext, SessionAzureMaaTrust, TlsManualOverride, VerifiedPortalTls,
+    PortalSessionVerificationContext, SessionAuthority, TlsManualOverride, VerifiedPortalTls,
 };
 use crate::trust::builder::TrustAnchorsBuilder;
 use crate::trust::measurement::write_tls_attestation_report;
@@ -193,15 +193,15 @@ async fn resolve_tdx_dcap_for_source(
 /// that signed the *TLS* token; the committed session's token may be signed by
 /// a different registered key, and reusing the TLS key would both reject that
 /// legitimate case and skip re-checking revocation at session time.
-pub(crate) fn session_azure_maa_trust(
+pub(crate) fn session_authority(
     trust_source: &TrustSource,
     anchors: &atakit_attestation::TrustAnchors,
-) -> SessionAzureMaaTrust {
+) -> SessionAuthority {
     match trust_source {
-        TrustSource::Chain(source) => SessionAzureMaaTrust::Chain(source.client().clone()),
-        TrustSource::Explicit(_) | TrustSource::Packs(_) => {
-            SessionAzureMaaTrust::Offline(anchors.azure_maa_keys.clone())
-        }
+        TrustSource::Chain(source) => SessionAuthority::Chain(source.client().clone()),
+        TrustSource::Explicit(_) | TrustSource::Packs(_) => SessionAuthority::Offline {
+            azure_maa_keys: anchors.azure_maa_keys.clone(),
+        },
     }
 }
 
@@ -393,7 +393,7 @@ pub async fn bootstrap_portal_tls(
             );
         }
     };
-    let azure_maa_trust = session_azure_maa_trust(trust_source, &trust_anchors);
+    let authority = session_authority(trust_source, &trust_anchors);
     let session_verification =
         measurement_policy
             .clone()
@@ -401,7 +401,7 @@ pub async fn bootstrap_portal_tls(
                 platform: response.platform.clone(),
                 measurement_policy,
                 trust_anchors: trust_anchors.clone(),
-                azure_maa_trust: azure_maa_trust.clone(),
+                authority: authority.clone(),
                 amd_snp_collateral: amd_snp_collateral.clone(),
                 intel_tdx_dcap_collateral: intel_tdx_dcap_collateral.clone(),
             });
@@ -617,7 +617,7 @@ fn random_nonce() -> Result<[u8; 32], PortalVerificationError> {
 }
 
 #[cfg(test)]
-mod session_azure_maa_trust_tests {
+mod session_authority_tests {
     use super::*;
     use crate::chain::{AttestationClient, AttestationClientConfig};
     use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
@@ -662,12 +662,12 @@ mod session_azure_maa_trust_tests {
             IntelTdxDcapCollateralConfig::default(),
         ));
 
-        match session_azure_maa_trust(&source, &anchors) {
-            SessionAzureMaaTrust::Chain(_) => {}
-            SessionAzureMaaTrust::Offline(keys) => panic!(
+        match session_authority(&source, &anchors) {
+            SessionAuthority::Chain(_) => {}
+            SessionAuthority::Offline { azure_maa_keys } => panic!(
                 "chain mode must not carry offline keys; it carried {} of them, which is the \
                  TLS key standing in for the committed-session key",
-                keys.len()
+                azure_maa_keys.len()
             ),
         }
     }
@@ -695,14 +695,98 @@ mod session_azure_maa_trust_tests {
             ),
         ] {
             let mode = source.mode();
-            match session_azure_maa_trust(&source, &anchors) {
-                SessionAzureMaaTrust::Offline(keys) => {
-                    assert_eq!(keys.len(), 1, "{mode} must retain its supplied key");
+            match session_authority(&source, &anchors) {
+                SessionAuthority::Offline { azure_maa_keys } => {
+                    assert_eq!(
+                        azure_maa_keys.len(),
+                        1,
+                        "{mode} must retain its supplied key"
+                    );
                 }
-                SessionAzureMaaTrust::Chain(_) => {
+                SessionAuthority::Chain(_) => {
                     panic!("{mode} has no registry to resolve a committed-session key from")
                 }
             }
         }
+    }
+}
+
+/// The authority recorded during portal TLS must be the authority session
+/// verification runs under.
+///
+/// These drive the two decisions the public entry points make. Before them,
+/// the chain methods overwrote the recorded authority, so explicit-to-chain and
+/// chain-A-to-chain-B were accepted silently, and the offline function had the
+/// mirror bypass.
+#[cfg(test)]
+mod session_authority_enforcement {
+    use super::*;
+    use crate::chain::{same_chain_authority, AttestationClient, AttestationClientConfig};
+    use crate::portal::session::reject_chain_authority;
+    use crate::test_support::CountingRpcEndpoint;
+
+    async fn client(registry: &str) -> AttestationClient {
+        // Leaked so the endpoint outlives the client; nothing here issues a
+        // request, so the count is irrelevant.
+        let endpoint = Box::leak(Box::new(CountingRpcEndpoint::start().await));
+        AttestationClient::connect(AttestationClientConfig {
+            rpc_url: endpoint.url().to_string(),
+            session_registry: registry.to_string(),
+            expected_chain_id: None,
+            expected_base_image_registry: None,
+            expected_workload_registry: None,
+        })
+        .await
+        .expect("connect")
+    }
+
+    const CHAIN_A: &str = "0x1111111111111111111111111111111111111111";
+    const CHAIN_B: &str = "0x2222222222222222222222222222222222222222";
+
+    #[tokio::test]
+    async fn a_chain_client_refuses_portal_tls_verified_without_a_chain() {
+        let chain = client(CHAIN_A).await;
+        let offline = SessionAuthority::Offline {
+            azure_maa_keys: Vec::new(),
+        };
+
+        let error = same_chain_authority(&offline, chain.context())
+            .expect_err("explicit portal TLS must not gain a chain binding");
+        assert!(error.to_string().contains("without a chain"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_client_refuses_portal_tls_verified_against_another_chain() {
+        let chain_a = client(CHAIN_A).await;
+        let chain_b = client(CHAIN_B).await;
+
+        let error = same_chain_authority(&SessionAuthority::Chain(chain_a), chain_b.context())
+            .expect_err("a session must not cross chains");
+        let message = error.to_string();
+        assert!(message.contains(CHAIN_A), "got {message}");
+        assert!(message.contains(CHAIN_B), "got {message}");
+    }
+
+    /// The control: the same chain is the normal case, so the two rejections
+    /// above are about crossing authorities rather than refusing everything.
+    #[tokio::test]
+    async fn a_chain_client_accepts_portal_tls_it_verified_itself() {
+        let chain = client(CHAIN_A).await;
+        same_chain_authority(&SessionAuthority::Chain(chain.clone()), chain.context())
+            .expect("the same chain is the normal case");
+    }
+
+    #[tokio::test]
+    async fn the_offline_entry_point_refuses_chain_verified_portal_tls() {
+        let chain = client(CHAIN_A).await;
+        let error = reject_chain_authority(Some(&SessionAuthority::Chain(chain)))
+            .expect_err("chain-verified TLS must not take an operator policy");
+        assert!(error.to_string().contains("under a chain"), "got {error}");
+
+        reject_chain_authority(Some(&SessionAuthority::Offline {
+            azure_maa_keys: Vec::new(),
+        }))
+        .expect("offline TLS is what this entry point is for");
+        reject_chain_authority(None).expect("no session context is not a chain authority");
     }
 }
