@@ -42,20 +42,13 @@ pub struct PackProvenance {
     pub digest: String,
 }
 
-/// Convert one verified `collateral-trust` pack.
-pub fn collateral_trust_inputs(pack: &TrustPack) -> Result<CollateralTrustInputs, TrustPackError> {
-    let mut inputs = CollateralTrustInputs::default();
-    merge_collateral_pack(&mut inputs, pack)?;
-    Ok(inputs)
-}
-
 /// Convert several packs into one set of inputs.
 ///
 /// Duplicate claims across packs are fatal: two packs supplying the same CPUID
 /// policy, or the same root, means refusing to start. Silently choosing one
 /// would make the winner invisible, and an operator who believed they pinned a
 /// value could not tell which one was used.
-pub fn collateral_trust_inputs_from_all(
+pub(crate) fn collateral_trust_inputs_from_all(
     packs: &[TrustPack],
 ) -> Result<CollateralTrustInputs, TrustPackError> {
     let mut inputs = CollateralTrustInputs::default();
@@ -424,7 +417,8 @@ mod tests {
             .insert("payload/tdx-dcap/00806f050000.json", tdx_dcap_document())
             .unwrap();
 
-        let inputs = collateral_trust_inputs(&pack(&builder, &publisher)).expect("conversion");
+        let inputs =
+            collateral_trust_inputs_from_all(&[pack(&builder, &publisher)]).expect("conversion");
 
         assert_eq!(inputs.trust_anchors.gcp_roots.len(), 1);
         assert_eq!(inputs.trust_anchors.aws_nitro_roots.len(), 1);
@@ -461,7 +455,7 @@ mod tests {
             .insert("payload/azure-maa/sharedeus.pem", certificate_pem("maa"))
             .unwrap();
 
-        let inputs = collateral_trust_inputs(&pack(&builder, &publisher)).unwrap();
+        let inputs = collateral_trust_inputs_from_all(&[pack(&builder, &publisher)]).unwrap();
         let certificate = &inputs.trust_anchors.azure_maa_keys[0];
         assert!(!certificate.public_key.is_empty());
         assert_ne!(
@@ -490,7 +484,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = collateral_trust_inputs(&pack(&builder, &publisher))
+        let error = collateral_trust_inputs_from_all(&[pack(&builder, &publisher)])
             .expect_err("a CPUID claimed twice must be refused");
         assert!(
             error.to_string().contains("duplicate claims are fatal"),
@@ -511,7 +505,7 @@ mod tests {
                 amd_snp_policy_document("0x190f10"),
             )
             .unwrap();
-        let inputs = collateral_trust_inputs(&pack(&distinct, &publisher))
+        let inputs = collateral_trust_inputs_from_all(&[pack(&distinct, &publisher)])
             .expect("distinct CPUIDs are not duplicates");
         assert_eq!(inputs.trust_anchors.amd_snp_security_policies.len(), 2);
     }
@@ -584,7 +578,7 @@ mod tests {
             &crate::pack::fixture::options(TrustPackKind::CollateralTrust, &publisher),
         )
         .expect("the archive is structurally valid");
-        let error = collateral_trust_inputs(&read)
+        let error = collateral_trust_inputs_from_all(&[read])
             .expect_err("a non-certificate MAA entry must be refused on read");
         assert!(error.to_string().contains("X.509"), "got {error}");
     }
@@ -607,7 +601,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = collateral_trust_inputs(&pack(&builder, &publisher))
+        let error = collateral_trust_inputs_from_all(&[pack(&builder, &publisher)])
             .expect_err("a zero maximum age must be refused");
         assert!(
             error.to_string().contains("maximum_age_seconds"),
@@ -722,7 +716,7 @@ mod tests {
             )
             .unwrap();
 
-        let inputs = collateral_trust_inputs(&pack(&builder, &publisher)).unwrap();
+        let inputs = collateral_trust_inputs_from_all(&[pack(&builder, &publisher)]).unwrap();
         let request = CollateralRequest {
             cloud: "aws".to_string(),
             tee: "sev-snp".to_string(),

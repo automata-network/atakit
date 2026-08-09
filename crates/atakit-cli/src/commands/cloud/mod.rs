@@ -317,14 +317,22 @@ pub(crate) fn warn_unsafe_skip_tls_attestation() {
     );
 }
 
-pub(crate) async fn resolve_tls_measurement_policy(
+/// The operator-supplied base-image measurement policy, if there is one.
+///
+/// Returns `None` when no `--measurements` was given, which means the chain is
+/// the authority and [`atakit_cloud::init::portal_tls_mode_for_init_chain`]
+/// resolves the policy from the registry instead. It no longer resolves the
+/// chain policy itself: that was the "explicit wins, otherwise chain"
+/// precedence the exclusive-source rule withdrew, and it applied to every
+/// command except `atakit cloud verify-session`.
+pub(crate) async fn resolve_explicit_tls_measurement_policy(
     measurements: Option<&std::path::Path>,
     expected_base_image: Option<&str>,
     untrusted_portal_base_image_id: Option<[u8; 32]>,
     measurement_publisher_keys: &[String],
     data_dir: &std::path::Path,
     init_chain: &InitChainConfig,
-) -> Result<MeasurementPolicy> {
+) -> Result<Option<MeasurementPolicy>> {
     if measurements.is_some() {
         return atakit_cloud::init::load_measurement_policy(
             measurements,
@@ -333,7 +341,8 @@ pub(crate) async fn resolve_tls_measurement_policy(
             Some(data_dir),
         )
         .map_err(|error| anyhow::anyhow!("{error}"))?
-        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"));
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"))
+        .map(Some);
     }
     if !measurement_publisher_keys.is_empty() {
         bail!("--measurement-publisher-key requires --measurements");
@@ -345,12 +354,12 @@ pub(crate) async fn resolve_tls_measurement_policy(
         );
     }
 
-    let base_image_id = B256::from(untrusted_portal_base_image_id.ok_or_else(|| {
-        anyhow::anyhow!(
-            "normal portal TLS attestation requires the untrusted base_image_id from GET /status"
-        )
-    })?);
-    if let Some(expected_base_image) = expected_base_image {
+    // The portal's claimed identifier selects which registry record is read, so
+    // when the operator also named a base image the two must agree. Without
+    // this a portal could steer the verifier at another image's policy.
+    if let (Some(expected_base_image), Some(reported)) =
+        (expected_base_image, untrusted_portal_base_image_id)
+    {
         let expected_ref: AppRef = expected_base_image.parse()?;
         let expected_id = B256::from(atakit_cvm_encoding::base_image_id(
             &atakit_cvm_types::AppRef::new(
@@ -359,17 +368,16 @@ pub(crate) async fn resolve_tls_measurement_policy(
                 expected_ref.version,
             ),
         ));
-        if expected_id != base_image_id {
+        let reported_id = B256::from(reported);
+        if expected_id != reported_id {
             bail!(
                 "GET /status claimed base_image_id {} but --base-image {expected_base_image} resolves to {}",
-                hex0x(base_image_id),
+                hex0x(reported_id),
                 hex0x(expected_id)
             );
         }
     }
-
-    let base_image_registry = resolve_tls_base_image_registry(init_chain).await?;
-    load_measurement_policy_from_chain_id(base_image_id, &base_image_registry, init_chain).await
+    Ok(None)
 }
 
 /// Resolve base-image measurement collateral from sources selected by the
@@ -409,258 +417,6 @@ pub(crate) async fn resolve_verifier_tls_measurement_policy(
 fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
     !init_chain.rpc_url.trim().is_empty()
         && (init_chain.base_image_registry != ZERO_ADDR || init_chain.session_registry != ZERO_ADDR)
-}
-
-async fn resolve_tls_base_image_registry(init_chain: &InitChainConfig) -> Result<String> {
-    if init_chain.base_image_registry != ZERO_ADDR {
-        return Ok(init_chain.base_image_registry.clone());
-    }
-    let session_registry: Address = init_chain.session_registry.parse().with_context(|| {
-        format!(
-            "invalid session_registry address for TLS measurement lookup: {}",
-            init_chain.session_registry
-        )
-    })?;
-    let provider = NetworkProvider::with_http(
-        &init_chain.rpc_url,
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(37)),
-        100,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to connect to rpc_url while deriving BaseImageRegistry for TLS measurement lookup: {}",
-            init_chain.rpc_url
-        )
-    })?;
-    let base_image_registry = SessionRegistryInstance::new(session_registry, provider)
-        .baseImageRegistry()
-        .call()
-        .await
-        .context(
-            "failed to derive BaseImageRegistry from SessionRegistry for TLS measurement lookup",
-        )?;
-    if base_image_registry == Address::ZERO {
-        bail!("SessionRegistry returned the zero BaseImageRegistry address");
-    }
-    Ok(base_image_registry.to_string())
-}
-
-async fn load_measurement_policy_from_chain_id(
-    base_image_id: B256,
-    base_image_registry: &str,
-    init_chain: &InitChainConfig,
-) -> Result<MeasurementPolicy> {
-    let registry_addr: Address = base_image_registry.parse().with_context(|| {
-        format!(
-            "invalid base_image_registry address for TLS measurement lookup: {}",
-            base_image_registry
-        )
-    })?;
-    let provider = NetworkProvider::with_http(
-        &init_chain.rpc_url,
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(37)),
-        100,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to connect to rpc_url for TLS measurement lookup: {}",
-            init_chain.rpc_url
-        )
-    })?;
-    let registry_client = BaseImageRegistry::new(registry_addr, provider);
-    let hierarchy = registry_client
-        .get_hierarchy(base_image_id)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to fetch BaseImageRegistry hierarchy for untrusted portal base_image_id {}",
-                hex0x(base_image_id)
-            )
-        })?;
-    if hierarchy.base_image_id != base_image_id {
-        bail!(
-            "BaseImageRegistry returned hierarchy {} for requested base_image_id {}",
-            hex0x(hierarchy.base_image_id),
-            hex0x(base_image_id)
-        );
-    }
-
-    // subject.publisher must reproduce subject.id, and the hierarchy does not
-    // carry the owner, so it is read separately.
-    let owner = registry_client
-        .get_base_image_owner(base_image_id)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to fetch BaseImageRegistry owner for base_image_id {}",
-                hex0x(base_image_id)
-            )
-        })?;
-    chain_hierarchy_to_measurement_policy(&hierarchy, owner, base_image_registry)
-}
-
-fn chain_hierarchy_to_measurement_policy(
-    hierarchy: &BaseImageHierarchy,
-    owner: alloy_ext::core::primitives::B256,
-    registry: &str,
-) -> Result<MeasurementPolicy> {
-    let profiles = hierarchy
-        .profiles
-        .iter()
-        .map(|profile| {
-            let (cloud, tee) = infer_cloud_tee_from_profile_name(&profile.profile.name)?;
-            let variants = profile
-                .variants
-                .iter()
-                .map(|(variant_id, variant)| MeasurementVariant {
-                    name: variant.name.clone(),
-                    id: hex0x(variant_id),
-                    machine_types: vec![variant.name.clone()],
-                    variant_pcrs256: variant
-                        .variantPcrPolicy
-                        .pcrSpecs256
-                        .iter()
-                        .map(chain_pcr_spec256_to_measurement)
-                        .collect(),
-                    variant_pcrs384: variant
-                        .variantPcrPolicy
-                        .pcrSpecs384
-                        .iter()
-                        .map(chain_pcr_spec384_to_measurement)
-                        .collect(),
-                    attributes: variant
-                        .attributes
-                        .iter()
-                        .map(|attr| {
-                            serde_json::json!({
-                                "key": hex0x(attr.key),
-                                "value": hex0x(attr.value),
-                            })
-                        })
-                        .collect(),
-                })
-                .collect();
-            Ok(MeasurementProfile {
-                name: profile.profile.name.clone(),
-                id: hex0x(profile.profile_id),
-                cloud: cloud.to_string(),
-                tee: tee.to_string(),
-                pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
-                invariant_pcrs256: profile
-                    .profile
-                    .invariantPcrPolicy
-                    .pcrSpecs256
-                    .iter()
-                    .map(chain_pcr_spec256_to_measurement)
-                    .collect(),
-                invariant_pcrs384: profile
-                    .profile
-                    .invariantPcrPolicy
-                    .pcrSpecs384
-                    .iter()
-                    .map(chain_pcr_spec384_to_measurement)
-                    .collect(),
-                variants,
-                attributes: profile
-                    .profile
-                    .attributes
-                    .iter()
-                    .map(|attr| {
-                        serde_json::json!({
-                            "key": hex0x(attr.key),
-                            "value": hex0x(attr.value),
-                        })
-                    })
-                    .collect(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(MeasurementPolicy {
-        source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
-        pack: MeasurementPack {
-            schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
-            revision: 1,
-            published_at: chrono::Utc::now().timestamp().max(0) as u64,
-            subject: Subject {
-                publisher: hex0x(owner),
-                name: hierarchy.spec.name.clone(),
-                version: hierarchy.spec.version.clone(),
-                id: hex0x(hierarchy.base_image_id),
-                uri: if hierarchy.spec.uri.is_empty() {
-                    None
-                } else {
-                    Some(hierarchy.spec.uri.clone())
-                },
-                archive_sha256: None,
-            },
-            measurements: serde_json::to_value(atakit_attestation::BaseImageMeasurements {
-                profiles,
-            })?,
-        },
-    })
-}
-
-fn chain_pcr_spec256_to_measurement(
-    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256,
-) -> PcrSpec256 {
-    PcrSpec256 {
-        pcr_index: spec.pcrIndex,
-        comparison: hex0x(&spec.comparison),
-    }
-}
-
-fn chain_pcr_spec384_to_measurement(
-    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec384,
-) -> PcrSpec384 {
-    PcrSpec384 {
-        pcr_index: spec.pcrIndex,
-        comparison: hex0x(&spec.comparison),
-    }
-}
-
-fn chain_pcr_bank_selection(value: u8) -> PcrBankSelection {
-    match value {
-        0 => PcrBankSelection::Sha256,
-        1 => PcrBankSelection::Sha384,
-        2 => PcrBankSelection::Sha256AndSha384,
-        _ => unreachable!("Solidity enum decoder rejects invalid values"),
-    }
-}
-
-fn infer_cloud_tee_from_profile_name(name: &str) -> Result<(&'static str, &'static str)> {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
-    let cloud = if normalized.starts_with("gcp-") || normalized.contains("-gcp-") {
-        "gcp"
-    } else if normalized.starts_with("azure-") || normalized.contains("-azure-") {
-        "azure"
-    } else if normalized.starts_with("aws-") || normalized.contains("-aws-") {
-        "aws"
-    } else {
-        bail!(
-            "cannot infer cloud from BaseImageRegistry platform profile name {:?}; \
-             expected names like gcp-tdx, gcp-sev-snp, azure-tdx, azure-sev-snp, or aws-sev-snp",
-            name
-        );
-    };
-    let tee = if normalized.contains("tdx") {
-        "tdx"
-    } else if normalized.contains("sev-snp") || normalized.contains("snp") {
-        "sev-snp"
-    } else if normalized.contains("nitro") {
-        "nitro"
-    } else {
-        bail!(
-            "cannot infer TEE from BaseImageRegistry platform profile name {:?}; \
-             expected names containing tdx, sev-snp, snp, or nitro",
-            name
-        );
-    };
-    Ok((cloud, tee))
 }
 
 fn hex0x(bytes: impl AsRef<[u8]>) -> String {
@@ -2041,7 +1797,7 @@ mod tls_measurement_policy_tests {
 
         let chain = synthesize_off_init_chain();
 
-        let error = resolve_tls_measurement_policy(
+        let error = resolve_explicit_tls_measurement_policy(
             None,
             None,
             Some([0x11; 32]),
@@ -2067,7 +1823,7 @@ mod tls_measurement_policy_tests {
         chain.rpc_url = "https://rpc.example.com".to_string();
         chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
 
-        let error = resolve_tls_measurement_policy(
+        let error = resolve_explicit_tls_measurement_policy(
             None,
             Some("0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/base:v1"),
             Some([0x11; 32]),
@@ -2091,7 +1847,7 @@ mod tls_measurement_policy_tests {
     async fn measurement_publisher_key_requires_explicit_measurements() {
         let data_dir = tempfile::tempdir().unwrap();
         let chain = synthesize_off_init_chain();
-        let error = resolve_tls_measurement_policy(
+        let error = resolve_explicit_tls_measurement_policy(
             None,
             None,
             Some([0x11; 32]),
@@ -2106,4 +1862,268 @@ mod tls_measurement_policy_tests {
             "--measurement-publisher-key requires --measurements"
         );
     }
+}
+
+// Chain-derived measurement policy now resolves through
+// `AttestationClient::resolve_base_image_measurement_policy_by_id`, so these
+// remain only as the reference the tests below check that conversion against.
+// They are dead in the binary by design; the duplicate production path they
+// used to serve is gone.
+#[allow(dead_code)]
+async fn resolve_tls_base_image_registry(init_chain: &InitChainConfig) -> Result<String> {
+    if init_chain.base_image_registry != ZERO_ADDR {
+        return Ok(init_chain.base_image_registry.clone());
+    }
+    let session_registry: Address = init_chain.session_registry.parse().with_context(|| {
+        format!(
+            "invalid session_registry address for TLS measurement lookup: {}",
+            init_chain.session_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &init_chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url while deriving BaseImageRegistry for TLS measurement lookup: {}",
+            init_chain.rpc_url
+        )
+    })?;
+    let base_image_registry = SessionRegistryInstance::new(session_registry, provider)
+        .baseImageRegistry()
+        .call()
+        .await
+        .context(
+            "failed to derive BaseImageRegistry from SessionRegistry for TLS measurement lookup",
+        )?;
+    if base_image_registry == Address::ZERO {
+        bail!("SessionRegistry returned the zero BaseImageRegistry address");
+    }
+    Ok(base_image_registry.to_string())
+}
+
+#[allow(dead_code)]
+async fn load_measurement_policy_from_chain_id(
+    base_image_id: B256,
+    base_image_registry: &str,
+    init_chain: &InitChainConfig,
+) -> Result<MeasurementPolicy> {
+    let registry_addr: Address = base_image_registry.parse().with_context(|| {
+        format!(
+            "invalid base_image_registry address for TLS measurement lookup: {}",
+            base_image_registry
+        )
+    })?;
+    let provider = NetworkProvider::with_http(
+        &init_chain.rpc_url,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(37)),
+        100,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to rpc_url for TLS measurement lookup: {}",
+            init_chain.rpc_url
+        )
+    })?;
+    let registry_client = BaseImageRegistry::new(registry_addr, provider);
+    let hierarchy = registry_client
+        .get_hierarchy(base_image_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch BaseImageRegistry hierarchy for untrusted portal base_image_id {}",
+                hex0x(base_image_id)
+            )
+        })?;
+    if hierarchy.base_image_id != base_image_id {
+        bail!(
+            "BaseImageRegistry returned hierarchy {} for requested base_image_id {}",
+            hex0x(hierarchy.base_image_id),
+            hex0x(base_image_id)
+        );
+    }
+
+    // subject.publisher must reproduce subject.id, and the hierarchy does not
+    // carry the owner, so it is read separately.
+    let owner = registry_client
+        .get_base_image_owner(base_image_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch BaseImageRegistry owner for base_image_id {}",
+                hex0x(base_image_id)
+            )
+        })?;
+    chain_hierarchy_to_measurement_policy(&hierarchy, owner, base_image_registry)
+}
+
+#[allow(dead_code)]
+fn chain_hierarchy_to_measurement_policy(
+    hierarchy: &BaseImageHierarchy,
+    owner: alloy_ext::core::primitives::B256,
+    registry: &str,
+) -> Result<MeasurementPolicy> {
+    let profiles = hierarchy
+        .profiles
+        .iter()
+        .map(|profile| {
+            let (cloud, tee) = infer_cloud_tee_from_profile_name(&profile.profile.name)?;
+            let variants = profile
+                .variants
+                .iter()
+                .map(|(variant_id, variant)| MeasurementVariant {
+                    name: variant.name.clone(),
+                    id: hex0x(variant_id),
+                    machine_types: vec![variant.name.clone()],
+                    variant_pcrs256: variant
+                        .variantPcrPolicy
+                        .pcrSpecs256
+                        .iter()
+                        .map(chain_pcr_spec256_to_measurement)
+                        .collect(),
+                    variant_pcrs384: variant
+                        .variantPcrPolicy
+                        .pcrSpecs384
+                        .iter()
+                        .map(chain_pcr_spec384_to_measurement)
+                        .collect(),
+                    attributes: variant
+                        .attributes
+                        .iter()
+                        .map(|attr| {
+                            serde_json::json!({
+                                "key": hex0x(attr.key),
+                                "value": hex0x(attr.value),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok(MeasurementProfile {
+                name: profile.profile.name.clone(),
+                id: hex0x(profile.profile_id),
+                cloud: cloud.to_string(),
+                tee: tee.to_string(),
+                pcr_bank_selection: chain_pcr_bank_selection(profile.profile.pcrBankSelection),
+                invariant_pcrs256: profile
+                    .profile
+                    .invariantPcrPolicy
+                    .pcrSpecs256
+                    .iter()
+                    .map(chain_pcr_spec256_to_measurement)
+                    .collect(),
+                invariant_pcrs384: profile
+                    .profile
+                    .invariantPcrPolicy
+                    .pcrSpecs384
+                    .iter()
+                    .map(chain_pcr_spec384_to_measurement)
+                    .collect(),
+                variants,
+                attributes: profile
+                    .profile
+                    .attributes
+                    .iter()
+                    .map(|attr| {
+                        serde_json::json!({
+                            "key": hex0x(attr.key),
+                            "value": hex0x(attr.value),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(MeasurementPolicy {
+        source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
+        pack: MeasurementPack {
+            schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
+            revision: 1,
+            published_at: chrono::Utc::now().timestamp().max(0) as u64,
+            subject: Subject {
+                publisher: hex0x(owner),
+                name: hierarchy.spec.name.clone(),
+                version: hierarchy.spec.version.clone(),
+                id: hex0x(hierarchy.base_image_id),
+                uri: if hierarchy.spec.uri.is_empty() {
+                    None
+                } else {
+                    Some(hierarchy.spec.uri.clone())
+                },
+                archive_sha256: None,
+            },
+            measurements: serde_json::to_value(atakit_attestation::BaseImageMeasurements {
+                profiles,
+            })?,
+        },
+    })
+}
+
+#[allow(dead_code)]
+fn chain_pcr_spec256_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256,
+) -> PcrSpec256 {
+    PcrSpec256 {
+        pcr_index: spec.pcrIndex,
+        comparison: hex0x(&spec.comparison),
+    }
+}
+
+#[allow(dead_code)]
+fn chain_pcr_spec384_to_measurement(
+    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec384,
+) -> PcrSpec384 {
+    PcrSpec384 {
+        pcr_index: spec.pcrIndex,
+        comparison: hex0x(&spec.comparison),
+    }
+}
+
+#[allow(dead_code)]
+fn chain_pcr_bank_selection(value: u8) -> PcrBankSelection {
+    match value {
+        0 => PcrBankSelection::Sha256,
+        1 => PcrBankSelection::Sha384,
+        2 => PcrBankSelection::Sha256AndSha384,
+        _ => unreachable!("Solidity enum decoder rejects invalid values"),
+    }
+}
+
+#[allow(dead_code)]
+fn infer_cloud_tee_from_profile_name(name: &str) -> Result<(&'static str, &'static str)> {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    let cloud = if normalized.starts_with("gcp-") || normalized.contains("-gcp-") {
+        "gcp"
+    } else if normalized.starts_with("azure-") || normalized.contains("-azure-") {
+        "azure"
+    } else if normalized.starts_with("aws-") || normalized.contains("-aws-") {
+        "aws"
+    } else {
+        bail!(
+            "cannot infer cloud from BaseImageRegistry platform profile name {:?}; \
+             expected names like gcp-tdx, gcp-sev-snp, azure-tdx, azure-sev-snp, or aws-sev-snp",
+            name
+        );
+    };
+    let tee = if normalized.contains("tdx") {
+        "tdx"
+    } else if normalized.contains("sev-snp") || normalized.contains("snp") {
+        "sev-snp"
+    } else if normalized.contains("nitro") {
+        "nitro"
+    } else {
+        bail!(
+            "cannot infer TEE from BaseImageRegistry platform profile name {:?}; \
+             expected names containing tdx, sev-snp, snp, or nitro",
+            name
+        );
+    };
+    Ok((cloud, tee))
 }

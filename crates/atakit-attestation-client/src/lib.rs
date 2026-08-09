@@ -46,17 +46,18 @@ pub use collateral::intel_tdx::{
     tdx_dcap_collateral_config_with_read_strategy, IntelTdxDcapCollateralConfig,
     IntelTdxDcapCollateralSource, TdxDcapAutomataReadStrategy,
 };
-pub use pack::collateral::{
-    collateral_trust_inputs, collateral_trust_inputs_from_all, CollateralTrustInputs,
-};
+// The raw conversions are deliberately not exported. They take a `TrustPack`
+// and perform no validity check, because they are pure conversions; exporting
+// them would give a caller a way to use an expired pack's contents without
+// passing any of the boundaries that check the window. The public surface is
+// `PackTrustSource` and the two verification modes, all of which check.
 pub use pack::read::{read_trust_pack, read_trust_pack_file, TrustPack, TrustPackReadOptions};
-pub use pack::workload::{
-    packed_measurement_policy, packed_workload_policy, workload_trust_inputs, WorkloadTrustInputs,
-};
 pub use pack::write::TrustPackBuilder;
 pub use pack::{ArchiveLimits, TrustPackError, TrustPackIndex, TrustPackKind};
 pub use portal::status::read_untrusted_portal_base_image_id;
-pub use portal::tls::{bootstrap_portal_tls, tls_manual_override_message};
+pub use portal::tls::{
+    bootstrap_portal_tls, tls_manual_override_message, ChainBaseImage, PortalTlsVerificationMode,
+};
 pub use trust::builder::TrustAnchorsBuilder;
 pub use trust::files::{
     azure_maa_trust_config_from_chain, chain_coordinates_configured, load_tls_verification_trust,

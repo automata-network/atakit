@@ -7,9 +7,9 @@ use atakit_cvm_types::AppRef;
 
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
-use crate::pack::workload::{packed_measurement_policy, packed_workload_policy};
+use crate::pack::workload::packed_workload_policy;
 use crate::portal::session::{verify_current_session, VerifiedPortalTls};
-use crate::portal::tls::bootstrap_portal_tls;
+use crate::portal::tls::{bootstrap_portal_tls, ChainBaseImage, PortalTlsVerificationMode};
 use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
 
 /// One complete verification: its trust authority, and every policy that
@@ -57,55 +57,49 @@ pub enum SessionVerificationMode {
 }
 
 impl SessionVerificationMode {
-    /// The trust-anchor source for this mode.
+    /// The portal TLS half of this mode.
     ///
-    /// Anchor resolution stays a separate concern with its own type: it runs
-    /// against the presented platform, which is not known until the attestation
-    /// response arrives.
-    pub fn trust_source(&self) -> TrustSource {
-        match self {
-            Self::Chain { source, .. } => TrustSource::Chain(source.clone()),
-            Self::Explicit { source, .. } => TrustSource::Explicit(source.clone()),
-            Self::Packs { source, .. } => TrustSource::Packs(source.clone()),
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Chain { .. } => "chain",
-            Self::Explicit { .. } => "explicit",
-            Self::Packs { .. } => "trust-pack",
-        }
-    }
-
-    /// The base-image measurement policy, from this mode's own authority.
-    ///
-    /// Resolved before the portal is contacted, because portal TLS consumes it
-    /// in order to produce the verified base-image identity that the workload
-    /// policy is then checked against.
-    pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
+    /// Built rather than duplicated, so a mode cannot describe one authority
+    /// for TLS verification and another for the session that follows it.
+    pub fn tls_mode(&self) -> PortalTlsVerificationMode {
         match self {
             Self::Chain {
                 source, base_image, ..
-            } => source
-                .client()
-                .resolve_base_image_measurement_policy(&base_image.to_string())
-                .await
-                .map_err(|error| PortalVerificationError::Config {
-                    message: error.to_string(),
-                }),
+            } => PortalTlsVerificationMode::Chain {
+                source: source.clone(),
+                base_image: ChainBaseImage::Reference(base_image.clone()),
+            },
             Self::Explicit {
-                measurement_policy, ..
-            } => Ok((**measurement_policy).clone()),
+                source,
+                measurement_policy,
+                ..
+            } => PortalTlsVerificationMode::Explicit {
+                source: source.clone(),
+                measurement_policy: measurement_policy.clone(),
+            },
             Self::Packs {
                 source,
                 base_image_id,
                 ..
-            } => Ok(packed_measurement_policy(
-                source.workload_pack()?,
-                *base_image_id,
-            )?),
+            } => PortalTlsVerificationMode::Packs {
+                source: source.clone(),
+                base_image_id: *base_image_id,
+            },
         }
+    }
+
+    /// The trust-anchor source for this mode.
+    pub fn trust_source(&self) -> TrustSource {
+        self.tls_mode().trust_source()
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.tls_mode().name()
+    }
+
+    /// The base-image measurement policy, from this mode's own authority.
+    pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
+        self.tls_mode().measurement_policy().await
     }
 }
 
@@ -140,15 +134,11 @@ pub async fn verify_portal_session(
         required_binding,
     } = request;
 
-    let trust_source = mode.trust_source();
-    let measurement_policy = mode.measurement_policy().await?;
-
     let portal_tls = bootstrap_portal_tls(
         &host,
         status_port,
-        Some(measurement_policy),
+        &mode.tls_mode(),
         None,
-        &trust_source,
         None,
         report_path.as_deref(),
     )
@@ -220,7 +210,6 @@ mod tests {
     use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
     use crate::pack::fixture::Publisher;
     use crate::pack::TrustPackKind;
-    use crate::portal::tls::bootstrap_portal_tls;
 
     /// A port nothing listens on. Reaching a connection attempt at all means
     /// the check under test did not run first.
@@ -344,16 +333,23 @@ mod tests {
     /// requiring the validity error rather than a connection error.
     #[tokio::test]
     async fn expired_packs_stop_portal_tls_before_it_connects() {
-        let SessionVerificationMode::Packs { source, .. } = packs_mode(true) else {
+        let SessionVerificationMode::Packs {
+            source,
+            base_image_id,
+            ..
+        } = packs_mode(true)
+        else {
             unreachable!()
         };
 
         let error = bootstrap_portal_tls(
             "127.0.0.1",
             CLOSED_PORT,
+            &PortalTlsVerificationMode::Packs {
+                source,
+                base_image_id,
+            },
             None,
-            None,
-            &TrustSource::Packs(source),
             None,
             None,
         )
@@ -371,16 +367,23 @@ mod tests {
     /// always.
     #[tokio::test]
     async fn an_unexpired_pack_gets_past_the_validity_check() {
-        let SessionVerificationMode::Packs { source, .. } = packs_mode(false) else {
+        let SessionVerificationMode::Packs {
+            source,
+            base_image_id,
+            ..
+        } = packs_mode(false)
+        else {
             unreachable!()
         };
 
         let error = bootstrap_portal_tls(
             "127.0.0.1",
             CLOSED_PORT,
+            &PortalTlsVerificationMode::Packs {
+                source,
+                base_image_id,
+            },
             None,
-            None,
-            &TrustSource::Packs(source),
             None,
             None,
         )

@@ -286,7 +286,29 @@ impl AttestationClient {
                 "parse canonical base-image reference {base_image:?}: {error}"
             ))
         })?;
-        let base_image_id = B256::from(atakit_cvm_encoding::base_image_id(&app_ref));
+        self.resolve_base_image_measurement_policy_by_id(
+            atakit_cvm_encoding::base_image_id(&app_ref),
+            base_image,
+        )
+        .await
+    }
+
+    /// The same registry read, for a caller that has an identifier rather than
+    /// a reference.
+    ///
+    /// `atakit cloud init`, `deploy`, and `workload init` reach a portal before
+    /// the operator has necessarily named a base image, and take the identifier
+    /// from the portal's untrusted `GET /status`. That identifier selects which
+    /// registry record is read; it never decides what that record says, and the
+    /// measured PCRs still have to match the policy the registry returns.
+    ///
+    /// `described_as` appears in failure messages only.
+    pub async fn resolve_base_image_measurement_policy_by_id(
+        &self,
+        base_image_id: [u8; 32],
+        described_as: &str,
+    ) -> Result<MeasurementPolicy, AttestationClientError> {
+        let base_image_id = B256::from(base_image_id);
         let registry_address = parse_address(
             "resolved BaseImageRegistry",
             &self.context.base_image_registry,
@@ -298,7 +320,7 @@ impl AttestationClient {
             .await
             .map_err(|error| {
                 AttestationClientError::Rpc(format!(
-                    "fetch BaseImageRegistry hierarchy for {base_image}: {error}"
+                    "fetch BaseImageRegistry hierarchy for {described_as}: {error}"
                 ))
             })?;
         // The subject carries the publisher, and a verifier recomputes the id
@@ -309,7 +331,7 @@ impl AttestationClient {
             .await
             .map_err(|error| {
                 AttestationClientError::Rpc(format!(
-                    "fetch BaseImageRegistry owner for {base_image}: {error}"
+                    "fetch BaseImageRegistry owner for {described_as}: {error}"
                 ))
             })?;
         hierarchy_to_measurement_policy(&hierarchy, owner, &self.context.base_image_registry)

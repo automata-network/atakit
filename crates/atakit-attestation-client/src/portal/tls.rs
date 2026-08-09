@@ -28,16 +28,123 @@ use crate::portal::session::{
 use crate::trust::builder::TrustAnchorsBuilder;
 use crate::trust::measurement::write_tls_attestation_report;
 use crate::trust::request::CollateralRequest;
-use crate::trust::source::TrustSource;
+use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
+use atakit_cvm_types::AppRef;
 
 const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Fetch and verify the portal's TLS attestation, resolving every trust input
-/// from one selected source, then return a client pinned to the attested
-/// self-signed certificate.
-// Keep the request inputs explicit at this protocol boundary.
-#[allow(clippy::too_many_arguments)]
+/// One authority for portal TLS verification: the trust source, and the
+/// base-image measurement policy that same authority supplies.
+///
+/// This is the boundary every command crosses, so it is where the exclusive
+/// rule has to live. `bootstrap_portal_tls` previously took a
+/// `MeasurementPolicy` and a `TrustSource` as independent arguments, which made
+/// mixed authority representable for every caller that did not go through
+/// `verify_portal_session` — `atakit cloud init`, `deploy`, `workload init`,
+/// and every `atakit cloud session` subcommand. Closing it in the session
+/// workflow alone left the rule enforced in one command out of eight.
+///
+/// [`crate::workflow::SessionVerificationMode`] adds the workload policy on top
+/// of this, so one choice of authority covers both stages of a verification.
+#[derive(Debug, Clone)]
+pub enum PortalTlsVerificationMode {
+    /// The registry graph rooted at the verifier-selected `SessionRegistry`
+    /// supplies the measurement policy.
+    Chain {
+        source: ChainTrustSource,
+        base_image: ChainBaseImage,
+    },
+    /// The operator supplies the measurement policy directly.
+    Explicit {
+        source: ExplicitTrustSource,
+        measurement_policy: Box<MeasurementPolicy>,
+    },
+    /// The configured `workload-trust` pack supplies the measurement policy for
+    /// the named base image.
+    Packs {
+        source: PackTrustSource,
+        base_image_id: [u8; 32],
+    },
+}
+
+/// Which registry record chain mode reads its measurement policy from.
+///
+/// Two shapes because the commands differ. `verify-session` knows the
+/// base-image reference the operator asked about. `init`, `deploy`, and
+/// `workload init` reach a portal before a reference is necessarily known and
+/// take the identifier from the portal's untrusted `GET /status`.
+///
+/// The untrusted identifier selects which record is read; it never decides what
+/// that record says. The registry is still the authority, and the measured PCRs
+/// still have to match what it returns, so a portal claiming another image's
+/// identifier gets that image's policy applied to its own measurements and
+/// fails.
+#[derive(Debug, Clone)]
+pub enum ChainBaseImage {
+    /// The operator named it.
+    Reference(AppRef),
+    /// Taken from `GET /status`, optionally cross-checked against a reference
+    /// the operator did name.
+    PortalReported([u8; 32]),
+}
+
+impl PortalTlsVerificationMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Chain { .. } => "chain",
+            Self::Explicit { .. } => "explicit",
+            Self::Packs { .. } => "trust-pack",
+        }
+    }
+
+    /// The trust-anchor source for this mode.
+    pub fn trust_source(&self) -> TrustSource {
+        match self {
+            Self::Chain { source, .. } => TrustSource::Chain(source.clone()),
+            Self::Explicit { source, .. } => TrustSource::Explicit(source.clone()),
+            Self::Packs { source, .. } => TrustSource::Packs(source.clone()),
+        }
+    }
+
+    /// The base-image measurement policy, from this mode's own authority.
+    pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
+        match self {
+            Self::Chain { source, base_image } => {
+                let client = source.client();
+                match base_image {
+                    ChainBaseImage::Reference(app_ref) => {
+                        client
+                            .resolve_base_image_measurement_policy(&app_ref.to_string())
+                            .await
+                    }
+                    ChainBaseImage::PortalReported(id) => {
+                        client
+                            .resolve_base_image_measurement_policy_by_id(
+                                *id,
+                                "the base image the portal reported",
+                            )
+                            .await
+                    }
+                }
+                .map_err(|error| PortalVerificationError::Config {
+                    message: error.to_string(),
+                })
+            }
+            Self::Explicit {
+                measurement_policy, ..
+            } => Ok((**measurement_policy).clone()),
+            Self::Packs {
+                source,
+                base_image_id,
+            } => Ok(crate::pack::workload::packed_measurement_policy(
+                source.workload_pack()?,
+                *base_image_id,
+            )?),
+        }
+    }
+}
+
 /// Resolve Intel TDX DCAP collateral for the selected trust source.
 ///
 /// In trust-pack mode the configured packs are consulted first, and only a
@@ -79,23 +186,24 @@ async fn resolve_tdx_dcap_for_source(
     resolve_tdx_dcap_collateral(response, config).await
 }
 
+/// Fetch and verify the portal's TLS attestation, resolving every trust input
+/// from one selected authority, then return a client pinned to the attested
+/// self-signed certificate.
 pub async fn bootstrap_portal_tls(
     host: &str,
     status_port: u16,
-    measurement_policy: Option<MeasurementPolicy>,
+    mode: &PortalTlsVerificationMode,
     workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
-    trust_source: &TrustSource,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
-    // This function is public and takes a `TrustSource` directly, so it is a
-    // pack-consuming boundary in its own right — a caller that never goes
-    // through `verify_portal_session` reaches packs through here. The window is
-    // therefore checked before anything else, including before the portal is
-    // contacted.
+    let trust_source = &mode.trust_source();
+    // The window is checked before anything else, including before the portal
+    // is contacted, because this is the boundary every caller crosses.
     if let TrustSource::Packs(source) = trust_source {
         source.ensure_valid_now()?;
     }
+    let measurement_policy = Some(mode.measurement_policy().await?);
     let amd_snp_crls = match trust_source {
         TrustSource::Explicit(source) => source.amd_snp_crls().to_vec(),
         TrustSource::Packs(source) => source.amd_snp_crls().to_vec(),

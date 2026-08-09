@@ -173,6 +173,12 @@ fn resolve_from_packs(
     source: &PackTrustSource,
     request: &CollateralRequest,
 ) -> Result<(TrustAnchors, TrustProvenance), PortalVerificationError> {
+    // `TrustAnchorsBuilder::resolve` is public, so a caller holding a source
+    // past `not_after` reaches trust anchors through here without going near
+    // `bootstrap_portal_tls`. Every public path that hands out packed material
+    // checks the window.
+    source.ensure_valid_now()?;
+
     let anchors = source.anchors().clone();
     let mut provenance = TrustProvenance::default();
 

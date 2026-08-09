@@ -99,30 +99,6 @@ pub struct PackedPcrSpec {
     pub comparison: String,
 }
 
-/// What a `workload-trust` pack resolves to for one verification.
-#[derive(Debug, Clone)]
-pub struct WorkloadTrustInputs {
-    pub workload_policy: TrustedWorkloadSessionPolicy,
-    pub measurement_policy: MeasurementPolicy,
-}
-
-/// Resolve workload and base-image policy from a verified pack.
-///
-/// `expected_workload` is what the caller asked to verify and
-/// `selected_base_image_id` is what verified portal TLS selected — neither is
-/// taken from the pack, because a pack that chose either would be answering a
-/// question it also asked.
-pub fn workload_trust_inputs(
-    pack: &TrustPack,
-    expected_workload: &AppRef,
-    selected_base_image_id: [u8; 32],
-) -> Result<WorkloadTrustInputs, TrustPackError> {
-    Ok(WorkloadTrustInputs {
-        measurement_policy: packed_measurement_policy(pack, selected_base_image_id)?,
-        workload_policy: packed_workload_policy(pack, expected_workload, selected_base_image_id)?,
-    })
-}
-
 /// The base-image measurement policy for one base image.
 ///
 /// Separate from [`packed_workload_policy`] because the two are needed at
@@ -131,7 +107,7 @@ pub fn workload_trust_inputs(
 /// policy is then checked against. Chain mode has the same split, resolving
 /// `--base-image` policy before the connection and the registered
 /// `WorkloadSpec` after it.
-pub fn packed_measurement_policy(
+pub(crate) fn packed_measurement_policy(
     pack: &TrustPack,
     base_image_id: [u8; 32],
 ) -> Result<MeasurementPolicy, TrustPackError> {
@@ -176,7 +152,7 @@ fn declared_base_images(pack: &TrustPack) -> Result<(u8, Vec<B256>), TrustPackEr
 }
 
 /// The session policy for the workload the caller asked about.
-pub fn packed_workload_policy(
+pub(crate) fn packed_workload_policy(
     pack: &TrustPack,
     expected_workload: &AppRef,
     selected_base_image_id: [u8; 32],
@@ -477,6 +453,32 @@ mod tests {
         workload_builder, workload_spec_json, Publisher,
     };
     use crate::pack::write::TrustPackBuilder;
+
+    /// Both policies at once.
+    ///
+    /// Production callers take them separately, at the two different moments
+    /// they are needed; these tests assert on the pair, so the convenience
+    /// lives here rather than in the public surface where it had no user.
+    #[derive(Debug)]
+    struct WorkloadTrustInputs {
+        workload_policy: TrustedWorkloadSessionPolicy,
+        measurement_policy: MeasurementPolicy,
+    }
+
+    fn workload_trust_inputs(
+        pack: &TrustPack,
+        expected_workload: &AppRef,
+        selected_base_image_id: [u8; 32],
+    ) -> Result<WorkloadTrustInputs, TrustPackError> {
+        Ok(WorkloadTrustInputs {
+            measurement_policy: packed_measurement_policy(pack, selected_base_image_id)?,
+            workload_policy: packed_workload_policy(
+                pack,
+                expected_workload,
+                selected_base_image_id,
+            )?,
+        })
+    }
 
     const WORKLOAD_NAME: &str = "peer-attestation-demo";
     const WORKLOAD_VERSION: &str = "v1.0.0";

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CloudError;
 use crate::pcr_policy::ResolvedPcrPolicyConfig;
+use atakit_attestation::MeasurementPolicy;
 
 pub use atakit_attestation_client::{
     bootstrap_portal_tls, cloud_tls_attestation_report_path, load_measurement_policy,
@@ -24,52 +25,71 @@ pub use atakit_attestation_client::{
     read_untrusted_portal_base_image_id, required_trust_inputs, tdx_dcap_automata_read_strategy,
     tdx_dcap_collateral_config, tdx_dcap_collateral_config_with_read_strategy,
     tls_manual_override_message, unsatisfied_trust_inputs, workload_tls_attestation_report_path,
-    write_tls_attestation_report, AzureMaaTrustConfig, AzureMaaTrustSource, ChainTrustSource,
-    CollateralRequest, ExplicitTrustSource, IntelTdxDcapCollateralConfig,
-    IntelTdxDcapCollateralSource, PortalVerificationError, RequiredTrustInput,
-    TdxDcapAutomataReadStrategy, TlsManualOverride, TlsVerificationTrust, TrustAnchorsBuilder,
-    TrustInputSource, TrustProvenance, TrustSource, VerifiedPortalTls,
+    write_tls_attestation_report, AzureMaaTrustConfig, AzureMaaTrustSource, ChainBaseImage,
+    ChainTrustSource, CollateralRequest, ExplicitTrustSource, IntelTdxDcapCollateralConfig,
+    IntelTdxDcapCollateralSource, PortalTlsVerificationMode, PortalVerificationError,
+    RequiredTrustInput, TdxDcapAutomataReadStrategy, TlsManualOverride, TlsVerificationTrust,
+    TrustAnchorsBuilder, TrustInputSource, TrustProvenance, TrustSource, VerifiedPortalTls,
 };
 
-/// Select the trust source for a deployment command from the chain section of
-/// the `/init` payload.
+/// Choose one authority for portal TLS verification.
 ///
-/// A deployment always carries a chain, because the portal needs one, so a
-/// configured chain means chain mode. Pinned trust files cannot be combined
-/// with it: the exclusive-source rule withdrew per-field precedence, and
-/// silently ignoring a pin the operator supplied is exactly the outcome that
-/// rule exists to prevent. The refusal names the flags so the operator can
-/// either drop them or verify explicitly with `atakit cloud verify-session`,
-/// where `--chain` is optional.
-pub async fn trust_source_for_init_chain(
+/// Every command that verifies a portal goes through here, so this is where the
+/// exclusive rule is enforced for all of them rather than in one command. A
+/// configured chain means the registry supplies the trust anchors *and* the
+/// base-image measurement policy; pinned files or an operator-supplied
+/// measurement policy alongside it are refused rather than silently unused.
+///
+/// `portal_reported_base_image_id` is the untrusted identifier from
+/// `GET /status`, used only to select which registry record is read.
+pub async fn portal_tls_mode_for_init_chain(
     chain: &InitChainConfig,
     trust: TlsVerificationTrust,
     tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
-) -> Result<TrustSource, CloudError> {
+    explicit_measurement_policy: Option<MeasurementPolicy>,
+    portal_reported_base_image_id: Option<[u8; 32]>,
+) -> Result<PortalTlsVerificationMode, CloudError> {
     if atakit_attestation_client::chain_coordinates_configured(
         &chain.rpc_url,
         &chain.session_registry,
     ) {
-        if !trust.sources.is_empty() {
-            let flags: Vec<&str> = trust.sources.keys().map(String::as_str).collect();
+        let mut conflicting: Vec<&str> = trust.sources.keys().map(String::as_str).collect();
+        if explicit_measurement_policy.is_some() {
+            conflicting.push("--measurements");
+        }
+        if !conflicting.is_empty() {
             return Err(CloudError::Config {
                 message: format!(
-                    "a configured chain resolves every trust anchor from the registry, so {} \
-                     cannot also be supplied; drop the pinned files, or verify explicitly with \
-                     `atakit cloud verify-session` without --chain",
-                    flags.join(", ")
+                    "a configured chain resolves every trust input from the registry, so {} \
+                     cannot also be supplied; drop them, or verify explicitly without a chain",
+                    conflicting.join(", ")
                 ),
             });
         }
-        return Ok(TrustSource::Chain(
-            ChainTrustSource::connect(&chain.rpc_url, &chain.session_registry, tdx_dcap_collateral)
-                .await?,
-        ));
+        let base_image_id = portal_reported_base_image_id.ok_or_else(|| CloudError::Config {
+            message: "normal portal TLS attestation requires the untrusted base_image_id from \
+                      GET /status"
+                .to_string(),
+        })?;
+        return Ok(PortalTlsVerificationMode::Chain {
+            source: ChainTrustSource::connect(
+                &chain.rpc_url,
+                &chain.session_registry,
+                tdx_dcap_collateral,
+            )
+            .await?,
+            base_image: ChainBaseImage::PortalReported(base_image_id),
+        });
     }
-    Ok(TrustSource::Explicit(ExplicitTrustSource::new(
-        trust,
-        tdx_dcap_collateral,
-    )?))
+    let measurement_policy = explicit_measurement_policy.ok_or_else(|| CloudError::Config {
+        message: "explicit verification needs a base-image measurement policy; supply \
+                  --measurements, or select a chain"
+            .to_string(),
+    })?;
+    Ok(PortalTlsVerificationMode::Explicit {
+        source: ExplicitTrustSource::new(trust, tdx_dcap_collateral)?,
+        measurement_policy: Box::new(measurement_policy),
+    })
 }
 
 /// Build verifier-side Automata on-chain trust config from the chain section of

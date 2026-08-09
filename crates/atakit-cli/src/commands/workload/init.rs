@@ -8,7 +8,7 @@ use owo_colors::OwoColorize;
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
-    resolve_init_pcr_policy, resolve_tls_measurement_policy, resolve_unmeasured_tar,
+    resolve_explicit_tls_measurement_policy, resolve_init_pcr_policy, resolve_unmeasured_tar,
     resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
 };
 use crate::config::Config;
@@ -214,7 +214,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         } else {
             None
         };
-        let measurement_policy = resolve_tls_measurement_policy(
+        let measurement_policy = resolve_explicit_tls_measurement_policy(
             args.measurements.as_deref(),
             args.base_image.as_deref(),
             untrusted_portal_base_image_id,
@@ -244,19 +244,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             automata_read_strategy,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let trust_source = init::trust_source_for_init_chain(
+        let tls_mode = init::portal_tls_mode_for_init_chain(
             &init_config.chain,
             tls_verification_trust,
             tdx_dcap_collateral,
+            measurement_policy,
+            untrusted_portal_base_image_id,
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let verified_tls = init::bootstrap_portal_tls(
             &host,
             status_port,
-            Some(measurement_policy),
+            &tls_mode,
             Some(workload_attributes),
-            &trust_source,
             args.trust_tls_cert_sha256.as_deref(),
             Some(&init::workload_tls_attestation_report_path(
                 &env.cache_dir,

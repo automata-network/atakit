@@ -17,8 +17,8 @@ use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
 use atakit_workload::{inspect_workload, InspectOptions};
 
 use super::{
-    init_chain_from_config, portal_endpoints, registration_is_off, resolve_instance,
-    resolve_tls_measurement_policy, synthesize_off_init_chain,
+    init_chain_from_config, portal_endpoints, registration_is_off,
+    resolve_explicit_tls_measurement_policy, resolve_instance, synthesize_off_init_chain,
 };
 use crate::config::{ChainConfig, Config};
 
@@ -157,7 +157,7 @@ pub(crate) async fn resolve_verified_portal_access(
     } else {
         None
     };
-    let measurement_policy = resolve_tls_measurement_policy(
+    let measurement_policy = resolve_explicit_tls_measurement_policy(
         verification.measurements.as_deref(),
         verification.base_image.as_deref(),
         untrusted_portal_base_image_id,
@@ -188,16 +188,20 @@ pub(crate) async fn resolve_verified_portal_access(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let trust_source =
-        init::trust_source_for_init_chain(&init_chain, tls_verification_trust, tdx_dcap)
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tls_mode = init::portal_tls_mode_for_init_chain(
+        &init_chain,
+        tls_verification_trust,
+        tdx_dcap,
+        measurement_policy,
+        untrusted_portal_base_image_id,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     let verified_tls = init::bootstrap_portal_tls(
         &host,
         status_port,
-        Some(measurement_policy),
+        &tls_mode,
         None,
-        &trust_source,
         None,
         Some(&init::cloud_tls_attestation_report_path(
             &env.data_dir,
