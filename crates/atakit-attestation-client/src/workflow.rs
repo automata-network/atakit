@@ -7,8 +7,7 @@ use atakit_cvm_types::AppRef;
 
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
-use crate::pack::workload::packed_workload_policy;
-use crate::portal::session::{verify_current_session, VerifiedPortalTls};
+use crate::portal::session::{verify_current_session, SessionWorkloadSelector, VerifiedPortalTls};
 use crate::portal::tls::{bootstrap_portal_tls, ChainBaseImage, PortalTlsVerificationMode};
 use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
 
@@ -144,52 +143,25 @@ pub async fn verify_portal_session(
     )
     .await?;
 
-    // The workload policy is resolved after portal TLS, against the base image
-    // TLS actually selected rather than one the caller declared.
-    let session = match &mode {
-        SessionVerificationMode::Chain {
-            source, workload, ..
-        } => {
-            source
-                .client()
-                .verify_current_session(
-                    &portal_tls,
-                    &host,
-                    status_port,
-                    &workload.to_string(),
-                    required_binding,
-                )
-                .await
+    // The workload policy is resolved after portal TLS, by the authority that
+    // verified it, against the base image TLS actually selected.
+    let selector = match &mode {
+        SessionVerificationMode::Chain { workload, .. }
+        | SessionVerificationMode::Packs { workload, .. } => {
+            SessionWorkloadSelector::Reference(workload.clone())
         }
         SessionVerificationMode::Explicit {
             workload_policy, ..
-        } => {
-            verify_current_session(
-                &portal_tls,
-                &host,
-                status_port,
-                workload_policy.clone(),
-                required_binding,
-            )
+        } => SessionWorkloadSelector::OperatorPolicy(workload_policy.clone()),
+    };
+    let session =
+        verify_current_session(&portal_tls, &host, status_port, &selector, required_binding)
             .await
-        }
-        SessionVerificationMode::Packs {
-            source, workload, ..
-        } => {
-            let base_image_id = portal_tls.identity.base_image_id.ok_or_else(|| {
-                PortalVerificationError::PortalTlsAttestationFailed {
-                    message: "verified portal TLS identity has no base-image ID".to_string(),
-                }
-            })?;
-            let policy = packed_workload_policy(source.workload_pack()?, workload, base_image_id)?;
-            verify_current_session(&portal_tls, &host, status_port, policy, required_binding).await
-        }
-    }
-    .map_err(
-        |error| PortalVerificationError::PortalSessionVerificationFailed {
-            message: error.to_string(),
-        },
-    )?;
+            .map_err(
+                |error| PortalVerificationError::PortalSessionVerificationFailed {
+                    message: error.to_string(),
+                },
+            )?;
 
     Ok(VerifiedPortalSession {
         portal_tls,

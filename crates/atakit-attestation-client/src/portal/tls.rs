@@ -199,7 +199,11 @@ pub(crate) fn session_authority(
 ) -> SessionAuthority {
     match trust_source {
         TrustSource::Chain(source) => SessionAuthority::Chain(source.client().clone()),
-        TrustSource::Explicit(_) | TrustSource::Packs(_) => SessionAuthority::Offline {
+        TrustSource::Explicit(_) => SessionAuthority::Explicit {
+            azure_maa_keys: anchors.azure_maa_keys.clone(),
+        },
+        TrustSource::Packs(source) => SessionAuthority::Packs {
+            source: source.clone(),
             azure_maa_keys: anchors.azure_maa_keys.clone(),
         },
     }
@@ -664,7 +668,8 @@ mod session_authority_tests {
 
         match session_authority(&source, &anchors) {
             SessionAuthority::Chain(_) => {}
-            SessionAuthority::Offline { azure_maa_keys } => panic!(
+            SessionAuthority::Explicit { azure_maa_keys }
+            | SessionAuthority::Packs { azure_maa_keys, .. } => panic!(
                 "chain mode must not carry offline keys; it carried {} of them, which is the \
                  TLS key standing in for the committed-session key",
                 azure_maa_keys.len()
@@ -696,7 +701,8 @@ mod session_authority_tests {
         ] {
             let mode = source.mode();
             match session_authority(&source, &anchors) {
-                SessionAuthority::Offline { azure_maa_keys } => {
+                SessionAuthority::Explicit { azure_maa_keys }
+                | SessionAuthority::Packs { azure_maa_keys, .. } => {
                     assert_eq!(
                         azure_maa_keys.len(),
                         1,
@@ -711,82 +717,116 @@ mod session_authority_tests {
     }
 }
 
-/// The authority recorded during portal TLS must be the authority session
-/// verification runs under.
+/// The workload policy must come from the authority that verified portal TLS.
 ///
-/// These drive the two decisions the public entry points make. Before them,
-/// the chain methods overwrote the recorded authority, so explicit-to-chain and
-/// chain-A-to-chain-B were accepted silently, and the offline function had the
-/// mirror bypass.
+/// These drive `authority_accepts`, which the single session entry point calls
+/// before resolving anything. The crossings they reject were each reachable
+/// through a public API at some point in this branch's history: a bare
+/// `TrustedWorkloadSessionPolicy` carries no evidence of its source, so every
+/// entry point that accepted one accepted a foreign policy with it.
 #[cfg(test)]
 mod session_authority_enforcement {
     use super::*;
-    use crate::chain::{same_chain_authority, AttestationClient, AttestationClientConfig};
-    use crate::portal::session::reject_chain_authority;
+    use crate::chain::{AttestationClient, AttestationClientConfig, TrustedWorkloadSessionPolicy};
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::portal::session::{authority_accepts, SessionWorkloadSelector};
     use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+    use atakit_cvm_types::AppRef;
 
-    async fn client(registry: &str) -> AttestationClient {
-        // Leaked so the endpoint outlives the client; nothing here issues a
-        // request, so the count is irrelevant.
+    async fn chain_authority() -> SessionAuthority {
         let endpoint = Box::leak(Box::new(CountingRpcEndpoint::start().await));
-        AttestationClient::connect(AttestationClientConfig {
-            rpc_url: endpoint.url().to_string(),
-            session_registry: registry.to_string(),
-            expected_chain_id: None,
-            expected_base_image_registry: None,
-            expected_workload_registry: None,
+        SessionAuthority::Chain(
+            AttestationClient::connect(AttestationClientConfig {
+                rpc_url: endpoint.url().to_string(),
+                session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+                expected_chain_id: None,
+                expected_base_image_registry: None,
+                expected_workload_registry: None,
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    fn explicit_authority() -> SessionAuthority {
+        SessionAuthority::Explicit {
+            azure_maa_keys: Vec::new(),
+        }
+    }
+
+    fn pack_authority() -> SessionAuthority {
+        SessionAuthority::Packs {
+            source: crate::trust::source::PackTrustSource::new(
+                Vec::new(),
+                Vec::new(),
+                IntelTdxDcapCollateralConfig::default(),
+            )
+            .expect("pack source"),
+            azure_maa_keys: Vec::new(),
+        }
+    }
+
+    fn reference() -> SessionWorkloadSelector {
+        SessionWorkloadSelector::Reference(AppRef::new([0x11; 32], "w", "v1"))
+    }
+
+    fn operator_policy() -> SessionWorkloadSelector {
+        SessionWorkloadSelector::OperatorPolicy(TrustedWorkloadSessionPolicy {
+            workload_id: [0u8; 32],
+            pcr_specs256: Vec::new(),
+            pcr_specs384: Vec::new(),
+            attribute_requirements: Vec::new(),
         })
-        .await
-        .expect("connect")
     }
 
-    const CHAIN_A: &str = "0x1111111111111111111111111111111111111111";
-    const CHAIN_B: &str = "0x2222222222222222222222222222222222222222";
-
+    /// Each authority accepts exactly the selector it can resolve, which is the
+    /// control for the rejections below.
     #[tokio::test]
-    async fn a_chain_client_refuses_portal_tls_verified_without_a_chain() {
-        let chain = client(CHAIN_A).await;
-        let offline = SessionAuthority::Offline {
-            azure_maa_keys: Vec::new(),
-        };
-
-        let error = same_chain_authority(&offline, chain.context())
-            .expect_err("explicit portal TLS must not gain a chain binding");
-        assert!(error.to_string().contains("without a chain"), "got {error}");
+    async fn each_authority_accepts_only_its_own_workload_source() {
+        authority_accepts(&chain_authority().await, &reference())
+            .expect("chain resolves a reference");
+        authority_accepts(&pack_authority(), &reference()).expect("a pack resolves a reference");
+        authority_accepts(&explicit_authority(), &operator_policy())
+            .expect("the operator is the source in explicit mode");
     }
 
+    /// An operator policy under chain or trust-pack authority is the crossing
+    /// that survived six earlier fixes, one call frame at a time.
     #[tokio::test]
-    async fn a_chain_client_refuses_portal_tls_verified_against_another_chain() {
-        let chain_a = client(CHAIN_A).await;
-        let chain_b = client(CHAIN_B).await;
-
-        let error = same_chain_authority(&SessionAuthority::Chain(chain_a), chain_b.context())
-            .expect_err("a session must not cross chains");
-        let message = error.to_string();
-        assert!(message.contains(CHAIN_A), "got {message}");
-        assert!(message.contains(CHAIN_B), "got {message}");
+    async fn a_resolving_authority_refuses_an_operator_supplied_policy() {
+        for authority in [chain_authority().await, pack_authority()] {
+            let name = authority.name();
+            let Err(error) = authority_accepts(&authority, &operator_policy()) else {
+                panic!("{name} authority must refuse an operator-supplied workload policy");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(name),
+                "the failure must name the authority; got {message}"
+            );
+            assert!(
+                message.contains("explicit verification only"),
+                "the failure must say where such a policy belongs; got {message}"
+            );
+        }
     }
 
-    /// The control: the same chain is the normal case, so the two rejections
-    /// above are about crossing authorities rather than refusing everything.
+    /// Explicit authority has nothing to resolve a reference from.
     #[tokio::test]
-    async fn a_chain_client_accepts_portal_tls_it_verified_itself() {
-        let chain = client(CHAIN_A).await;
-        same_chain_authority(&SessionAuthority::Chain(chain.clone()), chain.context())
-            .expect("the same chain is the normal case");
+    async fn explicit_authority_refuses_a_workload_reference() {
+        let error = authority_accepts(&explicit_authority(), &reference())
+            .expect_err("explicit mode has no registry or pack");
+        assert!(
+            error.to_string().contains("no registry or pack"),
+            "got {error}"
+        );
     }
 
-    #[tokio::test]
-    async fn the_offline_entry_point_refuses_chain_verified_portal_tls() {
-        let chain = client(CHAIN_A).await;
-        let error = reject_chain_authority(Some(&SessionAuthority::Chain(chain)))
-            .expect_err("chain-verified TLS must not take an operator policy");
-        assert!(error.to_string().contains("under a chain"), "got {error}");
-
-        reject_chain_authority(Some(&SessionAuthority::Offline {
-            azure_maa_keys: Vec::new(),
-        }))
-        .expect("offline TLS is what this entry point is for");
-        reject_chain_authority(None).expect("no session context is not a chain authority");
+    #[test]
+    fn offline_authorities_stay_distinct() {
+        assert_eq!(explicit_authority().name(), "explicit");
+        assert_eq!(pack_authority().name(), "trust-pack");
+        let _ = TlsVerificationTrust::default();
     }
 }

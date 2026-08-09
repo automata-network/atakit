@@ -35,7 +35,8 @@ pub use chain::{
 };
 pub use error::PortalVerificationError;
 pub use portal::session::{
-    verify_current_session, PortalSessionVerificationContext, TlsManualOverride, VerifiedPortalTls,
+    verify_current_session, PortalSessionVerificationContext, SessionAuthority,
+    SessionWorkloadSelector, TlsManualOverride, VerifiedPortalTls,
 };
 
 /// Retained for callers that referenced the pre-module path.

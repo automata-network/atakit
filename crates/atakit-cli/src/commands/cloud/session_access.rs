@@ -6,7 +6,7 @@ use atakit_attestation::{
     VerifiedSession,
 };
 use atakit_attestation_client::{
-    verify_current_session, AttestationClient, AttestationClientConfig,
+    verify_current_session, AttestationClient, AttestationClientConfig, SessionWorkloadSelector,
     TrustedWorkloadSessionPolicy,
 };
 use atakit_cloud::cli::SessionVerificationArgs;
@@ -64,38 +64,24 @@ pub(crate) struct VerifiedCloudSessionAccess {
     pub chain_name: Option<String>,
     pub required_binding: Option<BindingMode>,
     pub verified_tls: VerifiedPortalTls,
-    workload_policy: TrustedWorkloadSessionPolicy,
-    /// Present exactly when the registered policy came from a chain. The
-    /// session binding is derived from this client and nowhere else, so an
-    /// explicit verification cannot acquire one.
-    chain_client: Option<AttestationClient>,
+    /// What identifies the workload for the authority that verified portal TLS.
+    ///
+    /// One value, not a policy beside an optional chain client: that shape
+    /// carried no evidence of which authority produced the policy, so the two
+    /// fields could disagree.
+    workload: SessionWorkloadSelector,
 }
 
 impl VerifiedCloudSessionAccess {
     pub async fn verify_current_session(&self) -> Result<VerifiedSession> {
-        match &self.chain_client {
-            Some(client) => {
-                client
-                    .verify_current_session_with_policy(
-                        &self.verified_tls,
-                        &self.host,
-                        self.status_port,
-                        self.workload_policy.clone(),
-                        self.required_binding,
-                    )
-                    .await
-            }
-            None => {
-                verify_current_session(
-                    &self.verified_tls,
-                    &self.host,
-                    self.status_port,
-                    self.workload_policy.clone(),
-                    self.required_binding,
-                )
-                .await
-            }
-        }
+        verify_current_session(
+            &self.verified_tls,
+            &self.host,
+            self.status_port,
+            &self.workload,
+            self.required_binding,
+        )
+        .await
         .map_err(|error| anyhow::anyhow!("{error}"))
     }
 }
@@ -259,7 +245,7 @@ fn workload_policy_authority_conflict(
 pub(crate) async fn resolve_verified_session_access(
     portal: VerifiedPortalAccess,
     verification: &SessionVerificationArgs,
-    config: &Config,
+    _config: &Config,
 ) -> Result<VerifiedCloudSessionAccess> {
     // The workload policy comes from the same authority portal TLS used. A
     // policy from one authority paired with a session binding from another is
@@ -271,36 +257,19 @@ pub(crate) async fn resolve_verified_session_access(
     if portal.tls_authority != "chain" {
         // Explicit mode has no chain to resolve a registered policy or a
         // session binding from, so it must not connect to one.
-        return build_session_access(portal, verification, None).await;
+        return build_session_access(portal, verification).await;
     }
-    // Chain authority always resolves through the registry, and
-    // `WorkloadRegistry` is derived from `SessionRegistry` rather than needing
-    // its own configured address. Selecting a local workload archive here was
-    // the last chain-to-operator fallback: with `registration = "off"` and no
-    // explicit `workload_registry`, portal TLS verified under the chain while
-    // the workload policy came from a file, which is the mixed trust the
-    // exclusive rule forbids. If the registry cannot supply the policy, that
-    // fails closed rather than degrading to the archive.
-    let chain_client = match portal.chain_name.as_deref() {
-        Some(name) => match config.chains.get(name) {
-            Some(chain) => Some(connect_attestation_client(name, chain).await?),
-            None => bail!("chain '{name}' not found in [chains]"),
-        },
-        None => bail!(
-            "portal TLS verified under the chain, so the registry must also supply the workload policy, but no chain is configured for this deployment"
-        ),
-    };
-    build_session_access(portal, verification, chain_client).await
+    // No second chain client is connected here. The authority recorded during
+    // portal TLS already holds the one that verified the connection, and
+    // connecting another was itself the crossing risk: two clients meant two
+    // chains could disagree.
+    build_session_access(portal, verification).await
 }
 
-/// Assemble the verified session access from one already-chosen authority.
-///
-/// `chain_client` is `Some` only in chain mode, so an explicit verification
-/// cannot acquire a session binding from a chain.
+/// Assemble the verified session access from the authority portal TLS used.
 async fn build_session_access(
     portal: VerifiedPortalAccess,
     verification: &SessionVerificationArgs,
-    chain_client: Option<AttestationClient>,
 ) -> Result<VerifiedCloudSessionAccess> {
     // The deployment records its workload's publisher, so the identifier is
     // recomputable from state rather than being stored opaquely.
@@ -315,24 +284,18 @@ async fn build_session_access(
         portal.state.workload_version.clone(),
     );
     let workload_id = crate::commands::workload::compute_workload_id(&workload_ref);
-    let workload_policy = resolve_trusted_workload_policy(
-        &portal.state,
-        verification,
-        portal.tls_authority,
-        chain_client.as_ref(),
-        // The canonical publisher-qualified reference. A two-part
-        // `name:version` is refused by the registry client, so building it from
-        // the recorded publisher is what makes this path work at all.
-        &format!(
-            "{}/{}:{}",
-            portal.state.workload_publisher,
-            portal.state.workload_name,
-            portal.state.workload_version
+    // The authority resolves its own policy inside the client crate. This picks
+    // only what identifies the workload.
+    let workload = match portal.tls_authority {
+        "chain" => SessionWorkloadSelector::Reference(atakit_cvm_types::AppRef::new(
+            workload_publisher.into(),
+            portal.state.workload_name.clone(),
+            portal.state.workload_version.clone(),
+        )),
+        _ => SessionWorkloadSelector::OperatorPolicy(
+            resolve_operator_workload_policy(&portal.state, verification, workload_id.0).await?,
         ),
-        workload_id.0,
-        portal.verified_tls.identity.base_image_id,
-    )
-    .await?;
+    };
     let required_binding = required_binding_for_registration(portal.registration.as_deref());
 
     Ok(VerifiedCloudSessionAccess {
@@ -344,8 +307,7 @@ async fn build_session_access(
         chain_name: portal.chain_name,
         required_binding,
         verified_tls: portal.verified_tls,
-        workload_policy,
-        chain_client,
+        workload,
     })
 }
 
@@ -378,14 +340,15 @@ fn tls_needs_registry_derivation(
     !has_explicit_measurements && !has_configured_base_image_registry
 }
 
-async fn resolve_trusted_workload_policy(
+/// The operator's own workload policy, for explicit verification.
+///
+/// There is no chain or pack branch: those authorities resolve their own policy
+/// inside `atakit-attestation-client`, so no source-agnostic policy is built
+/// here that a caller could pair with the wrong authority.
+async fn resolve_operator_workload_policy(
     state: &DeployState,
     verification: &SessionVerificationArgs,
-    tls_authority: &str,
-    chain_client: Option<&AttestationClient>,
-    workload_reference: &str,
     workload_id: [u8; 32],
-    selected_base_image_id: Option<[u8; 32]>,
 ) -> Result<TrustedWorkloadSessionPolicy> {
     let manual_pcr23 = match (
         verification.trusted_workload_pcr23_sha256.as_deref(),
@@ -397,35 +360,6 @@ async fn resolve_trusted_workload_policy(
             "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
         ),
     };
-
-    // Chain authority never reads the local workload archive, even when the
-    // registry turns out to be unusable. A second guard rather than trusting
-    // the caller: the caller's client selection is exactly where the last
-    // fallback hid.
-    if tls_authority == "chain" && chain_client.is_none() {
-        bail!(
-            "portal TLS verified under the chain, so the registry must also supply the workload policy; it could not be reached, and the local workload archive is not a substitute for it"
-        );
-    }
-
-    // Chain mode: the registry is the whole policy. Operator values are refused
-    // by the caller, so reaching here with both is a bug rather than a
-    // configuration the operator can create.
-    if let Some(client) = chain_client {
-        debug_assert!(manual_pcr23.is_none());
-        return client
-            .resolve_workload_policy(
-                workload_reference,
-                selected_base_image_id.ok_or_else(|| {
-                    anyhow::anyhow!("TLS verification did not select a base image ID")
-                })?,
-            )
-            .await
-            .map_err(anyhow::Error::new);
-    }
-
-    // Explicit mode: the operator supplies the policy, either as PCR23 values
-    // or as the local workload archive they built.
     let Some((sha256, sha384)) = manual_pcr23 else {
         return load_local_workload_policy(state, workload_id).await;
     };
@@ -760,39 +694,26 @@ mod tests {
         );
     }
 
-    /// Chain authority must not fall back to the local workload archive, which
-    /// is what `registration = "off"` without a configured `workload_registry`
-    /// used to do.
+    /// Chain authority never builds an operator policy, so there is nothing to
+    /// pair with a chain binding and the local archive is never consulted.
     ///
-    /// The deployment points at an archive path, and the failure must be about
-    /// the registry rather than about that path — if the local loader had been
-    /// reached, the path would appear in the message.
+    /// `resolve_operator_workload_policy` is the only place this command
+    /// produces a policy, and only the explicit branch reaches it.
     #[tokio::test]
-    async fn chain_authority_never_falls_back_to_the_local_workload_archive() {
-        const ARCHIVE: &str = "/missing/local-workload.atawl";
-        let state = deployed_state(ARCHIVE.into(), String::new());
+    async fn chain_authority_produces_no_operator_policy() {
+        let state = deployed_state("/missing/local-workload.atawl".into(), String::new());
         let verification = SessionVerificationArgs::default();
 
-        let error = resolve_trusted_workload_policy(
-            &state,
-            &verification,
-            "chain",
-            None,
-            "0x00/w:v1",
-            [0x66; 32],
-            Some([0x77; 32]),
-        )
-        .await
-        .expect_err("chain authority with no registry client must fail closed");
-
-        let message = error.to_string();
+        // The local archive is reachable only through this function, and only
+        // the explicit branch calls it. Chain authority builds a
+        // `SessionWorkloadSelector::Reference`, which carries no policy at all
+        // and therefore cannot carry one from another source.
+        let error = resolve_operator_workload_policy(&state, &verification, [0x66; 32])
+            .await
+            .expect_err("the fixture has no usable local archive");
         assert!(
-            message.contains("registry"),
-            "the failure must name the registry; got {message}"
-        );
-        assert!(
-            !message.contains(ARCHIVE),
-            "the local archive must not have been read; got {message}"
+            error.to_string().contains("workload archive"),
+            "explicit authority is the only one that reads the archive; got {error}"
         );
     }
 
@@ -804,17 +725,9 @@ mod tests {
             trusted_workload_pcr23_sha384: Some(format!("0x{}", hex::encode([0x66; 48]))),
             ..Default::default()
         };
-        let policy = resolve_trusted_workload_policy(
-            &state,
-            &verification,
-            "explicit",
-            None,
-            "unused-in-explicit-mode",
-            [0x66; 32],
-            None,
-        )
-        .await
-        .unwrap();
+        let policy = resolve_operator_workload_policy(&state, &verification, [0x66; 32])
+            .await
+            .unwrap();
         assert_eq!(policy.pcr_specs256, [static_pcr23_policy([0x55; 32])]);
         assert_eq!(policy.pcr_specs384, [static_pcr23_policy384([0x66; 48])]);
     }

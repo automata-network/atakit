@@ -39,9 +39,21 @@ pub enum SessionAuthority {
     /// Chain mode: resolve the committed token's own `kid` and `iss` against
     /// the registry, at session verification time.
     Chain(AttestationClient),
-    /// Explicit and trust-pack modes: select from the keys that authority
-    /// supplied. There is no registry to ask.
-    Offline {
+    /// Explicit mode: the operator supplied both the keys and the workload
+    /// policy. There is no registry to ask.
+    Explicit {
+        azure_maa_keys: Vec<AzureMaaTrustCertificate>,
+    },
+    /// Trust-pack mode: the pack publishers supplied the keys, and the
+    /// `workload-trust` pack resolves the workload policy.
+    ///
+    /// Kept distinct from `Explicit` rather than folded into one offline
+    /// variant. Merging them made an operator policy and a packed policy
+    /// interchangeable, so trust-pack TLS could take an operator's policy and
+    /// explicit TLS could take one lifted out of an unrelated pack — the same
+    /// crossing as chain-to-offline, one level down.
+    Packs {
+        source: crate::trust::source::PackTrustSource,
         azure_maa_keys: Vec<AzureMaaTrustCertificate>,
     },
 }
@@ -51,16 +63,42 @@ impl SessionAuthority {
     pub fn chain(&self) -> Option<&AttestationClient> {
         match self {
             Self::Chain(client) => Some(client),
-            Self::Offline { .. } => None,
+            Self::Explicit { .. } | Self::Packs { .. } => None,
+        }
+    }
+
+    fn azure_maa_keys(&self) -> &[AzureMaaTrustCertificate] {
+        match self {
+            Self::Chain(_) => &[],
+            Self::Explicit { azure_maa_keys } | Self::Packs { azure_maa_keys, .. } => {
+                azure_maa_keys
+            }
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             Self::Chain(_) => "chain",
-            Self::Offline { .. } => "offline",
+            Self::Explicit { .. } => "explicit",
+            Self::Packs { .. } => "trust-pack",
         }
     }
+}
+
+/// What identifies the workload, for the authority to resolve a policy from.
+///
+/// Not a `TrustedWorkloadSessionPolicy`. A bare policy is source-agnostic: it
+/// carries no evidence of which authority produced it, so accepting one let a
+/// caller hand chain-verified TLS an operator policy, or hand explicit TLS a
+/// policy lifted from a pack. Only the operator, who *is* the authority in
+/// explicit mode, may supply a policy directly.
+#[derive(Debug, Clone)]
+pub enum SessionWorkloadSelector {
+    /// Chain and trust-pack authorities resolve the policy themselves.
+    Reference(atakit_cvm_types::AppRef),
+    /// Explicit authority: the operator is the source, so the policy is the
+    /// input.
+    OperatorPolicy(TrustedWorkloadSessionPolicy),
 }
 
 #[derive(Debug, Clone)]
@@ -102,56 +140,99 @@ struct EvidenceBundleResponse {
     request_binding: SessionRequestBinding,
 }
 
-/// Fetch and verify the current portal session using only caller-selected
-/// policy and trust material. Registry state is not read and no transaction is
-/// created or submitted.
+/// Whether this workload selector is one the authority can act on.
+///
+/// Named and separate so its tests drive what the entry point runs. Every
+/// mismatch here is a crossing: an operator policy under chain or trust-pack
+/// authority, or a reference under explicit authority where nothing exists to
+/// resolve it from.
+pub(crate) fn authority_accepts(
+    authority: &SessionAuthority,
+    workload: &SessionWorkloadSelector,
+) -> Result<(), AttestationClientError> {
+    match (authority, workload) {
+        (SessionAuthority::Chain(_), SessionWorkloadSelector::Reference(_))
+        | (SessionAuthority::Packs { .. }, SessionWorkloadSelector::Reference(_))
+        | (SessionAuthority::Explicit { .. }, SessionWorkloadSelector::OperatorPolicy(_)) => Ok(()),
+        (authority, SessionWorkloadSelector::OperatorPolicy(_)) => {
+            Err(AttestationClientError::Verification(format!(
+                "portal TLS was verified under {} authority, which resolves the workload policy \
+                 itself; an operator-supplied policy belongs to explicit verification only",
+                authority.name()
+            )))
+        }
+        (authority, SessionWorkloadSelector::Reference(_)) => {
+            Err(AttestationClientError::Verification(format!(
+                "portal TLS was verified under {} authority, which has no registry or pack to \
+                 resolve a workload reference from; supply the policy instead",
+                authority.name()
+            )))
+        }
+    }
+}
+
+/// Fetch and verify the current portal session under the authority portal TLS
+/// ran under.
+///
+/// The single entry point. There is no variant taking a bare
+/// `TrustedWorkloadSessionPolicy` beside an optional chain client: a bare
+/// policy carries no evidence of which authority produced it, which is how
+/// chain-verified TLS could take an operator policy, and how explicit TLS could
+/// take a policy lifted from an unrelated trust pack. The authority recorded on
+/// the verified TLS context decides, and resolves its own policy.
 pub async fn verify_current_session(
     verified_tls: &VerifiedPortalTls,
     host: &str,
     status_port: u16,
-    workload: TrustedWorkloadSessionPolicy,
+    workload: &SessionWorkloadSelector,
     required_binding: Option<BindingMode>,
 ) -> Result<VerifiedSession, AttestationClientError> {
-    // Portal TLS verified under a chain must not have an operator policy
-    // attached to it here. The authority is decided once, before the portal is
-    // contacted, and this is the offline entry point.
-    reject_chain_authority(
-        verified_tls
-            .session_verification
-            .as_ref()
-            .map(|c| &c.authority),
-    )?;
-    // No binding parameter: an explicit verification has no chain context and
-    // must not be handed one. Chain mode reaches the binding through
-    // `ChainTrustSource`, which is the only place it exists.
+    let context = verified_tls.session_verification.as_ref().ok_or_else(|| {
+        AttestationClientError::Verification(
+            "verified portal TLS context has no session verification inputs".to_string(),
+        )
+    })?;
+    let base_image_id = || {
+        verified_tls.identity.base_image_id.ok_or_else(|| {
+            AttestationClientError::Verification(
+                "verified portal TLS identity has no base-image ID".to_string(),
+            )
+        })
+    };
+
+    authority_accepts(&context.authority, workload)?;
+    let (policy, binding) = match (&context.authority, workload) {
+        (SessionAuthority::Chain(client), SessionWorkloadSelector::Reference(reference)) => (
+            client
+                .resolve_workload_policy(&reference.to_string(), base_image_id()?)
+                .await?,
+            Some(client.trusted_session_binding()),
+        ),
+        (SessionAuthority::Packs { source, .. }, SessionWorkloadSelector::Reference(reference)) => {
+            let pack = source
+                .workload_pack()
+                .map_err(|error| AttestationClientError::Verification(error.to_string()))?;
+            (
+                crate::pack::workload::packed_workload_policy(pack, reference, base_image_id()?)
+                    .map_err(|error| AttestationClientError::WorkloadPolicy(error.to_string()))?,
+                None,
+            )
+        }
+        (SessionAuthority::Explicit { .. }, SessionWorkloadSelector::OperatorPolicy(policy)) => {
+            (policy.clone(), None)
+        }
+        _ => unreachable!("the pairing is checked above"),
+    };
+
     verify_current_session_bound(
         verified_tls,
         host,
         status_port,
-        workload,
+        policy,
         required_binding,
-        None,
+        binding,
     )
     .await
-}
-
-/// Refuse an operator-supplied policy on portal TLS that a chain verified.
-///
-/// Separated so its test drives it directly. Without it this function was the
-/// mirror of the chain methods' bypass: they could take offline-verified TLS,
-/// and this could take chain-verified TLS.
-pub(crate) fn reject_chain_authority(
-    authority: Option<&SessionAuthority>,
-) -> Result<(), AttestationClientError> {
-    if authority.and_then(SessionAuthority::chain).is_some() {
-        return Err(AttestationClientError::Verification(
-            "portal TLS was verified under a chain, so the registry must also supply the \
-             workload policy and the session binding; use the chain client's \
-             verify_current_session instead of supplying a policy here"
-                .to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Chain-mode verification, which binds the session to the client's own chain
@@ -239,8 +320,8 @@ async fn committed_session_maa_keys(
             .await
             .map(|key| vec![key])
             .map_err(committed_session_maa_error),
-        SessionAuthority::Offline { azure_maa_keys } => {
-            { select_azure_maa_manual_trust_key(&binding, azure_maa_keys) }
+        SessionAuthority::Explicit { .. } | SessionAuthority::Packs { .. } => {
+            select_azure_maa_manual_trust_key(&binding, context.authority.azure_maa_keys())
                 .map(|key| vec![key])
                 .map_err(|detail| {
                     session_error(format!("committed_session_maa_signature_invalid: {detail}"))
