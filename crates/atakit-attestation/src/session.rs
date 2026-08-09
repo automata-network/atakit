@@ -2229,15 +2229,25 @@ fn verify_policies(
         checks,
         errors,
     );
+    let bundle_projection_is_empty = [
+        &bundle.policy.invariant_pcr_policy,
+        &bundle.policy.variant_pcr_policy,
+        &bundle.policy.workload_pcr_policy,
+        &bundle.policy.provider_pcr_policy,
+    ]
+    .into_iter()
+    .all(|block| block.pcr_specs256.is_empty() && block.pcr_specs384.is_empty());
+    let bundle_projection_matches = bundle_projection_is_empty
+        || (bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
+            && bundle.policy.invariant_pcr_policy == trusted.invariant_pcr_policy
+            && bundle.policy.variant_pcr_policy == trusted.variant_pcr_policy
+            && bundle.policy.workload_pcr_policy == trusted.workload_pcr_policy
+            && bundle.policy.provider_pcr_policy == trusted.provider_pcr_policy);
     record(
         checks,
         errors,
         "trusted-pcr-policy-projection",
-        bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
-            && bundle.policy.invariant_pcr_policy == trusted.invariant_pcr_policy
-            && bundle.policy.variant_pcr_policy == trusted.variant_pcr_policy
-            && bundle.policy.workload_pcr_policy == trusted.workload_pcr_policy
-            && bundle.policy.provider_pcr_policy == trusted.provider_pcr_policy,
+        bundle_projection_matches,
         "bundle PCR policy blocks differ from the caller-supplied trusted policy blocks",
     );
     let pcr_specs256 = trusted.complete_pcr_specs256();
@@ -3552,6 +3562,27 @@ mod tests {
         let mut checks = Vec::new();
         let mut errors = Vec::new();
         verify_policies(&bundle, &trusted, None, &mut checks, &mut errors);
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && check.valid }));
+
+        let empty_projection = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            // An empty projection supplies no policy. Its bank selection is
+            // only the shape of the Quote the portal collected, so it is not
+            // a second trusted policy input.
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(&empty_projection, &trusted, None, &mut checks, &mut errors);
         assert!(checks
             .iter()
             .any(|check| { check.name == "trusted-pcr-policy-projection" && check.valid }));
