@@ -6,8 +6,8 @@ use atakit_attestation::{
     VerifiedSession,
 };
 use atakit_attestation_client::{
-    verify_current_session, AttestationClient, AttestationClientConfig, SessionWorkloadSelector,
-    TrustedWorkloadSessionPolicy,
+    verify_current_session, AttestationClient, AttestationClientConfig, SessionAuthorityKind,
+    SessionWorkloadSelector, TrustedWorkloadSessionPolicy,
 };
 use atakit_cloud::cli::SessionVerificationArgs;
 use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
@@ -46,13 +46,6 @@ pub(crate) struct VerifiedPortalAccess {
     pub chain_name: Option<String>,
     pub verified_tls: VerifiedPortalTls,
     registration: Option<String>,
-    /// Which authority portal TLS actually verified under.
-    ///
-    /// Carried forward rather than re-derived, because the session half used to
-    /// reconstruct it from `chain_name` and could reach a different answer than
-    /// the TLS half did — which is how chain-resolved workload policy ended up
-    /// with operator PCR23 values appended to it.
-    tls_authority: &'static str,
 }
 
 pub(crate) struct VerifiedCloudSessionAccess {
@@ -214,7 +207,6 @@ pub(crate) async fn resolve_verified_portal_access(
         chain_name,
         verified_tls,
         registration: target.registration.clone(),
-        tls_authority: tls_mode.name(),
     })
 }
 
@@ -226,18 +218,18 @@ pub(crate) async fn resolve_verified_portal_access(
 /// `chain_name` and could reach a different answer than the TLS half, which is
 /// how a chain-resolved policy ended up with operator PCR23 values appended.
 fn workload_policy_authority_conflict(
-    tls_authority: &str,
+    authority: SessionAuthorityKind,
     verification: &SessionVerificationArgs,
 ) -> Option<String> {
     let manual = verification.trusted_workload_pcr23_sha256.is_some()
         || verification.trusted_workload_pcr23_sha384.is_some();
-    if tls_authority == "chain" && manual {
-        return Some(
-            "portal TLS verified under the chain, so the registry also supplies the workload \
-             policy; --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 cannot \
-             be added to it"
-                .to_string(),
-        );
+    if authority != SessionAuthorityKind::Explicit && manual {
+        return Some(format!(
+            "portal TLS verified under {} authority, which also supplies the workload policy; \
+             --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 cannot be added \
+             to it",
+            authority.name()
+        ));
     }
     None
 }
@@ -251,25 +243,44 @@ pub(crate) async fn resolve_verified_session_access(
     // policy from one authority paired with a session binding from another is
     // the mixed trust `docs/specs/atatp-archive-spec.md` forbids, even when
     // every individual value is well formed.
-    if let Some(message) = workload_policy_authority_conflict(portal.tls_authority, verification) {
+    // Read back from the verified TLS itself rather than kept alongside it. A
+    // second copy of the authority is a second thing that can disagree, and a
+    // string one silently mapped trust-pack onto the operator branch.
+    let authority = portal.verified_tls.authority_kind().ok_or_else(|| {
+        anyhow::anyhow!("verified portal TLS carries no session verification inputs")
+    })?;
+    if let Some(message) = workload_policy_authority_conflict(authority, verification) {
         bail!(message);
     }
-    if portal.tls_authority != "chain" {
+    if authority != SessionAuthorityKind::Chain {
         // Explicit mode has no chain to resolve a registered policy or a
         // session binding from, so it must not connect to one.
-        return build_session_access(portal, verification).await;
+        return build_session_access(portal, verification, authority).await;
     }
     // No second chain client is connected here. The authority recorded during
     // portal TLS already holds the one that verified the connection, and
     // connecting another was itself the crossing risk: two clients meant two
     // chains could disagree.
-    build_session_access(portal, verification).await
+    build_session_access(portal, verification, authority).await
+}
+
+/// Whether this authority resolves its own workload policy from a reference.
+///
+/// Both chain and trust-pack do. Trust-pack used to fall through to the
+/// operator branch, which `authority_accepts` then refused — so the mode failed
+/// closed, but could never work through this command at all.
+fn selects_workload_reference(authority: SessionAuthorityKind) -> bool {
+    match authority {
+        SessionAuthorityKind::Chain | SessionAuthorityKind::Packs => true,
+        SessionAuthorityKind::Explicit => false,
+    }
 }
 
 /// Assemble the verified session access from the authority portal TLS used.
 async fn build_session_access(
     portal: VerifiedPortalAccess,
     verification: &SessionVerificationArgs,
+    authority: SessionAuthorityKind,
 ) -> Result<VerifiedCloudSessionAccess> {
     // The deployment records its workload's publisher, so the identifier is
     // recomputable from state rather than being stored opaquely.
@@ -286,15 +297,16 @@ async fn build_session_access(
     let workload_id = crate::commands::workload::compute_workload_id(&workload_ref);
     // The authority resolves its own policy inside the client crate. This picks
     // only what identifies the workload.
-    let workload = match portal.tls_authority {
-        "chain" => SessionWorkloadSelector::Reference(atakit_cvm_types::AppRef::new(
+    let workload = if selects_workload_reference(authority) {
+        SessionWorkloadSelector::Reference(atakit_cvm_types::AppRef::new(
             workload_publisher.into(),
             portal.state.workload_name.clone(),
             portal.state.workload_version.clone(),
-        )),
-        _ => SessionWorkloadSelector::OperatorPolicy(
+        ))
+    } else {
+        SessionWorkloadSelector::OperatorPolicy(
             resolve_operator_workload_policy(&portal.state, verification, workload_id.0).await?,
-        ),
+        )
     };
     let required_binding = required_binding_for_registration(portal.registration.as_deref());
 
@@ -660,12 +672,13 @@ mod tests {
             .contains("archive hash mismatch"));
     }
 
-    /// Chain mode refuses operator PCR23 values; explicit mode accepts them.
+    /// Only explicit authority accepts operator PCR23 values.
     ///
-    /// Drives the guard the command runs, so removing or weakening it fails
-    /// here rather than silently reopening chain-plus-operator layering.
+    /// Previously this compared a string, and every value except `"chain"` was
+    /// treated as the operator branch — so trust-pack silently took the
+    /// operator path. A typed authority makes all three cases explicit.
     #[test]
-    fn the_workload_policy_authority_guard_matches_the_tls_authority() {
+    fn only_explicit_authority_accepts_operator_supplied_workload_pcr23() {
         let with_values = SessionVerificationArgs {
             trusted_workload_pcr23_sha256: Some(format!("0x{}", hex::encode([0x55; 32]))),
             trusted_workload_pcr23_sha384: Some(format!("0x{}", hex::encode([0x66; 48]))),
@@ -673,24 +686,44 @@ mod tests {
         };
         let without = SessionVerificationArgs::default();
 
-        let message = workload_policy_authority_conflict("chain", &with_values)
-            .expect("chain mode must refuse operator workload PCR23 values");
-        assert!(
-            message.contains("--trusted-workload-pcr23-sha256"),
-            "the failure must name the flag; got {message}"
-        );
+        for authority in [SessionAuthorityKind::Chain, SessionAuthorityKind::Packs] {
+            let message = workload_policy_authority_conflict(authority, &with_values)
+                .unwrap_or_else(|| panic!("{} must refuse operator values", authority.name()));
+            assert!(
+                message.contains(authority.name())
+                    && message.contains("--trusted-workload-pcr23-sha256"),
+                "the failure must name the authority and the flag; got {message}"
+            );
+            assert!(
+                workload_policy_authority_conflict(authority, &without).is_none(),
+                "{} without operator values is the normal case",
+                authority.name()
+            );
+        }
 
         assert!(
-            workload_policy_authority_conflict("chain", &without).is_none(),
-            "chain mode without operator values is the normal case"
-        );
-        assert!(
-            workload_policy_authority_conflict("explicit", &with_values).is_none(),
+            workload_policy_authority_conflict(SessionAuthorityKind::Explicit, &with_values)
+                .is_none(),
             "explicit mode is where those values belong"
         );
+    }
+
+    /// The selector the command builds, for every authority.
+    ///
+    /// The earlier test only exercised the early guard, so it could not see
+    /// that trust-pack fell into the operator branch below it.
+    #[test]
+    fn both_resolving_authorities_select_a_reference() {
+        for authority in [SessionAuthorityKind::Chain, SessionAuthorityKind::Packs] {
+            assert!(
+                selects_workload_reference(authority),
+                "{} resolves its own policy from a reference",
+                authority.name()
+            );
+        }
         assert!(
-            workload_policy_authority_conflict("trust-pack", &with_values).is_none(),
-            "trust-pack mode resolves its own policy and is refused elsewhere"
+            !selects_workload_reference(SessionAuthorityKind::Explicit),
+            "explicit authority supplies the policy itself"
         );
     }
 

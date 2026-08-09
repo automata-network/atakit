@@ -34,9 +34,14 @@ pub use chain::{
     TrustedWorkloadSessionPolicy,
 };
 pub use error::PortalVerificationError;
+// `PortalSessionVerificationContext` and `SessionAuthority` are deliberately
+// not exported. They record what was verified; a caller able to construct or
+// mutate one could replace the authority after portal TLS established it, which
+// defeats every check that follows. `VerifiedPortalTls::authority_kind` is the
+// read-only view callers need.
 pub use portal::session::{
-    verify_current_session, PortalSessionVerificationContext, SessionAuthority,
-    SessionWorkloadSelector, TlsManualOverride, VerifiedPortalTls,
+    verify_current_session, SessionAuthorityKind, SessionWorkloadSelector, TlsManualOverride,
+    VerifiedPortalTls,
 };
 
 /// Retained for callers that referenced the pre-module path.

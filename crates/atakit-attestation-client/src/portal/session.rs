@@ -77,10 +77,36 @@ impl SessionAuthority {
     }
 
     pub fn name(&self) -> &'static str {
+        self.kind().name()
+    }
+
+    pub fn kind(&self) -> SessionAuthorityKind {
         match self {
-            Self::Chain(_) => "chain",
-            Self::Explicit { .. } => "explicit",
-            Self::Packs { .. } => "trust-pack",
+            Self::Chain(_) => SessionAuthorityKind::Chain,
+            Self::Explicit { .. } => SessionAuthorityKind::Explicit,
+            Self::Packs { .. } => SessionAuthorityKind::Packs,
+        }
+    }
+}
+
+/// Which authority verified a portal connection, without exposing the client,
+/// keys, or packs behind it.
+///
+/// This is what a caller outside the crate is allowed to know. It is enough to
+/// choose the right [`SessionWorkloadSelector`] and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthorityKind {
+    Chain,
+    Explicit,
+    Packs,
+}
+
+impl SessionAuthorityKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chain => "chain",
+            Self::Explicit => "explicit",
+            Self::Packs => "trust-pack",
         }
     }
 }
@@ -102,18 +128,25 @@ pub enum SessionWorkloadSelector {
 }
 
 #[derive(Debug, Clone)]
+/// Inputs carried from portal TLS into session verification.
+///
+/// Every field is crate-private, and the type is not exported. It records what
+/// *was verified*, so a caller able to write to it could replace the authority
+/// after the fact — swapping `Chain` for `Explicit` and then supplying an
+/// operator policy passes every check downstream, which is the crossing this
+/// design exists to prevent. Read-only accessors expose what callers need.
 pub struct PortalSessionVerificationContext {
-    pub platform: PlatformEvidence,
-    pub measurement_policy: MeasurementPolicy,
-    pub trust_anchors: TrustAnchors,
-    /// The authority portal TLS ran under. Session verification must run
-    /// under the same one.
-    pub authority: SessionAuthority,
+    pub(crate) platform: PlatformEvidence,
+    pub(crate) measurement_policy: MeasurementPolicy,
+    pub(crate) trust_anchors: TrustAnchors,
+    /// The authority portal TLS ran under. Session verification runs under the
+    /// same one, and nothing outside this crate can change it.
+    pub(crate) authority: SessionAuthority,
     /// Collateral resolved during this portal TLS bootstrap. Session
     /// verification rechecks its certificate and revocation validity against
     /// the session verification time. No process-wide cache stores this value.
-    pub amd_snp_collateral: Option<AmdSnpVerificationCollateral>,
-    pub intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
+    pub(crate) amd_snp_collateral: Option<AmdSnpVerificationCollateral>,
+    pub(crate) intel_tdx_dcap_collateral: Option<IntelTdxDcapCollateral>,
 }
 
 /// Portal TLS connection and the independently verified identity bound to it.
@@ -122,9 +155,25 @@ pub struct VerifiedPortalTls {
     pub client: reqwest::Client,
     pub identity: VerifiedTlsIdentity,
     pub manual_override: Option<TlsManualOverride>,
-    pub session_verification: Option<PortalSessionVerificationContext>,
+    /// Crate-private: this is the record of what was verified, not an input.
+    /// See [`VerifiedPortalTls::authority_kind`] for the read-only view.
+    pub(crate) session_verification: Option<PortalSessionVerificationContext>,
     /// Where each trust input for this verification came from.
     pub trust_provenance: crate::trust::source::TrustProvenance,
+}
+
+impl VerifiedPortalTls {
+    /// Which authority verified this connection, if session verification
+    /// inputs were collected.
+    ///
+    /// The only view of the authority available outside this crate: enough to
+    /// choose a [`SessionWorkloadSelector`], and not enough to substitute one
+    /// authority for another.
+    pub fn authority_kind(&self) -> Option<SessionAuthorityKind> {
+        self.session_verification
+            .as_ref()
+            .map(|context| context.authority.kind())
+    }
 }
 
 #[derive(Debug, Clone)]
