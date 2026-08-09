@@ -14,7 +14,13 @@ const INTEL_PCK_PLATFORM_CA_CN: &str = "Intel SGX PCK Platform CA";
 const INTEL_PCK_PROCESSOR_CA_CN: &str = "Intel SGX PCK Processor CA";
 const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
 const MAX_COLLATERAL_FILE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_COLLATERAL_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single Intel TDX DCAP collateral component this crate will parse.
+///
+/// Public because `.atatp` pins its single-entry archive limit to this value:
+/// a component a trust pack reader accepted but this parser rejected would be
+/// a wasted parse, so the two must agree. The `.atatp` reader asserts the
+/// equality in a test rather than restating the number.
+pub const MAX_COLLATERAL_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ISSUER_CHAIN_CERTIFICATES: usize = 8;
 
 #[derive(Debug, Error)]

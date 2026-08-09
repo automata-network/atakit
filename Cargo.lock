@@ -1301,13 +1301,16 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "sha3 0.10.8",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "urlencoding",
  "x509-cert",
+ "zstd",
 ]
 
 [[package]]

@@ -870,18 +870,20 @@ pub fn verify_measurement_pack(
             "measurement pack JSON is not canonical".to_string(),
         ));
     }
-    let signature = parse_es256k_signature(sig)?;
+    // A key that does not parse is reported separately from one that parsed and
+    // did not verify: the first is a malformed trusted key, the second is a
+    // signature the operator's key does not cover, and they are fixed
+    // differently.
     let mut key_errors = Vec::new();
     for key_bytes in trusted_publisher_keys {
-        let verifying_key = match K256VerifyingKey::from_sec1_bytes(key_bytes) {
-            Ok(key) => key,
-            Err(e) => {
-                key_errors.push(format!("trusted key did not parse as SEC1 ES256K: {e}"));
-                continue;
+        match verify_es256k_detached(bytes, sig, key_bytes) {
+            Ok(()) => return parse_measurement_pack(bytes),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("did not parse as SEC1 ES256K") {
+                    key_errors.push(text);
+                }
             }
-        };
-        if verifying_key.verify(bytes, &signature).is_ok() {
-            return parse_measurement_pack(bytes);
         }
     }
     let detail = if key_errors.is_empty() {
@@ -893,6 +895,25 @@ pub fn verify_measurement_pack(
         )
     };
     Err(AttestationError::MeasurementPackSignature(detail))
+}
+
+/// Verify a detached ES256K signature over `message` under one uncompressed
+/// SEC1 secp256k1 public key.
+///
+/// Shared by measurement packs and `.atatp` trust packs so the accepted
+/// signature encodings are defined once. Both formats sign the exact canonical
+/// JSON bytes: SHA-256 is ECDSA's own digest step here, not a separate pre-hash
+/// applied before signing.
+pub fn verify_es256k_detached(message: &[u8], sig: &[u8], public_key: &[u8]) -> Result<()> {
+    let signature = parse_es256k_signature(sig)?;
+    let verifying_key = K256VerifyingKey::from_sec1_bytes(public_key).map_err(|e| {
+        AttestationError::MeasurementPackSignature(format!(
+            "trusted key did not parse as SEC1 ES256K: {e}"
+        ))
+    })?;
+    verifying_key.verify(message, &signature).map_err(|e| {
+        AttestationError::MeasurementPackSignature(format!("signature did not verify: {e}"))
+    })
 }
 
 fn parse_es256k_signature(sig: &[u8]) -> Result<K256Signature> {

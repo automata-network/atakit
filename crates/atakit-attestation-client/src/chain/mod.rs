@@ -1016,7 +1016,13 @@ fn trusted_workload_policy(
     })
 }
 
-fn ensure_base_image_allowed(
+/// Apply a `WorkloadSpec`'s base-image access mode to the base image that
+/// verified portal TLS selected.
+///
+/// Shared with the `.atatp` `workload-trust` path so both resolve the mode
+/// through one implementation. A pack whose access rule disagreed with the
+/// chain's would be precisely the weakening the trust-pack format forbids.
+pub(crate) fn ensure_base_image_allowed(
     mode: u8,
     configured: &[B256],
     selected: B256,

@@ -7,18 +7,21 @@
 //! precisely so a configuration naming two sources cannot be constructed —
 //! a shape that cannot express two sources cannot be misconfigured into two.
 //!
-//! `TrustSource::Packs` is deliberately absent. It requires the `.atatp`
-//! reader, which is blocked on the base-image publisher authority defect in
-//! `docs/specs/atatp-archive-spec.md`; adding the variant before it can
-//! complete a verification would ship a mode that always fails. It is additive
-//! when that lands, and the exclusivity this type provides does not depend on
-//! how many variants exist.
+//! `TrustSource::Packs` arrived on 2026-08-09, once `.atatp` could complete a
+//! verification. It was deliberately absent before then: the `workload-trust`
+//! namespace was blocked on the base-image publisher authority defect, and a
+//! variant that always failed would have been a mode in name only. Adding it
+//! changed nothing about the exclusivity above, which never depended on how
+//! many variants exist.
 
 use atakit_attestation::{TrustAnchors, TrustedSessionBinding};
 
 use crate::chain::{AttestationClient, AttestationClientConfig};
 use crate::collateral::intel_tdx::{IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource};
 use crate::error::PortalVerificationError;
+use crate::pack::collateral::{collateral_trust_inputs_from_all, CollateralTrustInputs};
+use crate::pack::read::TrustPack;
+use crate::pack::{TrustPackError, TrustPackKind};
 use crate::trust::files::TlsVerificationTrust;
 use crate::trust::requirements::RequiredTrustInput;
 
@@ -29,6 +32,9 @@ pub enum TrustSource {
     Chain(ChainTrustSource),
     /// The operator supplies every trust input directly and is the authority.
     Explicit(ExplicitTrustSource),
+    /// Signed `.atatp` trust packs supply every trust input, and the packs'
+    /// publishers are the authority.
+    Packs(PackTrustSource),
 }
 
 impl TrustSource {
@@ -37,6 +43,7 @@ impl TrustSource {
         match self {
             Self::Chain(_) => "chain",
             Self::Explicit(_) => "explicit",
+            Self::Packs(_) => "trust-pack",
         }
     }
 
@@ -44,6 +51,115 @@ impl TrustSource {
         match self {
             Self::Chain(source) => &source.tdx_dcap_collateral,
             Self::Explicit(source) => &source.tdx_dcap_collateral,
+            Self::Packs(source) => &source.tdx_dcap_collateral,
+        }
+    }
+}
+
+/// Trust-pack mode: the configured packs' publishers are the authority.
+///
+/// Every pack is verified before this value exists, so holding one means the
+/// signature, validity window, namespace, and hashes already passed. A pack
+/// that exists but cannot be used is fatal rather than a fallback, which is why
+/// construction fails rather than leaving an unusable source in place.
+#[derive(Debug, Clone)]
+pub struct PackTrustSource {
+    collateral: CollateralTrustInputs,
+    workload_packs: Vec<TrustPack>,
+    tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+}
+
+impl PackTrustSource {
+    /// Build from already-verified packs.
+    ///
+    /// Rejects the Automata on-chain Provisioning Certificate Caching Service
+    /// for the reason explicit mode does: reading it is a chain query, and this
+    /// mode issues none. Off-chain HTTP PCCS and the AMD Key Distribution
+    /// Service stay permitted, because vendor-signed collateral is
+    /// self-authenticating and is validated against the anchors these packs
+    /// supply — an availability choice, not a trust one.
+    pub fn new(
+        collateral_packs: Vec<TrustPack>,
+        workload_packs: Vec<TrustPack>,
+        tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+    ) -> Result<Self, PortalVerificationError> {
+        if let IntelTdxDcapCollateralSource::AutomataOnchainPccs { .. } = tdx_dcap_collateral.source
+        {
+            return Err(PortalVerificationError::Config {
+                message: "trust-pack mode cannot read the Automata on-chain Provisioning \
+                          Certificate Caching Service, because reading it is a chain query; \
+                          supply --tdx-dcap-collateral or --tdx-dcap-pccs-url instead"
+                    .to_string(),
+            });
+        }
+        for pack in &workload_packs {
+            if pack.kind != TrustPackKind::WorkloadTrust {
+                return Err(TrustPackError::KindMismatch {
+                    expected: TrustPackKind::WorkloadTrust.as_str(),
+                    found: pack.kind.as_str().to_string(),
+                }
+                .into());
+            }
+        }
+        Ok(Self {
+            collateral: collateral_trust_inputs_from_all(&collateral_packs)?,
+            workload_packs,
+            tdx_dcap_collateral,
+        })
+    }
+
+    pub(crate) fn anchors(&self) -> &TrustAnchors {
+        &self.collateral.trust_anchors
+    }
+
+    pub(crate) fn amd_snp_crls(&self) -> &[Vec<u8>] {
+        &self.collateral.amd_snp_crls
+    }
+
+    /// The one workload-trust pack, or a failure naming why there is not
+    /// exactly one.
+    ///
+    /// Two packs could each answer for the same workload with different policy,
+    /// and choosing between them silently would make the winner invisible —
+    /// the rule duplicate claims follow everywhere else in this format.
+    pub fn workload_pack(&self) -> Result<&TrustPack, PortalVerificationError> {
+        match self.workload_packs.as_slice() {
+            [pack] => Ok(pack),
+            [] => Err(PortalVerificationError::Config {
+                message: "trust-pack mode has no workload-trust pack, so there is no workload \
+                          policy or base-image measurement policy to verify against"
+                    .to_string(),
+            }),
+            packs => Err(PortalVerificationError::Config {
+                message: format!(
+                    "trust-pack mode has {} workload-trust packs; supply exactly one, because \
+                     choosing between them silently would make the winner invisible",
+                    packs.len()
+                ),
+            }),
+        }
+    }
+
+    /// Which packs supplied the collateral inputs.
+    ///
+    /// Uniform within a run by construction, which is the point of an
+    /// exclusive mode. It stays worth reporting because `Vendor` can appear
+    /// beside it when self-authenticating collateral was fetched rather than
+    /// packed.
+    pub(crate) fn provenance(&self) -> TrustInputSource {
+        TrustInputSource::Pack {
+            issuers: self
+                .collateral
+                .issuers
+                .iter()
+                .map(|provenance| provenance.issuer.clone())
+                .collect(),
+            digests: self
+                .collateral
+                .issuers
+                .iter()
+                .map(|provenance| provenance.digest.clone())
+                .collect(),
         }
     }
 }
@@ -197,6 +313,14 @@ pub enum TrustInputSource {
     Chain { registry: String },
     /// Supplied by the operator through this flag, from these paths.
     File { flag: String, paths: Vec<String> },
+    /// Supplied by these `.atatp` publishers, from packs with these digests.
+    ///
+    /// The digest is the value a pin names, so a reader can tell which exact
+    /// artifact was used without re-deriving it from the archive.
+    Pack {
+        issuers: Vec<String>,
+        digests: Vec<String>,
+    },
     /// Fetched from a vendor endpoint and validated against source anchors.
     Vendor { endpoint: String },
 }

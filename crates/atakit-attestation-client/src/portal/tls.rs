@@ -46,6 +46,7 @@ pub async fn bootstrap_portal_tls(
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
     let amd_snp_crls = match trust_source {
         TrustSource::Explicit(source) => source.amd_snp_crls().to_vec(),
+        TrustSource::Packs(source) => source.amd_snp_crls().to_vec(),
         TrustSource::Chain(_) => Vec::new(),
     };
     let tdx_dcap_collateral = trust_source.tdx_dcap_collateral().clone();
@@ -215,9 +216,12 @@ pub async fn bootstrap_portal_tls(
     };
     let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
 
+    // Only chain mode has a chain client to bind a session to. Trust-pack and
+    // explicit modes have none by construction, which is what stops a session
+    // binding being taken from one authority while policy comes from another.
     let session_chain_client = match trust_source {
         TrustSource::Chain(source) => Some(source.client().clone()),
-        TrustSource::Explicit(_) => None,
+        TrustSource::Explicit(_) | TrustSource::Packs(_) => None,
     };
     let session_verification =
         measurement_policy

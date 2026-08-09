@@ -19,7 +19,8 @@ use crate::error::PortalVerificationError;
 use crate::trust::request::CollateralRequest;
 use crate::trust::requirements::{required_trust_inputs_for_request, RequiredTrustInput};
 use crate::trust::source::{
-    ChainTrustSource, ExplicitTrustSource, TrustInputSource, TrustProvenance, TrustSource,
+    ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustInputSource, TrustProvenance,
+    TrustSource,
 };
 
 /// Resolves trust anchors from exactly one source.
@@ -46,6 +47,7 @@ impl TrustAnchorsBuilder {
         match &self.source {
             TrustSource::Chain(source) => resolve_from_chain(source, request).await,
             TrustSource::Explicit(source) => resolve_from_explicit(source, request),
+            TrustSource::Packs(source) => resolve_from_packs(source, request),
         }
     }
 }
@@ -160,6 +162,38 @@ fn resolve_from_explicit(
     Ok((anchors, provenance))
 }
 
+/// Trust-pack mode. The configured packs' publishers are the authority.
+///
+/// Structurally the same as explicit mode, and deliberately so: both resolve
+/// from inputs already in hand, neither reads a chain, and a required input the
+/// source cannot supply fails closed naming the input rather than being filled
+/// from somewhere else. Only the authority differs, and only the message says
+/// so.
+fn resolve_from_packs(
+    source: &PackTrustSource,
+    request: &CollateralRequest,
+) -> Result<(TrustAnchors, TrustProvenance), PortalVerificationError> {
+    let anchors = source.anchors().clone();
+    let mut provenance = TrustProvenance::default();
+
+    for input in required_trust_inputs_for_request(request) {
+        if !input.is_satisfied_by(&anchors, request) {
+            return Err(PortalVerificationError::Config {
+                message: format!(
+                    "trust-pack mode is missing {} for {}/{}; the configured collateral-trust \
+                     packs do not cover this platform, and there is no chain to fill it from",
+                    input.name(),
+                    request.cloud,
+                    request.tee
+                ),
+            });
+        }
+        provenance.record(input.name(), source.provenance());
+    }
+
+    Ok((anchors, provenance))
+}
+
 fn missing(input: RequiredTrustInput) -> PortalVerificationError {
     PortalVerificationError::PortalTlsAttestationFailed {
         message: format!(
@@ -253,6 +287,97 @@ mod tests {
             ExplicitTrustSource::new(trust, IntelTdxDcapCollateralConfig::default())
                 .expect("explicit source"),
         ))
+    }
+
+    /// A trust-pack source carrying the roots and policy an AWS AMD SEV-SNP
+    /// request requires.
+    ///
+    /// Built through the real writer and reader rather than by constructing
+    /// `PackTrustSource` from anchors directly, so what this resolves from is
+    /// an actual signed archive.
+    pub(super) fn packs() -> TrustAnchorsBuilder {
+        use crate::pack::fixture::{
+            amd_snp_policy_document, certificate_pem, collateral_builder, round_trip, Publisher,
+        };
+        use crate::pack::TrustPackKind;
+
+        let publisher = Publisher::new(0x51);
+        let mut builder = collateral_builder("example-publisher");
+        builder
+            .insert(
+                "payload/roots/aws-nitro-root.pem",
+                certificate_pem("aws-nitro"),
+            )
+            .unwrap();
+        builder
+            .insert(
+                "payload/roots/amd-ark-milan.pem",
+                certificate_pem("amd-ark-milan"),
+            )
+            .unwrap();
+        builder
+            .insert(
+                "payload/amd-snp-security-policy/milan.json",
+                amd_snp_policy_document("0x191101"),
+            )
+            .unwrap();
+        let pack = round_trip(&builder, TrustPackKind::CollateralTrust, &publisher)
+            .expect("a readable collateral pack");
+
+        TrustAnchorsBuilder::new(TrustSource::Packs(
+            crate::trust::source::PackTrustSource::new(
+                vec![pack],
+                Vec::new(),
+                IntelTdxDcapCollateralConfig::default(),
+            )
+            .expect("pack source"),
+        ))
+    }
+
+    pub(super) fn aws_snp_request() -> CollateralRequest {
+        let mut request = request("aws", "sev-snp");
+        request.amd_snp_cpuid = Some(0x0019_1101);
+        request
+    }
+
+    /// Trust-pack mode resolves from the packs and reports their publishers as
+    /// the authority — not the operator, and not a registry.
+    #[tokio::test]
+    async fn a_complete_pack_set_resolves_with_pack_provenance() {
+        let request = aws_snp_request();
+        let (_, provenance) = packs().resolve(&request).await.expect("pack resolution");
+
+        assert!(!provenance.inputs.is_empty());
+        for (input, source) in &provenance.inputs {
+            let TrustInputSource::Pack { issuers, digests } = source else {
+                panic!("{input} must report a pack as its authority, got {source:?}");
+            };
+            assert_eq!(issuers, &["example-publisher".to_string()]);
+            assert_eq!(digests.len(), 1, "the pack digest is what a pin names");
+        }
+    }
+
+    /// A platform the configured packs do not cover fails closed naming the
+    /// input, and says there is no chain to fill it from — the distinction an
+    /// operator needs in order to fix it.
+    #[tokio::test]
+    async fn a_platform_the_packs_do_not_cover_fails_closed() {
+        // The pack set carries no Azure MAA signing certificate, so an Azure
+        // response bound by a MAA token has no trust anchor for that token.
+        let request = request("azure", "tdx");
+        let error = packs()
+            .resolve(&request)
+            .await
+            .expect_err("an uncovered platform must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("azure-maa-signing-certificate"),
+            "the failure must name the missing input; got {message}"
+        );
+        assert!(
+            message.contains("no chain to fill it from"),
+            "the failure must say why it cannot be resolved elsewhere; got {message}"
+        );
     }
 
     /// Explicit mode resolves every required input from the supplied anchors,
@@ -375,7 +500,9 @@ mod tests {
 /// which is why the exclusive-mode test list calls for a call counter.
 #[cfg(test)]
 mod no_chain_read_outside_chain_mode {
-    use super::tests::{complete_anchors, explicit, request, SUPPORTED_PLATFORMS};
+    use super::tests::{
+        aws_snp_request, complete_anchors, explicit, packs, request, SUPPORTED_PLATFORMS,
+    };
     use crate::chain::{AttestationClient, AttestationClientConfig};
     use crate::test_support::CountingRpcEndpoint;
 
@@ -456,6 +583,30 @@ mod no_chain_read_outside_chain_mode {
         );
         // The client is still usable, so the count above is not zero because
         // the endpoint died partway through.
+        assert_eq!(client.context().session_registry, SESSION_REGISTRY);
+    }
+
+    /// The same proof for trust-pack mode. Asserting only that the
+    /// verification succeeded would not distinguish a run that consulted a
+    /// chain and happened to agree from one that never consulted it, which is
+    /// why this counts what reached the network.
+    #[tokio::test]
+    async fn trust_pack_mode_performs_no_chain_rpc() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let client = connect(&endpoint).await;
+        let after_connect = endpoint.requests();
+        assert!(after_connect > 0, "the client must be genuinely connected");
+
+        packs()
+            .resolve(&aws_snp_request())
+            .await
+            .expect("pack resolution");
+
+        assert_eq!(
+            endpoint.requests(),
+            after_connect,
+            "a trust-pack verification reached a chain endpoint"
+        );
         assert_eq!(client.context().session_registry, SESSION_REGISTRY);
     }
 }

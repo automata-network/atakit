@@ -22,6 +22,7 @@ pub mod chain;
 pub mod collateral;
 pub mod error;
 mod http;
+pub mod pack;
 pub mod portal;
 #[cfg(test)]
 mod test_support;
@@ -45,6 +46,15 @@ pub use collateral::intel_tdx::{
     tdx_dcap_collateral_config_with_read_strategy, IntelTdxDcapCollateralConfig,
     IntelTdxDcapCollateralSource, TdxDcapAutomataReadStrategy,
 };
+pub use pack::collateral::{
+    collateral_trust_inputs, collateral_trust_inputs_from_all, CollateralTrustInputs,
+};
+pub use pack::read::{read_trust_pack, read_trust_pack_file, TrustPack, TrustPackReadOptions};
+pub use pack::workload::{
+    packed_measurement_policy, packed_workload_policy, workload_trust_inputs, WorkloadTrustInputs,
+};
+pub use pack::write::TrustPackBuilder;
+pub use pack::{ArchiveLimits, TrustPackError, TrustPackIndex, TrustPackKind};
 pub use portal::status::read_untrusted_portal_base_image_id;
 pub use portal::tls::{bootstrap_portal_tls, tls_manual_override_message};
 pub use trust::builder::TrustAnchorsBuilder;
@@ -62,7 +72,8 @@ pub use trust::requirements::{
     RequiredTrustInput,
 };
 pub use trust::source::{
-    ChainTrustSource, ExplicitTrustSource, TrustInputSource, TrustProvenance, TrustSource,
+    ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustInputSource, TrustProvenance,
+    TrustSource,
 };
 pub use workflow::{
     verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,

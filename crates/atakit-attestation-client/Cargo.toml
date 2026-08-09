@@ -22,12 +22,15 @@ pem.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 sha3.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 urlencoding.workspace = true
 x509-cert.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 dcap-rs.workspace = true

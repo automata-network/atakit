@@ -3,9 +3,11 @@
 use std::path::PathBuf;
 
 use atakit_attestation::{BindingMode, MeasurementPolicy, VerifiedSession};
+use atakit_cvm_types::AppRef;
 
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
+use crate::pack::workload::packed_workload_policy;
 use crate::portal::session::{verify_current_session, VerifiedPortalTls};
 use crate::portal::tls::bootstrap_portal_tls;
 use crate::trust::source::TrustSource;
@@ -26,6 +28,14 @@ pub enum SessionWorkloadPolicySource {
     Explicit {
         policy: TrustedWorkloadSessionPolicy,
     },
+    /// Resolve the workload policy from the configured `workload-trust` pack,
+    /// after verified portal TLS selects the base-image ID.
+    ///
+    /// Carries the reference rather than a resolved policy because the pack
+    /// must be shown to answer for the workload the caller asked about. Handing
+    /// in a policy would have made that the caller's job, and a caller that
+    /// skipped it would get a pack answering for a workload nobody requested.
+    Pack { workload: AppRef },
 }
 
 /// Complete inputs for portal TLS and current-session verification.
@@ -68,7 +78,8 @@ pub async fn verify_portal_session(
     // the mismatch is refused before the portal is contacted.
     match (&trust_source, &workload_policy) {
         (TrustSource::Chain(_), SessionWorkloadPolicySource::Registry { .. })
-        | (TrustSource::Explicit(_), SessionWorkloadPolicySource::Explicit { .. }) => {}
+        | (TrustSource::Explicit(_), SessionWorkloadPolicySource::Explicit { .. })
+        | (TrustSource::Packs(_), SessionWorkloadPolicySource::Pack { .. }) => {}
         (TrustSource::Chain(_), SessionWorkloadPolicySource::Explicit { .. }) => {
             return Err(PortalVerificationError::Config {
                 message: "chain trust mode resolves the registered workload policy from the \
@@ -82,6 +93,22 @@ pub async fn verify_portal_session(
                 message: "explicit trust mode has no chain to resolve a registered workload \
                           policy from; supply --trusted-workload-pcr23-sha256 and \
                           --trusted-workload-pcr23-sha384"
+                    .to_string(),
+            })
+        }
+        (TrustSource::Packs(_), _) => {
+            return Err(PortalVerificationError::Config {
+                message: "trust-pack mode resolves the workload policy from the configured \
+                          workload-trust pack; name the workload instead of supplying a policy \
+                          or a registry lookup"
+                    .to_string(),
+            })
+        }
+        (_, SessionWorkloadPolicySource::Pack { .. }) => {
+            return Err(PortalVerificationError::Config {
+                message: "a workload-trust pack supplies the workload policy only in trust-pack \
+                          mode; taking policy from a pack while resolving anchors elsewhere is \
+                          the mixed trust the exclusive-source rule forbids"
                     .to_string(),
             })
         }
@@ -114,6 +141,18 @@ pub async fn verify_portal_session(
                 required_binding,
             )
             .await
+        }
+        (TrustSource::Packs(source), SessionWorkloadPolicySource::Pack { workload }) => {
+            // Resolved after portal TLS, because the pack's workload spec is
+            // checked against the base image TLS actually selected rather than
+            // one the caller declared.
+            let base_image_id = portal_tls.identity.base_image_id.ok_or_else(|| {
+                PortalVerificationError::PortalTlsAttestationFailed {
+                    message: "verified portal TLS identity has no base-image ID".to_string(),
+                }
+            })?;
+            let policy = packed_workload_policy(source.workload_pack()?, workload, base_image_id)?;
+            verify_current_session(&portal_tls, &host, status_port, policy, required_binding).await
         }
         _ => unreachable!("the mode pairing is checked above"),
     }
