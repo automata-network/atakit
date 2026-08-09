@@ -1463,6 +1463,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "atakit-verifierd"
+version = "0.5.5"
+dependencies = [
+ "atakit-attestation-client",
+ "hex",
+ "k256",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
 name = "atakit-workload"
 version = "0.5.5"
 dependencies = [

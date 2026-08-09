@@ -1,0 +1,17 @@
+[package]
+name = "atakit-verifierd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+atakit-attestation-client.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+k256.workspace = true
+tempfile.workspace = true
