@@ -273,21 +273,22 @@ pub(crate) async fn resolve_verified_session_access(
         // session binding from, so it must not connect to one.
         return build_session_access(portal, verification, None).await;
     }
+    // Chain authority always resolves through the registry, and
+    // `WorkloadRegistry` is derived from `SessionRegistry` rather than needing
+    // its own configured address. Selecting a local workload archive here was
+    // the last chain-to-operator fallback: with `registration = "off"` and no
+    // explicit `workload_registry`, portal TLS verified under the chain while
+    // the workload policy came from a file, which is the mixed trust the
+    // exclusive rule forbids. If the registry cannot supply the policy, that
+    // fails closed rather than degrading to the archive.
     let chain_client = match portal.chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain)
-                if should_resolve_registered_workload_policy(
-                    portal.registration.as_deref(),
-                    chain,
-                ) =>
-            {
-                Some(connect_attestation_client(name, chain).await?)
-            }
-            Some(_) => None,
+            Some(chain) => Some(connect_attestation_client(name, chain).await?),
             None => bail!("chain '{name}' not found in [chains]"),
         },
-        None if registration_is_off(portal.registration.as_deref()) => None,
-        None => bail!("no chain config is available for verifier trust lookup"),
+        None => bail!(
+            "portal TLS verified under the chain, so the registry must also supply the workload policy, but no chain is configured for this deployment"
+        ),
     };
     build_session_access(portal, verification, chain_client).await
 }
@@ -317,6 +318,7 @@ async fn build_session_access(
     let workload_policy = resolve_trusted_workload_policy(
         &portal.state,
         verification,
+        portal.tls_authority,
         chain_client.as_ref(),
         // The canonical publisher-qualified reference. A two-part
         // `name:version` is refused by the registry client, so building it from
@@ -376,23 +378,10 @@ fn tls_needs_registry_derivation(
     !has_explicit_measurements && !has_configured_base_image_registry
 }
 
-fn should_resolve_registered_workload_policy(
-    registration: Option<&str>,
-    chain: &ChainConfig,
-) -> bool {
-    if !registration_is_off(registration) {
-        return true;
-    }
-    !chain.rpc_url.trim().is_empty()
-        && chain
-            .workload_registry
-            .as_deref()
-            .is_some_and(|address| address != super::ZERO_ADDR)
-}
-
 async fn resolve_trusted_workload_policy(
     state: &DeployState,
     verification: &SessionVerificationArgs,
+    tls_authority: &str,
     chain_client: Option<&AttestationClient>,
     workload_reference: &str,
     workload_id: [u8; 32],
@@ -408,6 +397,16 @@ async fn resolve_trusted_workload_policy(
             "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
         ),
     };
+
+    // Chain authority never reads the local workload archive, even when the
+    // registry turns out to be unusable. A second guard rather than trusting
+    // the caller: the caller's client selection is exactly where the last
+    // fallback hid.
+    if tls_authority == "chain" && chain_client.is_none() {
+        bail!(
+            "portal TLS verified under the chain, so the registry must also supply the workload policy; it could not be reached, and the local workload archive is not a substitute for it"
+        );
+    }
 
     // Chain mode: the registry is the whole policy. Operator values are refused
     // by the caller, so reaching here with both is a bug rather than a
@@ -682,33 +681,6 @@ mod tests {
         assert!(tls_needs_registry_derivation(false, false));
     }
 
-    #[test]
-    fn registration_off_without_configured_workload_registry_uses_local_policy() {
-        let mut chain = super::super::test_chain_config();
-        assert!(!should_resolve_registered_workload_policy(
-            Some("off"),
-            &chain
-        ));
-
-        chain.workload_registry = Some(super::super::ZERO_ADDR.to_string());
-        assert!(!should_resolve_registered_workload_policy(
-            Some("off"),
-            &chain
-        ));
-
-        chain.workload_registry = Some("0x2222222222222222222222222222222222222222".into());
-        assert!(should_resolve_registered_workload_policy(
-            Some("off"),
-            &chain
-        ));
-
-        chain.workload_registry = None;
-        assert!(should_resolve_registered_workload_policy(
-            Some("required"),
-            &chain
-        ));
-    }
-
     #[tokio::test]
     async fn registration_off_loads_and_checks_saved_workload_archive() {
         let dir = TempDir::new().unwrap();
@@ -788,6 +760,42 @@ mod tests {
         );
     }
 
+    /// Chain authority must not fall back to the local workload archive, which
+    /// is what `registration = "off"` without a configured `workload_registry`
+    /// used to do.
+    ///
+    /// The deployment points at an archive path, and the failure must be about
+    /// the registry rather than about that path — if the local loader had been
+    /// reached, the path would appear in the message.
+    #[tokio::test]
+    async fn chain_authority_never_falls_back_to_the_local_workload_archive() {
+        const ARCHIVE: &str = "/missing/local-workload.atawl";
+        let state = deployed_state(ARCHIVE.into(), String::new());
+        let verification = SessionVerificationArgs::default();
+
+        let error = resolve_trusted_workload_policy(
+            &state,
+            &verification,
+            "chain",
+            None,
+            "0x00/w:v1",
+            [0x66; 32],
+            Some([0x77; 32]),
+        )
+        .await
+        .expect_err("chain authority with no registry client must fail closed");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("registry"),
+            "the failure must name the registry; got {message}"
+        );
+        assert!(
+            !message.contains(ARCHIVE),
+            "the local archive must not have been read; got {message}"
+        );
+    }
+
     #[tokio::test]
     async fn manually_trusted_workload_pcr23_banks_are_available_without_a_local_archive() {
         let state = deployed_state("/missing/workload.atawl".into(), String::new());
@@ -799,6 +807,7 @@ mod tests {
         let policy = resolve_trusted_workload_policy(
             &state,
             &verification,
+            "explicit",
             None,
             "unused-in-explicit-mode",
             [0x66; 32],
