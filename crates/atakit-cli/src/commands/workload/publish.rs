@@ -147,7 +147,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     }
 
     // Build WorkloadSpec using the contract's generated types
-    use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
+    use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
     use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
         AttributeRequirement, PcrPolicyBlock, PcrSpec256, PcrSpec384, WorkloadSpec,
     };
@@ -180,11 +180,11 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         workloadPcrPolicy: PcrPolicyBlock {
             pcrSpecs256: vec![PcrSpec256 {
                 pcrIndex: 23,
-                comparison: encode_static256(pcr23_bytes.into()),
+                comparison: encode_static256(pcr23_bytes).into(),
             }],
             pcrSpecs384: vec![PcrSpec384 {
                 pcrIndex: 23,
-                comparison: encode_static384(pcr23_sha384),
+                comparison: encode_static384(pcr23_sha384).into(),
             }],
         },
     };

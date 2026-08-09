@@ -12,8 +12,7 @@
 
 use std::time::SystemTime;
 
-use alloy::primitives::B256;
-use automata_tee_workload_measurement::pcr_comparison::{
+use atakit_cvm_encoding::pcr_comparison::{
     decode256, decode384, encode_extend_from_zero256, encode_extend_from_zero384, PcrComparison256,
     PcrComparison384,
 };
@@ -29,7 +28,6 @@ use signature::{hazmat::PrehashVerifier, Verifier};
 use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral, PcrBankSelection};
 
 const SESSION_DOMAIN: &str = "CVM_SESSION_V1";
-const KEY_DOMAIN: &str = "KEY_RESOLVER_V1";
 const SESSION_NONCE_DOMAIN: &str = "CVM_SESSION_REG_NONCE_V1";
 const DELEGATION_DOMAIN: &str = "CVM_SESSION_KEY_DELEGATION";
 const EVIDENCE_BINDING_DOMAIN: &str = "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_EVIDENCE_BUNDLE_V1";
@@ -2112,7 +2110,7 @@ fn resolve_provider_pcr_rules(
                         pcr_index: 15,
                         comparison: format!(
                             "0x{}",
-                            hex::encode(encode_extend_from_zero256(B256::from(extend_value)))
+                            hex::encode(encode_extend_from_zero256(extend_value))
                         ),
                     });
             }
@@ -2127,10 +2125,10 @@ fn resolve_provider_pcr_rules(
                         report.len()
                     ));
                 }
-                let report_id = B256::from_slice(
-                    &report[super::SNP_REPORT_REPORT_ID_OFFSET
-                        ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN],
-                );
+                let report_id = report[super::SNP_REPORT_REPORT_ID_OFFSET
+                    ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN]
+                    .try_into()
+                    .expect("fixed report ID length");
                 resolved
                     .provider_pcr_policy
                     .pcr_specs256
@@ -2178,9 +2176,9 @@ fn resolve_provider_pcr_rules(
                             pcr_index: 15,
                             comparison: format!(
                                 "0x{}",
-                                hex::encode(encode_extend_from_zero256(B256::from_slice(
-                                    report_id
-                                )))
+                                hex::encode(encode_extend_from_zero256(
+                                    report_id.try_into().expect("fixed report ID length")
+                                ))
                             ),
                         });
                 }
@@ -2849,14 +2847,7 @@ pub fn compute_session_id(tpm_signature_hash: [u8; 32], tee_hash: [u8; 32]) -> [
 }
 
 pub fn compute_key_fingerprint(type_id: u8, key: &[u8]) -> [u8; 32] {
-    let padded = key.len().div_ceil(32) * 32;
-    let mut encoded = vec![0u8; 128 + padded];
-    encoded[..32].copy_from_slice(&keccak(KEY_DOMAIN.as_bytes()));
-    encoded[63] = type_id;
-    encoded[95] = 96;
-    encoded[112..128].copy_from_slice(&(key.len() as u128).to_be_bytes());
-    encoded[128..128 + key.len()].copy_from_slice(key);
-    keccak(&encoded)
+    atakit_cvm_encoding::key_fingerprint(type_id, key)
 }
 
 pub fn compute_session_qualifying_data(
@@ -2992,7 +2983,7 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use automata_tee_workload_measurement::pcr_comparison::{
+    use atakit_cvm_encoding::pcr_comparison::{
         encode_dynamic256, encode_static256, encode_static384, DYNAMIC_SUBSEQUENCE, DYNAMIC_SUBSET,
     };
     use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -3320,7 +3311,7 @@ mod tests {
 
         let static_policy = SessionPcrPolicy {
             pcr_index: 0,
-            comparison: comparison(&encode_static256(final_value.into())),
+            comparison: comparison(&encode_static256(final_value)),
         };
         evaluate_session_pcr_policy(&static_policy, final_value, &events).unwrap();
         for malformed in ["0x".to_string(), format!("{}00", static_policy.comparison)] {
@@ -3334,8 +3325,7 @@ mod tests {
         let subset = SessionPcrPolicy {
             pcr_index: 10,
             comparison: comparison(
-                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[2].into(), events[0].into()])
-                    .unwrap(),
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[2], events[0]]).unwrap(),
             ),
         };
         evaluate_session_pcr_policy(&subset, final_value, &events).unwrap();
@@ -3349,8 +3339,7 @@ mod tests {
         );
         let missing_subset = SessionPcrPolicy {
             comparison: comparison(
-                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[0].into(), [4u8; 32].into()])
-                    .unwrap(),
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[0], [4u8; 32]]).unwrap(),
             ),
             ..subset
         };
@@ -3362,11 +3351,7 @@ mod tests {
         let subsequence = SessionPcrPolicy {
             pcr_index: 10,
             comparison: comparison(
-                &encode_dynamic256(
-                    DYNAMIC_SUBSEQUENCE,
-                    vec![events[0].into(), events[2].into()],
-                )
-                .unwrap(),
+                &encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![events[0], events[2]]).unwrap(),
             ),
         };
         evaluate_session_pcr_policy(&subsequence, final_value, &events).unwrap();
@@ -3380,11 +3365,7 @@ mod tests {
         );
         let reversed = SessionPcrPolicy {
             comparison: comparison(
-                &encode_dynamic256(
-                    DYNAMIC_SUBSEQUENCE,
-                    vec![events[2].into(), events[0].into()],
-                )
-                .unwrap(),
+                &encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![events[2], events[0]]).unwrap(),
             ),
             ..subsequence
         };
@@ -3422,7 +3403,7 @@ mod tests {
     fn trusted_policy_must_match_bundle_projection_and_drives_evaluation() {
         let pcr = SessionPcrPolicy {
             pcr_index: 7,
-            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32].into()))),
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32]))),
         };
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
@@ -3528,10 +3509,7 @@ mod tests {
     fn trusted_policy_projection_preserves_named_azure_blocks() {
         let rule = |pcr_index| SessionPcrPolicy {
             pcr_index,
-            comparison: format!(
-                "0x{}",
-                hex::encode(encode_static256([pcr_index; 32].into()))
-            ),
+            comparison: format!("0x{}", hex::encode(encode_static256([pcr_index; 32]))),
         };
         let invariant_pcr_policy = SessionPcrPolicyBlock {
             pcr_specs256: [4, 9, 11].into_iter().map(rule).collect(),
@@ -3611,7 +3589,7 @@ mod tests {
     fn sha384_session_does_not_evaluate_committed_sha256_rules() {
         let pcr256 = SessionPcrPolicy {
             pcr_index: 7,
-            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32].into()))),
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32]))),
         };
         let pcr384 = SessionPcrPolicy384 {
             pcr_index: 7,

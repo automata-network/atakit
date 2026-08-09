@@ -770,19 +770,19 @@ fn random_challenge() -> Result<[u8; 32], AttestationClientError> {
 mod tests {
     use super::*;
     use atakit_attestation::{MeasurementPack, PcrBankSelection, PcrSpec256, Subject};
-    use automata_tee_workload_measurement::pcr_comparison::{
+    use atakit_cvm_encoding::pcr_comparison::{
         encode_dynamic256, encode_static256, DYNAMIC_SUBSEQUENCE,
     };
 
     fn dynamic_subsequence_comparison(value: [u8; 32]) -> String {
         format!(
             "0x{}",
-            hex::encode(encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![value.into()]).unwrap())
+            hex::encode(encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![value]).unwrap())
         )
     }
 
     fn static_comparison(value: [u8; 32]) -> String {
-        format!("0x{}", hex::encode(encode_static256(value.into())))
+        format!("0x{}", hex::encode(encode_static256(value)))
     }
 
     fn profile() -> MeasurementProfile {

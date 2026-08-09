@@ -352,7 +352,13 @@ pub(crate) async fn resolve_tls_measurement_policy(
     })?);
     if let Some(expected_base_image) = expected_base_image {
         let expected_ref: AppRef = expected_base_image.parse()?;
-        let expected_id = BaseImageRegistry::get_image_id(&expected_ref);
+        let expected_id = B256::from(atakit_cvm_encoding::base_image_id(
+            &atakit_cvm_types::AppRef::new(
+                expected_ref.publisher.into(),
+                expected_ref.name,
+                expected_ref.version,
+            ),
+        ));
         if expected_id != base_image_id {
             bail!(
                 "GET /status claimed base_image_id {} but --base-image {expected_base_image} resolves to {}",
@@ -1964,7 +1970,6 @@ mod portal_endpoint_tests {
 #[cfg(test)]
 mod tls_measurement_policy_tests {
     use super::*;
-    use alloy_ext::core::primitives::B256;
 
     #[test]
     fn infers_cloud_and_tee_from_supported_profile_names() {
@@ -1997,12 +2002,10 @@ mod tls_measurement_policy_tests {
 
     #[test]
     fn converts_chain_pcr_spec_to_measurement_pack_shape() {
-        let comparison = automata_tee_workload_measurement::pcr_comparison::encode_static256(
-            B256::repeat_byte(0xaa),
-        );
+        let comparison = atakit_cvm_encoding::pcr_comparison::encode_static256([0xaa; 32]);
         let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec256 {
             pcrIndex: 4,
-            comparison: comparison.clone(),
+            comparison: comparison.clone().into(),
         };
 
         let got = chain_pcr_spec256_to_measurement(&spec);

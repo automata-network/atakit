@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{keccak256, B256};
-use alloy::sol_types::{sol_data, SolType};
+use alloy_primitives::{keccak256, B256};
+use alloy_sol_types::{sol_data, SolType};
 use ciborium::value::Value;
 use p256::pkcs8::DecodePublicKey;
 

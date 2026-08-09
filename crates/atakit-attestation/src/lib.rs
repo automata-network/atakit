@@ -2451,44 +2451,20 @@ pub fn compute_tls_bootstrap_qualifying_data(
     Keccak256::digest(encoded).into()
 }
 
-/// The on-chain base-image identifier.
-///
-/// Delegates to the registry crate that defines the encoding. A local copy that
-/// drifted would derive identifiers registered to nobody.
+/// The specification-defined base-image identifier.
 pub fn compute_base_image_id(publisher: &[u8; 32], name: &str, version: &str) -> [u8; 32] {
-    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
-    use automata_tee_workload_measurement::types::AppRef;
-
-    let app_ref = AppRef::new(alloy::primitives::B256::from(*publisher), name, version);
-    BaseImageRegistry::get_image_id(&app_ref).into()
+    let app_ref = atakit_cvm_types::AppRef::new(*publisher, name, version);
+    atakit_cvm_encoding::base_image_id(&app_ref)
 }
 
-/// Delegates to the registry that defines the encoding, like the base-image id
-/// above. A local copy that drifted would derive profile identifiers that no
-/// registry holds.
+/// The specification-defined platform-profile identifier.
 pub fn compute_platform_profile_id(base_image_id: &[u8; 32], profile_name: &str) -> [u8; 32] {
-    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
-
-    BaseImageRegistry::get_platform_profile_id(
-        alloy::primitives::B256::from(*base_image_id),
-        profile_name,
-    )
-    .into()
+    atakit_cvm_encoding::platform_profile_id(*base_image_id, profile_name)
 }
 
 pub fn compute_variant_id(platform_profile_id: &[u8; 32], variant_name: &str) -> [u8; 32] {
-    use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
-
-    BaseImageRegistry::get_variant_id(
-        alloy::primitives::B256::from(*platform_profile_id),
-        variant_name,
-    )
-    .into()
+    atakit_cvm_encoding::variant_id(*platform_profile_id, variant_name)
 }
-
-
-
-
 
 fn verify_pcr_spec256(
     report: &mut VerificationReport,
@@ -2716,7 +2692,7 @@ fn pad_left(bytes: &[u8], len: usize) -> Vec<u8> {
 mod tests {
     use super::verification_core::*;
     use super::*;
-    use automata_tee_workload_measurement::pcr_comparison::{
+    use atakit_cvm_encoding::pcr_comparison::{
         encode_dynamic256, encode_static256, encode_static384, DYNAMIC_SUBSEQUENCE, DYNAMIC_SUBSET,
     };
     use aws_lc_rs::rand::SystemRandom;
@@ -2732,7 +2708,7 @@ mod tests {
     use signature::{hazmat::PrehashSigner, Signer};
 
     fn static_comparison256(value: [u8; 32]) -> String {
-        hex0x(&encode_static256(value.into()))
+        hex0x(&encode_static256(value))
     }
 
     fn static_comparison384(value: [u8; 48]) -> String {
@@ -2741,11 +2717,7 @@ mod tests {
 
     fn dynamic_comparison256(comparison_type: u16, values: Vec<[u8; 32]>) -> String {
         hex0x(
-            &encode_dynamic256(
-                comparison_type,
-                values.into_iter().map(Into::into).collect(),
-            )
-            .expect("valid dynamic PCR comparison type"),
+            &encode_dynamic256(comparison_type, values).expect("valid dynamic PCR comparison type"),
         )
     }
 
@@ -6087,10 +6059,10 @@ mod tests {
         let pcr15_policy = SessionPcrPolicy {
             pcr_index: 15,
             comparison: hex0x(
-                &automata_tee_workload_measurement::pcr_comparison::encode_extend_from_zero256(
-                    alloy::primitives::B256::from_slice(
-                        &snp_report[SNP_REPORT_REPORT_ID_OFFSET..SNP_REPORT_REPORT_ID_OFFSET + 32],
-                    ),
+                &atakit_cvm_encoding::pcr_comparison::encode_extend_from_zero256(
+                    snp_report[SNP_REPORT_REPORT_ID_OFFSET..SNP_REPORT_REPORT_ID_OFFSET + 32]
+                        .try_into()
+                        .expect("fixed report ID length"),
                 ),
             ),
         };

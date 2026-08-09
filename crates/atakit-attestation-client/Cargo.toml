@@ -2,9 +2,12 @@
 name = "atakit-attestation-client"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 atakit-attestation.workspace = true
+atakit-cvm-encoding.workspace = true
+atakit-cvm-types.workspace = true
 atakit-core.workspace = true
 alloy.workspace = true
 alloy-ext.workspace = true

@@ -15,13 +15,13 @@ use atakit_attestation::{
     MeasurementVariant, PcrBankSelection, PcrSpec256, PcrSpec384, SessionAttributeRequirement,
     SessionPcrPolicy, SessionPcrPolicy384, Subject, TrustedSessionBinding,
 };
+use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
+use atakit_cvm_types::AppRef;
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
 };
-use automata_tee_workload_measurement::pcr_comparison::{encode_static256, encode_static384};
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::WorkloadSpec;
-use automata_tee_workload_measurement::types::AppRef;
 use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -112,7 +112,7 @@ fn parse_canonical_workload_ref(workload: &str) -> Result<AppRef, AttestationCli
             "canonical workload version must start with 'v' and may contain only ASCII alphanumeric characters, '.', '-', or '_' after it, got {version:?}"
         )));
     }
-    Ok(AppRef::new(publisher, name, version))
+    Ok(AppRef::new(publisher.into(), name, version))
 }
 
 impl TrustedWorkloadSessionPolicy {
@@ -127,10 +127,10 @@ impl TrustedWorkloadSessionPolicy {
     ) -> Result<Self, AttestationClientError> {
         let app_ref = parse_canonical_workload_ref(workload)?;
         Ok(Self {
-            workload_id: WorkloadRegistry::get_workload_id(&app_ref).0,
+            workload_id: atakit_cvm_encoding::workload_id(&app_ref),
             pcr_specs256: vec![SessionPcrPolicy {
                 pcr_index: 23,
-                comparison: hex0x(encode_static256(manifest_pcr23_sha256.into())),
+                comparison: hex0x(encode_static256(manifest_pcr23_sha256)),
             }],
             pcr_specs384: vec![SessionPcrPolicy384 {
                 pcr_index: 23,
@@ -286,7 +286,7 @@ impl AttestationClient {
                 "parse canonical base-image reference {base_image:?}: {error}"
             ))
         })?;
-        let base_image_id = BaseImageRegistry::get_image_id(&app_ref);
+        let base_image_id = B256::from(atakit_cvm_encoding::base_image_id(&app_ref));
         let registry_address = parse_address(
             "resolved BaseImageRegistry",
             &self.context.base_image_registry,
@@ -322,7 +322,7 @@ impl AttestationClient {
         selected_base_image_id: [u8; 32],
     ) -> Result<TrustedWorkloadSessionPolicy, AttestationClientError> {
         let app_ref = parse_canonical_workload_ref(workload)?;
-        let workload_id = WorkloadRegistry::get_workload_id(&app_ref);
+        let workload_id = B256::from(atakit_cvm_encoding::workload_id(&app_ref));
         let registry_address =
             parse_address("resolved WorkloadRegistry", &self.context.workload_registry)?;
         let provider = connect_provider(&self.config.rpc_url).await?;
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(policy.pcr_specs256[0].pcr_index, 23);
         assert_eq!(
             policy.pcr_specs256[0].comparison,
-            hex0x(encode_static256([0x55; 32].into()))
+            hex0x(encode_static256([0x55; 32]))
         );
         assert_eq!(policy.pcr_specs384.len(), 1);
         assert_eq!(policy.pcr_specs384[0].pcr_index, 23);
@@ -1324,17 +1324,14 @@ mod tests {
 
     #[test]
     fn registered_workload_policy_converts_all_rules() {
-        use automata_tee_workload_measurement::pcr_comparison::{
-            encode_dynamic256, DYNAMIC_SUBSEQUENCE,
-        };
+        use atakit_cvm_encoding::pcr_comparison::{encode_dynamic256, DYNAMIC_SUBSEQUENCE};
         use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
             AttributeRequirement, PcrPolicyBlock, PcrSpec256 as WorkloadPcrSpec256,
             PcrSpec384 as WorkloadPcrSpec384,
         };
 
-        let dynamic_comparison =
-            encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![B256::repeat_byte(0x20)]).unwrap();
-        let static_comparison = encode_static256(B256::repeat_byte(0x23));
+        let dynamic_comparison = encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![[0x20; 32]]).unwrap();
+        let static_comparison = encode_static256([0x23; 32]);
         let static_comparison384 = encode_static384([0x38; 48]);
 
         let selected_base_image = B256::repeat_byte(0x44);
@@ -1352,16 +1349,16 @@ mod tests {
                 pcrSpecs256: vec![
                     WorkloadPcrSpec256 {
                         pcrIndex: 20,
-                        comparison: dynamic_comparison.clone(),
+                        comparison: dynamic_comparison.clone().into(),
                     },
                     WorkloadPcrSpec256 {
                         pcrIndex: 23,
-                        comparison: static_comparison.clone(),
+                        comparison: static_comparison.clone().into(),
                     },
                 ],
                 pcrSpecs384: vec![WorkloadPcrSpec384 {
                     pcrIndex: 23,
-                    comparison: static_comparison384.clone(),
+                    comparison: static_comparison384.clone().into(),
                 }],
             },
         };

@@ -3,8 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use atakit_attestation::{verify_measurement_pack, MeasurementPolicy, VerificationReport};
-use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
-use automata_tee_workload_measurement::types::AppRef;
+use atakit_cvm_types::AppRef;
 
 use crate::error::PortalVerificationError;
 use crate::trust::files::parse_measurement_publisher_keys;
@@ -183,11 +182,11 @@ fn measurement_pack_dir_paths(path: &Path) -> (PathBuf, PathBuf) {
 /// publisher-qualified, so two publishers holding the same name and version get
 /// separate directories instead of overwriting each other.
 fn local_measurement_pack_dir(data_dir: &Path, app_ref: &AppRef) -> PathBuf {
-    let base_image_id = BaseImageRegistry::get_image_id(app_ref);
+    let base_image_id = atakit_cvm_encoding::base_image_id(app_ref);
     data_dir
         .join("baseimage")
         .join("measurements")
-        .join(format!("{base_image_id:#x}"))
+        .join(format!("0x{}", hex::encode(base_image_id)))
 }
 
 struct LocalMeasurementPackSelection {

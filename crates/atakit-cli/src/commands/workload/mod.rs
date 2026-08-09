@@ -17,12 +17,10 @@ use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 use alloy_ext::core::primitives::B256;
+use atakit_cvm_encoding::pcr_comparison::{decode256, PcrComparison256};
 use atakit_workload::store::CachedPcrSpec;
 use atakit_workload::CachedChainSpec;
-use automata_tee_workload_measurement::base_image_registry::BaseImageRegistry;
-use automata_tee_workload_measurement::pcr_comparison::{decode256, PcrComparison256};
 use automata_tee_workload_measurement::types::AppRef;
-use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 use sha2::{Digest, Sha256};
 
 /// Look for a single `.atawl` file in the directory.
@@ -60,24 +58,27 @@ pub fn find_versioned_archive(dir: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// The on-chain workload identifier for a publisher-qualified reference.
-///
-/// This delegates rather than reimplementing the derivation. Two hand-rolled
-/// copies lived here and silently omitted the publisher once it entered the
-/// identifier, producing well-formed hexadecimal that matched nothing on chain.
-/// One implementation, in the crate that also defines the on-chain encoding.
+/// The specification-defined workload identifier for a publisher-qualified reference.
 pub fn compute_workload_id(app_ref: &AppRef) -> B256 {
-    WorkloadRegistry::get_workload_id(app_ref)
+    B256::from(atakit_cvm_encoding::workload_id(&shared_app_ref(app_ref)))
 }
 
-/// The on-chain base-image identifier for a publisher-qualified reference.
+/// The specification-defined base-image identifier for a publisher-qualified reference.
 pub fn compute_base_image_id(app_ref: &AppRef) -> B256 {
-    BaseImageRegistry::get_image_id(app_ref)
+    B256::from(atakit_cvm_encoding::base_image_id(&shared_app_ref(app_ref)))
+}
+
+fn shared_app_ref(app_ref: &AppRef) -> atakit_cvm_types::AppRef {
+    atakit_cvm_types::AppRef::new(
+        app_ref.publisher.into(),
+        app_ref.name.clone(),
+        app_ref.version.clone(),
+    )
 }
 
 pub(crate) fn static_pcr256_value(comparison: &[u8]) -> Option<[u8; 32]> {
     match decode256(comparison).ok()? {
-        PcrComparison256::Static(value) => Some(value.into()),
+        PcrComparison256::Static(value) => Some(value),
         _ => None,
     }
 }

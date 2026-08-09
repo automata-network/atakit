@@ -2,6 +2,7 @@
 name = "atakit-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "atakit"
@@ -9,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 atakit-core.workspace = true
+atakit-cvm-encoding.workspace = true
+atakit-cvm-types.workspace = true
 atakit-config.workspace = true
 atakit-image = { workspace = true, features = ["cli"] }
 atakit-workload = { workspace = true, features = ["cli"] }

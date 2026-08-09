@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/atakit-cvm-types",
+    "crates/atakit-cvm-encoding",
     "crates/atakit-core",
     "crates/atakit-config",
     "crates/atakit-github",
@@ -18,6 +20,7 @@ exclude = [
 [workspace.package]
 version = "0.5.5"
 edition = "2021"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Shared
@@ -28,6 +31,8 @@ base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
 libc = "0.2"
+alloy-primitives = "1.6.1"
+alloy-sol-types = "1.6.1"
 
 # Network
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
@@ -78,6 +83,8 @@ shell-escape = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Internal
+atakit-cvm-types = { version = "0.1.0", path = "crates/atakit-cvm-types" }
+atakit-cvm-encoding = { version = "0.1.0", path = "crates/atakit-cvm-encoding" }
 atakit-core = { path = "crates/atakit-core" }
 atakit-config = { path = "crates/atakit-config" }
 atakit-github = { path = "crates/atakit-github" }

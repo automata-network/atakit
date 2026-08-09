@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use atakit_workload::cli::SpecArgs;
-use automata_tee_workload_measurement::pcr_comparison::{
+use atakit_cvm_encoding::pcr_comparison::{
     decode256, decode384, PcrComparison256, PcrComparison384,
 };
+use atakit_workload::cli::SpecArgs;
 use owo_colors::OwoColorize;
 
 use super::resolve_chain;
@@ -166,7 +166,10 @@ fn print_comparison256(pcr_index: u8, comparison: &[u8]) {
     match decode256(comparison) {
         Ok(PcrComparison256::Static(value)) => {
             println!("    PCR{pcr_index:<4} {} (0)", "STATIC".dimmed());
-            println!("      value  {}", format!("{value:#x}").green());
+            println!(
+                "      value  {}",
+                format!("0x{}", hex::encode(value)).green()
+            );
         }
         Ok(PcrComparison256::DynamicSubset(values)) => {
             println!("    PCR{pcr_index:<4} {} (1)", "DYNAMIC_SUBSET".dimmed());
@@ -192,7 +195,10 @@ fn print_comparison256(pcr_index: u8, comparison: &[u8]) {
         }
         Ok(PcrComparison256::ExtendFromZero(value)) => {
             println!("    PCR{pcr_index:<4} {} (4)", "EXTEND_FROM_ZERO".dimmed());
-            println!("      extend value  {}", format!("{value:#x}").green());
+            println!(
+                "      extend value  {}",
+                format!("0x{}", hex::encode(value)).green()
+            );
         }
         Err(error) => {
             println!("    PCR{pcr_index:<4} {}", "UNKNOWN".dimmed());
@@ -202,9 +208,9 @@ fn print_comparison256(pcr_index: u8, comparison: &[u8]) {
     }
 }
 
-fn print_values256(label: &str, values: &[alloy_ext::core::primitives::B256]) {
+fn print_values256(label: &str, values: &[[u8; 32]]) {
     for value in values {
-        println!("      {label}: {value:#x}");
+        println!("      {label}: 0x{}", hex::encode(value));
     }
 }
 

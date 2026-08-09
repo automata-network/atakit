@@ -480,6 +480,8 @@ See [`docs/atakit-workload-toml-spec.md`](docs/atakit-workload-toml-spec.md) for
 
 ```
 crates/
+  atakit-cvm-types/     # Chain-independent CVM protocol types
+  atakit-cvm-encoding/  # Canonical identifier and PCR-policy encodings
   atakit-core/         # Shared types and progress-reporting abstractions
   atakit-config/       # Shared operator-config schema and secret resolution
   atakit-github/       # GitHub Releases client
@@ -495,5 +497,4 @@ Library crates are frontend-agnostic -- the CLI binary owns all terminal present
 
 ## License
 
-This repository does not currently include a license file or Cargo package
-license metadata. Add both before distributing the source or published crates.
+Licensed under the [Apache License, Version 2.0](LICENSE).
