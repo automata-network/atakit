@@ -7,7 +7,7 @@ use atakit_cvm_types::AppRef;
 
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
-use crate::pack::workload::packed_workload_policy;
+use crate::pack::workload::{packed_measurement_policy, packed_workload_policy};
 use crate::portal::session::{verify_current_session, VerifiedPortalTls};
 use crate::portal::tls::bootstrap_portal_tls;
 use crate::trust::source::TrustSource;
@@ -38,16 +38,51 @@ pub enum SessionWorkloadPolicySource {
     Pack { workload: AppRef },
 }
 
+/// Where the base-image measurement policy comes from.
+///
+/// A bare `MeasurementPolicy` used to sit on the request, which let a caller
+/// pair `TrustSource::Packs` with a policy from anywhere — mixed trust that the
+/// mode pairing below could not see, because it only ever compared the trust
+/// source against the *workload* policy source. Measurement policy is a trust
+/// input like any other, so its origin belongs in the same exclusive decision.
+#[derive(Debug, Clone)]
+pub enum SessionMeasurementPolicySource {
+    /// Already resolved by the caller from the selected mode's own authority:
+    /// the registry in chain mode, `--measurements` in explicit mode.
+    ///
+    /// Boxed because a `MeasurementPolicy` carries a whole measurement pack and
+    /// would otherwise set the size of every value of this type, including the
+    /// variant that holds only an identifier.
+    Supplied(Box<MeasurementPolicy>),
+    /// Resolved here from the configured `workload-trust` pack, for the base
+    /// image named by the caller.
+    Pack { base_image_id: [u8; 32] },
+}
+
 /// Complete inputs for portal TLS and current-session verification.
 #[derive(Debug, Clone)]
 pub struct PortalSessionVerificationRequest {
     pub host: String,
     pub status_port: u16,
-    pub measurement_policy: MeasurementPolicy,
+    pub measurement_policy: SessionMeasurementPolicySource,
     pub trust_source: TrustSource,
     pub workload_policy: SessionWorkloadPolicySource,
     pub report_path: Option<PathBuf>,
     pub required_binding: Option<BindingMode>,
+}
+
+/// Wall-clock seconds, for re-checking a pack's validity window per
+/// verification.
+///
+/// A pack that was valid when it was read is not necessarily valid now, and a
+/// daemon holds its packs for as long as it runs.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        // Before the epoch there is no verification time that can satisfy any
+        // pack, so refuse them all rather than treating the clock as valid.
+        .unwrap_or(0)
 }
 
 /// Verified portal TLS identity and the current session verified through that
@@ -113,6 +148,34 @@ pub async fn verify_portal_session(
             })
         }
     }
+
+    // The measurement policy is a trust input too, so its origin is decided by
+    // the same mode rather than accepted from the caller alongside it.
+    let measurement_policy = match (&trust_source, measurement_policy) {
+        (TrustSource::Packs(source), SessionMeasurementPolicySource::Pack { base_image_id }) => {
+            source.ensure_valid_at(now_unix())?;
+            packed_measurement_policy(source.workload_pack()?, base_image_id)?
+        }
+        (
+            TrustSource::Chain(_) | TrustSource::Explicit(_),
+            SessionMeasurementPolicySource::Supplied(policy),
+        ) => *policy,
+        (TrustSource::Packs(_), SessionMeasurementPolicySource::Supplied(_)) => {
+            return Err(PortalVerificationError::Config {
+                message: "trust-pack mode resolves the base-image measurement policy from the \
+                          configured workload-trust pack; supplying one alongside would take \
+                          measurements from one authority and anchors from another"
+                    .to_string(),
+            })
+        }
+        (_, SessionMeasurementPolicySource::Pack { .. }) => {
+            return Err(PortalVerificationError::Config {
+                message: "a workload-trust pack supplies the base-image measurement policy only \
+                          in trust-pack mode"
+                    .to_string(),
+            })
+        }
+    };
 
     let portal_tls = bootstrap_portal_tls(
         &host,

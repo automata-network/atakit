@@ -283,6 +283,45 @@ fn parse_amd_snp_policies(
     })
 }
 
+/// Whether a packed Intel TDX DCAP collateral document claims this quote's
+/// `(fmspc, pceId, pckCa)`.
+///
+/// Read from the document's own `selector` so that a miss and a broken entry
+/// can be told apart *before* parsing. A parse failure alone cannot distinguish
+/// "this entry is for other hardware" from "this entry is for this hardware and
+/// is corrupt", and the two have opposite consequences: the first may fall
+/// through to a configured off-chain source, the second must fail the
+/// verification, because fetching past a broken pinned entry would make pinning
+/// advisory.
+///
+/// A document whose selector cannot be read counts as not claiming the
+/// identity. It cannot thereby be used, and if nothing else covers the quote
+/// the verification fails closed anyway.
+pub(crate) fn claims_collateral_identity(
+    document: &[u8],
+    identity: &atakit_attestation::IntelTdxQuoteCollateralIdentity,
+) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(document) else {
+        return false;
+    };
+    let Some(selector) = value.get("selector") else {
+        return false;
+    };
+    let field = |name: &str| {
+        selector
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let pck_ca = match identity.pck_ca {
+        atakit_attestation::IntelTdxPckCa::Platform => "platform",
+        atakit_attestation::IntelTdxPckCa::Processor => "processor",
+    };
+    field("fmspc") == hex::encode(identity.fmspc)
+        && field("pceId") == hex::encode(identity.pce_id)
+        && field("pckCa") == pck_ca
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AwsDocumentLimits {
@@ -547,6 +586,65 @@ mod tests {
         assert!(
             error.to_string().contains("maximum_age_seconds"),
             "got {error}"
+        );
+    }
+
+    /// Packed Intel TDX DCAP collateral is selected by the quote's own
+    /// `(fmspc, pceId, pckCa)`, not merely stored.
+    ///
+    /// Asserting that `tdx_dcap_documents` is non-empty — which this test file
+    /// previously did, and which was all it did — proves the entry survived the
+    /// archive, not that any verification can reach it. The identity match is
+    /// what makes it reachable, and it is what tells a genuine miss apart from
+    /// a present-but-broken entry.
+    #[test]
+    fn packed_collateral_is_selected_by_the_quote_identity() {
+        use atakit_attestation::{IntelTdxPckCa, IntelTdxQuoteCollateralIdentity};
+
+        let document = tdx_dcap_document();
+        let covered = IntelTdxQuoteCollateralIdentity {
+            fmspc: [0x00, 0x80, 0x6f, 0x05, 0x00, 0x00],
+            pce_id: [0x00, 0x00],
+            pck_ca: IntelTdxPckCa::Platform,
+        };
+        assert!(
+            claims_collateral_identity(&document, &covered),
+            "the fixture's own selector must match"
+        );
+
+        // Each field on its own decides coverage, so a near-miss is a miss.
+        for (label, identity) in [
+            (
+                "another fmspc",
+                IntelTdxQuoteCollateralIdentity {
+                    fmspc: [0x00, 0x80, 0x6f, 0x05, 0x00, 0x01],
+                    ..covered
+                },
+            ),
+            (
+                "another pceId",
+                IntelTdxQuoteCollateralIdentity {
+                    pce_id: [0x00, 0x01],
+                    ..covered
+                },
+            ),
+            (
+                "the other PCK CA",
+                IntelTdxQuoteCollateralIdentity {
+                    pck_ca: IntelTdxPckCa::Processor,
+                    ..covered
+                },
+            ),
+        ] {
+            assert!(
+                !claims_collateral_identity(&document, &identity),
+                "{label} must not be treated as covered"
+            );
+        }
+
+        assert!(
+            !claims_collateral_identity(b"not json", &covered),
+            "an unreadable entry claims nothing"
         );
     }
 

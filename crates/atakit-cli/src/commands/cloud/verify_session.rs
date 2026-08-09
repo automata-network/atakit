@@ -6,7 +6,8 @@ use atakit_cloud::cli::VerifySessionArgs;
 use atakit_cloud::init;
 use atakit_cloud::init::{ChainTrustSource, ExplicitTrustSource, TrustSource};
 use atakit_cloud::session::{
-    verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
+    verify_portal_session, PortalSessionVerificationRequest, SessionMeasurementPolicySource,
+    SessionWorkloadPolicySource,
 };
 use atakit_cloud::state::{DeployState, DeployStatus};
 use atakit_cloud::DEFAULT_PORTAL_STATUS_PORT;
@@ -132,7 +133,10 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     let outcome = verify_portal_session(PortalSessionVerificationRequest {
         host: subject.host.clone(),
         status_port: subject.status_port,
-        measurement_policy,
+        // This command resolves the policy itself, from the chain or from
+        // `--measurements`. `SessionMeasurementPolicySource::Pack` belongs to
+        // trust-pack mode, which has no command-line surface yet.
+        measurement_policy: SessionMeasurementPolicySource::Supplied(Box::new(measurement_policy)),
         trust_source,
         report_path: None,
         workload_policy,

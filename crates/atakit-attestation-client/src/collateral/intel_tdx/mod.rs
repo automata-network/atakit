@@ -157,10 +157,15 @@ pub fn tdx_dcap_automata_read_strategy(
     }
 }
 
-pub(crate) async fn resolve_tdx_dcap_collateral(
+/// The quote Intel TDX DCAP collateral is selected for, or `None` when the
+/// response is not Intel TDX.
+///
+/// Shared so packed collateral is selected for exactly the quote the
+/// configured-source path would have used. Two ways of deciding which bytes the
+/// quote is would be two ways of selecting the wrong collateral.
+pub(crate) fn tdx_collateral_quote(
     response: &TlsAttestationResponse,
-    config: &IntelTdxDcapCollateralConfig,
-) -> Result<Option<IntelTdxDcapCollateral>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     if !is_tdx(response) {
         return Ok(None);
     }
@@ -168,9 +173,19 @@ pub(crate) async fn resolve_tdx_dcap_collateral(
         .tee_evidence
         .as_ref()
         .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
-    let quote = URL_SAFE_NO_PAD
+    URL_SAFE_NO_PAD
         .decode(&evidence.report)
-        .map_err(|e| format!("decode teeEvidence.report for DCAP collateral lookup: {e}"))?;
+        .map(Some)
+        .map_err(|e| format!("decode teeEvidence.report for DCAP collateral lookup: {e}"))
+}
+
+pub(crate) async fn resolve_tdx_dcap_collateral(
+    response: &TlsAttestationResponse,
+    config: &IntelTdxDcapCollateralConfig,
+) -> Result<Option<IntelTdxDcapCollateral>, String> {
+    let Some(quote) = tdx_collateral_quote(response)? else {
+        return Ok(None);
+    };
     let collateral = match &config.source {
         IntelTdxDcapCollateralSource::None => return Ok(None),
         IntelTdxDcapCollateralSource::File(path) => {

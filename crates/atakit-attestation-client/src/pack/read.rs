@@ -91,6 +91,24 @@ impl TrustPack {
     pub fn digest_hex(&self) -> String {
         format!("0x{}", hex::encode(self.digest))
     }
+
+    /// Re-check the validity window.
+    ///
+    /// Reading a pack checks it once, which is enough for a command that exits
+    /// but not for a daemon: `atakit-verifierd` loads its packs at startup and
+    /// then runs, so a pack validated at load would otherwise keep answering
+    /// verifications indefinitely past `not_after`. Every verification calls
+    /// this, so expiry bounds the verification rather than the process.
+    pub fn ensure_valid_at(&self, now_unix: u64) -> Result<(), TrustPackError> {
+        if now_unix < self.index.not_before || now_unix >= self.index.not_after {
+            return Err(TrustPackError::OutsideValidity {
+                not_before: self.index.not_before,
+                not_after: self.index.not_after,
+                now: now_unix,
+            });
+        }
+        Ok(())
+    }
 }
 
 pub fn read_trust_pack_file(
@@ -1015,6 +1033,82 @@ mod tests {
         .expect_err("a malformed hash must be refused");
         assert!(
             matches!(error, TrustPackError::MalformedHash { .. }),
+            "got {error}"
+        );
+    }
+
+    /// A pack validated at read time must not keep answering forever. A
+    /// daemon loads packs once and runs, so expiry has to bound each
+    /// verification rather than the process.
+    #[test]
+    fn a_read_pack_re_checks_its_validity_window() {
+        let publisher = Publisher::new(0x11);
+        let pack = round_trip(
+            &collateral_builder("example-publisher"),
+            TrustPackKind::CollateralTrust,
+            &publisher,
+        )
+        .expect("round trip");
+
+        assert!(pack.ensure_valid_at(NOT_BEFORE).is_ok());
+        assert!(pack.ensure_valid_at(NOT_AFTER - 1).is_ok());
+        for outside in [NOT_BEFORE - 1, NOT_AFTER] {
+            let error = pack
+                .ensure_valid_at(outside)
+                .expect_err("a pack held past its window must stop being usable");
+            assert!(
+                matches!(error, TrustPackError::OutsideValidity { .. }),
+                "got {error}"
+            );
+        }
+    }
+
+    /// The writer enforces the bounds the reader enforces. An archive this
+    /// crate produces and its own reader refuses would turn a producer-side
+    /// mistake into a failure discovered at the verifier.
+    #[test]
+    fn the_writer_refuses_what_the_reader_would_refuse() {
+        let publisher = Publisher::new(0x11);
+        // A root entry, because the writer does not parse those for an expiry.
+        // The bounds are about bytes, so the content only has to be large and
+        // compressible.
+        let mut builder = collateral_builder("example-publisher");
+        builder
+            .insert("payload/roots/amd-ark-bomb.pem", vec![0x41; 1024 * 1024])
+            .expect("within the per-entry bound");
+
+        let error = builder
+            .build(|bytes| Ok::<_, std::convert::Infallible>(publisher.sign(bytes)))
+            .expect_err("a megabyte of one repeated byte exceeds the 100:1 ratio bound");
+        assert!(
+            matches!(
+                error,
+                TrustPackError::LimitExceeded {
+                    limit: "compression ratio",
+                    ..
+                }
+            ),
+            "got {error}"
+        );
+
+        let mut small = collateral_builder("example-publisher").with_limits(ArchiveLimits {
+            max_total_bytes: 4096,
+            ..ArchiveLimits::default()
+        });
+        small
+            .insert("payload/roots/amd-ark-big.pem", vec![0x41; 8192])
+            .expect("within the per-entry bound");
+        let error = small
+            .build(|bytes| Ok::<_, std::convert::Infallible>(publisher.sign(bytes)))
+            .expect_err("the total decompressed bound must apply to the writer too");
+        assert!(
+            matches!(
+                error,
+                TrustPackError::LimitExceeded {
+                    limit: "total decompressed size",
+                    ..
+                }
+            ),
             "got {error}"
         );
     }

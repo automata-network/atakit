@@ -5,6 +5,6 @@
 
 pub use atakit_attestation_client::session::*;
 pub use atakit_attestation_client::workflow::{
-    verify_portal_session, PortalSessionVerificationRequest, SessionWorkloadPolicySource,
-    VerifiedPortalSession,
+    verify_portal_session, PortalSessionVerificationRequest, SessionMeasurementPolicySource,
+    SessionWorkloadPolicySource, VerifiedPortalSession,
 };

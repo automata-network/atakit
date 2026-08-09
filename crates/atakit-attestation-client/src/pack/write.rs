@@ -155,9 +155,31 @@ impl TrustPackBuilder {
         }
 
         let tar = build_tar(&entries)?;
-        zstd::stream::encode_all(tar.as_slice(), 19).map_err(|error| TrustPackError::Archive {
-            message: format!("zstd compression failed: {error}"),
-        })
+        // The reader bounds total decompressed size and compression ratio, so
+        // the writer must too. Producing an archive that this crate's own
+        // reader refuses would turn a producer-side mistake into a failure that
+        // only shows up at the verifier, which is the worst place to find it.
+        if tar.len() as u64 > self.limits.max_total_bytes {
+            return Err(TrustPackError::LimitExceeded {
+                limit: "total decompressed size",
+                allowed: self.limits.max_total_bytes,
+                actual: tar.len() as u64,
+            });
+        }
+        let archive = zstd::stream::encode_all(tar.as_slice(), 19).map_err(|error| {
+            TrustPackError::Archive {
+                message: format!("zstd compression failed: {error}"),
+            }
+        })?;
+        let ratio = tar.len() as u64 / archive.len().max(1) as u64;
+        if ratio > self.limits.max_compression_ratio {
+            return Err(TrustPackError::LimitExceeded {
+                limit: "compression ratio",
+                allowed: self.limits.max_compression_ratio,
+                actual: ratio,
+            });
+        }
+        Ok(archive)
     }
 
     /// Structural rules a kind imposes beyond per-path namespace membership.

@@ -417,26 +417,38 @@ fn peek_subject(path: &str, bytes: &[u8]) -> Result<atakit_attestation::Subject,
     Ok(envelope.subject)
 }
 
+/// `0x` and lowercase hexadecimal, with at most one trailing newline.
+///
+/// Strict rather than forgiving, matching the specification exactly. The entry
+/// is covered by `hashes`, so tolerating uppercase, a missing prefix, or
+/// surrounding whitespace would let byte-different archives carry the same
+/// logical key under different digests — and digest pinning is the only
+/// rollback control this format has.
 fn parse_public_key(path: &str, bytes: &[u8]) -> Result<Vec<u8>, TrustPackError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| TrustPackError::Payload {
-            path: path.to_string(),
-            message: format!("not UTF-8: {error}"),
-        })?
-        .trim();
-    let raw = text.strip_prefix("0x").unwrap_or(text);
-    let key = hex::decode(raw).map_err(|error| TrustPackError::Payload {
+    let malformed = |message: String| TrustPackError::Payload {
         path: path.to_string(),
-        message: format!("not hexadecimal: {error}"),
-    })?;
+        message,
+    };
+    let text =
+        std::str::from_utf8(bytes).map_err(|error| malformed(format!("not UTF-8: {error}")))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let raw = text
+        .strip_prefix("0x")
+        .ok_or_else(|| malformed("must be '0x' followed by lowercase hexadecimal".to_string()))?;
+    if !raw
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(malformed(
+            "must be lowercase hexadecimal with no surrounding whitespace".to_string(),
+        ));
+    }
+    let key = hex::decode(raw).map_err(|error| malformed(format!("not hexadecimal: {error}")))?;
     if key.len() != 65 || key[0] != 0x04 {
-        return Err(TrustPackError::Payload {
-            path: path.to_string(),
-            message: format!(
-                "expected a 65-byte uncompressed SEC1 secp256k1 point beginning 0x04, got {} bytes",
-                key.len()
-            ),
-        });
+        return Err(malformed(format!(
+            "expected a 65-byte uncompressed SEC1 secp256k1 point beginning 0x04, got {} bytes",
+            key.len()
+        )));
     }
     Ok(key)
 }
@@ -830,6 +842,40 @@ mod tests {
             message.contains(&hex::encode(absent_id)),
             "the failure must name the missing base image; got {message}"
         );
+    }
+
+    /// The `.pubkey` grammar is exactly what the specification states.
+    ///
+    /// Forms that decode to the correct key but are spelled differently are
+    /// still refused: the entry is covered by `hashes`, so tolerating them
+    /// would let byte-different archives carry one logical key under two
+    /// digests, and digest pinning is this format's only rollback control.
+    #[test]
+    fn the_public_key_entry_grammar_is_strict() {
+        let signer = Publisher::new(0x32);
+        let canonical = signer.public_key_hex();
+
+        for (spelling, why) in [
+            (canonical.to_uppercase(), "uppercase hexadecimal"),
+            (canonical[2..].to_string(), "a missing 0x prefix"),
+            (format!(" {canonical}"), "leading whitespace"),
+            (format!("{canonical}  "), "trailing whitespace"),
+        ] {
+            let Err(error) =
+                parse_public_key("payload/measurement-packs/x.pubkey", spelling.as_bytes())
+            else {
+                panic!("{why} must be refused");
+            };
+            assert!(
+                matches!(error, TrustPackError::Payload { .. }),
+                "{why}: got {error}"
+            );
+        }
+
+        // The canonical form, and the same with one trailing newline, are both
+        // accepted — a file written by `printf` and one written by an editor.
+        assert!(parse_public_key("x", canonical.as_bytes()).is_ok());
+        assert!(parse_public_key("x", format!("{canonical}\n").as_bytes()).is_ok());
     }
 
     /// A `.pubkey` that is not an uncompressed SEC1 point is refused with a

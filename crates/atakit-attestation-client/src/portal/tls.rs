@@ -16,7 +16,10 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use crate::collateral::amd_snp::resolve_amd_snp_collateral;
-use crate::collateral::intel_tdx::resolve_tdx_dcap_collateral;
+use crate::collateral::intel_tdx::{
+    resolve_tdx_dcap_collateral, tdx_collateral_quote, IntelTdxDcapCollateralConfig,
+    IntelTdxDcapCollateralSource,
+};
 use crate::error::PortalVerificationError;
 use crate::http::read_response_bytes_limited;
 use crate::portal::session::{
@@ -35,6 +38,47 @@ const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 /// self-signed certificate.
 // Keep the request inputs explicit at this protocol boundary.
 #[allow(clippy::too_many_arguments)]
+/// Resolve Intel TDX DCAP collateral for the selected trust source.
+///
+/// In trust-pack mode the configured packs are consulted first, and only a
+/// genuine miss reaches the configured off-chain source. Vendor collateral is
+/// self-authenticating, so fetching what a pack does not contain is an
+/// availability choice rather than a trust one — but an entry that is present
+/// and unusable fails the verification, because fetching past a broken pinned
+/// entry would make pinning advisory.
+///
+/// Every other mode resolves exactly as before.
+async fn resolve_tdx_dcap_for_source(
+    response: &TlsAttestationResponse,
+    trust_source: &TrustSource,
+    config: &IntelTdxDcapCollateralConfig,
+) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
+    if let TrustSource::Packs(packs) = trust_source {
+        if let Some(quote) = tdx_collateral_quote(response)? {
+            match packs.select_tdx_dcap_collateral(&quote) {
+                Ok(Some(collateral)) => return Ok(Some(collateral)),
+                Err(error) => return Err(error.to_string()),
+                Ok(None) => {
+                    if matches!(config.source, IntelTdxDcapCollateralSource::None) {
+                        return Err(format!(
+                            "the configured trust packs carry no Intel TDX DCAP collateral for \
+                             this quote{}, and no off-chain source is configured to fetch it \
+                             from",
+                            if packs.carries_tdx_dcap_collateral() {
+                                " — they carry collateral for other hardware, so this peer's \
+                                 platform is not covered"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    resolve_tdx_dcap_collateral(response, config).await
+}
+
 pub async fn bootstrap_portal_tls(
     host: &str,
     status_port: u16,
@@ -132,7 +176,7 @@ pub async fn bootstrap_portal_tls(
             }
         })?;
     let intel_tdx_dcap_collateral =
-        match resolve_tdx_dcap_collateral(&response, &tdx_dcap_collateral).await {
+        match resolve_tdx_dcap_for_source(&response, trust_source, &tdx_dcap_collateral).await {
             Ok(collateral) => collateral,
             Err(detail) => {
                 let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();

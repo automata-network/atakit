@@ -65,6 +65,7 @@ impl TrustSource {
 #[derive(Debug, Clone)]
 pub struct PackTrustSource {
     collateral: CollateralTrustInputs,
+    collateral_packs: Vec<TrustPack>,
     workload_packs: Vec<TrustPack>,
     tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
 }
@@ -103,6 +104,7 @@ impl PackTrustSource {
         }
         Ok(Self {
             collateral: collateral_trust_inputs_from_all(&collateral_packs)?,
+            collateral_packs,
             workload_packs,
             tdx_dcap_collateral,
         })
@@ -114,6 +116,68 @@ impl PackTrustSource {
 
     pub(crate) fn amd_snp_crls(&self) -> &[Vec<u8>] {
         &self.collateral.amd_snp_crls
+    }
+
+    /// Re-check every configured pack's validity window.
+    ///
+    /// Called per verification rather than only at load. A source built once
+    /// and held by a long-running daemon would otherwise keep serving packs
+    /// past `not_after`, making the derived expiry bound the process instead of
+    /// the verification it was derived for.
+    pub fn ensure_valid_at(&self, now_unix: u64) -> Result<(), PortalVerificationError> {
+        for pack in self.collateral_packs.iter().chain(&self.workload_packs) {
+            pack.ensure_valid_at(now_unix)?;
+        }
+        Ok(())
+    }
+
+    /// Select the packed Intel TDX DCAP collateral covering this quote.
+    ///
+    /// Three outcomes, and the difference between the last two is the
+    /// no-fallback rule. `Ok(Some)` is a covered quote. `Err` is an entry that
+    /// claims this quote's identity but cannot be used — fatal, and explicitly
+    /// not a reason to fetch, because fetching past a broken pinned entry would
+    /// make pinning advisory. `Ok(None)` is a genuine miss, where the pack
+    /// simply does not cover that hardware, and only then may the caller reach
+    /// a configured off-chain source.
+    pub(crate) fn select_tdx_dcap_collateral(
+        &self,
+        quote: &[u8],
+    ) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, PortalVerificationError> {
+        let identity =
+            atakit_attestation::intel_tdx_quote_collateral_identity(quote).map_err(|error| {
+                PortalVerificationError::PortalTlsAttestationFailed {
+                    message: format!("read the quote's collateral identity: {error}"),
+                }
+            })?;
+
+        for (path, document) in &self.collateral.tdx_dcap_documents {
+            if !crate::pack::collateral::claims_collateral_identity(document, &identity) {
+                continue;
+            }
+            let text =
+                std::str::from_utf8(document).map_err(|error| PortalVerificationError::Config {
+                    message: format!("trust pack entry {path} is not UTF-8: {error}"),
+                })?;
+            return atakit_attestation::IntelTdxDcapCollateral::from_file_json(text, quote)
+                .map(Some)
+                .map_err(|error| PortalVerificationError::Config {
+                    message: format!(
+                        "trust pack entry {path} covers this quote's collateral identity but \
+                         cannot be used: {error}; a packed entry that is present and unusable \
+                         fails the verification rather than falling through to a vendor endpoint"
+                    ),
+                });
+        }
+        Ok(None)
+    }
+
+    /// Whether any pack carries Intel TDX DCAP collateral at all.
+    ///
+    /// Distinguishes "this pack set does not cover Intel TDX" from "it covers
+    /// Intel TDX but not this stepping", which need different operator action.
+    pub(crate) fn carries_tdx_dcap_collateral(&self) -> bool {
+        !self.collateral.tdx_dcap_documents.is_empty()
     }
 
     /// The one workload-trust pack, or a failure naming why there is not
