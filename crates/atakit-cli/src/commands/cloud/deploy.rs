@@ -461,7 +461,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
     let resolved_image = resolve_image(image_arg, &provider_config.platform, env)?;
     let image_ref = &resolved_image.display_name;
-    let base_image_ref = canonical_base_image_ref(image_ref, args.base_image.as_deref());
+    let measured_base_image_ref = resolved_image
+        .measured_base_image_ref
+        .as_deref()
+        .unwrap_or(image_ref);
+    let base_image_ref =
+        canonical_base_image_ref(measured_base_image_ref, args.base_image.as_deref());
 
     // 8b. Validate image against workload's base-image policy.
     if !image_only {

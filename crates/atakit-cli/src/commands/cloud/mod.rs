@@ -624,6 +624,8 @@ pub(super) struct ResolvedImage {
     pub source_path: Option<String>,
     /// Local secure-boot cert directory from the image store, if available.
     pub certs_dir: Option<String>,
+    /// Publisher-qualified identity measured inside a stored base image.
+    pub measured_base_image_ref: Option<String>,
 }
 
 /// Resolve the `--image` argument into a display name and optional source path.
@@ -674,6 +676,7 @@ pub(super) fn resolve_image(
         display_name: image_arg.to_string(),
         source_path: None,
         certs_dir: None,
+        measured_base_image_ref: None,
     })
 }
 
@@ -710,7 +713,32 @@ fn resolve_store_image(
         display_name: image_ref.to_string(),
         source_path: Some(disk_path.display().to_string()),
         certs_dir: Some(store.certs_dir(image_ref).display().to_string()),
+        measured_base_image_ref: Some(read_measured_base_image_ref(store, image_ref)?),
     })
+}
+
+fn read_measured_base_image_ref(store: &ImageStore, image_ref: &ImageRef) -> Result<String> {
+    let path = store
+        .base_dir()
+        .join(&image_ref.repository)
+        .join(&image_ref.tag)
+        .join("baseimage.toml");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let document: toml::Value =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let value = document
+        .get("meta")
+        .and_then(|meta| meta.get("base-image-ref"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{} does not define meta.base-image-ref", path.display()))?;
+    let measured: AppRef = value.parse().with_context(|| {
+        format!(
+            "{}.meta.base-image-ref is not a publisher-qualified base-image reference",
+            path.display()
+        )
+    })?;
+    Ok(measured.to_string())
 }
 
 /// Resolved workload source: archive path + name/version + declared ports + disks.
@@ -1017,7 +1045,7 @@ pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)
 
 /// Validate that the given image ref is allowed by the workload's base-image policy.
 pub(super) fn validate_base_image(
-    image_display_name: &str,
+    selected_base_image_ref: &str,
     base_image_mode: &str,
     base_image: &[String],
 ) -> Result<()> {
@@ -1025,40 +1053,45 @@ pub(super) fn validate_base_image(
         return Ok(());
     }
 
-    // Every entry must parse as a valid ImageRef (repository:tag).
-    for entry in base_image {
-        if entry.parse::<ImageRef>().is_err() {
-            bail!(
-                "invalid base-image entry '{}': must be repository:tag format \
-                 (e.g. 'automata-linux:v0.2.6-debug')",
-                entry,
-            );
-        }
-    }
+    let allowed: Vec<AppRef> = base_image
+        .iter()
+        .map(|entry| {
+            entry
+                .parse()
+                .with_context(|| format!("invalid publisher-qualified base-image entry {entry:?}"))
+        })
+        .collect::<Result<_>>()?;
+    let selected: AppRef = selected_base_image_ref.parse().with_context(|| {
+        format!(
+            "selected base image {selected_base_image_ref:?} has no publisher-qualified \
+             measured identity; pass --base-image <publisher>/<name>:<version>"
+        )
+    })?;
+    let selected_is_listed = allowed.iter().any(|entry| entry == &selected);
 
     match base_image_mode {
         "whitelist" => {
             // Empty whitelist = nothing allowed.
-            if !base_image.iter().any(|b| b == image_display_name) {
+            if !selected_is_listed {
                 if base_image.is_empty() {
                     bail!(
                         "image '{}' rejected: base-image-mode is 'whitelist' but \
                          base-image list is empty (no images are allowed)",
-                        image_display_name,
+                        selected_base_image_ref,
                     );
                 }
                 bail!(
                     "image '{}' is not in the workload's base-image whitelist: [{}]",
-                    image_display_name,
+                    selected_base_image_ref,
                     base_image.join(", "),
                 );
             }
         }
         "blacklist" => {
-            if base_image.iter().any(|b| b == image_display_name) {
+            if selected_is_listed {
                 bail!(
                     "image '{}' is blacklisted by the workload",
-                    image_display_name,
+                    selected_base_image_ref,
                 );
             }
         }
@@ -1070,6 +1103,119 @@ pub(super) fn validate_base_image(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod base_image_validation_tests {
+    use super::*;
+
+    const PUBLISHER_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUBLISHER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn stored_image_uses_its_measured_publisher_qualified_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            format!("[meta]\nformat = 2\nbase-image-ref = \"{PUBLISHER_A}/automata-linux:v1\"\n"),
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        assert_eq!(
+            read_measured_base_image_ref(&store, &image_ref).unwrap(),
+            format!("{PUBLISHER_A}/automata-linux:v1")
+        );
+    }
+
+    #[test]
+    fn stored_image_rejects_a_base_image_reference_without_a_publisher() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            "[meta]\nformat = 2\nbase-image-ref = \"automata-linux:v1\"\n",
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        let error = read_measured_base_image_ref(&store, &image_ref).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_whitelist_entry() {
+        validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bare_store_image_ref_cannot_discard_the_publisher() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("has no publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_base_image_assertion_matches_the_publisher_too() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_B}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not in"), "{error}");
+    }
+
+    #[test]
+    fn malformed_policy_entry_is_rejected() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &["automata-linux:v1".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid publisher-qualified base-image entry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_blacklist_entry() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "blacklist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("blacklisted"), "{error}");
+    }
 }
 
 /// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
