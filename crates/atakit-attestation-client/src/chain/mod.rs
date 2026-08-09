@@ -384,7 +384,7 @@ impl AttestationClient {
                 "verified portal TLS context has no session verification inputs".to_string(),
             )
         })?;
-        context.chain_client = Some(self.clone());
+        context.azure_maa_trust = crate::portal::session::SessionAzureMaaTrust::Chain(self.clone());
         session::verify_current_session_bound(
             &verified_tls,
             host,

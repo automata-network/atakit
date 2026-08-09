@@ -23,7 +23,7 @@ use crate::collateral::intel_tdx::{
 use crate::error::PortalVerificationError;
 use crate::http::read_response_bytes_limited;
 use crate::portal::session::{
-    PortalSessionVerificationContext, TlsManualOverride, VerifiedPortalTls,
+    PortalSessionVerificationContext, SessionAzureMaaTrust, TlsManualOverride, VerifiedPortalTls,
 };
 use crate::trust::builder::TrustAnchorsBuilder;
 use crate::trust::measurement::write_tls_attestation_report;
@@ -184,6 +184,25 @@ async fn resolve_tdx_dcap_for_source(
         }
     }
     resolve_tdx_dcap_collateral(response, config).await
+}
+
+/// How the committed session's Azure MAA key will be trusted, given the
+/// authority this verification used and the anchors it resolved for TLS.
+///
+/// Chain mode carries the client, not the key. The key in `anchors` is the one
+/// that signed the *TLS* token; the committed session's token may be signed by
+/// a different registered key, and reusing the TLS key would both reject that
+/// legitimate case and skip re-checking revocation at session time.
+pub(crate) fn session_azure_maa_trust(
+    trust_source: &TrustSource,
+    anchors: &atakit_attestation::TrustAnchors,
+) -> SessionAzureMaaTrust {
+    match trust_source {
+        TrustSource::Chain(source) => SessionAzureMaaTrust::Chain(source.client().clone()),
+        TrustSource::Explicit(_) | TrustSource::Packs(_) => {
+            SessionAzureMaaTrust::Offline(anchors.azure_maa_keys.clone())
+        }
+    }
 }
 
 /// Fetch and verify the portal's TLS attestation, resolving every trust input
@@ -374,15 +393,7 @@ pub async fn bootstrap_portal_tls(
             );
         }
     };
-    let manual_azure_maa_keys = trust_anchors.azure_maa_keys.clone();
-
-    // Only chain mode has a chain client to bind a session to. Trust-pack and
-    // explicit modes have none by construction, which is what stops a session
-    // binding being taken from one authority while policy comes from another.
-    let session_chain_client = match trust_source {
-        TrustSource::Chain(source) => Some(source.client().clone()),
-        TrustSource::Explicit(_) | TrustSource::Packs(_) => None,
-    };
+    let azure_maa_trust = session_azure_maa_trust(trust_source, &trust_anchors);
     let session_verification =
         measurement_policy
             .clone()
@@ -390,8 +401,7 @@ pub async fn bootstrap_portal_tls(
                 platform: response.platform.clone(),
                 measurement_policy,
                 trust_anchors: trust_anchors.clone(),
-                chain_client: session_chain_client.clone(),
-                manual_azure_maa_keys: manual_azure_maa_keys.clone(),
+                azure_maa_trust: azure_maa_trust.clone(),
                 amd_snp_collateral: amd_snp_collateral.clone(),
                 intel_tdx_dcap_collateral: intel_tdx_dcap_collateral.clone(),
             });
@@ -604,4 +614,95 @@ fn random_nonce() -> Result<[u8; 32], PortalVerificationError> {
             source: e,
         })?;
     Ok(nonce)
+}
+
+#[cfg(test)]
+mod session_azure_maa_trust_tests {
+    use super::*;
+    use crate::chain::{AttestationClient, AttestationClientConfig};
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+    use atakit_attestation::{AzureMaaTrustCertificate, TrustAnchors};
+
+    /// The key that signed the TLS token.
+    fn tls_key() -> TrustAnchors {
+        TrustAnchors {
+            azure_maa_keys: vec![AzureMaaTrustCertificate {
+                public_key: b"tls-signing-key-A".to_vec(),
+                not_after: u64::MAX,
+            }],
+            ..TrustAnchors::default()
+        }
+    }
+
+    /// Chain mode must not carry the TLS key forward as the committed-session
+    /// key. It carries the client instead, so the committed token's own `kid`
+    /// and `iss` are resolved against the registry at session time.
+    ///
+    /// This is the defect the type change removes: the TLS key used to be
+    /// copied into the context unconditionally and consulted first, which made
+    /// the registry lookup unreachable in chain mode.
+    #[tokio::test]
+    async fn chain_mode_carries_the_client_rather_than_the_tls_key() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let client = AttestationClient::connect(AttestationClientConfig {
+            rpc_url: endpoint.url().to_string(),
+            session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+            expected_chain_id: None,
+            expected_base_image_registry: None,
+            expected_workload_registry: None,
+        })
+        .await
+        .expect("connect");
+
+        let anchors = tls_key();
+        let source = TrustSource::Chain(crate::trust::source::ChainTrustSource::from_client(
+            client,
+            IntelTdxDcapCollateralConfig::default(),
+        ));
+
+        match session_azure_maa_trust(&source, &anchors) {
+            SessionAzureMaaTrust::Chain(_) => {}
+            SessionAzureMaaTrust::Offline(keys) => panic!(
+                "chain mode must not carry offline keys; it carried {} of them, which is the \
+                 TLS key standing in for the committed-session key",
+                keys.len()
+            ),
+        }
+    }
+
+    /// Explicit and trust-pack modes have no registry to ask, so they keep the
+    /// keys their own authority supplied.
+    #[test]
+    fn offline_modes_retain_their_own_keys() {
+        let anchors = tls_key();
+        for source in [
+            TrustSource::Explicit(
+                crate::trust::source::ExplicitTrustSource::new(
+                    TlsVerificationTrust::default(),
+                    IntelTdxDcapCollateralConfig::default(),
+                )
+                .unwrap(),
+            ),
+            TrustSource::Packs(
+                crate::trust::source::PackTrustSource::new(
+                    Vec::new(),
+                    Vec::new(),
+                    IntelTdxDcapCollateralConfig::default(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let mode = source.mode();
+            match session_azure_maa_trust(&source, &anchors) {
+                SessionAzureMaaTrust::Offline(keys) => {
+                    assert_eq!(keys.len(), 1, "{mode} must retain its supplied key");
+                }
+                SessionAzureMaaTrust::Chain(_) => {
+                    panic!("{mode} has no registry to resolve a committed-session key from")
+                }
+            }
+        }
+    }
 }

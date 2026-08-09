@@ -21,17 +21,36 @@ use serde::Deserialize;
 
 use crate::{AttestationClient, AttestationClientError};
 
+/// How the committed session's Azure MAA signing key is trusted.
+///
+/// One choice, rather than an optional chain client beside a list of keys.
+/// With both, the key list was populated in every mode from the TLS-resolved
+/// anchors and the committed-session branch consulted it first, so chain mode
+/// never reached the registry lookup and silently reused the key that signed
+/// the *TLS* token.
+///
+/// `docs/specs/session-attestation-spec.md` requires the opposite: the TLS and
+/// committed-session tokens may be signed by different registered keys, the
+/// committed-session key must be resolved independently, and the TLS key must
+/// never stand in for it. A committed session signed by a different valid key
+/// failed, and a key revoked between the two checks was never re-examined.
+#[derive(Debug, Clone)]
+pub enum SessionAzureMaaTrust {
+    /// Chain mode: resolve the committed token's own `kid` and `iss` against
+    /// the registry, at session verification time.
+    Chain(AttestationClient),
+    /// Explicit and trust-pack modes: select from the keys that authority
+    /// supplied. There is no registry to ask.
+    Offline(Vec<AzureMaaTrustCertificate>),
+}
+
 #[derive(Debug, Clone)]
 pub struct PortalSessionVerificationContext {
     pub platform: PlatformEvidence,
     pub measurement_policy: MeasurementPolicy,
     pub trust_anchors: TrustAnchors,
-    /// Verifier-selected chain client used for evidence-specific collateral.
-    /// This is optional only when manual platform trust is supplied.
-    pub chain_client: Option<AttestationClient>,
-    /// Verifier-supplied Azure MAA signing certificates, each carrying its own
-    /// expiry from the certificate validity period.
-    pub manual_azure_maa_keys: Vec<AzureMaaTrustCertificate>,
+    /// How the committed session's Azure MAA signing key is trusted.
+    pub azure_maa_trust: SessionAzureMaaTrust,
     /// Collateral resolved during this portal TLS bootstrap. Session
     /// verification rechecks its certificate and revocation validity against
     /// the session verification time. No process-wide cache stores this value.
@@ -163,21 +182,21 @@ async fn committed_session_maa_keys(
     let binding = azure_maa_binding_from_session_bundle(bundle).map_err(|detail| {
         session_error(format!("committed_session_maa_signature_invalid: {detail}"))
     })?;
-    if !context.manual_azure_maa_keys.is_empty() {
-        return select_azure_maa_manual_trust_key(&binding, &context.manual_azure_maa_keys)
+    // The binding here is the *committed session's* token, not the TLS one, so
+    // chain mode resolves that token's own kid and issuer rather than reusing
+    // anything established during the TLS handshake.
+    match &context.azure_maa_trust {
+        SessionAzureMaaTrust::Chain(client) => client
+            .resolve_azure_maa_signing_key_from_binding(&binding)
+            .await
+            .map(|key| vec![key])
+            .map_err(committed_session_maa_error),
+        SessionAzureMaaTrust::Offline(keys) => select_azure_maa_manual_trust_key(&binding, keys)
             .map(|key| vec![key])
             .map_err(|detail| {
                 session_error(format!("committed_session_maa_signature_invalid: {detail}"))
-            });
+            }),
     }
-    let client = context.chain_client.as_ref().ok_or_else(|| {
-        session_error("no verifier-selected chain is available for committed Azure MAA trust")
-    })?;
-    client
-        .resolve_azure_maa_signing_key_from_binding(&binding)
-        .await
-        .map(|key| vec![key])
-        .map_err(committed_session_maa_error)
 }
 
 fn committed_session_maa_error(error: AttestationClientError) -> AttestationClientError {
