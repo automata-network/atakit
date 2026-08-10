@@ -80,7 +80,13 @@ if [ "$packaged_user" != "1000:1000" ]; then
     echo "packaged image user is $packaged_user, expected 1000:1000" >&2
     exit 1
 fi
+packaged_workdir=$(podman image inspect "$image_tag" --format '{{.Config.WorkingDir}}')
+if [ "$packaged_workdir" != "/" ]; then
+    echo "packaged image working directory is $packaged_workdir, expected /" >&2
+    exit 1
+fi
 echo "packaged image user: $packaged_user"
+echo "packaged image working directory: $packaged_workdir"
 
 mkdir -p "$(dirname -- "$output")"
 oci_directory="$context/image"

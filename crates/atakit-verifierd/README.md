@@ -32,6 +32,8 @@ The script refuses to overwrite an existing archive. It also refuses a binary
 with a dynamic program interpreter or a shared library dependency. Before it
 starts the build, it checks the pinned runtime image's platform, non-root user,
 and certificate path. The packaged process runs as UID and GID 1000, which fit
-inside atakit-portal's 2,000-ID mapping for each workload service. The script
-checks this final image setting before it writes normalized archive metadata so
-the same image contents produce the same archive checksum.
+inside atakit-portal's 2,000-ID mapping for each workload service. Its working
+directory is `/`, rather than the pinned distroless image's `/home/nonroot`,
+which UID 1000 cannot enter. The script checks both final image settings before
+it writes normalized archive metadata so the same image contents produce the
+same archive checksum.

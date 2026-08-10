@@ -3,4 +3,5 @@ FROM gcr.io/distroless/static-debian12@sha256:7a2bd171a18bdd39a4729600d0dca5f16e
 COPY --chown=1000:1000 atakit-verifierd /usr/local/bin/atakit-verifierd
 
 USER 1000:1000
+WORKDIR /
 ENTRYPOINT ["/usr/local/bin/atakit-verifierd"]
