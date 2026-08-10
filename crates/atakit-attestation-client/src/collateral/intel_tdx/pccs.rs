@@ -323,6 +323,18 @@ mod tests {
         DistinguishedName, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, SerialNumber,
     };
 
+    fn exact_tdx_quote_fixture() -> Vec<u8> {
+        let mut provider_buffer =
+            hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
+                .expect("decode TDX quote fixture");
+        let mut unread = provider_buffer.as_slice();
+        dcap_rs::types::quote::Quote::read(&mut unread).expect("parse TDX quote fixture");
+        let exact_length = provider_buffer.len() - unread.len();
+        assert!(unread.iter().all(|byte| *byte == 0));
+        provider_buffer.truncate(exact_length);
+        provider_buffer
+    }
+
     fn synthetic_collateral_for_quote_with_selection(
         quote: &[u8],
         selection: IntelTdxCollateralSelection,
@@ -444,8 +456,7 @@ mod tests {
 
     #[test]
     fn extracts_material_from_the_upstream_tdx_quote_sample() {
-        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
-            .expect("decode quote");
+        let quote = exact_tdx_quote_fixture();
         let material = quote_material(&quote).expect("extract quote material");
         assert_eq!(material.fmspc.len(), 12);
         assert!(matches!(material.pck_ca, "processor" | "platform"));
@@ -453,8 +464,7 @@ mod tests {
 
     #[test]
     fn version_one_file_round_trip_preserves_collateral_and_exact_selector() {
-        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
-            .expect("decode TDX quote");
+        let quote = exact_tdx_quote_fixture();
         let collateral = synthetic_collateral_for_quote(&quote);
         let clone = collateral.clone();
         assert!(std::ptr::eq(collateral.parsed(), clone.parsed()));
@@ -482,8 +492,7 @@ mod tests {
 
     #[test]
     fn exact_evaluation_number_must_match_signed_tcb_info() {
-        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
-            .expect("decode TDX quote");
+        let quote = exact_tdx_quote_fixture();
         let collateral = synthetic_collateral_for_quote_with_selection(
             &quote,
             IntelTdxCollateralSelection::EvaluationDataNumber(7),
@@ -508,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_tdx_quotes_and_nonzero_trailing_bytes() {
+    fn rejects_non_tdx_quotes_and_all_trailing_bytes() {
         let sgx_quote =
             hex::decode(include_str!("../../../testdata/automata-dcap/quotev3.hex").trim())
                 .expect("decode SGX quote");
@@ -516,20 +525,20 @@ mod tests {
             .expect_err("SGX quote must not be accepted as TDX")
             .contains("expected a TDX quote"));
 
-        let mut padded_tdx_quote =
-            hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
-                .expect("decode TDX quote");
-        padded_tdx_quote.push(1);
-        assert!(quote_material(&padded_tdx_quote)
-            .expect_err("non-zero trailing bytes must be rejected")
-            .contains("non-zero trailing bytes"));
+        let tdx_quote = exact_tdx_quote_fixture();
+        for trailing_byte in [0, 1] {
+            let mut padded_tdx_quote = tdx_quote.clone();
+            padded_tdx_quote.push(trailing_byte);
+            assert!(quote_material(&padded_tdx_quote)
+                .expect_err("trailing bytes must be rejected")
+                .contains("trailing bytes"));
+        }
     }
 
     #[tokio::test]
     #[ignore = "requires a live Hoodi RPC endpoint"]
     async fn live_automata_collateral_verifies_the_tdx_sample() {
-        let quote = hex::decode(include_str!("../../../testdata/automata-dcap/quotev4.hex").trim())
-            .expect("decode TDX quote");
+        let quote = exact_tdx_quote_fixture();
         let collateral = fetch_automata_collateral(
             "https://ethereum-hoodi-rpc.publicnode.com",
             "hoodi",

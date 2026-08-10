@@ -721,13 +721,13 @@ fn verify_tdx_vendor_report(
         );
         return None;
     }
-    if quote_bytes.iter().any(|byte| *byte != 0) {
+    if !quote_bytes.is_empty() {
         fail(
             report,
             errors,
             check_name,
             format!(
-                "{provider_name} TDX DCAP quote has {} non-zero trailing bytes",
+                "{provider_name} TDX DCAP quote has {} trailing bytes",
                 quote_bytes.len()
             ),
         );
