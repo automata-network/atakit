@@ -75,6 +75,12 @@ trap 'rm -rf "$context"' EXIT HUP INT TERM
 cp "$binary" "$context/atakit-verifierd"
 cp crates/atakit-verifierd/Containerfile "$context/Containerfile"
 podman build --pull=never --timestamp 0 --format oci --tag "$image_tag" "$context"
+packaged_user=$(podman image inspect "$image_tag" --format '{{.Config.User}}')
+if [ "$packaged_user" != "1000:1000" ]; then
+    echo "packaged image user is $packaged_user, expected 1000:1000" >&2
+    exit 1
+fi
+echo "packaged image user: $packaged_user"
 
 mkdir -p "$(dirname -- "$output")"
 oci_directory="$context/image"
