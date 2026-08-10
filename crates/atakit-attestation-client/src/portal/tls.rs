@@ -3,6 +3,7 @@
 //! pinned to the attested certificate.
 
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,8 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::collateral::amd_snp::resolve_amd_snp_collateral;
 use crate::collateral::intel_tdx::{
-    resolve_tdx_dcap_collateral, tdx_collateral_quote, IntelTdxDcapCollateralConfig,
-    IntelTdxDcapCollateralSource,
+    resolve_tdx_dcap_collateral_for_quote, tdx_collateral_quote, IntelTdxDcapCollateralSource,
 };
 use crate::error::PortalVerificationError;
 use crate::http::read_response_bytes_limited;
@@ -148,7 +148,7 @@ impl PortalTlsVerificationMode {
 /// Resolve Intel TDX DCAP collateral for the selected trust source.
 ///
 /// In trust-pack mode the configured packs are consulted first, and only a
-/// genuine miss reaches the configured off-chain source. Vendor collateral is
+/// genuine miss reaches the configured collateral source. Vendor collateral is
 /// self-authenticating, so fetching what a pack does not contain is an
 /// availability choice rather than a trust one — but an entry that is present
 /// and unusable fails the verification, because fetching past a broken pinned
@@ -158,32 +158,36 @@ impl PortalTlsVerificationMode {
 async fn resolve_tdx_dcap_for_source(
     response: &TlsAttestationResponse,
     trust_source: &TrustSource,
-    config: &IntelTdxDcapCollateralConfig,
 ) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
+    let Some(quote) = tdx_collateral_quote(response)? else {
+        return Ok(None);
+    };
     if let TrustSource::Packs(packs) = trust_source {
-        if let Some(quote) = tdx_collateral_quote(response)? {
-            match packs.select_tdx_dcap_collateral(&quote) {
-                Ok(Some(collateral)) => return Ok(Some(collateral)),
-                Err(error) => return Err(error.to_string()),
-                Ok(None) => {
-                    if matches!(config.source, IntelTdxDcapCollateralSource::None) {
-                        return Err(format!(
-                            "the configured trust packs carry no Intel TDX DCAP collateral for \
-                             this quote{}, and no off-chain source is configured to fetch it \
-                             from",
-                            if packs.carries_tdx_dcap_collateral() {
-                                " — they carry collateral for other hardware, so this peer's \
-                                 platform is not covered"
-                            } else {
-                                ""
-                            }
-                        ));
-                    }
+        match packs.select_tdx_dcap_collateral(&quote) {
+            Ok(Some(collateral)) => return Ok(Some(collateral)),
+            Err(error) => return Err(error.to_string()),
+            Ok(None) => {
+                if matches!(
+                    trust_source.tdx_dcap_collateral().source,
+                    IntelTdxDcapCollateralSource::None
+                ) {
+                    return Err(format!(
+                        "the configured trust packs carry no Intel TDX DCAP collateral for \
+                         this quote{}, and no fallback collateral source is configured",
+                        if packs.carries_tdx_dcap_collateral() {
+                            " — they carry collateral for other hardware, so this peer's \
+                             platform is not covered"
+                        } else {
+                            ""
+                        }
+                    ));
                 }
             }
         }
     }
-    resolve_tdx_dcap_collateral(response, config).await
+    resolve_tdx_dcap_collateral_for_quote(&quote, trust_source.tdx_dcap_collateral())
+        .await
+        .map(Some)
 }
 
 /// How the committed session's Azure MAA key will be trusted, given the
@@ -220,6 +224,27 @@ pub async fn bootstrap_portal_tls(
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
+    bootstrap_portal_tls_at_address(
+        host,
+        status_port,
+        None,
+        mode,
+        workload_attributes,
+        trust_tls_cert_sha256,
+        report_path,
+    )
+    .await
+}
+
+pub(crate) async fn bootstrap_portal_tls_at_address(
+    host: &str,
+    status_port: u16,
+    resolved_address: Option<SocketAddr>,
+    mode: &PortalTlsVerificationMode,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
+    trust_tls_cert_sha256: Option<&str>,
+    report_path: Option<&Path>,
+) -> Result<VerifiedPortalTls, PortalVerificationError> {
     let trust_source = &mode.trust_source();
     // The window is checked before anything else, including before the portal
     // is contacted, because this is the boundary every caller crosses.
@@ -232,18 +257,26 @@ pub async fn bootstrap_portal_tls(
         TrustSource::Packs(source) => source.amd_snp_crls().to_vec(),
         TrustSource::Chain(_) => Vec::new(),
     };
-    let tdx_dcap_collateral = trust_source.tdx_dcap_collateral().clone();
     let nonce = random_nonce()?;
     let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
-    let url = format!("https://{host}:{status_port}/tls-attestation?nonce={nonce_b64}");
-    let bootstrap = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .tls_info(true)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| PortalVerificationError::Http {
-            message: e.to_string(),
-        })?;
+    let url = crate::portal::portal_url(
+        host,
+        status_port,
+        &format!("/tls-attestation?nonce={nonce_b64}"),
+    );
+    let bootstrap = apply_resolution(
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_info(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30)),
+        host,
+        resolved_address,
+    )
+    .build()
+    .map_err(|e| PortalVerificationError::Http {
+        message: e.to_string(),
+    })?;
 
     let resp = bootstrap.get(&url).send().await.map_err(|e| {
         PortalVerificationError::PortalTlsAttestationFailed {
@@ -271,7 +304,12 @@ pub async fn bootstrap_portal_tls(
             None
         };
         if trust_tls_cert_sha256 == Some(live_hash.as_str()) {
-            let client = pinned_client(&live_peer_cert_der, Duration::from_secs(300))?;
+            let client = pinned_client(
+                &live_peer_cert_der,
+                Duration::from_secs(300),
+                host,
+                resolved_address,
+            )?;
             return Ok(VerifiedPortalTls {
                 client,
                 identity: VerifiedTlsIdentity {
@@ -314,26 +352,28 @@ pub async fn bootstrap_portal_tls(
                 message: format!("invalid response JSON: {e}"),
             }
         })?;
-    let intel_tdx_dcap_collateral =
-        match resolve_tdx_dcap_for_source(&response, trust_source, &tdx_dcap_collateral).await {
-            Ok(collateral) => collateral,
-            Err(detail) => {
-                let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
-                let live_hash = format!("0x{}", hex::encode(live_sha));
-                let report = tls_preverification_failure_report(
-                    &response,
-                    &live_hash,
-                    "tdx-dcap-collateral",
-                    detail,
-                );
-                return handle_tls_attestation_failure(
-                    report,
-                    live_peer_cert_der,
-                    trust_tls_cert_sha256,
-                    report_path,
-                );
-            }
-        };
+    let intel_tdx_dcap_collateral = match resolve_tdx_dcap_for_source(&response, trust_source).await
+    {
+        Ok(collateral) => collateral,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "tdx-dcap-collateral",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+                host,
+                resolved_address,
+            );
+        }
+    };
 
     let amd_snp_collateral = match resolve_amd_snp_collateral(&response, amd_snp_crls).await {
         Ok(collateral) => collateral,
@@ -351,6 +391,8 @@ pub async fn bootstrap_portal_tls(
                 live_peer_cert_der,
                 trust_tls_cert_sha256,
                 report_path,
+                host,
+                resolved_address,
             );
         }
     };
@@ -371,6 +413,8 @@ pub async fn bootstrap_portal_tls(
                 live_peer_cert_der,
                 trust_tls_cert_sha256,
                 report_path,
+                host,
+                resolved_address,
             );
         }
     };
@@ -394,6 +438,8 @@ pub async fn bootstrap_portal_tls(
                 live_peer_cert_der,
                 trust_tls_cert_sha256,
                 report_path,
+                host,
+                resolved_address,
             );
         }
     };
@@ -426,7 +472,12 @@ pub async fn bootstrap_portal_tls(
     };
     match verification {
         Ok(identity) => {
-            let client = pinned_client(&identity.cert_der, Duration::from_secs(300))?;
+            let client = pinned_client(
+                &identity.cert_der,
+                Duration::from_secs(300),
+                host,
+                resolved_address,
+            )?;
             Ok(VerifiedPortalTls {
                 client,
                 identity,
@@ -440,6 +491,8 @@ pub async fn bootstrap_portal_tls(
             live_peer_cert_der,
             trust_tls_cert_sha256,
             report_path,
+            host,
+            resolved_address,
         ),
     }
 }
@@ -501,6 +554,8 @@ fn handle_tls_attestation_failure(
     live_peer_cert_der: Vec<u8>,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
     let written_report_path = if let Some(path) = report_path {
         write_tls_attestation_report(&report, path)?;
@@ -511,7 +566,12 @@ fn handle_tls_attestation_failure(
     let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
     let live_hash = format!("0x{}", hex::encode(live_sha));
     if trust_tls_cert_sha256 == Some(live_hash.as_str()) {
-        let client = pinned_client(&live_peer_cert_der, Duration::from_secs(300))?;
+        let client = pinned_client(
+            &live_peer_cert_der,
+            Duration::from_secs(300),
+            host,
+            resolved_address,
+        )?;
         return Ok(VerifiedPortalTls {
             client,
             identity: VerifiedTlsIdentity {
@@ -586,23 +646,45 @@ pub fn tls_manual_override_message(verified: &VerifiedPortalTls) -> Option<Strin
 fn pinned_client(
     cert_der: &[u8],
     timeout: Duration,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
 ) -> Result<reqwest::Client, PortalVerificationError> {
     let cert = reqwest::Certificate::from_der(cert_der).map_err(|e| {
         PortalVerificationError::PortalTlsAttestationFailed {
             message: format!("invalid attested TLS certificate: {e}"),
         }
     })?;
-    reqwest::Client::builder()
-        .add_root_certificate(cert)
-        // Portal certs are issued for `atakit-portal`, while clients usually
-        // connect by cloud IP. Cert validity is pinned by the attestation hash;
-        // only hostname verification is relaxed here.
-        .danger_accept_invalid_hostnames(true)
-        .timeout(timeout)
-        .build()
-        .map_err(|e| PortalVerificationError::Http {
-            message: e.to_string(),
-        })
+    apply_resolution(
+        reqwest::Client::builder()
+            .add_root_certificate(cert)
+            // Portal certs are issued for `atakit-portal`, while clients usually
+            // connect by cloud IP. Cert validity is pinned by the attestation hash;
+            // only hostname verification is relaxed here.
+            .danger_accept_invalid_hostnames(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout),
+        host,
+        resolved_address,
+    )
+    .build()
+    .map_err(|e| PortalVerificationError::Http {
+        message: e.to_string(),
+    })
+}
+
+fn apply_resolution(
+    builder: reqwest::ClientBuilder,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
+) -> reqwest::ClientBuilder {
+    let Some(address) = resolved_address else {
+        return builder;
+    };
+    let builder = builder.no_proxy();
+    match host.parse::<std::net::IpAddr>() {
+        Err(_) => builder.resolve(host, address),
+        Ok(_) => builder,
+    }
 }
 
 fn random_nonce() -> Result<[u8; 32], PortalVerificationError> {
@@ -618,6 +700,108 @@ fn random_nonce() -> Result<[u8; 32], PortalVerificationError> {
             source: e,
         })?;
     Ok(nonce)
+}
+
+#[cfg(test)]
+mod collateral_mode_tests {
+    use super::*;
+    use crate::collateral::intel_tdx::{
+        tdx_dcap_collateral_config, IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource,
+        TdxDcapAutomataReadStrategy,
+    };
+    use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+
+    fn captured_response() -> TlsAttestationResponse {
+        serde_json::from_str(include_str!("../testdata/azure-tdx-tls-attestation.json"))
+            .expect("captured Azure TDX response")
+    }
+
+    fn automata_onchain(rpc_url: &str) -> IntelTdxDcapCollateralConfig {
+        IntelTdxDcapCollateralConfig {
+            source: IntelTdxDcapCollateralSource::AutomataOnchainPccs {
+                chain: Some("hoodi".to_string()),
+                rpc_url: Some(rpc_url.to_string()),
+                pcs_dao: None,
+                pck_dao: None,
+                fmspc_tcb_dao: None,
+                enclave_identity_dao: None,
+                read_strategy: TdxDcapAutomataReadStrategy::DirectConcurrent,
+            },
+        }
+    }
+
+    /// An AMD SEV-SNP response returns before the configured Intel TDX source
+    /// is constructed or queried. The reachable counter is the proof: a
+    /// request would be visible even if it later failed to decode.
+    #[tokio::test]
+    async fn amd_sev_snp_does_not_touch_an_unused_intel_tdx_collateral_source() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let mut response = captured_response();
+        response.platform.tee = "sev-snp".to_string();
+        let source = TrustSource::Explicit(
+            ExplicitTrustSource::new(
+                TlsVerificationTrust::default(),
+                automata_onchain(endpoint.url()),
+            )
+            .expect("explicit source"),
+        );
+
+        let collateral = resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("an AMD response does not need Intel collateral");
+        assert!(collateral.is_none());
+        assert_eq!(
+            endpoint.requests(),
+            0,
+            "AMD SEV-SNP verification queried an unused Intel TDX collateral source"
+        );
+    }
+
+    /// Network-backed integration proof for explicit policy authority plus
+    /// Automata on-chain PCCS Intel TDX collateral. Ignored in the normal
+    /// offline test run; the live validation command runs it explicitly.
+    #[tokio::test]
+    #[ignore = "requires the public Hoodi RPC endpoint"]
+    async fn explicit_mode_fetches_intel_tdx_collateral_from_automata_onchain_pccs() {
+        let response = captured_response();
+        let source = TrustSource::Explicit(
+            ExplicitTrustSource::new(
+                TlsVerificationTrust::default(),
+                tdx_dcap_collateral_config(None, None, None, None)
+                    .expect("default Automata PCCS source"),
+            )
+            .expect("explicit source"),
+        );
+        assert_eq!(source.mode(), "explicit");
+        assert!(resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("Automata on-chain collateral fetch")
+            .is_some());
+    }
+
+    /// The same network-backed proof for trust-pack policy authority. The
+    /// on-chain query supplies only Intel collateral; the selected authority
+    /// remains `trust-pack`.
+    #[tokio::test]
+    #[ignore = "requires the public Hoodi RPC endpoint"]
+    async fn trust_pack_mode_fetches_intel_tdx_collateral_from_automata_onchain_pccs() {
+        let response = captured_response();
+        let source = TrustSource::Packs(
+            PackTrustSource::new(
+                Vec::new(),
+                Vec::new(),
+                tdx_dcap_collateral_config(None, None, None, None)
+                    .expect("default Automata PCCS source"),
+            )
+            .expect("pack source"),
+        );
+        assert_eq!(source.mode(), "trust-pack");
+        assert!(resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("Automata on-chain collateral fetch")
+            .is_some());
+    }
 }
 
 #[cfg(test)]

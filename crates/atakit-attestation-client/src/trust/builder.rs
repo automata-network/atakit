@@ -557,14 +557,17 @@ mod tests {
     }
 }
 
-/// Transport-level proof that explicit mode never reads a chain.
+/// Transport-level proof that explicit and trust-pack policy resolution never
+/// reads a registry.
 ///
 /// These assert on what reached the network, not on what a verification
-/// returned. A verification that wrongly consulted a chain and then succeeded
-/// is indistinguishable from one that never consulted it by return value alone,
-/// which is why the exclusive-mode test list calls for a call counter.
+/// returned. A verification that wrongly consulted a registry and then
+/// succeeded is indistinguishable from one that never consulted it by return
+/// value alone, which is why the exclusive-mode test list calls for a call
+/// counter. Automata on-chain PCCS is a separate collateral query and is
+/// tested at the portal TLS boundary instead.
 #[cfg(test)]
-mod no_chain_read_outside_chain_mode {
+mod no_registry_policy_read_outside_chain_mode {
     use super::tests::{
         aws_snp_request, complete_anchors, explicit, packs, request, SUPPORTED_PLATFORMS,
     };
@@ -598,10 +601,10 @@ mod no_chain_read_outside_chain_mode {
         );
     }
 
-    /// Test 8. A complete explicit resolution, for every supported platform,
-    /// performs no chain read at all.
+    /// A complete explicit trust-anchor resolution, for every supported
+    /// platform, performs no registry read.
     #[tokio::test]
-    async fn explicit_mode_performs_no_chain_rpc() {
+    async fn explicit_mode_performs_no_registry_rpc() {
         let endpoint = CountingRpcEndpoint::start().await;
 
         for (cloud, tee) in SUPPORTED_PLATFORMS {
@@ -615,19 +618,19 @@ mod no_chain_read_outside_chain_mode {
         assert_eq!(
             endpoint.requests(),
             0,
-            "explicit resolution reached a chain endpoint"
+            "explicit resolution reached a registry endpoint"
         );
     }
 
-    /// Test 10. A chain client reachable in the same process must be left
-    /// untouched by an explicit verification.
+    /// A registry client reachable in the same process must be left untouched
+    /// by explicit trust-anchor resolution.
     ///
     /// The type change makes a mixed binding unrepresentable, so this is not
     /// proving that `None` was assigned — it is proving that nothing reaches
     /// for a chain client by another route. The type stops one path; this
     /// covers the rest.
     #[tokio::test]
-    async fn a_reachable_chain_client_is_untouched_by_an_explicit_verification() {
+    async fn a_reachable_registry_client_is_untouched_by_explicit_resolution() {
         let endpoint = CountingRpcEndpoint::start().await;
         let client = connect(&endpoint).await;
         let after_connect = endpoint.requests();
@@ -644,19 +647,18 @@ mod no_chain_read_outside_chain_mode {
         assert_eq!(
             endpoint.requests(),
             after_connect,
-            "an explicit verification reached the chain client's endpoint"
+            "explicit resolution reached the registry client's endpoint"
         );
         // The client is still usable, so the count above is not zero because
         // the endpoint died partway through.
         assert_eq!(client.context().session_registry, SESSION_REGISTRY);
     }
 
-    /// The same proof for trust-pack mode. Asserting only that the
-    /// verification succeeded would not distinguish a run that consulted a
-    /// chain and happened to agree from one that never consulted it, which is
-    /// why this counts what reached the network.
+    /// The same proof for trust-pack trust-anchor resolution. The mode may use
+    /// Automata on-chain PCCS for Intel collateral, but it must not read trust
+    /// anchors or policies from registry contracts.
     #[tokio::test]
-    async fn trust_pack_mode_performs_no_chain_rpc() {
+    async fn trust_pack_mode_performs_no_registry_rpc() {
         let endpoint = CountingRpcEndpoint::start().await;
         let client = connect(&endpoint).await;
         let after_connect = endpoint.requests();
@@ -670,7 +672,7 @@ mod no_chain_read_outside_chain_mode {
         assert_eq!(
             endpoint.requests(),
             after_connect,
-            "a trust-pack verification reached a chain endpoint"
+            "trust-pack resolution reached a registry endpoint"
         );
         assert_eq!(client.context().session_registry, SESSION_REGISTRY);
     }

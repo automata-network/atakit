@@ -322,8 +322,11 @@ pub(crate) async fn verify_current_session_bound(
         .ok_or_else(|| session_error("verified TLS context did not retain session trust inputs"))?;
     let challenge = random_challenge()?;
     let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
-    let url =
-        format!("https://{host}:{status_port}/session/evidence-bundle?challenge={challenge_text}");
+    let url = crate::portal::portal_url(
+        host,
+        status_port,
+        &format!("/session/evidence-bundle?challenge={challenge_text}"),
+    );
     let response = verified_tls
         .client
         .get(url)

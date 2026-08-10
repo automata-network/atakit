@@ -1473,6 +1473,7 @@ dependencies = [
  "atakit-cvm-types",
  "axum",
  "hex",
+ "ipnet",
  "k256",
  "serde",
  "serde_json",
@@ -1482,6 +1483,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

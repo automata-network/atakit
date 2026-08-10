@@ -27,12 +27,13 @@ pub async fn read_untrusted_portal_base_image_id(
 ) -> Result<[u8; 32], PortalVerificationError> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| PortalVerificationError::Http {
             message: error.to_string(),
         })?;
-    let url = format!("https://{host}:{status_port}/status");
+    let url = crate::portal::portal_url(host, status_port, "/status");
     let response = client
         .get(&url)
         .send()

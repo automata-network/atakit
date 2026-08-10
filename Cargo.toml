@@ -40,6 +40,8 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 futures-util = "0.3"
 urlencoding = "2"
+ipnet = "2"
+url = "2"
 
 # Build / archive
 tempfile = "3"

@@ -1,7 +1,7 @@
 //! HTTP boundary for peer session verification.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atakit_attestation::{BindingMode, SessionVerificationFailure, VerifiedSession};
@@ -18,10 +18,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
-use crate::config::{LoadedPack, PeerAddress, TrustModeConfig, VerifierdConfig};
+use crate::config::{LoadedPack, TrustModeConfig, VerifierdConfig};
+use crate::destination::{PortalDestinationPolicy, PortalEndpoint, ResolvedPortalEndpoint};
 
 const MAX_VERIFY_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_CONCURRENT_VERIFICATIONS: usize = 8;
+const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(360);
 const SUPPORTED_PLATFORMS: &[&str] = &[
     "gcp-tdx",
     "gcp-sev-snp",
@@ -47,9 +51,16 @@ pub enum StartError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyRequest {
-    pub peer: String,
+    pub portal: PortalRequest,
     pub base_image: String,
     pub workload: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortalRequest {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +93,8 @@ pub struct HealthResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResponse {
     pub trust_mode: String,
-    pub peers: Vec<String>,
+    pub portal_allowed_ports: Vec<u16>,
+    pub portal_allowed_cidrs: Option<Vec<String>>,
     pub packs: Vec<LoadedPack>,
     pub supported_platforms: Vec<String>,
 }
@@ -94,7 +106,9 @@ pub struct Verifierd {
 }
 
 struct AppState {
-    peers: BTreeMap<String, PeerAddress>,
+    portal_destination_policy: PortalDestinationPolicy,
+    verification_slots: Semaphore,
+    verification_timeout: Duration,
     config: ConfigResponse,
     runner: Arc<dyn VerificationRunner>,
 }
@@ -103,7 +117,7 @@ struct AppState {
 trait VerificationRunner: Send + Sync {
     async fn verify(
         &self,
-        peer: &PeerAddress,
+        portal: &ResolvedPortalEndpoint,
         base_image: AppRef,
         workload: AppRef,
     ) -> Result<VerifyResponse, ApiError>;
@@ -129,7 +143,7 @@ impl Verifierd {
     pub async fn from_config(config: VerifierdConfig) -> Result<Self, StartError> {
         let report = config_response(&config);
         let listen = config.listen;
-        let peers = config.peers;
+        let portal_destination_policy = config.portal_destination_policy;
         let mode = match config.mode {
             TrustModeConfig::Chain {
                 client,
@@ -158,7 +172,9 @@ impl Verifierd {
         };
         Ok(Self {
             state: Arc::new(AppState {
-                peers,
+                portal_destination_policy,
+                verification_slots: Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
+                verification_timeout: VERIFICATION_TIMEOUT,
                 config: report,
                 runner: Arc::new(RuntimeRunner { mode }),
             }),
@@ -193,7 +209,7 @@ impl Verifierd {
 impl VerificationRunner for RuntimeRunner {
     async fn verify(
         &self,
-        peer: &PeerAddress,
+        portal: &ResolvedPortalEndpoint,
         base_image: AppRef,
         workload: AppRef,
     ) -> Result<VerifyResponse, ApiError> {
@@ -246,8 +262,9 @@ impl VerificationRunner for RuntimeRunner {
         };
 
         let outcome = verify_portal_session(PortalSessionVerificationRequest {
-            host: peer.host.clone(),
-            status_port: peer.port,
+            host: portal.host().to_string(),
+            status_port: portal.port(),
+            resolved_address: Some(portal.socket_address()),
             mode,
             report_path: None,
             required_binding,
@@ -278,15 +295,12 @@ async fn verify(
     let Json(request) = request.map_err(|error| {
         ApiError::bad_request(format!("invalid POST /v1/verify JSON body: {error}"))
     })?;
-    let peer_name = request.peer.to_ascii_lowercase();
-    let peer = state.peers.get(&peer_name).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "unknown peer {:?}; POST /v1/verify accepts only a configured VERIFIED_PEER_<NAME>",
-            request.peer
-        ))
-    })?;
-    // Resolve the allowlist before parsing anything that could be mistaken for
-    // an address. The request contains no host or port field by construction.
+    let permit = state
+        .verification_slots
+        .try_acquire()
+        .map_err(|_| ApiError::busy("too many portal verifications are already running"))?;
+    let portal = PortalEndpoint::parse(&request.portal.host, request.portal.port)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base_image = request
         .base_image
         .parse::<AppRef>()
@@ -295,11 +309,18 @@ async fn verify(
         .workload
         .parse::<AppRef>()
         .map_err(|error| ApiError::bad_request(format!("invalid workload: {error}")))?;
-    state
-        .runner
-        .verify(peer, base_image, workload)
-        .await
-        .map(Json)
+    let result = tokio::time::timeout(state.verification_timeout, async {
+        let portal = state
+            .portal_destination_policy
+            .resolve(portal)
+            .await
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        state.runner.verify(&portal, base_image, workload).await
+    })
+    .await
+    .map_err(|_| ApiError::timeout("portal verification exceeded its total time limit"))?;
+    drop(permit);
+    result.map(Json)
 }
 
 fn success_response(
@@ -343,7 +364,16 @@ fn config_response(config: &VerifierdConfig) -> ConfigResponse {
     };
     ConfigResponse {
         trust_mode: config.mode.name().to_string(),
-        peers: config.peers.keys().cloned().collect(),
+        portal_allowed_ports: config
+            .portal_destination_policy
+            .allowed_ports()
+            .iter()
+            .copied()
+            .collect(),
+        portal_allowed_cidrs: config
+            .portal_destination_policy
+            .allowed_cidrs()
+            .map(|networks| networks.iter().map(ToString::to_string).collect()),
         packs,
         supported_platforms,
     }
@@ -371,12 +401,54 @@ impl ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 failure: *failure,
             },
-            error => Self {
+            PortalVerificationError::Config { .. } => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 failure: SessionVerificationFailure {
                     checks: Vec::new(),
-                    errors: vec![error.to_string()],
+                    errors: vec!["portal verification configuration failed".to_string()],
                 },
+            },
+            PortalVerificationError::Http { .. } => {
+                Self::verification_message("portal connection failed")
+            }
+            PortalVerificationError::PortalTlsAttestationFailed { .. } => {
+                Self::verification_message("portal TLS attestation failed")
+            }
+            PortalVerificationError::PortalSessionVerificationFailed { .. } => {
+                Self::verification_message("portal session verification failed")
+            }
+            PortalVerificationError::IoPath { .. } | PortalVerificationError::Json(_) => {
+                Self::verification_message("portal verification failed")
+            }
+        }
+    }
+
+    fn verification_message(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            failure: SessionVerificationFailure {
+                checks: Vec::new(),
+                errors: vec![message.to_string()],
+            },
+        }
+    }
+
+    fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            failure: SessionVerificationFailure {
+                checks: Vec::new(),
+                errors: vec![message.into()],
+            },
+        }
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            failure: SessionVerificationFailure {
+                checks: Vec::new(),
+                errors: vec![message.into()],
             },
         }
     }
@@ -426,11 +498,13 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct PendingRunner;
+
     #[async_trait]
     impl VerificationRunner for CountingRunner {
         async fn verify(
             &self,
-            _peer: &PeerAddress,
+            _portal: &ResolvedPortalEndpoint,
             _base_image: AppRef,
             _workload: AppRef,
         ) -> Result<VerifyResponse, ApiError> {
@@ -439,19 +513,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl VerificationRunner for PendingRunner {
+        async fn verify(
+            &self,
+            _portal: &ResolvedPortalEndpoint,
+            _base_image: AppRef,
+            _workload: AppRef,
+        ) -> Result<VerifyResponse, ApiError> {
+            std::future::pending().await
+        }
+    }
+
     fn test_router(runner: Arc<CountingRunner>) -> Router {
-        let peers = BTreeMap::from([(
-            "beta".to_string(),
-            PeerAddress {
-                host: "203.0.113.10".to_string(),
-                port: 2024,
-            },
-        )]);
         let state = Arc::new(AppState {
-            peers: peers.clone(),
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
+            verification_timeout: VERIFICATION_TIMEOUT,
             config: ConfigResponse {
                 trust_mode: "explicit".to_string(),
-                peers: peers.keys().cloned().collect(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
                 packs: Vec::new(),
                 supported_platforms: Vec::new(),
             },
@@ -466,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_peer_is_rejected_before_the_runner() {
+    async fn an_invalid_dynamic_portal_is_rejected_before_the_runner() {
         let runner = Arc::new(CountingRunner {
             calls: AtomicUsize::new(0),
         });
@@ -475,7 +557,7 @@ mod tests {
                 Request::post("/v1/verify")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"peer":"unknown","base_image":"bad","workload":"bad"}"#,
+                        r#"{"portal":{"host":"https://peer.example","port":2024},"base_image":"bad","workload":"bad"}"#,
                     ))
                     .unwrap(),
             )
@@ -485,17 +567,17 @@ mod tests {
         assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let failure: SessionVerificationFailure = serde_json::from_slice(&body).unwrap();
-        assert!(failure.errors[0].contains("unknown peer"));
+        assert!(failure.errors[0].contains("portal.host"));
     }
 
     #[tokio::test]
-    async fn a_known_peer_reaches_the_runner_only_after_references_parse() {
+    async fn a_dynamic_portal_reaches_the_runner_after_destination_and_references_parse() {
         let runner = Arc::new(CountingRunner {
             calls: AtomicUsize::new(0),
         });
         let publisher = format!("0x{}", "11".repeat(32));
         let body = format!(
-            r#"{{"peer":"beta","base_image":"{publisher}/base:v1","workload":"{publisher}/workload:v1"}}"#
+            r#"{{"portal":{{"host":"203.0.113.10","port":2024}},"base_image":"{publisher}/base:v1","workload":"{publisher}/workload:v1"}}"#
         );
         let response = test_router(runner.clone())
             .oneshot(
@@ -524,6 +606,11 @@ mod tests {
             let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(value.get(field).is_some(), "{path}: {value}");
+            if path == "/v1/config" {
+                assert_eq!(value["portal_allowed_ports"], serde_json::json!([2024]));
+                assert!(value["portal_allowed_cidrs"].is_null());
+                assert!(value.get("peers").is_none());
+            }
         }
     }
 
@@ -534,7 +621,8 @@ mod tests {
         });
         for body in [
             "not JSON",
-            r#"{"peer":"beta","base_image":"x","workload":"y","host":"127.0.0.1"}"#,
+            r#"{"portal":{"host":"203.0.113.10","port":2024,"path":"/status"},"base_image":"x","workload":"y"}"#,
+            r#"{"portal":{"host":"203.0.113.10","port":2024},"base_image":"x","workload":"y","peer":"beta"}"#,
         ] {
             let response = test_router(runner.clone())
                 .oneshot(
@@ -560,7 +648,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let body = format!(
-            r#"{{"peer":"beta","base_image":"{}","workload":"x"}}"#,
+            r#"{{"portal":{{"host":"203.0.113.10","port":2024}},"base_image":"{}","workload":"x"}}"#,
             "a".repeat(MAX_VERIFY_REQUEST_BYTES)
         );
         let response = test_router(runner.clone())
@@ -601,6 +689,96 @@ mod tests {
             Some("signature mismatch")
         );
         assert_eq!(error.failure.errors, ["session verification failed"]);
+    }
+
+    #[test]
+    fn unverified_remote_details_are_not_returned() {
+        let secret = "internal-response-body-secret";
+        for error in [
+            PortalVerificationError::Http {
+                message: secret.to_string(),
+            },
+            PortalVerificationError::PortalTlsAttestationFailed {
+                message: secret.to_string(),
+            },
+            PortalVerificationError::PortalSessionVerificationFailed {
+                message: secret.to_string(),
+            },
+        ] {
+            let error = ApiError::verification(error);
+            let rendered = serde_json::to_string(&error.failure).unwrap();
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_verification_slot_set_fails_without_running_verification() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let state = Arc::new(AppState {
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: Semaphore::new(0),
+            verification_timeout: VERIFICATION_TIMEOUT,
+            config: ConfigResponse {
+                trust_mode: "explicit".to_string(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
+                packs: Vec::new(),
+                supported_platforms: Vec::new(),
+            },
+            runner: runner.clone(),
+        });
+        let response = Router::new()
+            .route("/v1/verify", post(verify))
+            .layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES))
+            .with_state(state)
+            .oneshot(
+                Request::post("/v1/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"portal":{"host":"203.0.113.10","port":2024},"base_image":"bad","workload":"bad"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_total_timeout_bounds_destination_resolution_and_verification() {
+        let state = Arc::new(AppState {
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: Semaphore::new(1),
+            verification_timeout: Duration::from_millis(1),
+            config: ConfigResponse {
+                trust_mode: "explicit".to_string(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
+                packs: Vec::new(),
+                supported_platforms: Vec::new(),
+            },
+            runner: Arc::new(PendingRunner),
+        });
+        let publisher = format!("0x{}", "11".repeat(32));
+        let body = format!(
+            r#"{{"portal":{{"host":"203.0.113.10","port":2024}},"base_image":"{publisher}/base:v1","workload":"{publisher}/workload:v1"}}"#
+        );
+        let response = Router::new()
+            .route("/v1/verify", post(verify))
+            .layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES))
+            .with_state(state)
+            .oneshot(
+                Request::post("/v1/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

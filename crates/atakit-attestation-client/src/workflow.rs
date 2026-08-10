@@ -8,7 +8,7 @@ use atakit_cvm_types::AppRef;
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
 use crate::portal::session::{verify_current_session, SessionWorkloadSelector, VerifiedPortalTls};
-use crate::portal::tls::{bootstrap_portal_tls, ChainBaseImage, PortalTlsVerificationMode};
+use crate::portal::tls::{ChainBaseImage, PortalTlsVerificationMode};
 use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
 
 /// One complete verification: its trust authority, and every policy that
@@ -107,6 +107,10 @@ impl SessionVerificationMode {
 pub struct PortalSessionVerificationRequest {
     pub host: String,
     pub status_port: u16,
+    /// One address resolved and checked by a caller that accepts dynamic
+    /// destinations. Both portal TLS and current-session verification use it,
+    /// so DNS cannot select a different socket after attestation.
+    pub resolved_address: Option<std::net::SocketAddr>,
     pub mode: SessionVerificationMode,
     pub report_path: Option<PathBuf>,
     pub required_binding: Option<BindingMode>,
@@ -128,14 +132,16 @@ pub async fn verify_portal_session(
     let PortalSessionVerificationRequest {
         host,
         status_port,
+        resolved_address,
         mode,
         report_path,
         required_binding,
     } = request;
 
-    let portal_tls = bootstrap_portal_tls(
+    let portal_tls = crate::portal::tls::bootstrap_portal_tls_at_address(
         &host,
         status_port,
+        resolved_address,
         &mode.tls_mode(),
         None,
         None,
@@ -182,9 +188,13 @@ pub async fn verify_portal_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::collateral::intel_tdx::{
+        IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource, TdxDcapAutomataReadStrategy,
+    };
     use crate::pack::fixture::Publisher;
     use crate::pack::TrustPackKind;
+    use crate::portal::tls::bootstrap_portal_tls;
+    use crate::test_support::CountingRpcEndpoint;
 
     /// A port nothing listens on. Reaching a connection attempt at all means
     /// the check under test did not run first.
@@ -195,7 +205,10 @@ mod tests {
     const EXPIRED_NOT_BEFORE: u64 = 1_600_000_000;
     const EXPIRED_NOT_AFTER: u64 = 1_600_100_000;
 
-    fn packs_mode(expired: bool) -> SessionVerificationMode {
+    fn packs_mode_with_tdx(
+        expired: bool,
+        tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
+    ) -> SessionVerificationMode {
         let workload_publisher = Publisher::new(0x31);
         let base_publisher = Publisher::new(0x32);
         let (not_before, not_after, read_at) = if expired {
@@ -233,12 +246,8 @@ mod tests {
         let pack = crate::pack::read::read_trust_pack(&archive, &options)
             .expect("the pack verifies inside its own window");
 
-        let source = PackTrustSource::new(
-            Vec::new(),
-            vec![pack],
-            IntelTdxDcapCollateralConfig::default(),
-        )
-        .expect("pack source");
+        let source =
+            PackTrustSource::new(Vec::new(), vec![pack], tdx_dcap_collateral).expect("pack source");
         SessionVerificationMode::Packs {
             source,
             base_image_id,
@@ -247,6 +256,24 @@ mod tests {
                 "peer-attestation-demo",
                 "v1.0.0",
             ),
+        }
+    }
+
+    fn packs_mode(expired: bool) -> SessionVerificationMode {
+        packs_mode_with_tdx(expired, IntelTdxDcapCollateralConfig::default())
+    }
+
+    fn automata_onchain(rpc_url: &str) -> IntelTdxDcapCollateralConfig {
+        IntelTdxDcapCollateralConfig {
+            source: IntelTdxDcapCollateralSource::AutomataOnchainPccs {
+                chain: Some("hoodi".to_string()),
+                rpc_url: Some(rpc_url.to_string()),
+                pcs_dao: None,
+                pck_dao: None,
+                fmspc_tcb_dao: None,
+                enclave_identity_dao: None,
+                read_strategy: TdxDcapAutomataReadStrategy::DirectConcurrent,
+            },
         }
     }
 
@@ -300,6 +327,88 @@ mod tests {
             packed.pack.subject.id
         );
         let _ = source;
+    }
+
+    /// An Automata on-chain PCCS endpoint is a collateral endpoint, not a
+    /// registry policy endpoint. Explicit mode keeps the operator's
+    /// measurement and workload policies and does not query that endpoint
+    /// while resolving either policy.
+    #[tokio::test]
+    async fn explicit_policy_with_automata_onchain_pccs_stays_explicit() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let packed = packs_mode(false).measurement_policy().await.unwrap();
+        let workload_policy = TrustedWorkloadSessionPolicy {
+            workload_id: [0x44; 32],
+            pcr_specs256: Vec::new(),
+            pcr_specs384: Vec::new(),
+            attribute_requirements: Vec::new(),
+        };
+        let mode = SessionVerificationMode::Explicit {
+            source: crate::trust::source::ExplicitTrustSource::new(
+                Default::default(),
+                automata_onchain(endpoint.url()),
+            )
+            .expect("explicit policy and Automata PCCS collateral are compatible"),
+            measurement_policy: Box::new(packed.clone()),
+            workload_policy: workload_policy.clone(),
+        };
+
+        let resolved = mode
+            .measurement_policy()
+            .await
+            .expect("explicit measurement policy");
+        assert_eq!(resolved.pack.subject.id, packed.pack.subject.id);
+        let SessionVerificationMode::Explicit {
+            workload_policy: resolved_workload,
+            ..
+        } = &mode
+        else {
+            unreachable!()
+        };
+        assert_eq!(resolved_workload.workload_id, workload_policy.workload_id);
+        assert_eq!(
+            endpoint.requests(),
+            0,
+            "policy resolution must not treat the Automata PCCS endpoint as a registry"
+        );
+    }
+
+    /// Trust-pack mode keeps both policies in its signed workload pack while
+    /// allowing an independent Automata on-chain PCCS collateral endpoint.
+    /// Resolving either policy must not query that endpoint as a registry.
+    #[tokio::test]
+    async fn trust_pack_policy_with_automata_onchain_pccs_stays_in_the_pack() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let mode = packs_mode_with_tdx(false, automata_onchain(endpoint.url()));
+        let measurement_policy = mode
+            .measurement_policy()
+            .await
+            .expect("packed measurement policy");
+        assert!(measurement_policy.source.starts_with("trust pack "));
+
+        let SessionVerificationMode::Packs {
+            source,
+            base_image_id,
+            workload,
+        } = &mode
+        else {
+            unreachable!()
+        };
+        let workload_policy = crate::pack::workload::packed_workload_policy(
+            source.workload_pack().expect("workload pack"),
+            workload,
+            *base_image_id,
+        )
+        .expect("packed workload policy");
+        assert_eq!(
+            workload_policy.workload_id,
+            atakit_cvm_encoding::workload_id(workload)
+        );
+        assert_eq!(
+            endpoint.requests(),
+            0,
+            "pack policy resolution must not treat the Automata PCCS endpoint as a registry"
+        );
     }
 
     /// `bootstrap_portal_tls` is public and takes a `TrustSource` directly, so

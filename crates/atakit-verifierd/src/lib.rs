@@ -1,6 +1,6 @@
 //! `atakit-verifierd`: peer session verification over HTTP.
 //!
-//! The daemon connects to a configured peer, verifies portal TLS, fetches a
+//! The daemon connects to a request-selected portal, verifies portal TLS, fetches a
 //! challenge-bound current-session evidence bundle, verifies it, and returns
 //! the peer's verified session public key. It does nothing else: no key
 //! exchange, no workload secrets, no signing, no transactions, no proxying.
@@ -12,4 +12,5 @@
 //! service rather than a party anyone else trusts.
 
 pub mod config;
+pub mod destination;
 pub mod server;

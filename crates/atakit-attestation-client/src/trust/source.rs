@@ -1,11 +1,12 @@
-//! The trust source a verification resolves everything from, and the
-//! provenance it reports afterwards.
+//! The authority that supplies a verification's trust anchors and policies,
+//! and the provenance reported afterwards.
 //!
-//! A verification selects exactly one source. There is no default, no
-//! precedence rule, and no operation that merges one source's inputs into
-//! another's. The type is a sum rather than a struct of optional fields
-//! precisely so a configuration naming two sources cannot be constructed —
-//! a shape that cannot express two sources cannot be misconfigured into two.
+//! A verification selects exactly one policy authority. There is no default,
+//! no precedence rule, and no operation that merges one authority's
+//! measurement or workload policy with another's. Vendor-authenticated
+//! attestation collateral is separate: it may come from a file, an HTTP
+//! service, a trust pack, or the Automata on-chain Provisioning Certificate
+//! Caching Service without changing the selected policy authority.
 //!
 //! `TrustSource::Packs` arrived on 2026-08-09, once `.atatp` could complete a
 //! verification. It was deliberately absent before then: the `workload-trust`
@@ -17,7 +18,7 @@
 use atakit_attestation::{IntelTdxQuoteCollateralIdentity, TrustAnchors, TrustedSessionBinding};
 
 use crate::chain::{AttestationClient, AttestationClientConfig};
-use crate::collateral::intel_tdx::{IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource};
+use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
 use crate::error::PortalVerificationError;
 use crate::pack::collateral::{collateral_trust_inputs_from_all, CollateralTrustInputs};
 use crate::pack::read::TrustPack;
@@ -28,12 +29,12 @@ use crate::trust::requirements::RequiredTrustInput;
 /// The single authority for one verification.
 #[derive(Debug, Clone)]
 pub enum TrustSource {
-    /// A verifier-selected registry graph supplies every trust input.
+    /// A verifier-selected registry graph supplies trust anchors and policies.
     Chain(ChainTrustSource),
-    /// The operator supplies every trust input directly and is the authority.
+    /// The operator supplies trust anchors and policies directly.
     Explicit(ExplicitTrustSource),
-    /// Signed `.atatp` trust packs supply every trust input, and the packs'
-    /// publishers are the authority.
+    /// Signed `.atatp` trust packs supply trust anchors and policies, and the
+    /// packs' publishers are the authority.
     Packs(PackTrustSource),
 }
 
@@ -98,26 +99,15 @@ struct PackedEntry {
 impl PackTrustSource {
     /// Build from already-verified packs.
     ///
-    /// Rejects the Automata on-chain Provisioning Certificate Caching Service
-    /// for the reason explicit mode does: reading it is a chain query, and this
-    /// mode issues none. Off-chain HTTP PCCS and the AMD Key Distribution
-    /// Service stay permitted, because vendor-signed collateral is
-    /// self-authenticating and is validated against the anchors these packs
-    /// supply — an availability choice, not a trust one.
+    /// The Intel TDX collateral source is independent of the packs' policy
+    /// authority. Automata on-chain PCCS is permitted here because it returns
+    /// vendor-signed collateral that is verified locally; it does not supply a
+    /// measurement policy or workload policy.
     pub fn new(
         collateral_packs: Vec<TrustPack>,
         workload_packs: Vec<TrustPack>,
         tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
     ) -> Result<Self, PortalVerificationError> {
-        if let IntelTdxDcapCollateralSource::AutomataOnchainPccs { .. } = tdx_dcap_collateral.source
-        {
-            return Err(PortalVerificationError::Config {
-                message: "trust-pack mode cannot read the Automata on-chain Provisioning \
-                          Certificate Caching Service, because reading it is a chain query; \
-                          supply --tdx-dcap-collateral or --tdx-dcap-pccs-url instead"
-                    .to_string(),
-            });
-        }
         for pack in &workload_packs {
             if pack.kind != TrustPackKind::WorkloadTrust {
                 return Err(TrustPackError::KindMismatch {
@@ -213,7 +203,7 @@ impl PackTrustSource {
     /// not a reason to fetch, because fetching past a broken pinned entry would
     /// make pinning advisory. `Ok(None)` is a genuine miss, where the pack
     /// simply does not cover that hardware, and only then may the caller reach
-    /// a configured off-chain source.
+    /// a configured HTTP or Automata on-chain PCCS collateral source.
     pub(crate) fn select_tdx_dcap_collateral(
         &self,
         quote: &[u8],
@@ -399,25 +389,14 @@ pub struct ExplicitTrustSource {
 impl ExplicitTrustSource {
     /// Build an explicit source from operator-supplied trust material.
     ///
-    /// Rejects the Automata on-chain Provisioning Certificate Caching Service
-    /// here rather than at request time: reading it is a chain query, so
-    /// selecting it alongside explicit trust is a configuration error, not a
-    /// runtime condition to skip. Off-chain HTTP PCCS and the AMD Key
-    /// Distribution Service stay permitted — vendor-signed collateral is
-    /// self-authenticating and is validated against the anchors supplied here.
+    /// The Intel TDX collateral source is independent of the operator's policy
+    /// authority. Automata on-chain PCCS is permitted here because it returns
+    /// vendor-signed collateral that is verified locally; it does not supply a
+    /// measurement policy or workload policy.
     pub fn new(
         trust: TlsVerificationTrust,
         tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
     ) -> Result<Self, PortalVerificationError> {
-        if let IntelTdxDcapCollateralSource::AutomataOnchainPccs { .. } = tdx_dcap_collateral.source
-        {
-            return Err(PortalVerificationError::Config {
-                message: "explicit trust mode cannot read the Automata on-chain Provisioning \
-                          Certificate Caching Service, because reading it is a chain query; \
-                          supply --tdx-dcap-collateral or --tdx-dcap-pccs-url instead"
-                    .to_string(),
-            });
-        }
         let TlsVerificationTrust {
             trust_anchors,
             amd_snp_crls,
@@ -517,6 +496,7 @@ impl TrustProvenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralSource;
 
     fn automata_onchain() -> IntelTdxDcapCollateralConfig {
         IntelTdxDcapCollateralConfig {
@@ -532,29 +512,30 @@ mod tests {
         }
     }
 
-    /// Test 6 of the exclusive-mode set: the Automata on-chain Provisioning
-    /// Certificate Caching Service is rejected outside chain mode, and it is
-    /// rejected while the configuration is being built rather than skipped
-    /// later.
     #[test]
-    fn explicit_mode_rejects_the_automata_onchain_pccs_at_construction() {
-        let error = ExplicitTrustSource::new(TlsVerificationTrust::default(), automata_onchain())
-            .expect_err("explicit mode must refuse a chain-read collateral source");
-        let message = error.to_string();
-        assert!(
-            message.contains("Automata on-chain"),
-            "the failure must name the rejected source; got {message}"
-        );
-        assert!(
-            message.contains("chain query"),
-            "the failure must say why it is refused; got {message}"
-        );
+    fn explicit_mode_accepts_automata_onchain_pccs_collateral() {
+        let source = ExplicitTrustSource::new(TlsVerificationTrust::default(), automata_onchain())
+            .expect("Automata on-chain PCCS is collateral, not the policy authority");
+        assert!(matches!(
+            source.tdx_dcap_collateral.source,
+            IntelTdxDcapCollateralSource::AutomataOnchainPccs { .. }
+        ));
+    }
+
+    #[test]
+    fn trust_pack_mode_accepts_automata_onchain_pccs_collateral() {
+        let source = PackTrustSource::new(Vec::new(), Vec::new(), automata_onchain())
+            .expect("Automata on-chain PCCS is collateral, not the pack authority");
+        assert!(matches!(
+            source.tdx_dcap_collateral.source,
+            IntelTdxDcapCollateralSource::AutomataOnchainPccs { .. }
+        ));
     }
 
     /// Off-chain vendor endpoints stay available: self-authenticating
     /// collateral is not a trust source, so fetching it is not a fallback.
     #[test]
-    fn explicit_mode_accepts_off_chain_collateral_sources() {
+    fn explicit_mode_accepts_file_http_and_no_collateral_sources() {
         for source in [
             IntelTdxDcapCollateralSource::None,
             IntelTdxDcapCollateralSource::File("/tmp/collateral.json".into()),
@@ -565,7 +546,7 @@ mod tests {
             let config = IntelTdxDcapCollateralConfig { source };
             assert!(
                 ExplicitTrustSource::new(TlsVerificationTrust::default(), config).is_ok(),
-                "off-chain collateral sources must remain available in explicit mode"
+                "file, HTTP, and no-collateral configurations must remain available in explicit mode"
             );
         }
     }

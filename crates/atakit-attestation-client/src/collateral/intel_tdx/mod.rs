@@ -179,25 +179,26 @@ pub(crate) fn tdx_collateral_quote(
         .map_err(|e| format!("decode teeEvidence.report for DCAP collateral lookup: {e}"))
 }
 
-pub(crate) async fn resolve_tdx_dcap_collateral(
-    response: &TlsAttestationResponse,
+pub(crate) async fn resolve_tdx_dcap_collateral_for_quote(
+    quote: &[u8],
     config: &IntelTdxDcapCollateralConfig,
-) -> Result<Option<IntelTdxDcapCollateral>, String> {
-    let Some(quote) = tdx_collateral_quote(response)? else {
-        return Ok(None);
-    };
+) -> Result<IntelTdxDcapCollateral, String> {
     let collateral = match &config.source {
-        IntelTdxDcapCollateralSource::None => return Ok(None),
+        IntelTdxDcapCollateralSource::None => {
+            return Err("no Intel TDX DCAP collateral source is configured".to_string())
+        }
         IntelTdxDcapCollateralSource::File(path) => {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| format!("read TDX DCAP collateral file {}: {e}", path.display()))?;
-            parse_dcap_collateral_json(&raw, &quote).map_err(|error| {
+            parse_dcap_collateral_json(&raw, quote).map_err(|error| {
                 format!("parse TDX DCAP collateral file {}: {error}", path.display())
             })?
         }
-        IntelTdxDcapCollateralSource::HttpPccs { url } => fetch_http_collateral(url, &quote)
-            .await
-            .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?,
+        IntelTdxDcapCollateralSource::HttpPccs { url } => {
+            fetch_http_collateral(url, quote)
+                .await
+                .map_err(|e| format!("fetch TDX DCAP collateral from {url}: {e}"))?
+        }
         IntelTdxDcapCollateralSource::AutomataOnchainPccs {
             chain,
             rpc_url,
@@ -223,7 +224,7 @@ pub(crate) async fn resolve_tdx_dcap_collateral(
                         enclave_identity_dao: enclave_identity_dao.as_deref(),
                     },
                     read_strategy,
-                    &quote,
+                    quote,
                 ),
             )
             .await
@@ -235,7 +236,7 @@ pub(crate) async fn resolve_tdx_dcap_collateral(
             .map_err(|e| format!("fetch TDX DCAP collateral from Automata {chain}: {e}"))?
         }
     };
-    Ok(Some(collateral))
+    Ok(collateral)
 }
 
 fn is_tdx(response: &TlsAttestationResponse) -> bool {

@@ -1087,7 +1087,7 @@ mod tests {
             "TOKEN=one\nTOKEN=two\n",
             "BAD-NAME=value\n",
             "ATAKIT_PUBLIC_IP=value\n",
-            "VERIFIED_PEER_BETA=203.0.113.10:2024\n",
+            "VERIFIED_PORTAL_ALLOWED_PORTS=[2024]\n",
         ] {
             assert!(parse_unmeasured_env_file_names(path, content).is_err());
         }

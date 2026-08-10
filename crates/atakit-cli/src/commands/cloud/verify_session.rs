@@ -161,6 +161,7 @@ pub async fn run(args: VerifySessionArgs, env: &Env, config: &Config) -> Result<
     let outcome = verify_portal_session(PortalSessionVerificationRequest {
         host: subject.host.clone(),
         status_port: subject.status_port,
+        resolved_address: None,
         mode,
         report_path: None,
         required_binding: None,
@@ -290,7 +291,10 @@ fn load_local_subject(
         host,
         status_port,
         base_image_ref: state.base_image_ref,
-        workload_ref: format!("{}:{}", state.workload_name, state.workload_version),
+        workload_ref: format!(
+            "{}/{}:{}",
+            state.workload_publisher, state.workload_name, state.workload_version
+        ),
         report_path: session_report_path(&env.data_dir, &target_name, &instance_name),
     })
 }
@@ -322,5 +326,54 @@ mod tests {
         assert!(validate_name_version("automata-linux:v1", "--base-image").is_ok());
         assert!(validate_name_version("automata-linux", "--base-image").is_err());
         assert!(validate_name_version(":v1", "--base-image").is_err());
+    }
+
+    #[test]
+    fn local_deployment_subject_includes_workload_publisher() {
+        use atakit_cloud::{
+            GcpResources, NewDeployParams, PersistedInitEnv, PlatformKind, PortalPorts,
+        };
+
+        let publisher = "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let env = Env {
+            data_dir: data_dir.clone(),
+            config_dir: root.path().join("config"),
+            cache_dir: root.path().join("cache"),
+            image_dir: data_dir.join("images"),
+            workload_dir: data_dir.join("workloads"),
+        };
+        let mut state = DeployState::new(NewDeployParams {
+            instance_name: "test-instance".to_string(),
+            workload_publisher: publisher.to_string(),
+            workload_name: "fedora-oci".to_string(),
+            workload_version: "v0.0.16".to_string(),
+            target_name: "test-target".to_string(),
+            provider_name: "test-provider".to_string(),
+            platform: PlatformKind::Gcp,
+            image_ref: "automata-linux:v0.2.8-debug".to_string(),
+            base_image_ref: Some(format!("{publisher}/automata-linux:v0.2.8-debug")),
+            archive_path: "/tmp/fedora-oci-v0.0.16.atawl".to_string(),
+            archive_hash: "unused".to_string(),
+            init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
+            total_steps: 7,
+        });
+        state.status = DeployStatus::Deployed {
+            ip: "192.0.2.10".to_string(),
+        };
+        state.resources.gcp = Some(GcpResources {
+            external_ip: Some("192.0.2.10".to_string()),
+            ..Default::default()
+        });
+        state.save(&env.data_dir).unwrap();
+
+        let subject = load_local_subject("test-instance", Some("test-target"), &env).unwrap();
+
+        assert_eq!(
+            subject.workload_ref,
+            format!("{publisher}/fedora-oci:v0.0.16")
+        );
     }
 }

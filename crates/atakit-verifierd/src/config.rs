@@ -4,7 +4,7 @@
 //! `VERIFIED_*` namespace are rejected, because ignoring a misspelled optional
 //! pin or expected chain ID would silently weaken verification.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -16,8 +16,10 @@ use atakit_attestation_client::{
     TlsVerificationTrustFiles, TrustPack, TrustPackError, TrustPackKind, TrustPackReadOptions,
 };
 use atakit_cvm_types::AppRef;
-use axum::http::uri::Authority;
+use ipnet::IpNet;
 use serde::Serialize;
+
+use crate::destination::PortalDestinationPolicy;
 
 /// Where the portal mounts unmeasured data, and therefore where packs are
 /// found. Pack bytes are signed and optionally pinned; their publisher keys
@@ -32,14 +34,6 @@ pub enum ConfigError {
 
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
-}
-
-/// One configured peer address. The HTTP request names `name`; it never
-/// supplies either field here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PeerAddress {
-    pub host: String,
-    pub port: u16,
 }
 
 /// Public information about one verified pack, used by `GET /v1/config`.
@@ -58,7 +52,7 @@ pub struct LoadedPack {
 pub struct VerifierdConfig {
     pub listen: SocketAddr,
     pub mode: TrustModeConfig,
-    pub peers: BTreeMap<String, PeerAddress>,
+    pub portal_destination_policy: PortalDestinationPolicy,
 }
 
 /// One authority, carrying only inputs supplied by that authority.
@@ -95,6 +89,8 @@ const GLOBAL: &[&str] = &[
     "VERIFIED_TRUST_MODE",
     "VERIFIED_LISTEN",
     "VERIFIED_PCCS_URL",
+    "VERIFIED_PORTAL_ALLOWED_PORTS",
+    "VERIFIED_PORTAL_ALLOWED_CIDRS",
 ];
 const CHAIN_ONLY: &[&str] = &[
     "VERIFIED_RPC_URL",
@@ -193,7 +189,7 @@ pub fn load(
     Ok(VerifierdConfig {
         listen,
         mode,
-        peers: peers(env)?,
+        portal_destination_policy: portal_destination_policy(env)?,
     })
 }
 
@@ -246,12 +242,8 @@ fn load_trust_pack_mode(
         .chain(&workload_packs)
         .map(pack_summary)
         .collect();
-    let tdx_dcap_collateral = IntelTdxDcapCollateralConfig {
-        source: match pccs_url {
-            Some(url) => IntelTdxDcapCollateralSource::HttpPccs { url },
-            None => IntelTdxDcapCollateralSource::None,
-        },
-    };
+    let tdx_dcap_collateral = tdx_dcap_collateral_config(None, pccs_url, None, None)
+        .map_err(|error| invalid(error.to_string()))?;
     let source = PackTrustSource::new(collateral_packs, workload_packs, tdx_dcap_collateral)
         .map_err(|error| invalid(error.to_string()))?;
     Ok(TrustModeConfig::TrustPack {
@@ -383,18 +375,20 @@ fn load_explicit_mode(
     .map_err(|error| invalid(error.to_string()))?;
 
     let collateral_file = optional_path(env, "VERIFIED_TDX_DCAP_COLLATERAL")?;
-    if collateral_file.is_some() && pccs_url.is_some() {
-        return Err(invalid(
-            "choose only one of VERIFIED_TDX_DCAP_COLLATERAL and VERIFIED_PCCS_URL",
-        ));
-    }
-    let tdx_dcap_collateral = IntelTdxDcapCollateralConfig {
-        source: match (collateral_file, pccs_url) {
-            (Some(path), None) => IntelTdxDcapCollateralSource::File(path),
-            (None, Some(url)) => IntelTdxDcapCollateralSource::HttpPccs { url },
-            (None, None) => IntelTdxDcapCollateralSource::None,
-            (Some(_), Some(_)) => unreachable!("checked above"),
+    let tdx_dcap_collateral = match (collateral_file, pccs_url) {
+        (Some(path), None) => IntelTdxDcapCollateralConfig {
+            source: IntelTdxDcapCollateralSource::File(path),
         },
+        (None, Some(url)) => IntelTdxDcapCollateralConfig {
+            source: IntelTdxDcapCollateralSource::HttpPccs { url },
+        },
+        (None, None) => tdx_dcap_collateral_config(None, None, None, None)
+            .map_err(|error| invalid(error.to_string()))?,
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "choose only one of VERIFIED_TDX_DCAP_COLLATERAL and VERIFIED_PCCS_URL",
+            ));
+        }
     };
     let source = ExplicitTrustSource::new(trust, tdx_dcap_collateral)
         .map_err(|error| invalid(error.to_string()))?;
@@ -417,10 +411,6 @@ fn reject_unknown_verified_names(env: &BTreeMap<String, String>) -> Result<(), C
         {
             continue;
         }
-        if let Some(name) = key.strip_prefix("VERIFIED_PEER_") {
-            validate_peer_name(key, name)?;
-            continue;
-        }
         return Err(invalid(format!(
             "unknown {key}; every VERIFIED_* variable must be recognized so a misspelled security input cannot be ignored"
         )));
@@ -428,55 +418,39 @@ fn reject_unknown_verified_names(env: &BTreeMap<String, String>) -> Result<(), C
     Ok(())
 }
 
-fn validate_peer_name(key: &str, name: &str) -> Result<(), ConfigError> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(invalid(format!(
-            "{key} must use VERIFIED_PEER_<NAME> with a nonempty uppercase ASCII name containing only letters, digits, and underscores"
-        )));
-    }
-    Ok(())
-}
-
-fn peers(env: &BTreeMap<String, String>) -> Result<BTreeMap<String, PeerAddress>, ConfigError> {
-    let mut peers = BTreeMap::new();
-    for (key, value) in env {
-        let Some(name) = key.strip_prefix("VERIFIED_PEER_") else {
-            continue;
-        };
-        validate_peer_name(key, name)?;
-        let authority: Authority = value
-            .parse()
-            .map_err(|error| invalid(format!("{key} must be '<host>:<port>': {error}")))?;
-        let port = authority
-            .port_u16()
-            .ok_or_else(|| invalid(format!("{key} must include a numeric port")))?;
-        if port == 0 {
-            return Err(invalid(format!("{key} port must be between 1 and 65535")));
+fn portal_destination_policy(
+    env: &BTreeMap<String, String>,
+) -> Result<PortalDestinationPolicy, ConfigError> {
+    let allowed_ports = match env.get("VERIFIED_PORTAL_ALLOWED_PORTS") {
+        Some(raw) => {
+            let ports: Vec<u16> = serde_json::from_str(raw).map_err(|error| {
+                invalid(format!(
+                    "VERIFIED_PORTAL_ALLOWED_PORTS must be a JSON array of ports: {error}"
+                ))
+            })?;
+            ports.into_iter().collect::<BTreeSet<_>>()
         }
-        let raw_host = authority.host();
-        if raw_host.is_empty() {
-            return Err(invalid(format!("{key} must include a host")));
-        }
-        let host = if raw_host.contains(':') && !raw_host.starts_with('[') {
-            format!("[{raw_host}]")
-        } else {
-            raw_host.to_string()
-        };
-        let normalized = name.to_ascii_lowercase();
-        if peers
-            .insert(normalized.clone(), PeerAddress { host, port })
-            .is_some()
-        {
-            return Err(invalid(format!(
-                "more than one VERIFIED_PEER_<NAME> normalizes to {normalized:?}"
-            )));
-        }
-    }
-    Ok(peers)
+        None => BTreeSet::from([2024]),
+    };
+    let allowed_cidrs = env
+        .get("VERIFIED_PORTAL_ALLOWED_CIDRS")
+        .map(|_| required_string_list(env, "VERIFIED_PORTAL_ALLOWED_CIDRS"))
+        .transpose()?
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| {
+                    value.parse::<IpNet>().map_err(|error| {
+                        invalid(format!(
+                            "VERIFIED_PORTAL_ALLOWED_CIDRS contains invalid CIDR {value:?}: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    PortalDestinationPolicy::new(allowed_ports, allowed_cidrs)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 fn discover_packs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
@@ -813,22 +787,64 @@ mod tests {
     }
 
     #[test]
-    fn peers_have_canonical_names_and_complete_addresses() {
-        let valid = env(&[("VERIFIED_PEER_BETA", "203.0.113.10:2024")]);
+    fn peer_variables_are_rejected_instead_of_silently_ignored() {
+        let dir = empty_dir();
+        let error = load(
+            &env(&[
+                ("VERIFIED_TRUST_MODE", "chain"),
+                ("VERIFIED_RPC_URL", "https://rpc.example"),
+                (
+                    "VERIFIED_SESSION_REGISTRY",
+                    "0x1111111111111111111111111111111111111111",
+                ),
+                ("VERIFIED_PEER_BETA", "203.0.113.10:2024"),
+            ]),
+            dir.path(),
+            NOW,
+        )
+        .expect_err("the removed peer allowlist must not be accepted");
+        assert!(error.to_string().contains("unknown VERIFIED_PEER_BETA"));
+    }
+
+    #[test]
+    fn destination_policy_defaults_to_port_2024_without_a_cidr_limit() {
+        let policy = portal_destination_policy(&env(&[])).unwrap();
+        assert_eq!(policy.allowed_ports(), &BTreeSet::from([2024]));
+        assert_eq!(policy.allowed_cidrs(), None);
+    }
+
+    #[test]
+    fn destination_policy_parses_optional_ports_and_cidrs_strictly() {
+        let policy = portal_destination_policy(&env(&[
+            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[2024,12024]"),
+            (
+                "VERIFIED_PORTAL_ALLOWED_CIDRS",
+                r#"["10.0.0.0/8","2001:db8::/32"]"#,
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(policy.allowed_ports(), &BTreeSet::from([2024, 12024]));
         assert_eq!(
-            peers(&valid).unwrap().get("beta"),
-            Some(&PeerAddress {
-                host: "203.0.113.10".to_string(),
-                port: 2024,
-            })
+            policy
+                .allowed_cidrs()
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.0.0.0/8", "2001:db8::/32"]
         );
+
         for (key, value) in [
-            ("VERIFIED_PEER_beta", "203.0.113.10:2024"),
-            ("VERIFIED_PEER_BETA", "203.0.113.10"),
-            ("VERIFIED_PEER_BETA", ":2024"),
-            ("VERIFIED_PEER_BETA", "203.0.113.10:0"),
+            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[]"),
+            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[0]"),
+            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[\"2024\"]"),
+            ("VERIFIED_PORTAL_ALLOWED_CIDRS", "[]"),
+            ("VERIFIED_PORTAL_ALLOWED_CIDRS", "[\"bad\"]"),
         ] {
-            assert!(peers(&env(&[(key, value)])).is_err(), "{key}={value}");
+            assert!(
+                portal_destination_policy(&env(&[(key, value)])).is_err(),
+                "{key}={value}"
+            );
         }
     }
 
@@ -912,6 +928,43 @@ mod tests {
         };
         assert_eq!(base_image.name, "automata-linux");
         assert_eq!(base_image.version, "v1");
+    }
+
+    #[test]
+    fn explicit_mode_names_both_conflicting_tdx_collateral_variables() {
+        let dir = empty_dir();
+        let (measurement_path, measurement_public_key) = write_measurement_pack(dir.path());
+        let collateral = dir.path().join("tdx-collateral.json");
+        std::fs::write(&collateral, b"{}").expect("collateral placeholder");
+        let error = load(
+            &env(&[
+                ("VERIFIED_TRUST_MODE", "explicit"),
+                ("VERIFIED_MEASUREMENTS", &measurement_path),
+                (
+                    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
+                    &format!(r#"["{measurement_public_key}"]"#),
+                ),
+                (
+                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
+                    &format!("0x{}", "11".repeat(32)),
+                ),
+                (
+                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
+                    &format!("0x{}", "22".repeat(48)),
+                ),
+                (
+                    "VERIFIED_TDX_DCAP_COLLATERAL",
+                    &collateral.display().to_string(),
+                ),
+                ("VERIFIED_PCCS_URL", "https://pccs.example/v4"),
+            ]),
+            dir.path(),
+            NOW,
+        )
+        .expect_err("two Intel TDX collateral sources must be refused");
+        let message = error.to_string();
+        assert!(message.contains("VERIFIED_TDX_DCAP_COLLATERAL"));
+        assert!(message.contains("VERIFIED_PCCS_URL"));
     }
 
     #[test]

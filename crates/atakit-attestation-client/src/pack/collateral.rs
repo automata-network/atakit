@@ -283,9 +283,10 @@ fn parse_amd_snp_policies(
 /// version answered the weaker question "does this document claim this
 /// identity?" and returned `false` when the selector was unreadable — which is
 /// indistinguishable from a genuine miss, and a miss is permitted to fetch from
-/// a configured off-chain source. A corrupt entry therefore became a silent
-/// fetch. Parsing up front makes it a configuration error instead, and leaves
-/// verification-time selection as a lookup that cannot be ambiguous.
+/// a configured HTTP or Automata on-chain PCCS source. A corrupt entry
+/// therefore became a silent fetch. Parsing up front makes it a configuration
+/// error instead, and leaves verification-time selection as a lookup that
+/// cannot be ambiguous.
 pub(crate) fn parse_collateral_selector(
     document: &[u8],
 ) -> Result<atakit_attestation::IntelTdxQuoteCollateralIdentity, String> {
