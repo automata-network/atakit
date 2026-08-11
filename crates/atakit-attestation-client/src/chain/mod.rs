@@ -19,8 +19,11 @@ use atakit_cvm_types::AppRef;
 use automata_tee_workload_measurement::base_image_registry::{
     BaseImageHierarchy, BaseImageRegistry,
 };
-use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::stubs::WorkloadRegistry::WorkloadSpec;
+use automata_tee_workload_measurement::stubs::{
+    SessionRegistry::SessionRegistryInstance,
+    TeeSecurityPolicyVerifier::TeeSecurityPolicyVerifierInstance,
+};
 use automata_tee_workload_measurement::workload_registry::WorkloadRegistry;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -61,6 +64,7 @@ pub struct ChainVerificationContext {
     pub session_registry: String,
     pub base_image_registry: String,
     pub workload_registry: String,
+    pub tee_security_policy_verifier: String,
     pub amd_snp_security_policy_registry: String,
 }
 
@@ -197,7 +201,7 @@ impl AttestationClient {
             }
         }
 
-        let registry = SessionRegistryInstance::new(session_registry, provider);
+        let registry = SessionRegistryInstance::new(session_registry, provider.clone());
         let workload_registry = registry.workloadRegistry().call().await.map_err(|error| {
             AttestationClientError::Rpc(format!("call SessionRegistry.workloadRegistry(): {error}"))
         })?;
@@ -206,16 +210,26 @@ impl AttestationClient {
                 "call SessionRegistry.baseImageRegistry(): {error}"
             ))
         })?;
-        let amd_snp_security_policy_registry = {
-            let result = raw_eth_call(
-                &config.rpc_url,
-                &session_registry.to_string(),
-                encode_no_arg_call("amdSnpSecurityPolicyRegistry()"),
-                "SessionRegistry.amdSnpSecurityPolicyRegistry",
-            )
-            .await?;
-            decode_address_return(&result, "SessionRegistry.amdSnpSecurityPolicyRegistry")?
-        };
+        let tee_security_policy_verifier = registry
+            .teeSecurityPolicyVerifier()
+            .call()
+            .await
+            .map_err(|error| {
+                AttestationClientError::Rpc(format!(
+                    "call SessionRegistry.teeSecurityPolicyVerifier(): {error}"
+                ))
+            })?;
+        let policy_verifier =
+            TeeSecurityPolicyVerifierInstance::new(tee_security_policy_verifier, provider);
+        let amd_snp_security_policy_registry = policy_verifier
+            .amdSnpSecurityPolicyRegistry()
+            .call()
+            .await
+            .map_err(|error| {
+                AttestationClientError::Rpc(format!(
+                    "call TeeSecurityPolicyVerifier.amdSnpSecurityPolicyRegistry(): {error}"
+                ))
+            })?;
 
         validate_expected_address(
             "expected_workload_registry",
@@ -233,7 +247,8 @@ impl AttestationClient {
             session_registry: session_registry.to_string(),
             base_image_registry: base_image_registry.to_string(),
             workload_registry: workload_registry.to_string(),
-            amd_snp_security_policy_registry,
+            tee_security_policy_verifier: tee_security_policy_verifier.to_string(),
+            amd_snp_security_policy_registry: amd_snp_security_policy_registry.to_string(),
         };
         Ok(Self { config, context })
     }

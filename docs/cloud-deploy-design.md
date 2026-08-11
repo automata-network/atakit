@@ -251,8 +251,9 @@ applies only the resolved base-image policy. Missing Boolean base-image values
 mean disabled, and a missing Intel TDX base-image TCB status means `ok` only.
 For AMD SEV-SNP, the verifier either receives the exact-CPUID registry default
 as an explicit trust input or reads it
-from the `AmdSnpSecurityPolicyRegistry` derived from the selected
-`SessionRegistry`. Custom attributes and all six reserved TEE attributes use
+from the `AmdSnpSecurityPolicyRegistry` reached through the
+`TeeSecurityPolicyVerifier` derived from the selected `SessionRegistry`.
+Custom attributes and all six reserved TEE attributes use
 measurement-variant-first lookup. The variant value replaces the matching
 profile value. With a workload, an explicit workload packed value replaces its
 registry default; without a workload, the resolved base-image value applies by

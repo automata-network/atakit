@@ -73,7 +73,8 @@ from explicit typed inputs. It performs no network access.
 
 `atakit-attestation-client` owns read-only access to verifier-selected chain
 state. It derives `BaseImageRegistry`, `WorkloadRegistry`, and
-`AmdSnpSecurityPolicyRegistry` from the selected `SessionRegistry`. It resolves
+`TeeSecurityPolicyVerifier` from the selected `SessionRegistry`, then derives
+`AmdSnpSecurityPolicyRegistry` from `TeeSecurityPolicyVerifier`. It resolves
 registered measurement and workload policy, resolves the active AMD SEV-SNP
 registry default for the exact signed CPUID, checks platform trust roots,
 resolves Azure MAA signing keys, fetches fresh challenge-bound current-session

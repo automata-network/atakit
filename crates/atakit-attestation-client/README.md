@@ -15,7 +15,8 @@ The client:
 - states which trust inputs each `(cloud, tee)` pair requires;
 - checks the RPC-reported chain ID;
 - derives `BaseImageRegistry`, `WorkloadRegistry`, and
-  `AmdSnpSecurityPolicyRegistry` from `SessionRegistry`;
+  `TeeSecurityPolicyVerifier` from `SessionRegistry`, then derives
+  `AmdSnpSecurityPolicyRegistry` from `TeeSecurityPolicyVerifier`;
 - checks optional expected registry addresses;
 - loads the registered base-image measurement policy;
 - loads and validates the registered `WorkloadSpec`;
