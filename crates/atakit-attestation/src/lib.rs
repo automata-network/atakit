@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::marker::PhantomData;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::signature::{
@@ -11,7 +13,9 @@ use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256VerifyingKey};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::EncodedPoint;
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest as Sha2Digest, Sha256, Sha384};
 use sha3::Keccak256;
 use signature::Verifier;
@@ -403,6 +407,142 @@ pub fn select_azure_maa_manual_trust_key(
     Err(detail)
 }
 
+const MAX_TLS_PCRS: usize = 24;
+const MAX_TLS_EVENT_HASHES_PER_BANK: usize = u16::MAX as usize;
+const MAX_TLS_EVENT_HASHES_TOTAL: usize = 2 * u16::MAX as usize;
+const MAX_TLS_COLLATERAL_JSON_BYTES: usize = 64 * 1024;
+const MAX_AZURE_HCL_KEYS: usize = 16;
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "an array containing at most {MAX} entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|length| length > MAX) {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX} entries"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+fn deserialize_tls_pcrs<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_bounded_vec::<D, T, MAX_TLS_PCRS>(deserializer)
+}
+
+fn deserialize_tls_event_hashes<'de, D, const HASH_BYTES: usize>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct EventHashesVisitor<const HASH_BYTES: usize>;
+
+    impl<'de, const HASH_BYTES: usize> Visitor<'de> for EventHashesVisitor<HASH_BYTES> {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "an array containing at most {MAX_TLS_EVENT_HASHES_PER_BANK} 0x-prefixed {HASH_BYTES}-byte hashes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|length| length > MAX_TLS_EVENT_HASHES_PER_BANK)
+            {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX_TLS_EVENT_HASHES_PER_BANK} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_TLS_EVENT_HASHES_PER_BANK),
+            );
+            while let Some(value) = sequence.next_element::<String>()? {
+                if values.len() == MAX_TLS_EVENT_HASHES_PER_BANK {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX_TLS_EVENT_HASHES_PER_BANK} entries"
+                    )));
+                }
+                let encoded = value.strip_prefix("0x").ok_or_else(|| {
+                    A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    ))
+                })?;
+                if encoded.len() != HASH_BYTES * 2
+                    || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(EventHashesVisitor::<HASH_BYTES>)
+}
+
+fn deserialize_tls_collateral<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    if raw.get().len() > MAX_TLS_COLLATERAL_JSON_BYTES {
+        return Err(D::Error::custom(format!(
+            "collateral exceeds the {MAX_TLS_COLLATERAL_JSON_BYTES}-byte JSON limit"
+        )));
+    }
+    serde_json::from_str(raw.get()).map_err(D::Error::custom)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsAttestationResponse {
@@ -417,7 +557,7 @@ pub struct TlsAttestationResponse {
     pub tee_evidence: Option<TeeEvidence>,
     #[serde(default)]
     pub ak_binding: Option<AkBinding>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tls_collateral")]
     pub collateral: serde_json::Value,
 }
 
@@ -429,7 +569,7 @@ pub struct PlatformEvidence {
     pub machine_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TpmEvidence {
     pub ak_public: String,
@@ -440,6 +580,46 @@ pub struct TpmEvidence {
     pub pcrs: Vec<PcrEvidence>,
     #[serde(default)]
     pub event_log_hashes: Vec<PcrEventHashes>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TpmEvidenceWire {
+    ak_public: String,
+    quote: String,
+    signature: String,
+    pcr0_startup_locality: u8,
+    #[serde(default, deserialize_with = "deserialize_tls_pcrs")]
+    pcrs: Vec<PcrEvidence>,
+    #[serde(default, deserialize_with = "deserialize_tls_pcrs")]
+    event_log_hashes: Vec<PcrEventHashes>,
+}
+
+impl<'de> Deserialize<'de> for TpmEvidence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TpmEvidenceWire::deserialize(deserializer)?;
+        let total = wire
+            .event_log_hashes
+            .iter()
+            .flat_map(|hashes| [hashes.sha256.len(), hashes.sha384.len()])
+            .try_fold(0usize, |total, count| total.checked_add(count));
+        if !matches!(total, Some(total) if total <= MAX_TLS_EVENT_HASHES_TOTAL) {
+            return Err(D::Error::custom(format!(
+                "eventLogHashes contains more than {MAX_TLS_EVENT_HASHES_TOTAL} hashes in total"
+            )));
+        }
+        Ok(Self {
+            ak_public: wire.ak_public,
+            quote: wire.quote,
+            signature: wire.signature,
+            pcr0_startup_locality: wire.pcr0_startup_locality,
+            pcrs: wire.pcrs,
+            event_log_hashes: wire.event_log_hashes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,9 +635,9 @@ pub struct PcrEvidence {
 #[serde(rename_all = "camelCase")]
 pub struct PcrEventHashes {
     pub pcr_index: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tls_event_hashes::<_, 32>")]
     pub sha256: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tls_event_hashes::<_, 48>")]
     pub sha384: Vec<String>,
 }
 
@@ -821,7 +1001,10 @@ struct AzureMaaJwtClaims {
 
 #[derive(Debug, Deserialize)]
 struct AzureHclVarData {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_AZURE_HCL_KEYS>"
+    )]
     keys: Vec<AzureJwk>,
 }
 
@@ -2745,6 +2928,73 @@ mod tests {
             serde_json::from_str::<PcrSpec256>(r#"{"pcrIndex":4,"comparison":"0x00"}"#,).is_err(),
             "the removed camelCase spelling must not become a second wire format"
         );
+    }
+
+    fn minimal_tls_attestation_response() -> serde_json::Value {
+        serde_json::json!({
+            "format": 2,
+            "nonce": "",
+            "tlsCertDer": "",
+            "tlsCertSha256": "",
+            "qualifyingData": "",
+            "platform": {
+                "cloud": "gcp",
+                "tee": "tdx",
+                "machineType": "c3-standard-4"
+            },
+            "tpm": {
+                "akPublic": "",
+                "quote": "",
+                "signature": "",
+                "pcr0StartupLocality": 0,
+                "pcrs": [],
+                "eventLogHashes": []
+            },
+            "collateral": {}
+        })
+    }
+
+    fn parse_tls_attestation_response(
+        value: &serde_json::Value,
+    ) -> std::result::Result<TlsAttestationResponse, serde_json::Error> {
+        serde_json::from_slice(&serde_json::to_vec(value).expect("serialize TLS response"))
+    }
+
+    #[test]
+    fn tls_attestation_response_rejects_unbounded_pcr_arrays() {
+        let mut response = minimal_tls_attestation_response();
+        response["tpm"]["pcrs"] = serde_json::json!((0..=MAX_TLS_PCRS)
+            .map(|index| serde_json::json!({"index": index, "sha256": null, "sha384": null}))
+            .collect::<Vec<_>>());
+        let error = parse_tls_attestation_response(&response)
+            .expect_err("more than 24 PCR entries must fail");
+        assert!(error.to_string().contains("more than 24"), "{error}");
+    }
+
+    #[test]
+    fn tls_attestation_response_rejects_non_hash_event_values() {
+        let mut response = minimal_tls_attestation_response();
+        response["tpm"]["eventLogHashes"] = serde_json::json!([{
+            "pcrIndex": 0,
+            "sha256": [""],
+            "sha384": []
+        }]);
+        let error = parse_tls_attestation_response(&response)
+            .expect_err("empty event strings must fail before retention");
+        assert!(
+            error.to_string().contains("encode exactly 32 bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tls_attestation_response_rejects_large_collateral_json() {
+        let mut response = minimal_tls_attestation_response();
+        response["collateral"] =
+            serde_json::Value::String("a".repeat(MAX_TLS_COLLATERAL_JSON_BYTES));
+        let error = parse_tls_attestation_response(&response)
+            .expect_err("collateral JSON above 64 KiB must fail");
+        assert!(error.to_string().contains("collateral exceeds"), "{error}");
     }
 
     fn static_comparison256(value: [u8; 32]) -> String {
@@ -6073,8 +6323,10 @@ mod tests {
 
         let workload_id = [0x31u8; 32];
         let base_image_id = [0x32u8; 32];
-        let platform_profile_id = [0x33u8; 32];
-        let measurement_variant_id = [0x34u8; 32];
+        let platform_profile_id =
+            atakit_cvm_encoding::platform_profile_id(base_image_id, "gcp-sev-snp");
+        let measurement_variant_id =
+            atakit_cvm_encoding::variant_id(platform_profile_id, "n2d-standard-4");
         let mut delegation_abi = [0u8; 224];
         delegation_abi[..32].copy_from_slice(&Keccak256::digest(b"CVM_SESSION_KEY_DELEGATION"));
         delegation_abi[76..96].copy_from_slice(&registry);

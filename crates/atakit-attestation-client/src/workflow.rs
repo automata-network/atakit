@@ -7,8 +7,14 @@ use atakit_cvm_types::AppRef;
 
 use crate::chain::TrustedWorkloadSessionPolicy;
 use crate::error::PortalVerificationError;
-use crate::portal::session::{verify_current_session, SessionWorkloadSelector, VerifiedPortalTls};
-use crate::portal::tls::{ChainBaseImage, PortalTlsVerificationMode};
+use crate::portal::session::{
+    fetch_current_session, FetchedCurrentSessionVerification, ParsedCurrentSessionVerification,
+    PreparedCurrentSessionVerification, SessionWorkloadSelector, VerifiedPortalTls,
+};
+use crate::portal::tls::{
+    prepare_portal_tls_at_address, ChainBaseImage, PortalTlsVerificationMode,
+    PreparedPortalTlsVerification,
+};
 use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
 
 /// One complete verification: its trust authority, and every policy that
@@ -96,6 +102,14 @@ impl SessionVerificationMode {
         self.tls_mode().name()
     }
 
+    /// The session binding required by this authority.
+    pub fn required_binding(&self) -> BindingMode {
+        match self {
+            Self::Chain { .. } => BindingMode::Chain,
+            Self::Explicit { .. } | Self::Packs { .. } => BindingMode::Local,
+        }
+    }
+
     /// The base-image measurement policy, from this mode's own authority.
     pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
         self.tls_mode().measurement_policy().await
@@ -124,11 +138,181 @@ pub struct VerifiedPortalSession {
     pub session: VerifiedSession,
 }
 
+/// A portal session whose network, policy, trust-anchor, and collateral work
+/// is complete. The remaining work is synchronous cryptographic verification.
+#[derive(Debug)]
+pub struct PreparedPortalSessionVerification {
+    portal_tls: VerifiedPortalTls,
+    session: PreparedCurrentSessionVerification,
+}
+
+/// A portal-session request whose portal TLS network and trust-data work is
+/// complete. Portal TLS cryptographic verification remains.
+pub struct PreparedPortalSessionTlsVerification {
+    host: String,
+    status_port: u16,
+    mode: SessionVerificationMode,
+    required_binding: Option<BindingMode>,
+    portal_tls: PreparedPortalTlsVerification,
+}
+
+/// A portal-session request whose portal TLS identity is verified. Fetching
+/// and preparing the current-session evidence remains.
+pub struct VerifiedPortalSessionTls {
+    host: String,
+    status_port: u16,
+    mode: SessionVerificationMode,
+    required_binding: Option<BindingMode>,
+    portal_tls: VerifiedPortalTls,
+}
+
+/// A portal-session request whose bounded current-session response is fetched
+/// but not yet parsed.
+pub struct FetchedPortalSessionVerification {
+    portal_tls: VerifiedPortalTls,
+    session: FetchedCurrentSessionVerification,
+}
+
+/// A portal-session request whose bounded current-session response has passed
+/// typed parsing. Remaining trust resolution is asynchronous.
+pub struct ParsedPortalSessionVerification {
+    portal_tls: VerifiedPortalTls,
+    session: ParsedCurrentSessionVerification,
+}
+
+impl PreparedPortalSessionTlsVerification {
+    /// Complete synchronous portal TLS cryptographic verification.
+    pub fn verify_tls(self) -> Result<VerifiedPortalSessionTls, PortalVerificationError> {
+        Ok(VerifiedPortalSessionTls {
+            host: self.host,
+            status_port: self.status_port,
+            mode: self.mode,
+            required_binding: self.required_binding,
+            portal_tls: self.portal_tls.verify()?,
+        })
+    }
+}
+
+impl VerifiedPortalSessionTls {
+    /// Fetch the bounded current-session response without parsing its JSON.
+    pub async fn fetch_session(
+        self,
+    ) -> Result<FetchedPortalSessionVerification, PortalVerificationError> {
+        let selector = match &self.mode {
+            SessionVerificationMode::Chain { workload, .. }
+            | SessionVerificationMode::Packs { workload, .. } => {
+                SessionWorkloadSelector::Reference(workload.clone())
+            }
+            SessionVerificationMode::Explicit {
+                workload_policy, ..
+            } => SessionWorkloadSelector::OperatorPolicy(workload_policy.clone()),
+        };
+        let session = fetch_current_session(
+            &self.portal_tls,
+            &self.host,
+            self.status_port,
+            &selector,
+            self.required_binding,
+        )
+        .await
+        .map_err(portal_session_error)?;
+
+        Ok(FetchedPortalSessionVerification {
+            portal_tls: self.portal_tls,
+            session,
+        })
+    }
+
+    /// Fetch, parse, and prepare current-session evidence.
+    pub async fn prepare_session(
+        self,
+    ) -> Result<PreparedPortalSessionVerification, PortalVerificationError> {
+        let fetched = self.fetch_session().await?;
+        let parsed = tokio::task::spawn_blocking(move || fetched.parse())
+            .await
+            .map_err(
+                |error| PortalVerificationError::PortalSessionVerificationFailed {
+                    message: format!("session response JSON worker failed: {error}"),
+                },
+            )??;
+        parsed.prepare().await
+    }
+}
+
+impl FetchedPortalSessionVerification {
+    /// Parse the bounded response on a caller-owned blocking worker.
+    pub fn parse(self) -> Result<ParsedPortalSessionVerification, PortalVerificationError> {
+        Ok(ParsedPortalSessionVerification {
+            portal_tls: self.portal_tls,
+            session: self.session.parse().map_err(portal_session_error)?,
+        })
+    }
+}
+
+impl ParsedPortalSessionVerification {
+    /// Resolve trust inputs that depend on the parsed current-session evidence.
+    pub async fn prepare(
+        self,
+    ) -> Result<PreparedPortalSessionVerification, PortalVerificationError> {
+        let session = self
+            .session
+            .prepare(&self.portal_tls)
+            .await
+            .map_err(portal_session_error)?;
+        Ok(PreparedPortalSessionVerification {
+            portal_tls: self.portal_tls,
+            session,
+        })
+    }
+}
+
+impl PreparedPortalSessionVerification {
+    /// Complete synchronous cryptographic and policy verification.
+    pub fn verify(self) -> Result<VerifiedPortalSession, PortalVerificationError> {
+        let session = self.session.verify().map_err(portal_session_error)?;
+        Ok(VerifiedPortalSession {
+            portal_tls: self.portal_tls,
+            session,
+        })
+    }
+}
+
 /// Verify portal TLS, then verify a fresh challenge-bound current-session
 /// evidence bundle through the pinned TLS connection.
 pub async fn verify_portal_session(
     request: PortalSessionVerificationRequest,
 ) -> Result<VerifiedPortalSession, PortalVerificationError> {
+    let prepared = prepare_portal_session_verification(request).await?;
+    tokio::task::spawn_blocking(move || prepared.verify())
+        .await
+        .map_err(
+            |error| PortalVerificationError::PortalSessionVerificationFailed {
+                message: format!("portal session verification worker failed: {error}"),
+            },
+        )?
+}
+
+/// Resolve portal TLS, network responses, policies, trust anchors, and
+/// collateral without running synchronous session cryptography.
+pub async fn prepare_portal_session_verification(
+    request: PortalSessionVerificationRequest,
+) -> Result<PreparedPortalSessionVerification, PortalVerificationError> {
+    let prepared_tls = prepare_portal_session_tls_verification(request).await?;
+    let verified_tls = tokio::task::spawn_blocking(move || prepared_tls.verify_tls())
+        .await
+        .map_err(
+            |error| PortalVerificationError::PortalSessionVerificationFailed {
+                message: format!("portal TLS verification worker failed: {error}"),
+            },
+        )??;
+    verified_tls.prepare_session().await
+}
+
+/// Resolve portal TLS network responses, policies, trust anchors, and
+/// collateral without running synchronous portal TLS cryptography.
+pub async fn prepare_portal_session_tls_verification(
+    request: PortalSessionVerificationRequest,
+) -> Result<PreparedPortalSessionTlsVerification, PortalVerificationError> {
     let PortalSessionVerificationRequest {
         host,
         status_port,
@@ -138,7 +322,7 @@ pub async fn verify_portal_session(
         required_binding,
     } = request;
 
-    let portal_tls = crate::portal::tls::bootstrap_portal_tls_at_address(
+    let portal_tls = prepare_portal_tls_at_address(
         &host,
         status_port,
         resolved_address,
@@ -149,33 +333,24 @@ pub async fn verify_portal_session(
     )
     .await?;
 
-    // The workload policy is resolved after portal TLS, by the authority that
-    // verified it, against the base image TLS actually selected.
-    let selector = match &mode {
-        SessionVerificationMode::Chain { workload, .. }
-        | SessionVerificationMode::Packs { workload, .. } => {
-            SessionWorkloadSelector::Reference(workload.clone())
-        }
-        SessionVerificationMode::Explicit {
-            workload_policy, ..
-        } => SessionWorkloadSelector::OperatorPolicy(workload_policy.clone()),
-    };
-    let session =
-        verify_current_session(&portal_tls, &host, status_port, &selector, required_binding)
-            .await
-            .map_err(|error| match error {
-                crate::AttestationClientError::SessionVerification(failure) => {
-                    PortalVerificationError::SessionVerification { failure }
-                }
-                error => PortalVerificationError::PortalSessionVerificationFailed {
-                    message: error.to_string(),
-                },
-            })?;
-
-    Ok(VerifiedPortalSession {
+    Ok(PreparedPortalSessionTlsVerification {
+        host,
+        status_port,
+        mode,
+        required_binding,
         portal_tls,
-        session,
     })
+}
+
+fn portal_session_error(error: crate::AttestationClientError) -> PortalVerificationError {
+    match error {
+        crate::AttestationClientError::SessionVerification(failure) => {
+            PortalVerificationError::SessionVerification { failure }
+        }
+        error => PortalVerificationError::PortalSessionVerificationFailed {
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Tests over the paths a verification actually takes, rather than over the

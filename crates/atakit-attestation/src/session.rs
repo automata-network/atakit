@@ -11,6 +11,7 @@
 //! required nor inferred here.
 
 use std::time::SystemTime;
+use std::{fmt, marker::PhantomData};
 
 use atakit_cvm_encoding::pcr_comparison::{
     decode256, decode384, encode_extend_from_zero256, encode_extend_from_zero384, PcrComparison256,
@@ -20,7 +21,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 use sha3::Keccak256;
 use signature::{hazmat::PrehashVerifier, Verifier};
@@ -34,7 +36,133 @@ const EVIDENCE_BINDING_DOMAIN: &str = "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_EVI
 const CHAIN_SUBMISSION_BINDING_DOMAIN: &str =
     "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_CHAIN_SUBMISSION_V1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const MAX_SESSION_PCRS: usize = 24;
+const MAX_SESSION_EVENT_HASHES_PER_BANK: usize = u16::MAX as usize;
+const MAX_SESSION_EVENT_HASHES_TOTAL: usize = 2 * u16::MAX as usize;
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "an array containing at most {MAX} entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|length| length > MAX) {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX} entries"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+fn deserialize_session_pcrs<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_bounded_vec::<D, T, MAX_SESSION_PCRS>(deserializer)
+}
+
+fn deserialize_session_event_hashes<'de, D, const HASH_BYTES: usize>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct EventHashesVisitor<const HASH_BYTES: usize>;
+
+    impl<'de, const HASH_BYTES: usize> Visitor<'de> for EventHashesVisitor<HASH_BYTES> {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "an array containing at most {MAX_SESSION_EVENT_HASHES_PER_BANK} 0x-prefixed {HASH_BYTES}-byte hashes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|length| length > MAX_SESSION_EVENT_HASHES_PER_BANK)
+            {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX_SESSION_EVENT_HASHES_PER_BANK} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_SESSION_EVENT_HASHES_PER_BANK),
+            );
+            while let Some(value) = sequence.next_element::<String>()? {
+                if values.len() == MAX_SESSION_EVENT_HASHES_PER_BANK {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX_SESSION_EVENT_HASHES_PER_BANK} entries"
+                    )));
+                }
+                let encoded = value.strip_prefix("0x").ok_or_else(|| {
+                    A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    ))
+                })?;
+                if encoded.len() != HASH_BYTES * 2
+                    || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(EventHashesVisitor::<HASH_BYTES>)
+}
+
+fn total_session_event_hash_count_is_valid(counts: impl IntoIterator<Item = usize>) -> bool {
+    matches!(
+        counts
+            .into_iter()
+            .try_fold(0usize, |total, count| total.checked_add(count)),
+        Some(total) if total <= MAX_SESSION_EVENT_HASHES_TOTAL
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionEvidenceBundle {
     pub format: u8,
     pub binding: SessionBinding,
@@ -52,7 +180,63 @@ pub struct SessionEvidenceBundle {
     pub owner: SessionOwner,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionEvidenceBundleWire {
+    format: u8,
+    binding: SessionBinding,
+    platform: SessionPlatform,
+    tee_evidence: RawEvidence,
+    ak_evidence: AkEvidence,
+    tpm_quote: TpmQuoteEvidence,
+    tpm_certify: TpmCertifyEvidence,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pcr_values: Vec<SessionPcrValue>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    event_log_hashes: Vec<SessionEventHashes>,
+    session_key: SessionPublicKey,
+    session_key_delegation: SessionKeyDelegation,
+    session_id: String,
+    policy: SessionPolicy,
+    owner: SessionOwner,
+}
+
+impl<'de> Deserialize<'de> for SessionEvidenceBundle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SessionEvidenceBundleWire::deserialize(deserializer)?;
+        if !total_session_event_hash_count_is_valid(
+            wire.event_log_hashes
+                .iter()
+                .flat_map(|hashes| [hashes.sha256.len(), hashes.sha384.len()]),
+        ) {
+            return Err(D::Error::custom(format!(
+                "event_log_hashes contains more than {MAX_SESSION_EVENT_HASHES_TOTAL} hashes in total"
+            )));
+        }
+        Ok(Self {
+            format: wire.format,
+            binding: wire.binding,
+            platform: wire.platform,
+            tee_evidence: wire.tee_evidence,
+            ak_evidence: wire.ak_evidence,
+            tpm_quote: wire.tpm_quote,
+            tpm_certify: wire.tpm_certify,
+            pcr_values: wire.pcr_values,
+            event_log_hashes: wire.event_log_hashes,
+            session_key: wire.session_key,
+            session_key_delegation: wire.session_key_delegation,
+            session_id: wire.session_id,
+            policy: wire.policy,
+            owner: wire.owner,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionBinding {
     pub mode: BindingMode,
     pub chain_id: u64,
@@ -69,6 +253,7 @@ pub enum BindingMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPlatform {
     pub cloud: String,
     pub attestation_mode: SessionAttestationMode,
@@ -85,6 +270,7 @@ pub enum SessionAttestationMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawEvidence {
     pub kind: String,
     pub report: String,
@@ -92,6 +278,7 @@ pub struct RawEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AkEvidence {
     pub kind: String,
     pub ak_public: String,
@@ -99,6 +286,7 @@ pub struct AkEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TpmQuoteEvidence {
     pub tpms_attest: String,
     pub tpm_signature: String,
@@ -107,6 +295,7 @@ pub struct TpmQuoteEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TpmCertifyEvidence {
     pub tpms_attest: String,
     pub tpm_signature: String,
@@ -114,6 +303,7 @@ pub struct TpmCertifyEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrValue {
     pub index: u8,
     pub sha256: Option<String>,
@@ -121,13 +311,17 @@ pub struct SessionPcrValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEventHashes {
     pub pcr_index: u8,
+    #[serde(deserialize_with = "deserialize_session_event_hashes::<_, 32>")]
     pub sha256: Vec<String>,
+    #[serde(deserialize_with = "deserialize_session_event_hashes::<_, 48>")]
     pub sha384: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPublicKey {
     pub type_id: u8,
     pub bytes: String,
@@ -135,6 +329,7 @@ pub struct SessionPublicKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionKeyDelegation {
     pub tpm_signing_key: SessionPublicKey,
     pub digest: String,
@@ -143,6 +338,7 @@ pub struct SessionKeyDelegation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPolicy {
     pub workload_id: String,
     pub base_image_id: String,
@@ -156,32 +352,49 @@ pub struct SessionPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrPolicyBlock {
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
     pub pcr_specs256: Vec<SessionPcrPolicy>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
     pub pcr_specs384: Vec<SessionPcrPolicy384>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrPolicy {
     pub pcr_index: u8,
     pub comparison: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrPolicy384 {
     pub pcr_index: u8,
     pub comparison: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionOwner {
     pub fingerprint: String,
     /// Optional on-chain transaction projection. It remains request-bound as
     /// part of the bundle JSON but is not an offline session-validity input.
-    pub contract_authorization: Option<serde_json::Value>,
+    pub contract_authorization: Option<SessionContractAuthorization>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionContractAuthorization {
+    pub op_expires_at: u64,
+    pub payload: String,
+    pub signature: String,
+    #[serde(default)]
+    pub calldata_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRequestBinding {
     pub challenge: String,
     pub signature: String,
@@ -1102,6 +1315,50 @@ pub fn azure_maa_binding_from_session_bundle(
         } else {
             errors.join("; ")
         }
+    })
+}
+
+/// Return the GCP attestation-key root certificate carried by a committed
+/// session evidence bundle.
+///
+/// The bundle stores the certificate chain as canonical `abi.encode(bytes[])`.
+/// Trust resolution needs the root before the full session verifier runs, so
+/// this helper uses the same strict decoder as the verification path.
+pub fn gcp_ak_root_from_session_bundle(bundle: &SessionEvidenceBundle) -> Result<Vec<u8>, String> {
+    if bundle.ak_evidence.kind != "gcp_cert_chain" {
+        return Err(format!(
+            "GCP session verification requires ak_evidence.kind=gcp_cert_chain, got {}",
+            bundle.ak_evidence.kind
+        ));
+    }
+    let mut errors = Vec::new();
+    let collateral = decode_b64(
+        &bundle.ak_evidence.collateral,
+        "ak_evidence.collateral",
+        &mut errors,
+    )
+    .ok_or_else(|| errors.join("; "))?;
+    let mut chain = decode_abi_bytes_array(&collateral)?;
+    chain
+        .pop()
+        .ok_or_else(|| "GCP AK collateral certificate chain is empty".to_string())
+}
+
+/// Project the AWS NitroTPM document from a committed session evidence bundle.
+/// Callers use this to resolve the document's root certificate before the full
+/// session verification runs.
+pub fn aws_nitro_binding_from_session_bundle(
+    bundle: &SessionEvidenceBundle,
+) -> Result<super::AkBinding, String> {
+    if bundle.ak_evidence.kind != "aws_nitro_doc" {
+        return Err(format!(
+            "AWS session verification requires ak_evidence.kind=aws_nitro_doc, got {}",
+            bundle.ak_evidence.kind
+        ));
+    }
+    Ok(super::AkBinding {
+        kind: "aws-nitro-doc".to_string(),
+        data: bundle.ak_evidence.collateral.clone(),
     })
 }
 
@@ -3269,6 +3526,94 @@ mod tests {
                 contract_authorization: None,
             },
         }
+    }
+
+    #[test]
+    fn session_evidence_json_bounds_collections_and_rejects_unknown_fields() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        };
+        let value = serde_json::to_value(bundle_for_policy(policy)).expect("serialize bundle");
+
+        let mut too_many_pcrs = value.clone();
+        too_many_pcrs["pcr_values"] = serde_json::Value::Array(
+            (0..=MAX_SESSION_PCRS)
+                .map(|index| {
+                    serde_json::json!({
+                        "index": index,
+                        "sha256": null,
+                        "sha384": null
+                    })
+                })
+                .collect(),
+        );
+        let error = serde_json::from_value::<SessionEvidenceBundle>(too_many_pcrs)
+            .expect_err("more than 24 PCR entries must fail");
+        assert!(
+            error.to_string().contains("more than 24 entries"),
+            "{error}"
+        );
+
+        let valid_sha256_hash = format!("0x{}", "00".repeat(32));
+        let mut invalid_event_hash = value.clone();
+        invalid_event_hash["event_log_hashes"] = serde_json::json!([{
+            "pcr_index": 10,
+            "sha256": [""],
+            "sha384": []
+        }]);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(invalid_event_hash)
+            .expect_err("an empty event hash must fail during parsing");
+        assert!(
+            error
+                .to_string()
+                .contains("event hash must be 0x-prefixed and encode exactly 32 bytes"),
+            "{error}"
+        );
+
+        let mut too_many_event_hashes = value.clone();
+        too_many_event_hashes["event_log_hashes"] = serde_json::json!([{
+            "pcr_index": 10,
+            "sha256": vec![valid_sha256_hash; MAX_SESSION_EVENT_HASHES_PER_BANK + 1],
+            "sha384": []
+        }]);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(too_many_event_hashes)
+            .expect_err("more than 65535 event hashes must fail");
+        assert!(
+            error.to_string().contains("more than 65535 entries"),
+            "{error}"
+        );
+
+        assert!(total_session_event_hash_count_is_valid([
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+        ]));
+        assert!(!total_session_event_hash_count_is_valid([
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            1,
+        ]));
+
+        let mut unknown_field = value;
+        unknown_field["unexpected"] = serde_json::Value::Bool(true);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(unknown_field)
+            .expect_err("unknown bundle fields must fail");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let error = serde_json::from_value::<SessionRequestBinding>(serde_json::json!({
+            "challenge": URL_SAFE_NO_PAD.encode([0x55; 32]),
+            "signature": "0x",
+            "unexpected": true
+        }))
+        .expect_err("unknown request-binding fields must fail");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     fn tdx_bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {

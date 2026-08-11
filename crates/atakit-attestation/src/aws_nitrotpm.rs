@@ -12,6 +12,7 @@ use super::*;
 const PROTECTED_HEADER: &[u8] = &[0xa1, 0x01, 0x38, 0x22];
 const PCR_COUNT: usize = 24;
 const SNP_REPORT_DATA_OFFSET: usize = 0x50;
+const MAX_NITROTPM_DOCUMENT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 struct CoseDocument {
@@ -252,7 +253,23 @@ fn decode_binding(binding: &AkBinding) -> std::result::Result<Vec<u8>, String> {
             binding.kind
         ));
     }
-    decode_b64("akBinding.data", &binding.data).map_err(|error| error.to_string())
+    let maximum_encoded_length = MAX_NITROTPM_DOCUMENT_BYTES
+        .checked_mul(4)
+        .map(|length| length.div_ceil(3))
+        .unwrap_or(usize::MAX);
+    if binding.data.len() > maximum_encoded_length {
+        return Err(format!(
+            "akBinding.data exceeds the {MAX_NITROTPM_DOCUMENT_BYTES}-byte decoded limit"
+        ));
+    }
+    let document =
+        decode_b64("akBinding.data", &binding.data).map_err(|error| error.to_string())?;
+    if document.len() > MAX_NITROTPM_DOCUMENT_BYTES {
+        return Err(format!(
+            "akBinding.data exceeds the {MAX_NITROTPM_DOCUMENT_BYTES}-byte decoded limit"
+        ));
+    }
+    Ok(document)
 }
 
 fn parse_cose_document(document: &[u8]) -> std::result::Result<CoseDocument, String> {

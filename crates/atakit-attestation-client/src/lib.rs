@@ -24,6 +24,7 @@ pub mod error;
 mod http;
 pub mod pack;
 pub mod portal;
+pub mod session_bundle;
 #[cfg(test)]
 mod test_support;
 pub mod trust;
@@ -64,6 +65,11 @@ pub use portal::status::read_untrusted_portal_base_image_id;
 pub use portal::tls::{
     bootstrap_portal_tls, tls_manual_override_message, ChainBaseImage, PortalTlsVerificationMode,
 };
+pub use session_bundle::{
+    prepare_supplied_session_bundle, verify_supplied_session_bundle, ChallengeBoundSessionEvidence,
+    PreparedSuppliedSessionBundleVerification, SuppliedSessionBundleVerificationRequest,
+    VerifiedSuppliedSessionBundle,
+};
 pub use trust::builder::TrustAnchorsBuilder;
 pub use trust::files::{
     azure_maa_trust_config_from_chain, chain_coordinates_configured, load_tls_verification_trust,
@@ -83,6 +89,9 @@ pub use trust::source::{
     TrustSource,
 };
 pub use workflow::{
-    verify_portal_session, PortalSessionVerificationRequest, SessionVerificationMode,
-    VerifiedPortalSession,
+    prepare_portal_session_tls_verification, prepare_portal_session_verification,
+    verify_portal_session, FetchedPortalSessionVerification, ParsedPortalSessionVerification,
+    PortalSessionVerificationRequest, PreparedPortalSessionTlsVerification,
+    PreparedPortalSessionVerification, SessionVerificationMode, VerifiedPortalSession,
+    VerifiedPortalSessionTls,
 };

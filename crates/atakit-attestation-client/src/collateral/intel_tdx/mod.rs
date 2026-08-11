@@ -6,7 +6,7 @@ mod pccs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use atakit_attestation::{IntelTdxDcapCollateral, TlsAttestationResponse};
+use atakit_attestation::{IntelTdxDcapCollateral, SessionEvidenceBundle, TlsAttestationResponse};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
@@ -18,6 +18,7 @@ use pccs::{
 
 const DEFAULT_TDX_DCAP_AUTOMATA_CHAIN: &str = "hoodi";
 const DEFAULT_TDX_DCAP_AUTOMATA_RPC_URL: &str = "https://ethereum-hoodi-rpc.publicnode.com";
+const MAX_TDX_QUOTE_BYTES: usize = 1024 * 1024;
 
 /// Verifier-side source for Intel TDX DCAP collateral.
 #[derive(Debug, Clone, Default)]
@@ -173,10 +174,39 @@ pub(crate) fn tdx_collateral_quote(
         .tee_evidence
         .as_ref()
         .ok_or_else(|| "TDX response is missing teeEvidence".to_string())?;
-    URL_SAFE_NO_PAD
-        .decode(&evidence.report)
-        .map(Some)
-        .map_err(|e| format!("decode teeEvidence.report for DCAP collateral lookup: {e}"))
+    decode_tdx_quote(&evidence.report, "teeEvidence.report").map(Some)
+}
+
+/// The Intel TDX quote carried by a committed session evidence bundle, or
+/// `None` when the bundle does not claim Intel TDX.
+pub(crate) fn tdx_collateral_quote_from_session_bundle(
+    bundle: &SessionEvidenceBundle,
+) -> Result<Option<Vec<u8>>, String> {
+    if !bundle.platform.tee.eq_ignore_ascii_case("tdx") {
+        return Ok(None);
+    }
+    decode_tdx_quote(&bundle.tee_evidence.report, "tee_evidence.report").map(Some)
+}
+
+fn decode_tdx_quote(encoded: &str, field: &str) -> Result<Vec<u8>, String> {
+    let maximum_encoded_length = MAX_TDX_QUOTE_BYTES
+        .checked_mul(4)
+        .map(|length| length.div_ceil(3))
+        .unwrap_or(usize::MAX);
+    if encoded.len() > maximum_encoded_length {
+        return Err(format!(
+            "decode {field} for DCAP collateral lookup: encoded quote exceeds the {MAX_TDX_QUOTE_BYTES}-byte decoded limit"
+        ));
+    }
+    let quote = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("decode {field} for DCAP collateral lookup: {error}"))?;
+    if quote.len() > MAX_TDX_QUOTE_BYTES {
+        return Err(format!(
+            "decode {field} for DCAP collateral lookup: quote exceeds the {MAX_TDX_QUOTE_BYTES}-byte limit"
+        ));
+    }
+    Ok(quote)
 }
 
 pub(crate) async fn resolve_tdx_dcap_collateral_for_quote(

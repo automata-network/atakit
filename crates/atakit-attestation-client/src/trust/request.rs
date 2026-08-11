@@ -12,12 +12,25 @@
 //! platform require" a testable function rather than a shape implied by the
 //! resolution code.
 
+use std::fmt;
+
 use atakit_attestation::{
-    amd_snp_security_state, aws_nitro_root_certificate, AkBinding, AmdSnpVerificationCollateral,
-    TlsAttestationResponse,
+    amd_snp_security_state, aws_nitro_binding_from_session_bundle, aws_nitro_root_certificate,
+    azure_maa_binding_from_session_bundle, gcp_ak_root_from_session_bundle, AkBinding,
+    AmdSnpVerificationCollateral, SessionEvidenceBundle, TlsAttestationResponse,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+const MAX_AK_BINDING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AZURE_MAA_BINDING_BYTES: usize = 1024 * 1024;
+const MAX_AZURE_MAA_JWT_HEADER_BYTES: usize = 16 * 1024;
+const MAX_AZURE_MAA_JWT_CLAIMS_BYTES: usize = 1024 * 1024;
+const MAX_GCP_AK_CERTIFICATES: usize = 16;
+const MAX_GCP_AK_CERTIFICATE_BYTES: usize = 1024 * 1024;
+const MAX_SNP_REPORT_BYTES: usize = 64 * 1024;
 
 /// Everything a trust source needs to resolve anchors for one verification.
 #[derive(Debug, Clone)]
@@ -91,9 +104,11 @@ impl CollateralRequest {
                 .tee_evidence
                 .as_ref()
                 .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
-            let report = URL_SAFE_NO_PAD.decode(&evidence.report).map_err(|error| {
-                format!("decode SNP report for security policy lookup: {error}")
-            })?;
+            let report = decode_base64url_limited(
+                &evidence.report,
+                "SNP report for security policy lookup",
+                MAX_SNP_REPORT_BYTES,
+            )?;
             Some(amd_snp_security_state(&report)?.cpuid)
         } else {
             None
@@ -114,6 +129,73 @@ impl CollateralRequest {
             cloud,
             tee,
             machine_type: response.platform.machine_type.clone(),
+            azure_maa_jwt,
+            gcp_ak_root,
+            aws_nitro_root,
+            amd_snp_cpuid,
+            amd_ark,
+        })
+    }
+
+    /// Derive a trust-resolution request from a caller-supplied committed
+    /// session evidence bundle.
+    ///
+    /// These fields select which configured trust inputs must be checked. They
+    /// remain untrusted until `verify_session_bundle` authenticates the full
+    /// bundle and compares it with the resolved policy.
+    pub fn from_session_bundle(
+        bundle: &SessionEvidenceBundle,
+        amd_snp_collateral: Option<&AmdSnpVerificationCollateral>,
+    ) -> Result<Self, String> {
+        let cloud = bundle.platform.cloud.clone();
+        let tee = bundle.platform.tee.clone();
+        let is_gcp = cloud.eq_ignore_ascii_case("gcp");
+        let is_azure = cloud.eq_ignore_ascii_case("azure");
+        let is_aws = cloud.eq_ignore_ascii_case("aws");
+        let is_snp = tee.eq_ignore_ascii_case("sev-snp");
+
+        let azure_maa_jwt = if is_azure {
+            let binding = azure_maa_binding_from_session_bundle(bundle)?;
+            Some(extract_azure_maa_jwt_info_from_binding(&binding)?)
+        } else {
+            None
+        };
+        let gcp_ak_root = if is_gcp {
+            Some(gcp_ak_root_from_session_bundle(bundle)?)
+        } else {
+            None
+        };
+        let aws_nitro_root = if is_aws {
+            let binding = aws_nitro_binding_from_session_bundle(bundle)?;
+            Some(aws_nitro_root_certificate(&binding)?)
+        } else {
+            None
+        };
+        let amd_snp_cpuid = if is_snp {
+            let report = decode_base64url_limited(
+                &bundle.tee_evidence.report,
+                "SNP report for security policy lookup",
+                MAX_SNP_REPORT_BYTES,
+            )?;
+            Some(amd_snp_security_state(&report)?.cpuid)
+        } else {
+            None
+        };
+        let amd_ark = if is_snp {
+            Some(
+                amd_snp_collateral
+                    .ok_or_else(|| "SNP bundle is missing resolved AMD collateral".to_string())?
+                    .ark_der()
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            cloud,
+            tee,
+            machine_type: bundle.platform.machine_type.clone(),
             azure_maa_jwt,
             gcp_ak_root,
             aws_nitro_root,
@@ -150,15 +232,19 @@ pub(crate) fn extract_azure_maa_jwt_info_from_binding(
             binding.kind
         ));
     }
-    let binding_bytes = URL_SAFE_NO_PAD
-        .decode(&binding.data)
-        .map_err(|e| format!("decode Azure MAA akBinding data: {e}"))?;
-    let binding_json: serde_json::Value = serde_json::from_slice(&binding_bytes)
+    let binding_bytes = decode_base64url_limited(
+        &binding.data,
+        "Azure MAA akBinding data",
+        MAX_AZURE_MAA_BINDING_BYTES,
+    )?;
+    #[derive(Deserialize)]
+    struct AzureMaaBindingIdentity {
+        jwt: String,
+    }
+    let binding_json: AzureMaaBindingIdentity = serde_json::from_slice(&binding_bytes)
         .map_err(|e| format!("parse Azure MAA akBinding JSON: {e}"))?;
-    let jwt = binding_json
-        .get("jwt")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty())
+    let jwt = (!binding_json.jwt.is_empty())
+        .then_some(binding_json.jwt.as_str())
         .ok_or_else(|| "Azure MAA akBinding JSON is missing non-empty jwt".to_string())?;
 
     let mut parts = jwt.split('.');
@@ -175,16 +261,32 @@ pub(crate) fn extract_azure_maa_jwt_info_from_binding(
         return Err("Azure MAA JWT must have exactly three non-empty parts".to_string());
     }
 
-    let header_json = decode_jwt_json(header, "Azure MAA JWT header")?;
-    let claims_json = decode_jwt_json(claims, "Azure MAA JWT claims")?;
+    #[derive(Deserialize)]
+    struct AzureMaaHeaderIdentity {
+        kid: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct AzureMaaClaimsIdentity {
+        iss: Option<String>,
+    }
+    let header_json: AzureMaaHeaderIdentity = decode_jwt_json(
+        header,
+        "Azure MAA JWT header",
+        MAX_AZURE_MAA_JWT_HEADER_BYTES,
+    )?;
+    let claims_json: AzureMaaClaimsIdentity = decode_jwt_json(
+        claims,
+        "Azure MAA JWT claims",
+        MAX_AZURE_MAA_JWT_CLAIMS_BYTES,
+    )?;
     let kid = header_json
-        .get("kid")
-        .and_then(|value| value.as_str())
+        .kid
+        .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Azure MAA JWT header is missing non-empty kid".to_string())?;
     let issuer = claims_json
-        .get("iss")
-        .and_then(|value| value.as_str())
+        .iss
+        .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Azure MAA JWT claims are missing non-empty iss".to_string())?;
 
@@ -205,29 +307,111 @@ fn extract_gcp_ak_root_cert(response: &TlsAttestationResponse) -> Result<Vec<u8>
             binding.kind
         ));
     }
-    let raw = URL_SAFE_NO_PAD
-        .decode(&binding.data)
-        .map_err(|e| format!("decode GCP AK cert-chain binding: {e}"))?;
-    let encoded_chain: Vec<String> = serde_json::from_slice(&raw)
+    let raw = decode_base64url_limited(
+        &binding.data,
+        "GCP AK cert-chain binding",
+        MAX_AK_BINDING_BYTES,
+    )?;
+    let encoded_chain: BoundedGcpCertificateChain = serde_json::from_slice(&raw)
         .map_err(|e| format!("parse GCP AK cert-chain binding JSON: {e}"))?;
-    let mut chain = Vec::with_capacity(encoded_chain.len());
-    for (index, encoded) in encoded_chain.iter().enumerate() {
-        chain.push(
-            URL_SAFE_NO_PAD
-                .decode(encoded)
-                .map_err(|e| format!("decode GCP AK cert-chain certificate {index}: {e}"))?,
-        );
+    let mut chain = Vec::with_capacity(encoded_chain.0.len());
+    for (index, encoded) in encoded_chain.0.iter().enumerate() {
+        chain.push(decode_base64url_limited(
+            encoded,
+            &format!("GCP AK cert-chain certificate {index}"),
+            MAX_GCP_AK_CERTIFICATE_BYTES,
+        )?);
     }
     chain
         .pop()
         .ok_or_else(|| "GCP AK cert-chain binding is empty".to_string())
 }
 
-fn decode_jwt_json(segment: &str, label: &str) -> Result<serde_json::Value, String> {
-    let raw = URL_SAFE_NO_PAD
-        .decode(segment)
-        .map_err(|e| format!("decode {label}: {e}"))?;
+fn decode_jwt_json<T: serde::de::DeserializeOwned>(
+    segment: &str,
+    label: &str,
+    maximum_bytes: usize,
+) -> Result<T, String> {
+    let raw = decode_base64url_limited(segment, label, maximum_bytes)?;
     serde_json::from_slice(&raw).map_err(|e| format!("parse {label} JSON: {e}"))
+}
+
+fn decode_base64url_limited(
+    encoded: &str,
+    label: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let maximum_encoded_length = maximum_bytes
+        .checked_mul(4)
+        .map(|length| length.div_ceil(3))
+        .unwrap_or(usize::MAX);
+    if encoded.len() > maximum_encoded_length {
+        return Err(format!(
+            "decode {label}: encoded value exceeds the {maximum_bytes}-byte decoded limit"
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("decode {label}: {error}"))?;
+    if decoded.len() > maximum_bytes {
+        return Err(format!(
+            "decode {label}: decoded value exceeds the {maximum_bytes}-byte limit"
+        ));
+    }
+    Ok(decoded)
+}
+
+struct BoundedGcpCertificateChain(Vec<String>);
+
+impl<'de> Deserialize<'de> for BoundedGcpCertificateChain {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CertificateChainVisitor;
+
+        impl<'de> Visitor<'de> for CertificateChainVisitor {
+            type Value = BoundedGcpCertificateChain;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "an array containing at most {MAX_GCP_AK_CERTIFICATES} certificates"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|length| length > MAX_GCP_AK_CERTIFICATES)
+                {
+                    return Err(A::Error::custom(format!(
+                        "certificate chain contains more than {MAX_GCP_AK_CERTIFICATES} entries"
+                    )));
+                }
+                let mut certificates = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or(0)
+                        .min(MAX_GCP_AK_CERTIFICATES),
+                );
+                while let Some(certificate) = sequence.next_element()? {
+                    if certificates.len() == MAX_GCP_AK_CERTIFICATES {
+                        return Err(A::Error::custom(format!(
+                            "certificate chain contains more than {MAX_GCP_AK_CERTIFICATES} entries"
+                        )));
+                    }
+                    certificates.push(certificate);
+                }
+                Ok(BoundedGcpCertificateChain(certificates))
+            }
+        }
+
+        deserializer.deserialize_seq(CertificateChainVisitor)
+    }
 }
 
 #[cfg(test)]
@@ -318,5 +502,33 @@ mod tests {
         let error = CollateralRequest::from_response(&response("gcp", "tdx", None), None)
             .expect_err("GCP responses must carry an akBinding");
         assert!(error.contains("akBinding"), "{error}");
+    }
+
+    #[test]
+    fn azure_maa_identity_rejects_an_oversized_decoded_binding() {
+        let binding = AkBinding {
+            kind: "azure-maa-jwt".to_string(),
+            data: URL_SAFE_NO_PAD.encode(vec![b' '; MAX_AZURE_MAA_BINDING_BYTES + 1]),
+        };
+        let error = extract_azure_maa_jwt_info_from_binding(&binding)
+            .expect_err("an oversized decoded binding must fail before JSON parsing");
+        assert!(error.contains("decoded limit"), "{error}");
+    }
+
+    #[test]
+    fn gcp_ak_identity_rejects_more_than_sixteen_certificates() {
+        let binding = AkBinding {
+            kind: "gcp-cert-chain".to_string(),
+            data: URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&vec![String::new(); MAX_GCP_AK_CERTIFICATES + 1])
+                    .expect("serialize certificate array"),
+            ),
+        };
+        let error = extract_gcp_ak_root_cert(&response("gcp", "tdx", Some(binding)))
+            .expect_err("an oversized certificate array must fail during streaming parsing");
+        assert!(
+            error.contains("more than 16 entries"),
+            "unexpected error: {error}"
+        );
     }
 }

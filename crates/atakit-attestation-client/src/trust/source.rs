@@ -55,6 +55,14 @@ impl TrustSource {
             Self::Packs(source) => &source.tdx_dcap_collateral,
         }
     }
+
+    pub(crate) fn amd_snp_crls(&self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Chain(_) => Vec::new(),
+            Self::Explicit(source) => source.amd_snp_crls().to_vec(),
+            Self::Packs(source) => source.amd_snp_crls().to_vec(),
+        }
+    }
 }
 
 /// Trust-pack mode: the configured packs' publishers are the authority.

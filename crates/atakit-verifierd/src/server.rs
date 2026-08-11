@@ -6,24 +6,29 @@ use std::time::Duration;
 use async_trait::async_trait;
 use atakit_attestation::{BindingMode, SessionVerificationFailure, VerifiedSession};
 use atakit_attestation_client::{
-    verify_portal_session, AttestationClient, ChainTrustSource, ExplicitTrustSource,
-    PackTrustSource, PortalSessionVerificationRequest, PortalVerificationError,
-    SessionVerificationMode, TrustProvenance, TrustedWorkloadSessionPolicy,
+    prepare_portal_session_tls_verification, prepare_supplied_session_bundle, AttestationClient,
+    ChainTrustSource, ChallengeBoundSessionEvidence, ExplicitTrustSource, PackTrustSource,
+    PortalSessionVerificationRequest, PortalVerificationError, SessionVerificationMode,
+    SuppliedSessionBundleVerificationRequest, TrustProvenance, TrustedWorkloadSessionPolicy,
 };
 use atakit_cvm_types::AppRef;
+use axum::body::{to_bytes, Body};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{LoadedPack, TrustModeConfig, VerifierdConfig};
 use crate::destination::{PortalDestinationPolicy, PortalEndpoint, ResolvedPortalEndpoint};
 
 const MAX_VERIFY_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_SESSION_BUNDLE_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_VERIFICATIONS: usize = 8;
 const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(360);
 const SUPPORTED_PLATFORMS: &[&str] = &[
@@ -61,6 +66,15 @@ pub struct VerifyRequest {
 pub struct PortalRequest {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifySessionBundleRequest {
+    pub session_evidence: ChallengeBoundSessionEvidence,
+    pub expected_challenge: String,
+    pub base_image: String,
+    pub workload: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,7 +121,7 @@ pub struct Verifierd {
 
 struct AppState {
     portal_destination_policy: PortalDestinationPolicy,
-    verification_slots: Semaphore,
+    verification_slots: Arc<Semaphore>,
     verification_timeout: Duration,
     config: ConfigResponse,
     runner: Arc<dyn VerificationRunner>,
@@ -120,6 +134,16 @@ trait VerificationRunner: Send + Sync {
         portal: &ResolvedPortalEndpoint,
         base_image: AppRef,
         workload: AppRef,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<VerifyResponse, ApiError>;
+
+    async fn verify_session_bundle(
+        &self,
+        session_evidence: ChallengeBoundSessionEvidence,
+        expected_challenge: [u8; 32],
+        base_image: AppRef,
+        workload: AppRef,
+        permit: OwnedSemaphorePermit,
     ) -> Result<VerifyResponse, ApiError>;
 }
 
@@ -137,6 +161,51 @@ enum RuntimeMode {
 
 struct RuntimeRunner {
     mode: RuntimeMode,
+}
+
+impl RuntimeRunner {
+    fn session_verification_mode(
+        &self,
+        base_image: &AppRef,
+        workload: &AppRef,
+    ) -> Result<SessionVerificationMode, ApiError> {
+        match &self.mode {
+            RuntimeMode::Chain(source) => Ok(SessionVerificationMode::Chain {
+                source: source.as_ref().clone(),
+                base_image: base_image.clone(),
+                workload: workload.clone(),
+            }),
+            RuntimeMode::TrustPack(source) => Ok(SessionVerificationMode::Packs {
+                source: source.clone(),
+                base_image_id: atakit_cvm_encoding::base_image_id(base_image),
+                workload: workload.clone(),
+            }),
+            RuntimeMode::Explicit {
+                source,
+                measurement_policy,
+                base_image: configured_base_image,
+                workload_pcr23_sha256,
+                workload_pcr23_sha384,
+            } => {
+                if base_image != configured_base_image {
+                    return Err(ApiError::bad_request(format!(
+                        "base_image is {base_image}, but VERIFIED_MEASUREMENTS is for {configured_base_image}"
+                    )));
+                }
+                let workload_policy = TrustedWorkloadSessionPolicy::from_manifest_pcr23(
+                    &workload.to_string(),
+                    *workload_pcr23_sha256,
+                    *workload_pcr23_sha384,
+                )
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                Ok(SessionVerificationMode::Explicit {
+                    source: source.as_ref().clone(),
+                    measurement_policy: measurement_policy.clone(),
+                    workload_policy,
+                })
+            }
+        }
+    }
 }
 
 impl Verifierd {
@@ -173,7 +242,7 @@ impl Verifierd {
         Ok(Self {
             state: Arc::new(AppState {
                 portal_destination_policy,
-                verification_slots: Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
+                verification_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
                 verification_timeout: VERIFICATION_TIMEOUT,
                 config: report,
                 runner: Arc::new(RuntimeRunner { mode }),
@@ -186,8 +255,11 @@ impl Verifierd {
         Router::new()
             .route("/v1/health", get(health))
             .route("/v1/config", get(get_config))
-            .route("/v1/verify", post(verify))
-            .layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES))
+            .route(
+                "/v1/verify",
+                post(verify).layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES)),
+            )
+            .route("/v1/verify-session-bundle", post(verify_session_bundle))
             .with_state(self.state.clone())
     }
 
@@ -212,65 +284,38 @@ impl VerificationRunner for RuntimeRunner {
         portal: &ResolvedPortalEndpoint,
         base_image: AppRef,
         workload: AppRef,
+        permit: OwnedSemaphorePermit,
     ) -> Result<VerifyResponse, ApiError> {
         let expected_base_image_id = atakit_cvm_encoding::base_image_id(&base_image);
         let expected_workload_id = atakit_cvm_encoding::workload_id(&workload);
-        let (mode, required_binding) = match &self.mode {
-            RuntimeMode::Chain(source) => (
-                SessionVerificationMode::Chain {
-                    source: source.as_ref().clone(),
-                    base_image,
-                    workload,
-                },
-                Some(BindingMode::Chain),
-            ),
-            RuntimeMode::TrustPack(source) => (
-                SessionVerificationMode::Packs {
-                    source: source.clone(),
-                    base_image_id: expected_base_image_id,
-                    workload,
-                },
-                Some(BindingMode::Local),
-            ),
-            RuntimeMode::Explicit {
-                source,
-                measurement_policy,
-                base_image: configured_base_image,
-                workload_pcr23_sha256,
-                workload_pcr23_sha384,
-            } => {
-                if &base_image != configured_base_image {
-                    return Err(ApiError::bad_request(format!(
-                        "base_image is {base_image}, but VERIFIED_MEASUREMENTS is for {configured_base_image}"
-                    )));
-                }
-                let workload_policy = TrustedWorkloadSessionPolicy::from_manifest_pcr23(
-                    &workload.to_string(),
-                    *workload_pcr23_sha256,
-                    *workload_pcr23_sha384,
-                )
-                .map_err(|error| ApiError::bad_request(error.to_string()))?;
-                (
-                    SessionVerificationMode::Explicit {
-                        source: source.as_ref().clone(),
-                        measurement_policy: measurement_policy.clone(),
-                        workload_policy,
-                    },
-                    Some(BindingMode::Local),
-                )
-            }
-        };
-
-        let outcome = verify_portal_session(PortalSessionVerificationRequest {
+        let mode = self.session_verification_mode(&base_image, &workload)?;
+        let required_binding = mode.required_binding();
+        let request = PortalSessionVerificationRequest {
             host: portal.host().to_string(),
             status_port: portal.port(),
             resolved_address: Some(portal.socket_address()),
             mode,
             report_path: None,
-            required_binding,
-        })
-        .await
-        .map_err(ApiError::verification)?;
+            required_binding: Some(required_binding),
+        };
+        let outcome = run_verification_worker(
+            permit,
+            async move {
+                let prepared_tls = prepare_portal_session_tls_verification(request)
+                    .await
+                    .map_err(ApiError::verification)?;
+                let verified_tls = prepared_tls.verify_tls().map_err(ApiError::verification)?;
+                let fetched = verified_tls
+                    .fetch_session()
+                    .await
+                    .map_err(ApiError::verification)?;
+                let parsed = fetched.parse().map_err(ApiError::verification)?;
+                let prepared = parsed.prepare().await.map_err(ApiError::verification)?;
+                prepared.verify().map_err(ApiError::verification)
+            },
+            "portal verification worker failed",
+        )
+        .await?;
         Ok(success_response(
             outcome.session,
             outcome.portal_tls.trust_provenance().clone(),
@@ -278,6 +323,65 @@ impl VerificationRunner for RuntimeRunner {
             expected_workload_id,
         ))
     }
+
+    async fn verify_session_bundle(
+        &self,
+        session_evidence: ChallengeBoundSessionEvidence,
+        expected_challenge: [u8; 32],
+        base_image: AppRef,
+        workload: AppRef,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<VerifyResponse, ApiError> {
+        let expected_base_image_id = atakit_cvm_encoding::base_image_id(&base_image);
+        let expected_workload_id = atakit_cvm_encoding::workload_id(&workload);
+        let mode = self.session_verification_mode(&base_image, &workload)?;
+        let outcome = run_verification_worker(
+            permit,
+            async move {
+                let prepared =
+                    prepare_supplied_session_bundle(SuppliedSessionBundleVerificationRequest {
+                        session_evidence,
+                        expected_challenge,
+                        mode,
+                    })
+                    .await
+                    .map_err(ApiError::bundle_verification)?;
+                prepared.verify().map_err(ApiError::bundle_verification)
+            },
+            "session bundle verification worker failed",
+        )
+        .await?;
+        Ok(success_response(
+            outcome.session,
+            outcome.trust_provenance,
+            expected_base_image_id,
+            expected_workload_id,
+        ))
+    }
+}
+
+/// Run one complete verification on a blocking worker while asynchronous I/O
+/// continues through the current Tokio runtime.
+///
+/// The worker owns the concurrency permit. If the HTTP timeout drops the
+/// JoinHandle, the detached worker keeps the permit until every synchronous
+/// parser and cryptographic check has stopped.
+async fn run_verification_worker<F, T>(
+    permit: OwnedSemaphorePermit,
+    verification: F,
+    worker_failure: &'static str,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(verification)
+    })
+    .await
+    .map_err(|_| ApiError::verification_message(worker_failure))?
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -297,8 +401,9 @@ async fn verify(
     })?;
     let permit = state
         .verification_slots
-        .try_acquire()
-        .map_err(|_| ApiError::busy("too many portal verifications are already running"))?;
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::busy("too many verifications are already running"))?;
     let portal = PortalEndpoint::parse(&request.portal.host, request.portal.port)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base_image = request
@@ -315,12 +420,113 @@ async fn verify(
             .resolve(portal)
             .await
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        state.runner.verify(&portal, base_image, workload).await
+        state
+            .runner
+            .verify(&portal, base_image, workload, permit)
+            .await
     })
     .await
     .map_err(|_| ApiError::timeout("portal verification exceeded its total time limit"))?;
-    drop(permit);
     result.map(Json)
+}
+
+async fn verify_session_bundle(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Result<Json<VerifyResponse>, ApiError> {
+    let permit = state
+        .verification_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::busy("too many verifications are already running"))?;
+    let result = tokio::time::timeout(state.verification_timeout, async move {
+        require_json_content_type(&request)?;
+        let body = to_bytes(request.into_body(), MAX_SESSION_BUNDLE_REQUEST_BYTES)
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!(
+                    "invalid POST /v1/verify-session-bundle JSON body: request body exceeds the {MAX_SESSION_BUNDLE_REQUEST_BYTES}-byte length limit: {error}"
+                ))
+            })?;
+        let (permit, request) = tokio::task::spawn_blocking(move || {
+            let request = serde_json::from_slice::<VerifySessionBundleRequest>(&body).map_err(
+                |error| {
+                    ApiError::bad_request(format!(
+                        "invalid POST /v1/verify-session-bundle JSON body: {error}"
+                    ))
+                },
+            );
+            (permit, request)
+        })
+        .await
+        .map_err(|_| ApiError::verification_message("session bundle JSON worker failed"))?;
+        let request = request?;
+        let expected_challenge = decode_expected_challenge(&request.expected_challenge)?;
+        let base_image = request
+            .base_image
+            .parse::<AppRef>()
+            .map_err(|error| ApiError::bad_request(format!("invalid base_image: {error}")))?;
+        let workload = request
+            .workload
+            .parse::<AppRef>()
+            .map_err(|error| ApiError::bad_request(format!("invalid workload: {error}")))?;
+        state
+            .runner
+            .verify_session_bundle(
+                request.session_evidence,
+                expected_challenge,
+                base_image,
+                workload,
+                permit,
+            )
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::timeout("session bundle verification exceeded its total time limit"))?;
+    result.map(Json)
+}
+
+fn require_json_content_type(request: &Request<Body>) -> Result<(), ApiError> {
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/json")
+            || value
+                .strip_prefix("application/")
+                .is_some_and(|subtype| subtype.to_ascii_lowercase().ends_with("+json"))
+    }) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "invalid POST /v1/verify-session-bundle JSON body: Content-Type must be application/json or application/*+json",
+        ))
+    }
+}
+
+fn decode_expected_challenge(value: &str) -> Result<[u8; 32], ApiError> {
+    if value.contains('=') {
+        return Err(ApiError::bad_request(
+            "expected_challenge must be unpadded base64url",
+        ));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|error| ApiError::bad_request(format!("invalid expected_challenge: {error}")))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        return Err(ApiError::bad_request(
+            "expected_challenge must use canonical unpadded base64url",
+        ));
+    }
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ApiError::bad_request(format!(
+            "expected_challenge must decode to exactly 32 bytes, got {}",
+            bytes.len()
+        ))
+    })
 }
 
 fn success_response(
@@ -423,6 +629,25 @@ impl ApiError {
         }
     }
 
+    fn bundle_verification(error: PortalVerificationError) -> Self {
+        match error {
+            PortalVerificationError::SessionVerification { failure } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                failure: *failure,
+            },
+            PortalVerificationError::Config { .. } => {
+                Self::verification_message("session bundle verification configuration failed")
+            }
+            PortalVerificationError::Http { .. }
+            | PortalVerificationError::PortalTlsAttestationFailed { .. }
+            | PortalVerificationError::PortalSessionVerificationFailed { .. }
+            | PortalVerificationError::IoPath { .. }
+            | PortalVerificationError::Json(_) => {
+                Self::verification_message("session bundle trust resolution failed")
+            }
+        }
+    }
+
     fn verification_message(message: &str) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -500,6 +725,16 @@ mod tests {
 
     struct PendingRunner;
 
+    struct BlockingPortalRunner {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    struct BlockingSessionBundleRunner {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
     #[async_trait]
     impl VerificationRunner for CountingRunner {
         async fn verify(
@@ -507,6 +742,19 @@ mod tests {
             _portal: &ResolvedPortalEndpoint,
             _base_image: AppRef,
             _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ApiError::bad_request("test runner"))
+        }
+
+        async fn verify_session_bundle(
+            &self,
+            _session_evidence: ChallengeBoundSessionEvidence,
+            _expected_challenge: [u8; 32],
+            _base_image: AppRef,
+            _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
         ) -> Result<VerifyResponse, ApiError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(ApiError::bad_request("test runner"))
@@ -520,15 +768,103 @@ mod tests {
             _portal: &ResolvedPortalEndpoint,
             _base_image: AppRef,
             _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
         ) -> Result<VerifyResponse, ApiError> {
             std::future::pending().await
+        }
+
+        async fn verify_session_bundle(
+            &self,
+            _session_evidence: ChallengeBoundSessionEvidence,
+            _expected_challenge: [u8; 32],
+            _base_image: AppRef,
+            _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl VerificationRunner for BlockingPortalRunner {
+        async fn verify(
+            &self,
+            _portal: &ResolvedPortalEndpoint,
+            _base_image: AppRef,
+            _workload: AppRef,
+            permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            let started = self.started.clone();
+            let release = self
+                .release
+                .lock()
+                .expect("release receiver lock")
+                .take()
+                .expect("one blocking verification");
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                started.send(()).expect("report blocking worker start");
+                release.recv().expect("release blocking worker");
+                Err(ApiError::bad_request("test runner"))
+            })
+            .await
+            .expect("blocking worker joins")
+        }
+
+        async fn verify_session_bundle(
+            &self,
+            _session_evidence: ChallengeBoundSessionEvidence,
+            _expected_challenge: [u8; 32],
+            _base_image: AppRef,
+            _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            Err(ApiError::bad_request("test runner"))
+        }
+    }
+
+    #[async_trait]
+    impl VerificationRunner for BlockingSessionBundleRunner {
+        async fn verify(
+            &self,
+            _portal: &ResolvedPortalEndpoint,
+            _base_image: AppRef,
+            _workload: AppRef,
+            _permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            Err(ApiError::bad_request("test runner"))
+        }
+
+        async fn verify_session_bundle(
+            &self,
+            _session_evidence: ChallengeBoundSessionEvidence,
+            _expected_challenge: [u8; 32],
+            _base_image: AppRef,
+            _workload: AppRef,
+            permit: OwnedSemaphorePermit,
+        ) -> Result<VerifyResponse, ApiError> {
+            let started = self.started.clone();
+            let release = self
+                .release
+                .lock()
+                .expect("release receiver lock")
+                .take()
+                .expect("one blocking verification");
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                started.send(()).expect("report blocking worker start");
+                release.recv().expect("release blocking worker");
+                Err(ApiError::bad_request("test runner"))
+            })
+            .await
+            .expect("blocking worker joins")
         }
     }
 
     fn test_router(runner: Arc<CountingRunner>) -> Router {
         let state = Arc::new(AppState {
             portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
-            verification_slots: Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
+            verification_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             verification_timeout: VERIFICATION_TIMEOUT,
             config: ConfigResponse {
                 trust_mode: "explicit".to_string(),
@@ -542,9 +878,86 @@ mod tests {
         Router::new()
             .route("/v1/health", get(health))
             .route("/v1/config", get(get_config))
-            .route("/v1/verify", post(verify))
-            .layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES))
+            .route(
+                "/v1/verify",
+                post(verify).layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES)),
+            )
+            .route("/v1/verify-session-bundle", post(verify_session_bundle))
             .with_state(state)
+    }
+
+    fn session_bundle_request_value(padding: String) -> serde_json::Value {
+        let publisher = format!("0x{}", "11".repeat(32));
+        let challenge = URL_SAFE_NO_PAD.encode([0x22; 32]);
+        let id = format!("0x{}", "00".repeat(32));
+        serde_json::json!({
+            "session_evidence": {
+                "evidence_bundle": {
+                    "format": 2,
+                    "binding": {
+                        "mode": "local",
+                        "chain_id": 0,
+                        "registry": format!("0x{}", "00".repeat(20)),
+                        "owner_nonce": id,
+                        "qualifying_data": id
+                    },
+                    "platform": {
+                        "cloud": "gcp",
+                        "attestation_mode": "hardware",
+                        "tee": "sev-snp",
+                        "machine_type": "n2d-standard-2"
+                    },
+                    "tee_evidence": {"kind": "configfs_tsm", "report": "", "auxiliary": null},
+                    "ak_evidence": {"kind": "gcp_cert_chain", "ak_public": "", "collateral": padding},
+                    "tpm_quote": {
+                        "tpms_attest": "",
+                        "tpm_signature": "",
+                        "signature_hash": id,
+                        "pcr0_startup_locality": 0
+                    },
+                    "tpm_certify": {"tpms_attest": "", "tpm_signature": "", "tpmt_public": ""},
+                    "pcr_values": [],
+                    "event_log_hashes": [],
+                    "session_key": {"type_id": 3, "bytes": "0x", "fingerprint": "0x"},
+                    "session_key_delegation": {
+                        "tpm_signing_key": {"type_id": 2, "bytes": "0x", "fingerprint": "0x"},
+                        "digest": "0x",
+                        "signature": "0x",
+                        "session_key_possession_signature": "0x"
+                    },
+                    "session_id": id,
+                    "policy": {
+                        "workload_id": id,
+                        "base_image_id": id,
+                        "platform_profile_id": id,
+                        "measurement_variant_id": id,
+                        "pcr_bank_selection": "sha256",
+                        "invariant_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                        "variant_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                        "workload_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                        "provider_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []}
+                    },
+                    "owner": {"fingerprint": id, "contract_authorization": null}
+                },
+                "request_binding": {"challenge": challenge, "signature": "0x"}
+            },
+            "expected_challenge": challenge,
+            "base_image": format!("{publisher}/base:v1"),
+            "workload": format!("{publisher}/workload:v1")
+        })
+    }
+
+    fn session_bundle_body_with_exact_length(length: usize) -> Vec<u8> {
+        let mut value = session_bundle_request_value(String::new());
+        let empty = serde_json::to_vec(&value).expect("serialize request without padding");
+        let padding_length = length
+            .checked_sub(empty.len())
+            .expect("requested body length can hold the fixed fields");
+        value["session_evidence"]["evidence_bundle"]["ak_evidence"]["collateral"] =
+            serde_json::Value::String("a".repeat(padding_length));
+        let body = serde_json::to_vec(&value).expect("serialize padded request");
+        assert_eq!(body.len(), length);
+        body
     }
 
     #[tokio::test]
@@ -590,6 +1003,150 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_bundle_request_reaches_the_runner_without_a_portal_destination() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let body = session_bundle_request_value("a".repeat(MAX_VERIFY_REQUEST_BYTES));
+        let response = test_router(runner.clone())
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_session_bundle_body_limit_accepts_exactly_eight_mib_and_rejects_the_next_byte() {
+        let at_limit_runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let response = test_router(at_limit_runner.clone())
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(session_bundle_body_with_exact_length(
+                        MAX_SESSION_BUNDLE_REQUEST_BYTES,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(at_limit_runner.calls.load(Ordering::SeqCst), 1);
+
+        let over_limit_runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let response = test_router(over_limit_runner.clone())
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(session_bundle_body_with_exact_length(
+                        MAX_SESSION_BUNDLE_REQUEST_BYTES + 1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let failure: SessionVerificationFailure = serde_json::from_slice(&body).unwrap();
+        assert!(failure.errors[0].contains("length limit"), "{failure:?}");
+        assert_eq!(over_limit_runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_bundle_slot_is_required_before_body_parsing() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let state = Arc::new(AppState {
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: Arc::new(Semaphore::new(0)),
+            verification_timeout: VERIFICATION_TIMEOUT,
+            config: ConfigResponse {
+                trust_mode: "explicit".to_string(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
+                packs: Vec::new(),
+                supported_platforms: Vec::new(),
+            },
+            runner: runner.clone(),
+        });
+        let response = Router::new()
+            .route("/v1/verify-session-bundle", post(verify_session_bundle))
+            .with_state(state)
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not JSON"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_noncanonical_or_wrong_length_expected_challenge_is_rejected() {
+        for challenge in ["AA==", "AA"] {
+            let runner = Arc::new(CountingRunner {
+                calls: AtomicUsize::new(0),
+            });
+            let publisher = format!("0x{}", "11".repeat(32));
+            let body = serde_json::json!({
+                "session_evidence": {
+                    "evidence_bundle": {},
+                    "request_binding": {"challenge": challenge, "signature": "0x"}
+                },
+                "expected_challenge": challenge,
+                "base_image": format!("{publisher}/base:v1"),
+                "workload": format!("{publisher}/workload:v1")
+            });
+            let response = test_router(runner.clone())
+                .oneshot(
+                    Request::post("/v1/verify-session-bundle")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_request_binding_field_is_rejected_before_the_runner() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let mut body = session_bundle_request_value(String::new());
+        body["session_evidence"]["request_binding"]["unexpected"] = serde_json::Value::Bool(true);
+        let response = test_router(runner.clone())
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -718,7 +1275,7 @@ mod tests {
         });
         let state = Arc::new(AppState {
             portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
-            verification_slots: Semaphore::new(0),
+            verification_slots: Arc::new(Semaphore::new(0)),
             verification_timeout: VERIFICATION_TIMEOUT,
             config: ConfigResponse {
                 trust_mode: "explicit".to_string(),
@@ -751,7 +1308,7 @@ mod tests {
     async fn the_total_timeout_bounds_destination_resolution_and_verification() {
         let state = Arc::new(AppState {
             portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
-            verification_slots: Semaphore::new(1),
+            verification_slots: Arc::new(Semaphore::new(1)),
             verification_timeout: Duration::from_millis(1),
             config: ConfigResponse {
                 trust_mode: "explicit".to_string(),
@@ -779,6 +1336,206 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_blocking_portal_verification_keeps_its_slot_and_health_stays_responsive() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(Semaphore::new(1));
+        let state = Arc::new(AppState {
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: slots.clone(),
+            verification_timeout: Duration::from_millis(20),
+            config: ConfigResponse {
+                trust_mode: "explicit".to_string(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
+                packs: Vec::new(),
+                supported_platforms: Vec::new(),
+            },
+            runner: Arc::new(BlockingPortalRunner {
+                started: started_tx,
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+        });
+        let router = Router::new()
+            .route("/v1/health", get(health))
+            .route(
+                "/v1/verify",
+                post(verify).layer(DefaultBodyLimit::max(MAX_VERIFY_REQUEST_BYTES)),
+            )
+            .with_state(state);
+        let publisher = format!("0x{}", "11".repeat(32));
+        let body = format!(
+            r#"{{"portal":{{"host":"203.0.113.10","port":2024}},"base_image":"{publisher}/base:v1","workload":"{publisher}/workload:v1"}}"#
+        );
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking worker started");
+
+        let health = router
+            .clone()
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::post("/v1/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        release_tx.send(()).expect("release blocking worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking worker releases its slot");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_blocking_verification_keeps_its_slot_until_it_exits() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(Semaphore::new(1));
+        let state = Arc::new(AppState {
+            portal_destination_policy: PortalDestinationPolicy::portal_port_only(),
+            verification_slots: slots.clone(),
+            verification_timeout: Duration::from_millis(20),
+            config: ConfigResponse {
+                trust_mode: "explicit".to_string(),
+                portal_allowed_ports: vec![2024],
+                portal_allowed_cidrs: None,
+                packs: Vec::new(),
+                supported_platforms: Vec::new(),
+            },
+            runner: Arc::new(BlockingSessionBundleRunner {
+                started: started_tx,
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+        });
+        let router = Router::new()
+            .route("/v1/verify-session-bundle", post(verify_session_bundle))
+            .with_state(state);
+        let body = serde_json::to_vec(&session_bundle_request_value(String::new())).unwrap();
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking worker started");
+
+        let response = router
+            .oneshot(
+                Request::post("/v1/verify-session-bundle")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        release_tx.send(()).expect("release blocking worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking worker releases its slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_runtime_worker_keeps_parsing_off_tokio_and_retains_its_permit() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots
+            .clone()
+            .try_acquire_owned()
+            .expect("one verification slot");
+
+        let verification = run_verification_worker(
+            permit,
+            async move {
+                started_tx.send(()).expect("report worker start");
+                release_rx.recv().expect("release worker");
+                Ok(())
+            },
+            "test worker failed",
+        );
+        let result = tokio::time::timeout(Duration::from_millis(20), verification).await;
+        assert!(result.is_err(), "the HTTP-side wait must time out");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the blocking worker owns the parsing future");
+        assert_eq!(slots.available_permits(), 0);
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("Tokio workers remain responsive");
+
+        release_tx.send(()).expect("release blocking worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached worker releases its permit only after exit");
+
+        let caller_thread = std::thread::current().id();
+        let permit = slots
+            .clone()
+            .try_acquire_owned()
+            .expect("the released verification slot");
+        let worker_result = run_verification_worker(
+            permit,
+            async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(std::thread::current().id())
+            },
+            "test worker failed",
+        )
+        .await;
+        let worker_thread = match worker_result {
+            Ok(worker_thread) => worker_thread,
+            Err(_) => panic!("the blocking worker must drive Tokio timers"),
+        };
+        assert_ne!(caller_thread, worker_thread);
     }
 
     #[test]

@@ -107,10 +107,30 @@ let result = client
 This method resolves the `WorkloadSpec`, generates a fresh 32-byte challenge,
 fetches `GET /session/evidence-bundle`, resolves the committed Azure MAA key
 when required, constructs `SessionVerificationInputs`, and calls
-`atakit_attestation::verify_session_bundle`.
+`atakit_attestation::verify_session_bundle` on a blocking worker. The success
+response from `GET /session/evidence-bundle` is limited to 8 MiB. An error
+response is limited to 64 KiB.
 
 The complete portal TLS plus current-session workflow is
-`atakit_attestation_client::workflow::verify_portal_session`.
+`atakit_attestation_client::workflow::verify_portal_session`. Services that
+must retain their own resource permit after an HTTP timeout can use the exposed
+preparation phases. After `prepare_portal_session_tls_verification`, move the
+prepared portal TLS verification and the permit into a blocking worker. Then
+call `VerifiedPortalSessionTls::fetch_session`, move the fetched response and
+the permit into a blocking worker for
+`FetchedPortalSessionVerification::parse`, call
+`ParsedPortalSessionVerification::prepare`, and finally move the prepared
+session verification and permit into its blocking worker.
+
+When the caller already holds the exact response from
+`GET /session/evidence-bundle`, use
+`atakit_attestation_client::verify_supplied_session_bundle`. This workflow
+resolves policy and collateral from one `SessionVerificationMode`, verifies the
+caller-supplied 32-byte challenge, and makes no portal network request. It runs
+the final synchronous cryptographic verification on a blocking worker. Services
+that must retain their own resource permit after an HTTP timeout can call
+`prepare_supplied_session_bundle`, then move both the prepared verification and
+that permit into their bounded blocking worker.
 
 Use `atakit_attestation::verify_session_bundle` directly when all typed inputs
 are already available and no network access is required.

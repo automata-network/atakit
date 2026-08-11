@@ -1472,6 +1472,7 @@ dependencies = [
  "atakit-cvm-encoding",
  "atakit-cvm-types",
  "axum",
+ "base64",
  "hex",
  "ipnet",
  "k256",

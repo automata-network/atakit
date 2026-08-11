@@ -11,6 +11,7 @@ atakit-cvm-encoding.workspace = true
 atakit-cvm-types.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 hex.workspace = true
 ipnet.workspace = true
 serde.workspace = true

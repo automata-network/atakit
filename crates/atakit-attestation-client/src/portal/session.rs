@@ -13,13 +13,18 @@ use atakit_attestation::{
     VerifiedTlsIdentity,
 };
 use atakit_attestation::{
-    MeasurementPolicy, MeasurementProfile, MeasurementVariant, PlatformEvidence, TrustAnchors,
+    BaseImageMeasurements, MeasurementPolicy, MeasurementProfile, MeasurementVariant,
+    PcrBankSelection, PlatformEvidence, TrustAnchors, BASE_IMAGE_MEASUREMENT_PACK_SCHEMA,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use serde::Deserialize;
 
+use crate::http::read_response_bytes_limited;
+use crate::session_bundle::ChallengeBoundSessionEvidence;
 use crate::{AttestationClient, AttestationClientError};
+
+const MAX_SESSION_EVIDENCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// The authority a session verification runs under, carried from portal TLS.
 ///
@@ -200,10 +205,92 @@ pub struct TlsManualOverride {
     pub report_path: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
-struct EvidenceBundleResponse {
-    evidence_bundle: serde_json::Value,
+#[derive(Debug)]
+pub(crate) struct PreparedCurrentSessionVerification {
+    verification_inputs: SessionVerificationInputs,
+    required_binding: Option<BindingMode>,
+}
+
+/// A bounded portal response whose JSON has not yet been parsed.
+///
+/// Parsing remains synchronous and must run on a blocking worker. Keeping this
+/// phase explicit lets services move their resource permit into that worker.
+#[derive(Debug)]
+pub(crate) struct FetchedCurrentSessionVerification {
+    response_body: Vec<u8>,
+    expected_challenge: [u8; 32],
+    workload: TrustedWorkloadSessionPolicy,
+    required_binding: Option<BindingMode>,
+    trusted_binding: Option<TrustedSessionBinding>,
+}
+
+/// A portal response parsed through the bounded typed bundle before retaining
+/// the exact JSON value covered by `request_binding.signature`.
+#[derive(Debug)]
+pub(crate) struct ParsedCurrentSessionVerification {
+    bundle: SessionEvidenceBundle,
+    signed_bundle: serde_json::Value,
     request_binding: SessionRequestBinding,
+    expected_challenge: [u8; 32],
+    workload: TrustedWorkloadSessionPolicy,
+    required_binding: Option<BindingMode>,
+    trusted_binding: Option<TrustedSessionBinding>,
+}
+
+impl FetchedCurrentSessionVerification {
+    pub(crate) fn parse(self) -> Result<ParsedCurrentSessionVerification, AttestationClientError> {
+        let response = serde_json::from_slice::<ChallengeBoundSessionEvidence>(&self.response_body);
+        let response = response
+            .map_err(|error| session_error(format!("decode evidence bundle response: {error}")))?;
+        let (bundle, signed_bundle, request_binding) = response.into_parts();
+        Ok(ParsedCurrentSessionVerification {
+            bundle,
+            signed_bundle,
+            request_binding,
+            expected_challenge: self.expected_challenge,
+            workload: self.workload,
+            required_binding: self.required_binding,
+            trusted_binding: self.trusted_binding,
+        })
+    }
+}
+
+impl ParsedCurrentSessionVerification {
+    pub(crate) async fn prepare(
+        self,
+        verified_tls: &VerifiedPortalTls,
+    ) -> Result<PreparedCurrentSessionVerification, AttestationClientError> {
+        let context = verified_tls.session_verification.as_ref().ok_or_else(|| {
+            session_error("verified TLS context did not retain session trust inputs")
+        })?;
+        let committed_maa_keys = committed_session_maa_keys(context, &self.bundle).await?;
+        let trust = build_session_trust(
+            context,
+            &verified_tls.identity,
+            &self.bundle,
+            self.workload,
+            committed_maa_keys,
+            self.trusted_binding,
+        )?;
+        Ok(PreparedCurrentSessionVerification {
+            verification_inputs: SessionVerificationInputs {
+                bundle: self.signed_bundle,
+                request_binding: self.request_binding,
+                expected_challenge: self.expected_challenge,
+                trust,
+            },
+            required_binding: self.required_binding,
+        })
+    }
+}
+
+impl PreparedCurrentSessionVerification {
+    pub(crate) fn verify(self) -> Result<VerifiedSession, AttestationClientError> {
+        let verified = verify_session_bundle(self.verification_inputs)
+            .map_err(|failure| AttestationClientError::SessionVerification(Box::new(failure)))?;
+        enforce_required_binding(verified.binding_mode, self.required_binding)?;
+        Ok(verified)
+    }
 }
 
 /// Whether this workload selector is one the authority can act on.
@@ -253,6 +340,42 @@ pub async fn verify_current_session(
     workload: &SessionWorkloadSelector,
     required_binding: Option<BindingMode>,
 ) -> Result<VerifiedSession, AttestationClientError> {
+    let prepared =
+        prepare_current_session(verified_tls, host, status_port, workload, required_binding)
+            .await?;
+    tokio::task::spawn_blocking(move || prepared.verify())
+        .await
+        .map_err(|error| {
+            session_error(format!(
+                "current-session verification worker failed: {error}"
+            ))
+        })?
+}
+
+pub(crate) async fn prepare_current_session(
+    verified_tls: &VerifiedPortalTls,
+    host: &str,
+    status_port: u16,
+    workload: &SessionWorkloadSelector,
+    required_binding: Option<BindingMode>,
+) -> Result<PreparedCurrentSessionVerification, AttestationClientError> {
+    let fetched =
+        fetch_current_session(verified_tls, host, status_port, workload, required_binding).await?;
+    let parsed = tokio::task::spawn_blocking(move || fetched.parse())
+        .await
+        .map_err(|error| {
+            session_error(format!("session response JSON worker failed: {error}"))
+        })??;
+    parsed.prepare(verified_tls).await
+}
+
+pub(crate) async fn fetch_current_session(
+    verified_tls: &VerifiedPortalTls,
+    host: &str,
+    status_port: u16,
+    workload: &SessionWorkloadSelector,
+    required_binding: Option<BindingMode>,
+) -> Result<FetchedCurrentSessionVerification, AttestationClientError> {
     let context = verified_tls.session_verification.as_ref().ok_or_else(|| {
         AttestationClientError::Verification(
             "verified portal TLS context has no session verification inputs".to_string(),
@@ -290,7 +413,7 @@ pub async fn verify_current_session(
         _ => unreachable!("the pairing is checked above"),
     };
 
-    verify_current_session_bound(
+    fetch_current_session_bound(
         verified_tls,
         host,
         status_port,
@@ -303,23 +426,19 @@ pub async fn verify_current_session(
 
 /// Chain-mode verification, which binds the session to the client's own chain
 /// context. Crate-private so no caller outside chain mode can supply one.
-pub(crate) async fn verify_current_session_bound(
+async fn fetch_current_session_bound(
     verified_tls: &VerifiedPortalTls,
     host: &str,
     status_port: u16,
     workload: TrustedWorkloadSessionPolicy,
     required_binding: Option<BindingMode>,
     trusted_binding: Option<TrustedSessionBinding>,
-) -> Result<VerifiedSession, AttestationClientError> {
+) -> Result<FetchedCurrentSessionVerification, AttestationClientError> {
     if verified_tls.manual_override.is_some() {
         return Err(session_error(
             "session verification is unavailable after a manual TLS certificate override",
         ));
     }
-    let context = verified_tls
-        .session_verification
-        .as_ref()
-        .ok_or_else(|| session_error("verified TLS context did not retain session trust inputs"))?;
     let challenge = random_challenge()?;
     let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
     let url = crate::portal::portal_url(
@@ -335,38 +454,35 @@ pub(crate) async fn verify_current_session_bound(
         .map_err(|error| session_error(format!("request evidence bundle: {error}")))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(
+            response,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal session evidence error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         return Err(session_error(format!(
             "evidence bundle endpoint returned {status}: {body}"
         )));
     }
-    let response: EvidenceBundleResponse = response
-        .json()
-        .await
-        .map_err(|error| session_error(format!("decode evidence bundle response: {error}")))?;
-    let bundle: SessionEvidenceBundle = serde_json::from_value(response.evidence_bundle.clone())
-        .map_err(|error| session_error(format!("decode session evidence bundle: {error}")))?;
-    let committed_maa_keys = committed_session_maa_keys(context, &bundle).await?;
-    let trust = build_session_trust(
-        context,
-        &verified_tls.identity,
-        &bundle,
-        workload,
-        committed_maa_keys,
-        trusted_binding,
-    )?;
-    let verified = verify_session_bundle(SessionVerificationInputs {
-        bundle: response.evidence_bundle,
-        request_binding: response.request_binding,
+    let response_body = read_response_bytes_limited(
+        response,
+        MAX_SESSION_EVIDENCE_RESPONSE_BYTES,
+        "portal session evidence response",
+    )
+    .await
+    .map_err(session_error)?;
+    Ok(FetchedCurrentSessionVerification {
+        response_body,
         expected_challenge: challenge,
-        trust,
+        workload,
+        required_binding,
+        trusted_binding,
     })
-    .map_err(|failure| AttestationClientError::SessionVerification(Box::new(failure)))?;
-    enforce_required_binding(verified.binding_mode, required_binding)?;
-    Ok(verified)
 }
 
-async fn committed_session_maa_keys(
+pub(crate) async fn committed_session_maa_keys(
     context: &PortalSessionVerificationContext,
     bundle: &SessionEvidenceBundle,
 ) -> Result<Vec<AzureMaaTrustKey>, AttestationClientError> {
@@ -410,7 +526,7 @@ fn committed_session_maa_error(error: AttestationClientError) -> AttestationClie
     session_error(format!("{code}: {error}"))
 }
 
-fn enforce_required_binding(
+pub(crate) fn enforce_required_binding(
     actual: BindingMode,
     required: Option<BindingMode>,
 ) -> Result<(), AttestationClientError> {
@@ -447,15 +563,71 @@ fn build_session_trust(
         )));
     }
 
+    let base_image_id = required_identity_id(identity.base_image_id, "base image")?;
+    let platform_profile_id =
+        required_identity_id(identity.platform_profile_id, "platform profile")?;
+    let measurement_variant_id = required_identity_id(identity.variant_id, "measurement variant")?;
+    build_session_trust_with_ids(
+        context,
+        bundle,
+        workload,
+        committed_maa_keys,
+        binding,
+        base_image_id,
+        platform_profile_id,
+        measurement_variant_id,
+    )
+}
+
+/// Build session trust without a portal TLS identity.
+///
+/// The trusted measurement policy selects one profile by `cloud` and `tee`,
+/// then one variant by `machine_type`. The submitted profile and variant IDs
+/// never select policy; the full session verifier compares them with these
+/// independently derived IDs afterwards.
+pub(crate) fn build_supplied_session_trust(
+    context: &PortalSessionVerificationContext,
+    bundle: &SessionEvidenceBundle,
+    workload: TrustedWorkloadSessionPolicy,
+    committed_maa_keys: Vec<AzureMaaTrustKey>,
+    binding: Option<TrustedSessionBinding>,
+    base_image_id: [u8; 32],
+) -> Result<SessionTrust, AttestationClientError> {
+    let (platform_profile_id, measurement_variant_id) =
+        select_measurement_ids_for_platform(&context.measurement_policy, base_image_id, bundle)?;
+    build_session_trust_with_ids(
+        context,
+        bundle,
+        workload,
+        committed_maa_keys,
+        binding,
+        base_image_id,
+        platform_profile_id,
+        measurement_variant_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_session_trust_with_ids(
+    context: &PortalSessionVerificationContext,
+    bundle: &SessionEvidenceBundle,
+    workload: TrustedWorkloadSessionPolicy,
+    committed_maa_keys: Vec<AzureMaaTrustKey>,
+    binding: Option<TrustedSessionBinding>,
+    base_image_id: [u8; 32],
+    platform_profile_id: [u8; 32],
+    measurement_variant_id: [u8; 32],
+) -> Result<SessionTrust, AttestationClientError> {
     let platform = match (bundle.platform.cloud.as_str(), bundle.platform.tee.as_str()) {
         ("gcp", "tdx") => SessionPlatformTrust::GcpTdx {
             gcp_ak_roots: certificate_trust(
                 &context.trust_anchors.gcp_roots,
                 &context.trust_anchors.gcp_root_hashes,
             ),
-            dcap_collateral: context.intel_tdx_dcap_collateral.clone().ok_or_else(|| {
-                session_error("verified TLS context has no GCP TDX DCAP collateral")
-            })?,
+            dcap_collateral: context
+                .intel_tdx_dcap_collateral
+                .clone()
+                .ok_or_else(|| session_error("session trust has no GCP TDX DCAP collateral"))?,
         },
         ("gcp", "sev-snp") => SessionPlatformTrust::GcpSnp {
             gcp_ak_roots: certificate_trust(
@@ -467,14 +639,15 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
             amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
-                session_error("verified TLS context has no GCP SNP verification collateral")
+                session_error("session trust has no GCP SNP verification collateral")
             })?,
         },
         ("azure", "tdx") => SessionPlatformTrust::AzureTdx {
             maa_signing_keys: committed_maa_keys,
-            dcap_collateral: context.intel_tdx_dcap_collateral.clone().ok_or_else(|| {
-                session_error("verified TLS context has no Azure TDX DCAP collateral")
-            })?,
+            dcap_collateral: context
+                .intel_tdx_dcap_collateral
+                .clone()
+                .ok_or_else(|| session_error("session trust has no Azure TDX DCAP collateral"))?,
         },
         ("azure", "sev-snp") => SessionPlatformTrust::AzureSnp {
             maa_signing_keys: committed_maa_keys,
@@ -483,7 +656,7 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
             amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
-                session_error("verified TLS context has no Azure SNP verification collateral")
+                session_error("session trust has no Azure SNP verification collateral")
             })?,
         },
         ("aws", "sev-snp") => SessionPlatformTrust::AwsSnp {
@@ -495,14 +668,14 @@ fn build_session_trust(
                 .trust_anchors
                 .aws_document_maximum_age_seconds
                 .ok_or_else(|| {
-                    session_error("verified TLS context has no AWS NitroTPM document maximum age")
+                    session_error("session trust has no AWS NitroTPM document maximum age")
                 })?,
             aws_document_allowed_future_clock_difference_seconds: context
                 .trust_anchors
                 .aws_document_allowed_future_clock_difference_seconds
                 .ok_or_else(|| {
                     session_error(
-                        "verified TLS context has no AWS NitroTPM allowed future clock difference",
+                        "session trust has no AWS NitroTPM allowed future clock difference",
                     )
                 })?,
             amd_ark_roots: certificate_trust(
@@ -510,7 +683,7 @@ fn build_session_trust(
                 &context.trust_anchors.amd_ark_root_hashes,
             ),
             amd_snp_collateral: context.amd_snp_collateral.clone().ok_or_else(|| {
-                session_error("verified TLS context has no AWS SNP verification collateral")
+                session_error("session trust has no AWS SNP verification collateral")
             })?,
         },
         (cloud, tee) => {
@@ -522,21 +695,119 @@ fn build_session_trust(
 
     Ok(SessionTrust {
         platform,
-        policy: trusted_policy(context, identity, bundle, workload)?,
+        policy: trusted_policy(
+            context,
+            bundle,
+            workload,
+            base_image_id,
+            platform_profile_id,
+            measurement_variant_id,
+        )?,
         binding,
     })
 }
 
+fn select_measurement_ids_for_platform(
+    policy: &MeasurementPolicy,
+    base_image_id: [u8; 32],
+    bundle: &SessionEvidenceBundle,
+) -> Result<([u8; 32], [u8; 32]), AttestationClientError> {
+    let body: BaseImageMeasurements = policy
+        .pack
+        .body(BASE_IMAGE_MEASUREMENT_PACK_SCHEMA)
+        .map_err(|error| session_error(error.to_string()))?;
+    let profiles = body
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile.cloud == bundle.platform.cloud && profile.tee == bundle.platform.tee
+        })
+        .collect::<Vec<_>>();
+    let profile = match profiles.as_slice() {
+        [profile] => *profile,
+        [] => {
+            return Err(session_error(format!(
+                "trusted measurement policy has no profile for cloud={} tee={}",
+                bundle.platform.cloud, bundle.platform.tee
+            )))
+        }
+        profiles => {
+            return Err(session_error(format!(
+                "trusted measurement policy has ambiguous profiles for cloud={} tee={}: {}",
+                bundle.platform.cloud,
+                bundle.platform.tee,
+                profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        }
+    };
+    let expected_profile_id =
+        atakit_cvm_encoding::platform_profile_id(base_image_id, &profile.name);
+    let declared_profile_id = decode_hex_32(&profile.id)?;
+    if declared_profile_id != expected_profile_id {
+        return Err(session_error(format!(
+            "trusted measurement profile {} has id {}, expected 0x{}",
+            profile.name,
+            profile.id,
+            hex::encode(expected_profile_id)
+        )));
+    }
+
+    let variants = profile
+        .variants
+        .iter()
+        .filter(|variant| {
+            variant
+                .machine_types
+                .iter()
+                .any(|machine_type| machine_type == &bundle.platform.machine_type)
+        })
+        .collect::<Vec<_>>();
+    let variant = match variants.as_slice() {
+        [variant] => *variant,
+        [] => {
+            return Err(session_error(format!(
+                "trusted measurement profile {} has no variant for machine_type={}",
+                profile.name, bundle.platform.machine_type
+            )))
+        }
+        variants => {
+            return Err(session_error(format!(
+                "trusted measurement profile {} has ambiguous variants for machine_type={}: {}",
+                profile.name,
+                bundle.platform.machine_type,
+                variants
+                    .iter()
+                    .map(|variant| variant.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        }
+    };
+    let expected_variant_id = atakit_cvm_encoding::variant_id(expected_profile_id, &variant.name);
+    let declared_variant_id = decode_hex_32(&variant.id)?;
+    if declared_variant_id != expected_variant_id {
+        return Err(session_error(format!(
+            "trusted measurement variant {} has id {}, expected 0x{}",
+            variant.name,
+            variant.id,
+            hex::encode(expected_variant_id)
+        )));
+    }
+    Ok((expected_profile_id, expected_variant_id))
+}
+
 fn trusted_policy(
     context: &PortalSessionVerificationContext,
-    identity: &atakit_attestation::VerifiedTlsIdentity,
     bundle: &SessionEvidenceBundle,
     workload: TrustedWorkloadSessionPolicy,
+    base_image_id: [u8; 32],
+    platform_profile_id: [u8; 32],
+    measurement_variant_id: [u8; 32],
 ) -> Result<TrustedSessionPolicy, AttestationClientError> {
-    let base_image_id = required_identity_id(identity.base_image_id, "base image")?;
-    let platform_profile_id =
-        required_identity_id(identity.platform_profile_id, "platform profile")?;
-    let measurement_variant_id = required_identity_id(identity.variant_id, "measurement variant")?;
     let profile = select_profile(&context.measurement_policy, platform_profile_id)?;
     let profile = &profile;
     let variant = select_variant(
@@ -545,10 +816,18 @@ fn trusted_policy(
         &bundle.platform.machine_type,
     )?;
 
-    // Validate the profile and variant relationship without collapsing their
-    // separately committed policy blocks.
-    effective_pcr_specs256(profile, variant)?;
-    effective_pcr_specs384(profile, variant)?;
+    // Validate the same base-image policy invariants as portal TLS
+    // verification before adding the separate workload policy. Checking only
+    // the combined policy would let a workload PCR rule hide an empty
+    // base-image policy.
+    let effective_pcrs256 = effective_pcr_specs256(profile, variant)?;
+    let effective_pcrs384 = effective_pcr_specs384(profile, variant)?;
+    validate_base_image_pcr_banks(
+        &bundle.platform.cloud,
+        profile.pcr_bank_selection,
+        effective_pcrs256.is_empty(),
+        effective_pcrs384.is_empty(),
+    )?;
 
     let invariant_pcr_policy = policy_block(
         profile
@@ -590,6 +869,42 @@ fn trusted_policy(
         attribute_requirements: workload.attribute_requirements,
         amd_snp_security_policies: context.trust_anchors.amd_snp_security_policies.clone(),
     })
+}
+
+fn validate_base_image_pcr_banks(
+    cloud: &str,
+    selection: PcrBankSelection,
+    sha256_is_empty: bool,
+    sha384_is_empty: bool,
+) -> Result<(), AttestationClientError> {
+    match (cloud, selection) {
+        ("aws", PcrBankSelection::Sha256) => {
+            return Err(session_error("AWS pcrBankSelection must include SHA-384"))
+        }
+        ("gcp", PcrBankSelection::Sha384) => {
+            return Err(session_error("GCP pcrBankSelection must include SHA-256"))
+        }
+        _ => {}
+    }
+    if matches!(
+        selection,
+        PcrBankSelection::Sha256 | PcrBankSelection::Sha256AndSha384
+    ) && sha256_is_empty
+    {
+        return Err(session_error(
+            "selected SHA-256 profile/variant has no PCR specs",
+        ));
+    }
+    if matches!(
+        selection,
+        PcrBankSelection::Sha384 | PcrBankSelection::Sha256AndSha384
+    ) && sha384_is_empty
+    {
+        return Err(session_error(
+            "selected SHA-384 profile/variant has no PCR specs",
+        ));
+    }
+    Ok(())
 }
 
 fn measurement_pcr_spec256(spec: &atakit_attestation::PcrSpec256) -> SessionPcrPolicy {
@@ -1000,6 +1315,68 @@ mod tests {
         format!("0x{}", hex::encode(encode_static256(value)))
     }
 
+    #[test]
+    fn portal_session_response_limits_reject_the_first_excess_byte() {
+        for (maximum, label) in [
+            (
+                MAX_SESSION_EVIDENCE_RESPONSE_BYTES,
+                "portal session evidence response",
+            ),
+            (
+                MAX_PORTAL_ERROR_RESPONSE_BYTES,
+                "portal session evidence error response",
+            ),
+        ] {
+            let mut body = vec![0; maximum];
+            let error = crate::http::append_response_chunk_limited(&mut body, &[0], maximum, label)
+                .expect_err("the first byte over the response limit must fail");
+            assert_eq!(body.len(), maximum);
+            assert!(error.contains(&format!("{maximum}-byte limit")), "{error}");
+        }
+    }
+
+    #[test]
+    fn portal_session_response_uses_the_bounded_typed_bundle_parser() {
+        let mut bundle =
+            serde_json::to_value(bundle_for_platform("gcp", "sev-snp", "n2d-standard-4"))
+                .expect("serialize test bundle");
+        bundle["event_log_hashes"] = serde_json::json!([{
+            "pcr_index": 10,
+            "sha256": [""],
+            "sha384": []
+        }]);
+        let response_body = serde_json::to_vec(&serde_json::json!({
+            "evidence_bundle": bundle,
+            "request_binding": {
+                "challenge": URL_SAFE_NO_PAD.encode([0x55; 32]),
+                "signature": "0x"
+            }
+        }))
+        .expect("serialize portal response");
+        let fetched = FetchedCurrentSessionVerification {
+            response_body,
+            expected_challenge: [0x55; 32],
+            workload: TrustedWorkloadSessionPolicy {
+                workload_id: [0; 32],
+                pcr_specs256: Vec::new(),
+                pcr_specs384: Vec::new(),
+                attribute_requirements: Vec::new(),
+            },
+            required_binding: None,
+            trusted_binding: None,
+        };
+
+        let error = fetched
+            .parse()
+            .expect_err("the bounded parser must reject an empty event hash");
+        assert!(
+            error
+                .to_string()
+                .contains("event hash must be 0x-prefixed and encode exactly 32 bytes"),
+            "{error}"
+        );
+    }
+
     fn profile() -> MeasurementProfile {
         MeasurementProfile {
             name: "gcp-tdx".into(),
@@ -1022,6 +1399,208 @@ mod tests {
             invariant_pcrs384: Vec::new(),
             attributes: Vec::new(),
         }
+    }
+
+    fn bundle_for_platform(cloud: &str, tee: &str, machine_type: &str) -> SessionEvidenceBundle {
+        serde_json::from_value(serde_json::json!({
+            "format": 2,
+            "binding": {
+                "mode": "local",
+                "chain_id": 0,
+                "registry": format!("0x{}", "00".repeat(20)),
+                "owner_nonce": format!("0x{}", "00".repeat(32)),
+                "qualifying_data": format!("0x{}", "00".repeat(32))
+            },
+            "platform": {
+                "cloud": cloud,
+                "attestation_mode": "hardware",
+                "tee": tee,
+                "machine_type": machine_type
+            },
+            "tee_evidence": {"kind": "test", "report": "", "auxiliary": null},
+            "ak_evidence": {"kind": "test", "ak_public": "", "collateral": ""},
+            "tpm_quote": {
+                "tpms_attest": "",
+                "tpm_signature": "",
+                "signature_hash": format!("0x{}", "00".repeat(32)),
+                "pcr0_startup_locality": 0
+            },
+            "tpm_certify": {"tpms_attest": "", "tpm_signature": "", "tpmt_public": ""},
+            "pcr_values": [],
+            "event_log_hashes": [],
+            "session_key": {"type_id": 3, "bytes": "0x", "fingerprint": "0x"},
+            "session_key_delegation": {
+                "tpm_signing_key": {"type_id": 2, "bytes": "0x", "fingerprint": "0x"},
+                "digest": "0x",
+                "signature": "0x",
+                "session_key_possession_signature": "0x"
+            },
+            "session_id": format!("0x{}", "00".repeat(32)),
+            "policy": {
+                "workload_id": format!("0x{}", "00".repeat(32)),
+                "base_image_id": format!("0x{}", "00".repeat(32)),
+                "platform_profile_id": format!("0x{}", "ff".repeat(32)),
+                "measurement_variant_id": format!("0x{}", "ee".repeat(32)),
+                "pcr_bank_selection": "sha256",
+                "invariant_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                "variant_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                "workload_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []},
+                "provider_pcr_policy": {"pcr_specs256": [], "pcr_specs384": []}
+            },
+            "owner": {"fingerprint": format!("0x{}", "00".repeat(32)), "contract_authorization": null}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn supplied_bundle_policy_selection_ignores_submitted_profile_and_variant_ids() {
+        let base_image_id = [0x33; 32];
+        let mut profile = profile();
+        let expected_profile_id =
+            atakit_cvm_encoding::platform_profile_id(base_image_id, &profile.name);
+        profile.id = format!("0x{}", hex::encode(expected_profile_id));
+        let expected_variant_id =
+            atakit_cvm_encoding::variant_id(expected_profile_id, &profile.variants[0].name);
+        profile.variants[0].id = format!("0x{}", hex::encode(expected_variant_id));
+        let policy = MeasurementPolicy {
+            source: "test".into(),
+            pack: MeasurementPack {
+                schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.into(),
+                revision: 1,
+                published_at: 1_786_000_000,
+                subject: Subject {
+                    publisher: format!("0x{}", "aa".repeat(32)),
+                    name: "automata-linux".into(),
+                    version: "v1".into(),
+                    id: format!("0x{}", hex::encode(base_image_id)),
+                    uri: None,
+                    archive_sha256: None,
+                },
+                measurements: serde_json::to_value(BaseImageMeasurements {
+                    profiles: vec![profile],
+                })
+                .unwrap(),
+            },
+        };
+        let bundle = bundle_for_platform("gcp", "tdx", "c3-standard-4");
+
+        let selected = select_measurement_ids_for_platform(&policy, base_image_id, &bundle)
+            .expect("trusted policy selects by platform, not submitted IDs");
+
+        assert_eq!(selected, (expected_profile_id, expected_variant_id));
+        assert_ne!(
+            bundle.policy.platform_profile_id,
+            profile_id_text(selected.0)
+        );
+        assert_ne!(
+            bundle.policy.measurement_variant_id,
+            profile_id_text(selected.1)
+        );
+    }
+
+    fn profile_id_text(id: [u8; 32]) -> String {
+        format!("0x{}", hex::encode(id))
+    }
+
+    #[test]
+    fn supplied_bundle_rejects_empty_base_image_policy_even_with_a_workload_rule() {
+        let base_image_id = [0x33; 32];
+        let mut profile = profile();
+        profile.invariant_pcrs256.clear();
+        let profile_id = atakit_cvm_encoding::platform_profile_id(base_image_id, &profile.name);
+        profile.id = profile_id_text(profile_id);
+        let variant_id = atakit_cvm_encoding::variant_id(profile_id, &profile.variants[0].name);
+        profile.variants[0].id = profile_id_text(variant_id);
+        let measurement_policy = MeasurementPolicy {
+            source: "test".into(),
+            pack: MeasurementPack {
+                schema: atakit_attestation::BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.into(),
+                revision: 1,
+                published_at: 1_786_000_000,
+                subject: Subject {
+                    publisher: format!("0x{}", "aa".repeat(32)),
+                    name: "automata-linux".into(),
+                    version: "v1".into(),
+                    id: profile_id_text(base_image_id),
+                    uri: None,
+                    archive_sha256: None,
+                },
+                measurements: serde_json::to_value(BaseImageMeasurements {
+                    profiles: vec![profile],
+                })
+                .unwrap(),
+            },
+        };
+        let bundle = bundle_for_platform("gcp", "tdx", "c3-standard-4");
+        let context = PortalSessionVerificationContext {
+            platform: PlatformEvidence {
+                cloud: "gcp".into(),
+                tee: "tdx".into(),
+                machine_type: "c3-standard-4".into(),
+            },
+            measurement_policy,
+            trust_anchors: TrustAnchors::default(),
+            authority: SessionAuthority::Explicit {
+                azure_maa_keys: Vec::new(),
+            },
+            amd_snp_collateral: None,
+            intel_tdx_dcap_collateral: None,
+        };
+        let workload = TrustedWorkloadSessionPolicy {
+            workload_id: [0x44; 32],
+            pcr_specs256: vec![SessionPcrPolicy {
+                pcr_index: 23,
+                comparison: static_comparison([0x55; 32]),
+            }],
+            pcr_specs384: Vec::new(),
+            attribute_requirements: Vec::new(),
+        };
+
+        let error = trusted_policy(
+            &context,
+            &bundle,
+            workload,
+            base_image_id,
+            profile_id,
+            variant_id,
+        )
+        .expect_err("a workload rule must not hide an empty base-image policy");
+
+        assert!(
+            error
+                .to_string()
+                .contains("selected SHA-256 profile/variant has no PCR specs"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn supplied_bundle_enforces_platform_pcr_bank_requirements() {
+        for (cloud, selection, message) in [
+            (
+                "aws",
+                PcrBankSelection::Sha256,
+                "AWS pcrBankSelection must include SHA-384",
+            ),
+            (
+                "gcp",
+                PcrBankSelection::Sha384,
+                "GCP pcrBankSelection must include SHA-256",
+            ),
+        ] {
+            let error = validate_base_image_pcr_banks(cloud, selection, false, false)
+                .expect_err("the platform-specific PCR bank rule must reject");
+            assert!(error.to_string().contains(message), "got: {error}");
+        }
+        let error =
+            validate_base_image_pcr_banks("azure", PcrBankSelection::Sha256AndSha384, false, true)
+                .expect_err("every selected bank must carry base-image PCR rules");
+        assert!(
+            error
+                .to_string()
+                .contains("selected SHA-384 profile/variant has no PCR specs"),
+            "got: {error}"
+        );
     }
 
     #[test]

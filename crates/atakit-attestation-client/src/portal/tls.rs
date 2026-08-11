@@ -4,7 +4,7 @@
 
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atakit_attestation::{
@@ -33,6 +33,90 @@ use atakit_cvm_types::AppRef;
 
 const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Portal TLS inputs whose network and trust-data work is complete.
+///
+/// [`PreparedPortalTlsVerification::verify`] performs the remaining
+/// synchronous cryptographic verification. Callers running on Tokio must run
+/// it with `tokio::task::spawn_blocking`.
+pub struct PreparedPortalTlsVerification {
+    state: PreparedPortalTlsVerificationState,
+}
+
+enum PreparedPortalTlsVerificationState {
+    Complete(Box<VerifiedPortalTls>),
+    Pending(Box<PendingPortalTlsVerification>),
+}
+
+struct PendingPortalTlsVerification {
+    verification_inputs: VerificationInputs,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
+    live_peer_cert_der: Vec<u8>,
+    trust_tls_cert_sha256: Option<String>,
+    report_path: Option<PathBuf>,
+    host: String,
+    resolved_address: Option<SocketAddr>,
+    session_verification: Option<PortalSessionVerificationContext>,
+    trust_provenance: crate::trust::source::TrustProvenance,
+}
+
+impl PreparedPortalTlsVerification {
+    /// Complete synchronous portal TLS cryptographic verification.
+    pub fn verify(self) -> Result<VerifiedPortalTls, PortalVerificationError> {
+        let pending = match self.state {
+            PreparedPortalTlsVerificationState::Complete(verified) => return Ok(*verified),
+            PreparedPortalTlsVerificationState::Pending(pending) => pending,
+        };
+        let PendingPortalTlsVerification {
+            verification_inputs,
+            workload_attributes,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+            host,
+            resolved_address,
+            session_verification,
+            trust_provenance,
+        } = *pending;
+        let verification = match workload_attributes.as_ref() {
+            Some(attributes) => {
+                verify_tls_attestation_with_workload_attributes(verification_inputs, attributes)
+            }
+            None => verify_tls_attestation(verification_inputs),
+        };
+        match verification {
+            Ok(identity) => {
+                let client = pinned_client(
+                    &identity.cert_der,
+                    Duration::from_secs(300),
+                    &host,
+                    resolved_address,
+                )?;
+                Ok(VerifiedPortalTls {
+                    client,
+                    identity,
+                    manual_override: None,
+                    session_verification,
+                    trust_provenance,
+                })
+            }
+            Err(failure) => handle_tls_attestation_failure(
+                *failure.report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256.as_deref(),
+                report_path.as_deref(),
+                &host,
+                resolved_address,
+            ),
+        }
+    }
+
+    fn complete(verified: VerifiedPortalTls) -> Self {
+        Self {
+            state: PreparedPortalTlsVerificationState::Complete(Box::new(verified)),
+        }
+    }
+}
 
 /// One authority for portal TLS verification: the trust source, and the
 /// base-image measurement policy that same authority supplies.
@@ -159,7 +243,14 @@ async fn resolve_tdx_dcap_for_source(
     response: &TlsAttestationResponse,
     trust_source: &TrustSource,
 ) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
-    let Some(quote) = tdx_collateral_quote(response)? else {
+    resolve_tdx_dcap_for_source_quote(tdx_collateral_quote(response)?, trust_source).await
+}
+
+pub(crate) async fn resolve_tdx_dcap_for_source_quote(
+    quote: Option<Vec<u8>>,
+    trust_source: &TrustSource,
+) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
+    let Some(quote) = quote else {
         return Ok(None);
     };
     if let TrustSource::Packs(packs) = trust_source {
@@ -224,7 +315,7 @@ pub async fn bootstrap_portal_tls(
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
 ) -> Result<VerifiedPortalTls, PortalVerificationError> {
-    bootstrap_portal_tls_at_address(
+    let prepared = prepare_portal_tls_at_address(
         host,
         status_port,
         None,
@@ -233,10 +324,17 @@ pub async fn bootstrap_portal_tls(
         trust_tls_cert_sha256,
         report_path,
     )
-    .await
+    .await?;
+    tokio::task::spawn_blocking(move || prepared.verify())
+        .await
+        .map_err(
+            |error| PortalVerificationError::PortalTlsAttestationFailed {
+                message: format!("portal TLS verification worker failed: {error}"),
+            },
+        )?
 }
 
-pub(crate) async fn bootstrap_portal_tls_at_address(
+pub(crate) async fn prepare_portal_tls_at_address(
     host: &str,
     status_port: u16,
     resolved_address: Option<SocketAddr>,
@@ -244,7 +342,7 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
     workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
     trust_tls_cert_sha256: Option<&str>,
     report_path: Option<&Path>,
-) -> Result<VerifiedPortalTls, PortalVerificationError> {
+) -> Result<PreparedPortalTlsVerification, PortalVerificationError> {
     let trust_source = &mode.trust_source();
     // The window is checked before anything else, including before the portal
     // is contacted, because this is the boundary every caller crosses.
@@ -310,7 +408,7 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                 host,
                 resolved_address,
             )?;
-            return Ok(VerifiedPortalTls {
+            return Ok(PreparedPortalTlsVerification::complete(VerifiedPortalTls {
                 client,
                 identity: VerifiedTlsIdentity {
                     cert_der: live_peer_cert_der,
@@ -326,7 +424,7 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                     report_path: written_report_path,
                 }),
                 session_verification: None,
-            });
+            }));
         }
         let report_location = written_report_path
             .as_ref()
@@ -371,7 +469,8 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                 report_path,
                 host,
                 resolved_address,
-            );
+            )
+            .map(PreparedPortalTlsVerification::complete);
         }
     };
 
@@ -393,7 +492,8 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                 report_path,
                 host,
                 resolved_address,
-            );
+            )
+            .map(PreparedPortalTlsVerification::complete);
         }
     };
 
@@ -415,7 +515,8 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                 report_path,
                 host,
                 resolved_address,
-            );
+            )
+            .map(PreparedPortalTlsVerification::complete);
         }
     };
 
@@ -440,7 +541,8 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
                 report_path,
                 host,
                 resolved_address,
-            );
+            )
+            .map(PreparedPortalTlsVerification::complete);
         }
     };
     let authority = session_authority(trust_source, &trust_anchors);
@@ -464,37 +566,21 @@ pub(crate) async fn bootstrap_portal_tls_at_address(
         measurement_policy,
         trust_anchors,
     };
-    let verification = match workload_attributes.as_ref() {
-        Some(attributes) => {
-            verify_tls_attestation_with_workload_attributes(verification_inputs, attributes)
-        }
-        None => verify_tls_attestation(verification_inputs),
-    };
-    match verification {
-        Ok(identity) => {
-            let client = pinned_client(
-                &identity.cert_der,
-                Duration::from_secs(300),
-                host,
+    Ok(PreparedPortalTlsVerification {
+        state: PreparedPortalTlsVerificationState::Pending(Box::new(
+            PendingPortalTlsVerification {
+                verification_inputs,
+                workload_attributes,
+                live_peer_cert_der,
+                trust_tls_cert_sha256: trust_tls_cert_sha256.map(ToOwned::to_owned),
+                report_path: report_path.map(Path::to_path_buf),
+                host: host.to_string(),
                 resolved_address,
-            )?;
-            Ok(VerifiedPortalTls {
-                client,
-                identity,
-                manual_override: None,
                 session_verification,
                 trust_provenance,
-            })
-        }
-        Err(failure) => handle_tls_attestation_failure(
-            *failure.report,
-            live_peer_cert_der,
-            trust_tls_cert_sha256,
-            report_path,
-            host,
-            resolved_address,
-        ),
-    }
+            },
+        )),
+    })
 }
 
 fn tls_preverification_failure_report(

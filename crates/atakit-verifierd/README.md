@@ -1,9 +1,13 @@
 # atakit-verifierd
 
 `atakit-verifierd` verifies the current atakit session at a request-selected
-portal endpoint. The portal endpoint is routing input. Portal TLS attestation
-and current-session evidence establish the verified identity. The daemon
-serves `POST /v1/verify`, `GET /v1/health`, and `GET /v1/config` over HTTP.
+portal endpoint, or verifies a challenge-bound session evidence bundle received
+through a caller-owned transport. The portal endpoint is routing input for
+`POST /v1/verify`. Portal TLS attestation and current-session evidence establish
+that path's verified identity. `POST /v1/verify-session-bundle` makes no peer
+connection and verifies the supplied bundle against the caller's exact 32-byte
+challenge. The daemon also serves `GET /v1/health` and `GET /v1/config` over
+HTTP.
 The canonical API and configuration rules are in
 `docs/specs/atakit-verifierd-spec.md` in the atakit suite repository.
 

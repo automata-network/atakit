@@ -6,7 +6,7 @@ use std::time::Duration;
 use atakit_attestation::{
     amd_snp_kds_product, amd_snp_signing_key_type, amd_snp_vcek_request,
     amd_snp_vlek_from_certificate_table, AmdSnpSigningKeyType, AmdSnpVerificationCollateral,
-    TlsAttestationResponse,
+    SessionEvidenceBundle, TlsAttestationResponse,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -15,6 +15,7 @@ use crate::http::read_response_bytes_limited;
 use crate::trust::files::parse_pem_certificates;
 
 const MAX_AMD_COLLATERAL_BYTES: usize = 1024 * 1024;
+const MAX_AMD_REPORT_BYTES: usize = 64 * 1024;
 
 pub(crate) async fn resolve_amd_snp_collateral(
     response: &TlsAttestationResponse,
@@ -42,9 +43,11 @@ pub(crate) async fn resolve_amd_snp_collateral(
             .auxiliary
             .as_ref()
             .ok_or_else(|| "SNP response is missing teeEvidence.auxiliary".to_string())?;
-        let certificate_table = URL_SAFE_NO_PAD
-            .decode(auxiliary)
-            .map_err(|error| format!("decode SNP auxiliary certificate table: {error}"))?;
+        let certificate_table = decode_base64url_limited(
+            auxiliary,
+            "SNP auxiliary certificate table",
+            MAX_AMD_COLLATERAL_BYTES,
+        )?;
         return AmdSnpVerificationCollateral::from_certificate_table(&certificate_table, crls)
             .map(Some)
             .map_err(|error| error.to_string());
@@ -55,6 +58,45 @@ pub(crate) async fn resolve_amd_snp_collateral(
     unreachable!("supported AMD SEV-SNP cloud checked above")
 }
 
+/// Resolve AMD SEV-SNP collateral for a committed session evidence bundle.
+///
+/// The collateral resolver consumes only the platform and raw TEE evidence.
+/// Projecting those fields into its existing input keeps the network and
+/// certificate handling identical to portal TLS verification.
+pub(crate) async fn resolve_amd_snp_collateral_for_session_bundle(
+    bundle: &SessionEvidenceBundle,
+    configured_crls: Vec<Vec<u8>>,
+) -> Result<Option<AmdSnpVerificationCollateral>, String> {
+    let response = TlsAttestationResponse {
+        format: bundle.format,
+        nonce: String::new(),
+        tls_cert_der: String::new(),
+        tls_cert_sha256: String::new(),
+        qualifying_data: String::new(),
+        platform: atakit_attestation::PlatformEvidence {
+            cloud: bundle.platform.cloud.clone(),
+            tee: bundle.platform.tee.clone(),
+            machine_type: bundle.platform.machine_type.clone(),
+        },
+        tpm: atakit_attestation::TpmEvidence {
+            ak_public: String::new(),
+            quote: String::new(),
+            signature: String::new(),
+            pcr0_startup_locality: 0,
+            pcrs: Vec::new(),
+            event_log_hashes: Vec::new(),
+        },
+        tee_evidence: Some(atakit_attestation::TeeEvidence {
+            kind: bundle.tee_evidence.kind.clone(),
+            report: bundle.tee_evidence.report.clone(),
+            auxiliary: bundle.tee_evidence.auxiliary.clone(),
+        }),
+        ak_binding: None,
+        collateral: serde_json::Value::Null,
+    };
+    resolve_amd_snp_collateral(&response, configured_crls).await
+}
+
 async fn fetch_aws_snp_collateral(
     response: &TlsAttestationResponse,
     crls: Vec<Vec<u8>>,
@@ -63,16 +105,17 @@ async fn fetch_aws_snp_collateral(
         .tee_evidence
         .as_ref()
         .ok_or_else(|| "AWS SNP response is missing teeEvidence".to_string())?;
-    let report = URL_SAFE_NO_PAD
-        .decode(&evidence.report)
-        .map_err(|error| format!("decode AWS SNP report: {error}"))?;
+    let report =
+        decode_base64url_limited(&evidence.report, "AWS SNP report", MAX_AMD_REPORT_BYTES)?;
     let auxiliary = evidence
         .auxiliary
         .as_ref()
         .ok_or_else(|| "AWS SNP response is missing teeEvidence.auxiliary".to_string())?;
-    let certificate_table = URL_SAFE_NO_PAD
-        .decode(auxiliary)
-        .map_err(|error| format!("decode AWS SNP auxiliary certificate table: {error}"))?;
+    let certificate_table = decode_base64url_limited(
+        auxiliary,
+        "AWS SNP auxiliary certificate table",
+        MAX_AMD_COLLATERAL_BYTES,
+    )?;
     let vlek = amd_snp_vlek_from_certificate_table(&certificate_table)
         .map_err(|error| error.to_string())?;
     let product = amd_snp_kds_product(&report)?;
@@ -118,9 +161,8 @@ async fn fetch_azure_snp_collateral(
         .tee_evidence
         .as_ref()
         .ok_or_else(|| "Azure SNP response is missing teeEvidence".to_string())?;
-    let report = URL_SAFE_NO_PAD
-        .decode(&evidence.report)
-        .map_err(|error| format!("decode Azure SNP report: {error}"))?;
+    let report =
+        decode_base64url_limited(&evidence.report, "Azure SNP report", MAX_AMD_REPORT_BYTES)?;
     let request = amd_snp_vcek_request(&report)?;
     let product = amd_snp_kds_product(&report)?;
     let client = reqwest::Client::builder()
@@ -189,9 +231,11 @@ async fn resolve_amd_snp_crls(
         .tee_evidence
         .as_ref()
         .ok_or_else(|| "SNP response is missing teeEvidence".to_string())?;
-    let report = URL_SAFE_NO_PAD
-        .decode(&evidence.report)
-        .map_err(|error| format!("decode SNP report for AMD CRL lookup: {error}"))?;
+    let report = decode_base64url_limited(
+        &evidence.report,
+        "SNP report for AMD CRL lookup",
+        MAX_AMD_REPORT_BYTES,
+    )?;
     let product = amd_snp_kds_product(&report)?;
     let signing_key_type = amd_snp_signing_key_type(&report)?;
     let (url, signing_key_name) = amd_snp_crl_endpoint(product, signing_key_type);
@@ -217,6 +261,31 @@ async fn resolve_amd_snp_crls(
     )
     .await?;
     Ok(vec![crl])
+}
+
+fn decode_base64url_limited(
+    encoded: &str,
+    label: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let maximum_encoded_length = maximum_bytes
+        .checked_mul(4)
+        .map(|length| length.div_ceil(3))
+        .unwrap_or(usize::MAX);
+    if encoded.len() > maximum_encoded_length {
+        return Err(format!(
+            "decode {label}: encoded value exceeds the {maximum_bytes}-byte decoded limit"
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("decode {label}: {error}"))?;
+    if decoded.len() > maximum_bytes {
+        return Err(format!(
+            "decode {label}: decoded value exceeds the {maximum_bytes}-byte limit"
+        ));
+    }
+    Ok(decoded)
 }
 
 fn amd_snp_crl_endpoint(
