@@ -1574,6 +1574,7 @@ dependencies = [
 [[package]]
 name = "automata-tee-workload-measurement"
 version = "0.2.0"
+source = "git+https://github.com/automata-network/automata-tee-workload-measurement?rev=61f9a80e7f0bcf9d97ce41564acb3abe7ebd51ee#61f9a80e7f0bcf9d97ce41564acb3abe7ebd51ee"
 dependencies = [
  "alloy-ext",
  "anyhow",
