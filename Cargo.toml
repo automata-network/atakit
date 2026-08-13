@@ -57,7 +57,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Blockchain
 alloy-ext = "1.7.4"
 alloy = { version = "1.7.3", default-features = false }
-automata-tee-workload-measurement = { version = "0.2.0", git = "https://github.com/automata-network/automata-tee-workload-measurement", rev = "61f9a80e7f0bcf9d97ce41564acb3abe7ebd51ee" }
+automata-tee-workload-measurement = { version = "0.2.0", git = "https://github.com/automata-network/automata-tee-workload-measurement", rev = "0d3248743ac1746be30622d615da47ae488b6595" }
 aws-lc-rs = "1"
 ciborium = "0.2"
 hex = "0.4"
@@ -71,9 +71,9 @@ pem = "3"
 rcgen = "0.13"
 
 # Pin all Automata DCAP crates to the same reviewed upstream commit.
-dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
-automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
-pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "3dfe43038c868a62337f83e20f8fd38bba9e351a" }
+dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "f71d6521cc30806da369c7ee609af47c02b73448" }
+automata-dcap-network-registry = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "f71d6521cc30806da369c7ee609af47c02b73448" }
+pccs-reader-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "f71d6521cc30806da369c7ee609af47c02b73448" }
 
 # Async
 async-trait = "0.1"
