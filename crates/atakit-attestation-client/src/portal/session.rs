@@ -1413,6 +1413,46 @@ mod tests {
             },
             "platform": {
                 "cloud": cloud,
+                "cloud_provenance": {
+                    "source": "dmi",
+                    "detection": {
+                        "dmi": {
+                            "sys_vendor": null,
+                            "product_name": null,
+                            "bios_vendor": null,
+                            "detected_cloud": cloud
+                        },
+                        "metadata": {
+                            "gcp": {
+                                "attempted": false,
+                                "matched": false,
+                                "http_status": null,
+                                "response_headers": {},
+                                "response_body": null,
+                                "error": null
+                            },
+                            "azure": {
+                                "attempted": false,
+                                "matched": false,
+                                "http_status": null,
+                                "response_headers": {},
+                                "response_body": null,
+                                "error": null
+                            },
+                            "aws": {
+                                "attempted": false,
+                                "matched": false,
+                                "http_status": null,
+                                "response_headers": {},
+                                "response_body": null,
+                                "error": null
+                            },
+                            "detected_cloud": "unknown",
+                            "conflict": false
+                        }
+                    },
+                    "user_provided": null
+                },
                 "attestation_mode": "hardware",
                 "tee": tee,
                 "machine_type": machine_type

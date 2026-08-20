@@ -1540,23 +1540,36 @@ pub(super) fn check_snp_octet_extension(
     else {
         return Err(format!("SNP VEK is missing required {name} extension"));
     };
-    let actual = if ext.value.len() >= 2 && ext.value[0] == 0x04 {
-        let len = usize::from(ext.value[1]);
-        if ext.value.len() != len + 2 {
-            return Err(format!(
-                "SNP VEK {name} extension OCTET STRING length is malformed"
-            ));
-        }
-        &ext.value[2..]
-    } else {
-        ext.value
-    };
+    let actual = snp_octet_extension_value(ext.value, expected.len(), name)?;
     if actual != expected {
         return Err(format!(
             "SNP VEK {name} extension does not match report value"
         ));
     }
     Ok(())
+}
+
+pub(super) fn snp_octet_extension_value<'a>(
+    value: &'a [u8],
+    expected_len: usize,
+    name: &str,
+) -> std::result::Result<&'a [u8], String> {
+    // x509-parser normally exposes the extension payload after removing the
+    // X.509 OCTET STRING wrapper. Treat an expected-length payload as raw
+    // first: a chip ID may itself begin with 0x04 and a length-like byte.
+    if value.len() == expected_len {
+        return Ok(value);
+    }
+    if value.first().copied() != Some(0x04) {
+        return Ok(value);
+    }
+    let (content_offset, content_len) = der_tlv(value, 0x04, &format!("SNP VEK {name} extension"))?;
+    if content_len != expected_len {
+        return Err(format!(
+            "SNP VEK {name} extension OCTET STRING length is malformed"
+        ));
+    }
+    Ok(&value[content_offset..content_offset + content_len])
 }
 
 fn check_snp_product_extension(

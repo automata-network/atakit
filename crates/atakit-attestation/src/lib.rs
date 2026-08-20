@@ -6273,12 +6273,12 @@ mod tests {
     fn public_session_verifier_accepts_ff_report_id_ma_absence_sentinel() {
         use crate::session::{
             compute_key_fingerprint, compute_session_id, compute_session_qualifying_data,
-            request_binding_digest, AkEvidence, BindingMode, CertificateTrust, RawEvidence,
-            SessionAttestationMode, SessionBinding, SessionEventHashes, SessionEvidenceBundle,
-            SessionKeyDelegation, SessionOwner, SessionPcrPolicy, SessionPcrValue, SessionPlatform,
-            SessionPlatformTrust, SessionPolicy, SessionPublicKey, SessionRequestBinding,
-            SessionTrust, SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence,
-            TrustedSessionPolicy,
+            request_binding_digest, test_session_cloud_provenance, AkEvidence, BindingMode,
+            CertificateTrust, RawEvidence, SessionAttestationMode, SessionBinding,
+            SessionCloudProvider, SessionEventHashes, SessionEvidenceBundle, SessionKeyDelegation,
+            SessionOwner, SessionPcrPolicy, SessionPcrValue, SessionPlatform, SessionPlatformTrust,
+            SessionPolicy, SessionPublicKey, SessionRequestBinding, SessionTrust,
+            SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence, TrustedSessionPolicy,
         };
 
         let (snp_report, amd_ark, snp_cert_table) = fixture_gcp_snp_report_and_certs();
@@ -6369,6 +6369,7 @@ mod tests {
             },
             platform: SessionPlatform {
                 cloud: "gcp".into(),
+                cloud_provenance: test_session_cloud_provenance(SessionCloudProvider::Gcp),
                 attestation_mode: SessionAttestationMode::Hardware,
                 tee: "sev-snp".into(),
                 machine_type: "n2d-standard-4".into(),
@@ -7025,6 +7026,37 @@ mod tests {
         assert!(verification_core::der_tlv(&long, 0x30, "test")
             .unwrap_err()
             .contains("exceeds buffer"));
+    }
+
+    #[test]
+    fn snp_octet_extension_treats_expected_length_value_as_raw() {
+        let mut chip_id = [0u8; 64];
+        chip_id[0] = 0x04;
+        chip_id[1] = 0x25;
+
+        let actual = verification_core::snp_octet_extension_value(&chip_id, 64, "chip_id")
+            .expect("raw chip ID");
+
+        assert_eq!(actual, chip_id);
+    }
+
+    #[test]
+    fn snp_octet_extension_accepts_der_wrapped_value() {
+        let mut short_form = vec![0x04, 64];
+        short_form.extend([0xa5; 64]);
+        assert_eq!(
+            verification_core::snp_octet_extension_value(&short_form, 64, "chip_id")
+                .expect("short-form OCTET STRING"),
+            &[0xa5; 64]
+        );
+
+        let mut long_form = vec![0x04, 0x81, 64];
+        long_form.extend([0x5a; 64]);
+        assert_eq!(
+            verification_core::snp_octet_extension_value(&long_form, 64, "chip_id")
+                .expect("long-form OCTET STRING"),
+            &[0x5a; 64]
+        );
     }
 
     #[test]

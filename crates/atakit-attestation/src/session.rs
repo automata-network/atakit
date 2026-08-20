@@ -10,6 +10,7 @@
 //! authorization, and registry state are separate concerns and are neither
 //! required nor inferred here.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 use std::{fmt, marker::PhantomData};
 
@@ -256,9 +257,107 @@ pub enum BindingMode {
 #[serde(deny_unknown_fields)]
 pub struct SessionPlatform {
     pub cloud: String,
+    pub cloud_provenance: SessionCloudProvenance,
     pub attestation_mode: SessionAttestationMode,
     pub tee: String,
     pub machine_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloudProvenance {
+    pub source: SessionCloudSource,
+    pub detection: SessionCloudDetectionObservation,
+    pub user_provided: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloudSource {
+    Dmi,
+    Metadata,
+    UserProvided,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloudProvider {
+    Gcp,
+    Azure,
+    Aws,
+    Qemu,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloudDetectionObservation {
+    pub dmi: SessionDmiCloudObservation,
+    pub metadata: SessionMetadataCloudObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDmiCloudObservation {
+    pub sys_vendor: Option<String>,
+    pub product_name: Option<String>,
+    pub bios_vendor: Option<String>,
+    pub detected_cloud: SessionCloudProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadataCloudObservation {
+    pub gcp: SessionMetadataProbeObservation,
+    pub azure: SessionMetadataProbeObservation,
+    pub aws: SessionMetadataProbeObservation,
+    pub detected_cloud: SessionCloudProvider,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadataProbeObservation {
+    pub attempted: bool,
+    pub matched: bool,
+    pub http_status: Option<u16>,
+    pub response_headers: BTreeMap<String, String>,
+    pub response_body: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_session_cloud_provenance(
+    detected_cloud: SessionCloudProvider,
+) -> SessionCloudProvenance {
+    let probe = SessionMetadataProbeObservation {
+        attempted: false,
+        matched: false,
+        http_status: None,
+        response_headers: BTreeMap::new(),
+        response_body: None,
+        error: None,
+    };
+    SessionCloudProvenance {
+        source: SessionCloudSource::Dmi,
+        detection: SessionCloudDetectionObservation {
+            dmi: SessionDmiCloudObservation {
+                sys_vendor: None,
+                product_name: None,
+                bios_vendor: None,
+                detected_cloud,
+            },
+            metadata: SessionMetadataCloudObservation {
+                gcp: probe.clone(),
+                azure: probe.clone(),
+                aws: probe,
+                detected_cloud: SessionCloudProvider::Unknown,
+                conflict: false,
+            },
+        },
+        user_provided: None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3473,6 +3572,7 @@ mod tests {
             },
             platform: SessionPlatform {
                 cloud: "qemu".into(),
+                cloud_provenance: test_session_cloud_provenance(SessionCloudProvider::Qemu),
                 attestation_mode: SessionAttestationMode::Emulation,
                 tee: "emulation".into(),
                 machine_type: "qemu".into(),
@@ -3542,6 +3642,65 @@ mod tests {
             provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let value = serde_json::to_value(bundle_for_policy(policy)).expect("serialize bundle");
+
+        let mut without_cloud_provenance = value.clone();
+        without_cloud_provenance["platform"]
+            .as_object_mut()
+            .expect("platform object")
+            .remove("cloud_provenance");
+        let error = serde_json::from_value::<SessionEvidenceBundle>(without_cloud_provenance)
+            .expect_err("cloud_provenance must be required");
+        assert!(error.to_string().contains("missing field"), "{error}");
+
+        let mut with_cloud_provenance = value.clone();
+        with_cloud_provenance["platform"]["cloud_provenance"] = serde_json::json!({
+            "source": "dmi",
+            "detection": {
+                "dmi": {
+                    "sys_vendor": "Amazon EC2",
+                    "product_name": "m6a.large",
+                    "bios_vendor": "Amazon EC2",
+                    "detected_cloud": "aws"
+                },
+                "metadata": {
+                    "gcp": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "azure": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "aws": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "detected_cloud": "unknown",
+                    "conflict": false
+                }
+            },
+            "user_provided": null
+        });
+        let decoded = serde_json::from_value::<SessionEvidenceBundle>(with_cloud_provenance)
+            .expect("current portal cloud_provenance must decode");
+        let provenance = decoded.platform.cloud_provenance;
+        assert_eq!(provenance.source, SessionCloudSource::Dmi);
+        assert_eq!(
+            provenance.detection.dmi.detected_cloud,
+            SessionCloudProvider::Aws
+        );
 
         let mut too_many_pcrs = value.clone();
         too_many_pcrs["pcr_values"] = serde_json::Value::Array(

@@ -44,6 +44,46 @@
     "platform": {
       "attestation_mode": "hardware",
       "cloud": "gcp",
+      "cloud_provenance": {
+        "source": "dmi",
+        "detection": {
+          "dmi": {
+            "sys_vendor": "Google",
+            "product_name": "Google Compute Engine",
+            "bios_vendor": "Google",
+            "detected_cloud": "gcp"
+          },
+          "metadata": {
+            "gcp": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "azure": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "aws": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "detected_cloud": "unknown",
+            "conflict": false
+          }
+        },
+        "user_provided": "gcp"
+      },
       "machine_type": "n2d-standard-4",
       "tee": "sev-snp"
     },

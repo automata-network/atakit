@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[derive(Deserialize)]
-    struct ValidSuppliedBundleFixture {
+    struct SuppliedBundleFixture {
         evidence_bundle: serde_json::Value,
         request_binding: SessionRequestBinding,
         gcp_ak_roots: Vec<String>,
@@ -378,11 +378,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_mode_prepares_and_verifies_a_valid_gcp_snp_bundle() {
-        let valid_fixture: ValidSuppliedBundleFixture = serde_json::from_str(include_str!(
+    async fn explicit_mode_rejects_a_signature_from_before_cloud_provenance_was_required() {
+        let supplied_fixture: SuppliedBundleFixture = serde_json::from_str(include_str!(
             "../testdata/supplied-session-bundle-gcp-snp.json"
         ))
-        .expect("parse valid supplied-session fixture");
+        .expect("parse supplied-session fixture");
         let report = fixture(include_str!(
             "../../atakit-attestation/testdata/fedora-oci-gcp-n2d-standard-4/report.bin.b64"
         ));
@@ -393,7 +393,7 @@ mod tests {
             "../../atakit-attestation/testdata/fedora-oci-gcp-n2d-standard-4/milan.crl.der.b64"
         ));
         let security_state = amd_snp_security_state(&report).expect("read SNP security state");
-        let gcp_ak_roots = valid_fixture
+        let gcp_ak_roots = supplied_fixture
             .gcp_ak_roots
             .iter()
             .map(|root| URL_SAFE_NO_PAD.decode(root).expect("decode GCP AK root"))
@@ -483,8 +483,8 @@ mod tests {
         let expected_challenge = [0x55; 32];
         let prepared = prepare_supplied_session_bundle(SuppliedSessionBundleVerificationRequest {
             session_evidence: ChallengeBoundSessionEvidence::from_parts(
-                valid_fixture.evidence_bundle,
-                valid_fixture.request_binding,
+                supplied_fixture.evidence_bundle,
+                supplied_fixture.request_binding,
             )
             .expect("validate supplied session evidence"),
             expected_challenge,
@@ -500,12 +500,20 @@ mod tests {
             .inputs
             .values()
             .all(|source| matches!(source, TrustInputSource::File { .. })));
-        let verified = prepared
+        let error = prepared
             .verify_at(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_851_200))
-            .expect("verify the supplied GCP SNP bundle");
-        assert_eq!(verified.session.binding_mode, BindingMode::Local);
-        assert_eq!(verified.session.binding_chain_id, 0);
-        assert_eq!(verified.session.session_key_type_id, 3);
-        assert!(verified.session.checks.iter().all(|check| check.valid));
+            .expect_err("the old signature must not cover the required cloud provenance");
+        let PortalVerificationError::SessionVerification { failure } = error else {
+            panic!("expected a session verification failure, got {error:?}");
+        };
+        assert_eq!(
+            failure.errors,
+            ["request-binding: request-binding signature mismatch"]
+        );
+        assert!(failure
+            .checks
+            .iter()
+            .filter(|check| check.name != "request-binding")
+            .all(|check| check.valid));
     }
 }

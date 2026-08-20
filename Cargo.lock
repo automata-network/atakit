@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-attestation"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-attestation-client"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "alloy",
  "alloy-ext",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-cli"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "alloy-ext",
  "anyhow",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-cloud"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "alloy",
  "async-trait",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-config"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "atakit-core",
  "indexmap 2.13.0",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-core"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "hex",
  "serde",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-github"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "atakit-core",
  "futures-util",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-image"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "atakit-core",
  "atakit-github",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-verifierd"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "atakit-attestation",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "atakit-workload"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "atakit-core",
  "atakit-github",
