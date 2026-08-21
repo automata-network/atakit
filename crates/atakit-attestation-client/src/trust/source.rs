@@ -318,10 +318,10 @@ impl PackTrustSource {
 /// `SessionRegistry` is the authority.
 ///
 /// The connected client is held rather than reconnected per input, and the
-/// session binding is reachable **only** through this variant. That is the
-/// point: operator-supplied policy combined with a chain-derived `chain_id`
-/// and `SessionRegistry` address is mixed trust even though both values are
-/// well-formed, so no other source has anywhere to put one.
+/// verifier-selected chain coordinates used to authenticate a chain-bound
+/// session are reachable only through this variant. Other sources currently
+/// have no trusted coordinates and therefore fail closed for chain-bound
+/// evidence. A local-bound session does not use these coordinates.
 #[derive(Debug, Clone)]
 pub struct ChainTrustSource {
     client: AttestationClient,
@@ -369,8 +369,8 @@ impl ChainTrustSource {
         &self.client
     }
 
-    /// The chain context this verification is bound to. Only chain mode has
-    /// one, which is what makes a mixed binding unrepresentable.
+    /// Verifier-selected chain coordinates. A chain-bound session is checked
+    /// against them. A local-bound session does not use them.
     pub fn binding(&self) -> TrustedSessionBinding {
         self.client.trusted_session_binding()
     }

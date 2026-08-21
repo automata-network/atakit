@@ -108,6 +108,9 @@ pub struct SuppliedSessionBundleVerificationRequest {
     pub session_evidence: ChallengeBoundSessionEvidence,
     pub expected_challenge: [u8; 32],
     pub mode: SessionVerificationMode,
+    /// Optional caller policy for the verified session's actual binding mode.
+    /// This is independent of the selected trust authority.
+    pub required_binding: Option<BindingMode>,
 }
 
 /// A verified session plus the source of every trust input used.
@@ -126,7 +129,7 @@ pub struct PreparedSuppliedSessionBundleVerification {
     request_binding: SessionRequestBinding,
     expected_challenge: [u8; 32],
     trust: atakit_attestation::SessionTrust,
-    required_binding: BindingMode,
+    required_binding: Option<BindingMode>,
     trust_provenance: TrustProvenance,
 }
 
@@ -152,7 +155,7 @@ impl PreparedSuppliedSessionBundleVerification {
         .map_err(|failure| PortalVerificationError::SessionVerification {
             failure: Box::new(failure),
         })?;
-        enforce_required_binding(verified.binding_mode, Some(self.required_binding))
+        enforce_required_binding(verified.binding_mode, self.required_binding)
             .map_err(client_error)?;
 
         Ok(VerifiedSuppliedSessionBundle {
@@ -171,6 +174,7 @@ pub async fn prepare_supplied_session_bundle(
         session_evidence,
         expected_challenge,
         mode,
+        required_binding,
     } = request;
     let (typed_bundle, signed_bundle, request_binding) = session_evidence.into_parts();
 
@@ -181,7 +185,6 @@ pub async fn prepare_supplied_session_bundle(
         }
     })?;
     let workload_policy = resolve_workload_policy(&mode, base_image_id).await?;
-    let required_binding = mode.required_binding();
     let trusted_binding = trusted_binding(&mode);
     let trust_source = mode.trust_source();
     if let TrustSource::Packs(source) = &trust_source {
@@ -378,7 +381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_mode_rejects_a_signature_from_before_cloud_provenance_was_required() {
+    async fn supplied_bundle_carries_optional_binding_policy_without_skipping_verification() {
         let supplied_fixture: SuppliedBundleFixture = serde_json::from_str(include_str!(
             "../testdata/supplied-session-bundle-gcp-snp.json"
         ))
@@ -481,19 +484,35 @@ mod tests {
             },
         };
         let expected_challenge = [0x55; 32];
+        let session_evidence = ChallengeBoundSessionEvidence::from_parts(
+            supplied_fixture.evidence_bundle,
+            supplied_fixture.request_binding,
+        )
+        .expect("validate supplied session evidence");
+
+        for required_binding in [Some(BindingMode::Local), Some(BindingMode::Chain)] {
+            let prepared =
+                prepare_supplied_session_bundle(SuppliedSessionBundleVerificationRequest {
+                    session_evidence: session_evidence.clone(),
+                    expected_challenge,
+                    mode: mode.clone(),
+                    required_binding,
+                })
+                .await
+                .expect("prepare supplied bundle with a caller binding policy");
+            assert_eq!(prepared.required_binding, required_binding);
+        }
+
         let prepared = prepare_supplied_session_bundle(SuppliedSessionBundleVerificationRequest {
-            session_evidence: ChallengeBoundSessionEvidence::from_parts(
-                supplied_fixture.evidence_bundle,
-                supplied_fixture.request_binding,
-            )
-            .expect("validate supplied session evidence"),
+            session_evidence,
             expected_challenge,
             mode,
+            required_binding: None,
         })
         .await
         .expect("prepare the supplied GCP SNP bundle");
 
-        assert_eq!(prepared.required_binding, BindingMode::Local);
+        assert_eq!(prepared.required_binding, None);
         assert!(!prepared.trust_provenance.inputs.is_empty());
         assert!(prepared
             .trust_provenance
@@ -502,7 +521,7 @@ mod tests {
             .all(|source| matches!(source, TrustInputSource::File { .. })));
         let error = prepared
             .verify_at(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_851_200))
-            .expect_err("the old signature must not cover the required cloud provenance");
+            .expect_err("no binding policy must not skip normal bundle verification");
         let PortalVerificationError::SessionVerification { failure } = error else {
             panic!("expected a session verification failure, got {error:?}");
         };

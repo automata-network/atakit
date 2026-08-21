@@ -625,10 +625,10 @@ mod no_registry_policy_read_outside_chain_mode {
     /// A registry client reachable in the same process must be left untouched
     /// by explicit trust-anchor resolution.
     ///
-    /// The type change makes a mixed binding unrepresentable, so this is not
-    /// proving that `None` was assigned — it is proving that nothing reaches
-    /// for a chain client by another route. The type stops one path; this
-    /// covers the rest.
+    /// Explicit trust does not contain verifier-selected chain coordinates, so
+    /// this is not proving that `None` was assigned — it is proving that
+    /// nothing reaches for a chain client by another route. The type stops one
+    /// path; this covers the rest.
     #[tokio::test]
     async fn a_reachable_registry_client_is_untouched_by_explicit_resolution() {
         let endpoint = CountingRpcEndpoint::start().await;

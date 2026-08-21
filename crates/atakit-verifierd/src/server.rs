@@ -31,6 +31,7 @@ const MAX_VERIFY_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SESSION_BUNDLE_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_VERIFICATIONS: usize = 8;
 const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(360);
+const VERIFIERD_REQUIRED_BINDING: Option<BindingMode> = None;
 const SUPPORTED_PLATFORMS: &[&str] = &[
     "gcp-tdx",
     "gcp-sev-snp",
@@ -289,14 +290,13 @@ impl VerificationRunner for RuntimeRunner {
         let expected_base_image_id = atakit_cvm_encoding::base_image_id(&base_image);
         let expected_workload_id = atakit_cvm_encoding::workload_id(&workload);
         let mode = self.session_verification_mode(&base_image, &workload)?;
-        let required_binding = mode.required_binding();
         let request = PortalSessionVerificationRequest {
             host: portal.host().to_string(),
             status_port: portal.port(),
             resolved_address: Some(portal.socket_address()),
             mode,
             report_path: None,
-            required_binding: Some(required_binding),
+            required_binding: VERIFIERD_REQUIRED_BINDING,
         };
         let outcome = run_verification_worker(
             permit,
@@ -343,6 +343,7 @@ impl VerificationRunner for RuntimeRunner {
                         session_evidence,
                         expected_challenge,
                         mode,
+                        required_binding: VERIFIERD_REQUIRED_BINDING,
                     })
                     .await
                     .map_err(ApiError::bundle_verification)?;
@@ -903,6 +904,46 @@ mod tests {
                     },
                     "platform": {
                         "cloud": "gcp",
+                        "cloud_provenance": {
+                            "source": "dmi",
+                            "detection": {
+                                "dmi": {
+                                    "sys_vendor": null,
+                                    "product_name": null,
+                                    "bios_vendor": null,
+                                    "detected_cloud": "gcp"
+                                },
+                                "metadata": {
+                                    "gcp": {
+                                        "attempted": false,
+                                        "matched": false,
+                                        "http_status": null,
+                                        "response_headers": {},
+                                        "response_body": null,
+                                        "error": null
+                                    },
+                                    "azure": {
+                                        "attempted": false,
+                                        "matched": false,
+                                        "http_status": null,
+                                        "response_headers": {},
+                                        "response_body": null,
+                                        "error": null
+                                    },
+                                    "aws": {
+                                        "attempted": false,
+                                        "matched": false,
+                                        "http_status": null,
+                                        "response_headers": {},
+                                        "response_body": null,
+                                        "error": null
+                                    },
+                                    "detected_cloud": "unknown",
+                                    "conflict": false
+                                }
+                            },
+                            "user_provided": null
+                        },
                         "attestation_mode": "hardware",
                         "tee": "sev-snp",
                         "machine_type": "n2d-standard-2"
@@ -945,6 +986,29 @@ mod tests {
             "base_image": format!("{publisher}/base:v1"),
             "workload": format!("{publisher}/workload:v1")
         })
+    }
+
+    #[test]
+    fn verifierd_does_not_impose_an_extra_binding_mode() {
+        assert_eq!(VERIFIERD_REQUIRED_BINDING, None);
+
+        let verify = serde_json::json!({
+            "portal": {"host": "203.0.113.10", "port": 2024},
+            "base_image": "base:v1",
+            "workload": "workload:v1",
+        });
+        serde_json::from_value::<VerifyRequest>(verify.clone())
+            .expect("the normal portal request schema remains valid");
+        let mut verify = verify;
+        verify["required_binding"] = serde_json::json!("chain");
+        assert!(serde_json::from_value::<VerifyRequest>(verify).is_err());
+
+        let supplied = session_bundle_request_value(String::new());
+        serde_json::from_value::<VerifySessionBundleRequest>(supplied.clone())
+            .expect("the normal supplied-bundle request schema remains valid");
+        let mut supplied = supplied;
+        supplied["required_binding"] = serde_json::json!("local");
+        assert!(serde_json::from_value::<VerifySessionBundleRequest>(supplied).is_err());
     }
 
     fn session_bundle_body_with_exact_length(length: usize) -> Vec<u8> {

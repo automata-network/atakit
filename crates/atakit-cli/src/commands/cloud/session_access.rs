@@ -244,10 +244,9 @@ pub(crate) async fn resolve_verified_session_access(
     verification: &SessionVerificationArgs,
     _config: &Config,
 ) -> Result<VerifiedCloudSessionAccess> {
-    // The workload policy comes from the same authority portal TLS used. A
-    // policy from one authority paired with a session binding from another is
-    // the mixed trust `docs/specs/atatp-archive-spec.md` forbids, even when
-    // every individual value is well formed.
+    // The workload policy comes from the same authority portal TLS used.
+    // Session binding is separate and is checked later against the deployment's
+    // registration policy.
     // Read back from the verified TLS itself rather than kept alongside it. A
     // second copy of the authority is a second thing that can disagree, and a
     // string one silently mapped trust-pack onto the operator branch.
@@ -258,8 +257,8 @@ pub(crate) async fn resolve_verified_session_access(
         bail!(message);
     }
     if authority != SessionAuthorityKind::Chain {
-        // Explicit mode has no chain to resolve a registered policy or a
-        // session binding from, so it must not connect to one.
+        // Explicit mode has no chain from which to resolve a registered policy,
+        // so it must not connect to one.
         return build_session_access(portal, verification, authority).await;
     }
     // No second chain client is connected here. The authority recorded during

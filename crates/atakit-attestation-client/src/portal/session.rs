@@ -424,8 +424,9 @@ pub(crate) async fn fetch_current_session(
     .await
 }
 
-/// Chain-mode verification, which binds the session to the client's own chain
-/// context. Crate-private so no caller outside chain mode can supply one.
+/// Verification with optional verifier-selected chain coordinates. A
+/// chain-bound session is checked against them; a local-bound session ignores
+/// them. Crate-private so callers cannot supply untrusted coordinates.
 async fn fetch_current_session_bound(
     verified_tls: &VerifiedPortalTls,
     host: &str,
@@ -1866,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn required_and_off_binding_policies_reject_the_opposite_binding() {
+    fn caller_binding_policies_reject_the_opposite_binding() {
         assert!(enforce_required_binding(BindingMode::Local, Some(BindingMode::Chain)).is_err());
         assert!(enforce_required_binding(BindingMode::Chain, Some(BindingMode::Local)).is_err());
         enforce_required_binding(BindingMode::Chain, Some(BindingMode::Chain)).unwrap();
@@ -1874,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_binding_policy_accepts_local_and_chain() {
+    fn no_caller_binding_policy_accepts_local_and_chain() {
         enforce_required_binding(BindingMode::Local, None).unwrap();
         enforce_required_binding(BindingMode::Chain, None).unwrap();
     }

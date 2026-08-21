@@ -80,13 +80,14 @@ floor.
 
 ## Verify a current session
 
-`verified_portal_tls` must have been verified under **this same chain**. The
-authority is chosen once, before the portal is contacted, and a session cannot
-take its workload policy and binding from a chain other than the one that
-verified the connection; passing portal TLS from another chain, or from
-explicit or trust-pack verification, is refused. Offline verification uses the
-free `session::verify_current_session`, which correspondingly refuses
-chain-verified portal TLS.
+`verified_portal_tls` fixes the trust authority before the portal is contacted.
+The current-session workflow uses the workload policy and trust inputs from
+that same authority. Session binding is separate. Chain authority also supplies
+verifier-selected chain coordinates for checking a chain-bound session, while
+a local-bound session does not use those coordinates. The caller may use
+`required_binding` to add an independent local-versus-chain policy. The current
+trust-pack and explicit inputs contain no trusted chain coordinates, so a
+chain-bound session fails closed under those authorities.
 
 References are publisher-qualified: `<publisher>/<name>:<version>`, where the
 publisher is the owner fingerprint as `0x` and 64 lowercase hexadecimal
@@ -126,7 +127,10 @@ When the caller already holds the exact response from
 `GET /session/evidence-bundle`, use
 `atakit_attestation_client::verify_supplied_session_bundle`. This workflow
 resolves policy and collateral from one `SessionVerificationMode`, verifies the
-caller-supplied 32-byte challenge, and makes no portal network request. It runs
+caller-supplied 32-byte challenge, applies the request's optional
+`required_binding` policy after normal binding verification, and makes no
+portal network request. `required_binding = None` accepts either valid binding
+mode and does not skip cryptographic binding checks. It runs
 the final synchronous cryptographic verification on a blocking worker. Services
 that must retain their own resource permit after an HTTP timeout can call
 `prepare_supplied_session_bundle`, then move both the prepared verification and

@@ -102,14 +102,6 @@ impl SessionVerificationMode {
         self.tls_mode().name()
     }
 
-    /// The session binding required by this authority.
-    pub fn required_binding(&self) -> BindingMode {
-        match self {
-            Self::Chain { .. } => BindingMode::Chain,
-            Self::Explicit { .. } | Self::Packs { .. } => BindingMode::Local,
-        }
-    }
-
     /// The base-image measurement policy, from this mode's own authority.
     pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
         self.tls_mode().measurement_policy().await
@@ -127,6 +119,8 @@ pub struct PortalSessionVerificationRequest {
     pub resolved_address: Option<std::net::SocketAddr>,
     pub mode: SessionVerificationMode,
     pub report_path: Option<PathBuf>,
+    /// Optional caller policy applied after normal cryptographic binding
+    /// verification. `None` accepts either valid binding mode.
     pub required_binding: Option<BindingMode>,
 }
 
