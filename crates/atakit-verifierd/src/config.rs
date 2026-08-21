@@ -1,7 +1,7 @@
-//! Strict `VERIFIED_*` configuration for `atakit-verifierd`.
+//! Strict `VERIFIERD_*` configuration for `atakit-verifierd`.
 //!
 //! A configuration selects exactly one trust authority. Unknown names in the
-//! `VERIFIED_*` namespace are rejected, because ignoring a misspelled optional
+//! `VERIFIERD_*` namespace are rejected, because ignoring a misspelled optional
 //! pin or expected chain ID would silently weaken verification.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,37 +86,37 @@ impl TrustModeConfig {
 }
 
 const GLOBAL: &[&str] = &[
-    "VERIFIED_TRUST_MODE",
-    "VERIFIED_LISTEN",
-    "VERIFIED_PCCS_URL",
-    "VERIFIED_PORTAL_ALLOWED_PORTS",
-    "VERIFIED_PORTAL_ALLOWED_CIDRS",
+    "VERIFIERD_TRUST_MODE",
+    "VERIFIERD_LISTEN",
+    "VERIFIERD_PCCS_URL",
+    "VERIFIERD_PORTAL_ALLOWED_PORTS",
+    "VERIFIERD_PORTAL_ALLOWED_CIDRS",
 ];
 const CHAIN_ONLY: &[&str] = &[
-    "VERIFIED_RPC_URL",
-    "VERIFIED_CHAIN_ID",
-    "VERIFIED_SESSION_REGISTRY",
+    "VERIFIERD_RPC_URL",
+    "VERIFIERD_CHAIN_ID",
+    "VERIFIERD_SESSION_REGISTRY",
 ];
 const TRUST_PACK_ONLY: &[&str] = &[
-    "VERIFIED_COLLATERAL_PUBLISHER_PUBKEY",
-    "VERIFIED_WORKLOAD_PUBLISHER_PUBKEY",
-    "VERIFIED_COLLATERAL_TRUST_PACK_SHA256",
-    "VERIFIED_WORKLOAD_TRUST_PACK_SHA256",
+    "VERIFIERD_COLLATERAL_PUBLISHER_PUBKEY",
+    "VERIFIERD_WORKLOAD_PUBLISHER_PUBKEY",
+    "VERIFIERD_COLLATERAL_TRUST_PACK_SHA256",
+    "VERIFIERD_WORKLOAD_TRUST_PACK_SHA256",
 ];
 const EXPLICIT_ONLY: &[&str] = &[
-    "VERIFIED_MEASUREMENTS",
-    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
-    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
-    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
-    "VERIFIED_GCP_AK_ROOT_CERTS",
-    "VERIFIED_AZURE_MAA_CERTS",
-    "VERIFIED_AWS_NITRO_ROOT_CERTS",
-    "VERIFIED_AMD_ARK_ROOT_CERTS",
-    "VERIFIED_AMD_SNP_CRLS",
-    "VERIFIED_AMD_SNP_SECURITY_POLICY",
-    "VERIFIED_TDX_DCAP_COLLATERAL",
-    "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS",
-    "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
+    "VERIFIERD_MEASUREMENTS",
+    "VERIFIERD_MEASUREMENT_PUBLISHER_PUBKEYS",
+    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA256",
+    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA384",
+    "VERIFIERD_GCP_AK_ROOT_CERTS",
+    "VERIFIERD_AZURE_MAA_CERTS",
+    "VERIFIERD_AWS_NITRO_ROOT_CERTS",
+    "VERIFIERD_AMD_ARK_ROOT_CERTS",
+    "VERIFIERD_AMD_SNP_CRLS",
+    "VERIFIERD_AMD_SNP_SECURITY_POLICY",
+    "VERIFIERD_TDX_DCAP_COLLATERAL",
+    "VERIFIERD_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS",
+    "VERIFIERD_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
 ];
 
 /// Parse and fully validate configuration. Trust packs and explicit trust
@@ -126,12 +126,12 @@ pub fn load(
     unmeasured_dir: &Path,
     now_unix: u64,
 ) -> Result<VerifierdConfig, ConfigError> {
-    reject_unknown_verified_names(env)?;
-    let mode_name = required(env, "VERIFIED_TRUST_MODE")?;
+    reject_unknown_verifierd_names(env)?;
+    let mode_name = required(env, "VERIFIERD_TRUST_MODE")?;
     let packs = discover_packs(unmeasured_dir)?;
-    let pccs_url = optional_nonempty(env, "VERIFIED_PCCS_URL")?;
+    let pccs_url = optional_nonempty(env, "VERIFIERD_PCCS_URL")?;
     if let Some(url) = &pccs_url {
-        validate_http_url("VERIFIED_PCCS_URL", url)?;
+        validate_http_url("VERIFIERD_PCCS_URL", url)?;
     }
 
     let mode = match mode_name.as_str() {
@@ -139,10 +139,10 @@ pub fn load(
             reject_foreign(env, &mode_name, TRUST_PACK_ONLY)?;
             reject_foreign(env, &mode_name, EXPLICIT_ONLY)?;
             reject_packs(&mode_name, &packs)?;
-            let rpc_url = required(env, "VERIFIED_RPC_URL")?;
-            validate_http_url("VERIFIED_RPC_URL", &rpc_url)?;
-            let session_registry = required(env, "VERIFIED_SESSION_REGISTRY")?;
-            let chain_id = optional_u64(env, "VERIFIED_CHAIN_ID")?;
+            let rpc_url = required(env, "VERIFIERD_RPC_URL")?;
+            validate_http_url("VERIFIERD_RPC_URL", &rpc_url)?;
+            let session_registry = required(env, "VERIFIERD_SESSION_REGISTRY")?;
+            let chain_id = optional_u64(env, "VERIFIERD_CHAIN_ID")?;
             let tdx_dcap_collateral =
                 tdx_dcap_collateral_config(None, pccs_url.clone(), None, None)
                     .map_err(|error| invalid(error.to_string()))?;
@@ -170,19 +170,19 @@ pub fn load(
         }
         other => {
             return Err(invalid(format!(
-                "VERIFIED_TRUST_MODE is {other:?}; expected chain, trust-pack, or explicit"
+                "VERIFIERD_TRUST_MODE is {other:?}; expected chain, trust-pack, or explicit"
             )))
         }
     };
 
     let listen = env
-        .get("VERIFIED_LISTEN")
+        .get("VERIFIERD_LISTEN")
         .map(String::as_str)
         .unwrap_or("0.0.0.0:9100")
         .parse::<SocketAddr>()
         .map_err(|error| {
             invalid(format!(
-                "VERIFIED_LISTEN must be an IP address and port: {error}"
+                "VERIFIERD_LISTEN must be an IP address and port: {error}"
             ))
         })?;
 
@@ -201,13 +201,13 @@ fn load_trust_pack_mode(
 ) -> Result<TrustModeConfig, ConfigError> {
     if packs.is_empty() {
         return Err(invalid(format!(
-            "VERIFIED_TRUST_MODE is trust-pack, but no *.atatp was found in {UNMEASURED_DATA_DIR}"
+            "VERIFIERD_TRUST_MODE is trust-pack, but no *.atatp was found in {UNMEASURED_DATA_DIR}"
         )));
     }
-    let collateral_key = publisher_key(env, "VERIFIED_COLLATERAL_PUBLISHER_PUBKEY")?;
-    let workload_key = publisher_key(env, "VERIFIED_WORKLOAD_PUBLISHER_PUBKEY")?;
-    let collateral_pin = pin(env, "VERIFIED_COLLATERAL_TRUST_PACK_SHA256")?;
-    let workload_pin = pin(env, "VERIFIED_WORKLOAD_TRUST_PACK_SHA256")?;
+    let collateral_key = publisher_key(env, "VERIFIERD_COLLATERAL_PUBLISHER_PUBKEY")?;
+    let workload_key = publisher_key(env, "VERIFIERD_WORKLOAD_PUBLISHER_PUBKEY")?;
+    let collateral_pin = pin(env, "VERIFIERD_COLLATERAL_TRUST_PACK_SHA256")?;
+    let workload_pin = pin(env, "VERIFIERD_WORKLOAD_TRUST_PACK_SHA256")?;
 
     let mut collateral_packs = Vec::new();
     let mut workload_packs = Vec::new();
@@ -227,7 +227,7 @@ fn load_trust_pack_mode(
     }
     if collateral_packs.is_empty() {
         return Err(invalid(
-            "VERIFIED_COLLATERAL_PUBLISHER_PUBKEY has no matching collateral-trust pack",
+            "VERIFIERD_COLLATERAL_PUBLISHER_PUBKEY has no matching collateral-trust pack",
         ));
     }
     if workload_packs.len() != 1 {
@@ -313,13 +313,15 @@ fn load_explicit_mode(
     env: &BTreeMap<String, String>,
     pccs_url: Option<String>,
 ) -> Result<TrustModeConfig, ConfigError> {
-    let measurements = PathBuf::from(required(env, "VERIFIED_MEASUREMENTS")?);
+    let measurements = PathBuf::from(required(env, "VERIFIERD_MEASUREMENTS")?);
     let measurement_publisher_keys =
-        required_string_list(env, "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS")?;
+        required_string_list(env, "VERIFIERD_MEASUREMENT_PUBLISHER_PUBKEYS")?;
     let measurement_policy =
         load_measurement_policy(Some(&measurements), None, &measurement_publisher_keys, None)
             .map_err(|error| invalid(error.to_string()))?
-            .ok_or_else(|| invalid("VERIFIED_MEASUREMENTS did not produce a measurement policy"))?;
+            .ok_or_else(|| {
+                invalid("VERIFIERD_MEASUREMENTS did not produce a measurement policy")
+            })?;
     let base_image = format!(
         "{}/{}:{}",
         measurement_policy.pack.subject.publisher,
@@ -329,21 +331,21 @@ fn load_explicit_mode(
     .parse::<AppRef>()
     .map_err(|error| {
         invalid(format!(
-            "VERIFIED_MEASUREMENTS has an invalid subject: {error}"
+            "VERIFIERD_MEASUREMENTS has an invalid subject: {error}"
         ))
     })?;
 
-    let gcp_roots = path_list(env, "VERIFIED_GCP_AK_ROOT_CERTS")?;
-    let azure_maa = path_list(env, "VERIFIED_AZURE_MAA_CERTS")?;
-    let aws_nitro_roots = path_list(env, "VERIFIED_AWS_NITRO_ROOT_CERTS")?;
-    let amd_ark = path_list(env, "VERIFIED_AMD_ARK_ROOT_CERTS")?;
-    let amd_crls = path_list(env, "VERIFIED_AMD_SNP_CRLS")?;
-    let amd_policy = optional_path(env, "VERIFIED_AMD_SNP_SECURITY_POLICY")?;
+    let gcp_roots = path_list(env, "VERIFIERD_GCP_AK_ROOT_CERTS")?;
+    let azure_maa = path_list(env, "VERIFIERD_AZURE_MAA_CERTS")?;
+    let aws_nitro_roots = path_list(env, "VERIFIERD_AWS_NITRO_ROOT_CERTS")?;
+    let amd_ark = path_list(env, "VERIFIERD_AMD_ARK_ROOT_CERTS")?;
+    let amd_crls = path_list(env, "VERIFIERD_AMD_SNP_CRLS")?;
+    let amd_policy = optional_path(env, "VERIFIERD_AMD_SNP_SECURITY_POLICY")?;
     let aws_document_maximum_age_seconds =
-        optional_u64(env, "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS")?;
+        optional_u64(env, "VERIFIERD_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS")?;
     let aws_document_allowed_future_clock_difference_seconds = optional_u64(
         env,
-        "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
+        "VERIFIERD_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
     )?;
     match (
         aws_document_maximum_age_seconds,
@@ -351,14 +353,14 @@ fn load_explicit_mode(
     ) {
         (Some(0), Some(_)) => {
             return Err(invalid(
-                "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS must be greater than zero",
+                "VERIFIERD_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS must be greater than zero",
             ));
         }
         (Some(_), Some(_)) | (None, None) => {}
         _ => {
             return Err(invalid(
-                "VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS and \
-                 VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS must be supplied together",
+                "VERIFIERD_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS and \
+                 VERIFIERD_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS must be supplied together",
             ));
         }
     }
@@ -374,7 +376,7 @@ fn load_explicit_mode(
     })
     .map_err(|error| invalid(error.to_string()))?;
 
-    let collateral_file = optional_path(env, "VERIFIED_TDX_DCAP_COLLATERAL")?;
+    let collateral_file = optional_path(env, "VERIFIERD_TDX_DCAP_COLLATERAL")?;
     let tdx_dcap_collateral = match (collateral_file, pccs_url) {
         (Some(path), None) => IntelTdxDcapCollateralConfig {
             source: IntelTdxDcapCollateralSource::File(path),
@@ -386,7 +388,7 @@ fn load_explicit_mode(
             .map_err(|error| invalid(error.to_string()))?,
         (Some(_), Some(_)) => {
             return Err(invalid(
-                "choose only one of VERIFIED_TDX_DCAP_COLLATERAL and VERIFIED_PCCS_URL",
+                "choose only one of VERIFIERD_TDX_DCAP_COLLATERAL and VERIFIERD_PCCS_URL",
             ));
         }
     };
@@ -397,13 +399,13 @@ fn load_explicit_mode(
         source: Box::new(source),
         measurement_policy: Box::new(measurement_policy),
         base_image,
-        workload_pcr23_sha256: fixed_hex::<32>(env, "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256")?,
-        workload_pcr23_sha384: fixed_hex::<48>(env, "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384")?,
+        workload_pcr23_sha256: fixed_hex::<32>(env, "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA256")?,
+        workload_pcr23_sha384: fixed_hex::<48>(env, "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA384")?,
     })
 }
 
-fn reject_unknown_verified_names(env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
-    for key in env.keys().filter(|key| key.starts_with("VERIFIED_")) {
+fn reject_unknown_verifierd_names(env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    for key in env.keys().filter(|key| key.starts_with("VERIFIERD_")) {
         if GLOBAL.contains(&key.as_str())
             || CHAIN_ONLY.contains(&key.as_str())
             || TRUST_PACK_ONLY.contains(&key.as_str())
@@ -412,7 +414,7 @@ fn reject_unknown_verified_names(env: &BTreeMap<String, String>) -> Result<(), C
             continue;
         }
         return Err(invalid(format!(
-            "unknown {key}; every VERIFIED_* variable must be recognized so a misspelled security input cannot be ignored"
+            "unknown {key}; every VERIFIERD_* variable must be recognized so a misspelled security input cannot be ignored"
         )));
     }
     Ok(())
@@ -421,11 +423,11 @@ fn reject_unknown_verified_names(env: &BTreeMap<String, String>) -> Result<(), C
 fn portal_destination_policy(
     env: &BTreeMap<String, String>,
 ) -> Result<PortalDestinationPolicy, ConfigError> {
-    let allowed_ports = match env.get("VERIFIED_PORTAL_ALLOWED_PORTS") {
+    let allowed_ports = match env.get("VERIFIERD_PORTAL_ALLOWED_PORTS") {
         Some(raw) => {
             let ports: Vec<u16> = serde_json::from_str(raw).map_err(|error| {
                 invalid(format!(
-                    "VERIFIED_PORTAL_ALLOWED_PORTS must be a JSON array of ports: {error}"
+                    "VERIFIERD_PORTAL_ALLOWED_PORTS must be a JSON array of ports: {error}"
                 ))
             })?;
             ports.into_iter().collect::<BTreeSet<_>>()
@@ -433,8 +435,8 @@ fn portal_destination_policy(
         None => BTreeSet::from([2024]),
     };
     let allowed_cidrs = env
-        .get("VERIFIED_PORTAL_ALLOWED_CIDRS")
-        .map(|_| required_string_list(env, "VERIFIED_PORTAL_ALLOWED_CIDRS"))
+        .get("VERIFIERD_PORTAL_ALLOWED_CIDRS")
+        .map(|_| required_string_list(env, "VERIFIERD_PORTAL_ALLOWED_CIDRS"))
         .transpose()?
         .map(|values| {
             values
@@ -442,7 +444,7 @@ fn portal_destination_policy(
                 .map(|value| {
                     value.parse::<IpNet>().map_err(|error| {
                         invalid(format!(
-                            "VERIFIED_PORTAL_ALLOWED_CIDRS contains invalid CIDR {value:?}: {error}"
+                            "VERIFIERD_PORTAL_ALLOWED_CIDRS contains invalid CIDR {value:?}: {error}"
                         ))
                     })
                 })
@@ -486,7 +488,7 @@ fn discover_packs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 fn reject_packs(mode: &str, packs: &[PathBuf]) -> Result<(), ConfigError> {
     if let Some(path) = packs.first() {
         return Err(invalid(format!(
-            "VERIFIED_TRUST_MODE is {mode}, but {} is present; remove it, or select trust-pack mode",
+            "VERIFIERD_TRUST_MODE is {mode}, but {} is present; remove it, or select trust-pack mode",
             path.display()
         )));
     }
@@ -624,7 +626,7 @@ fn reject_foreign(
         return Ok(());
     }
     Err(invalid(format!(
-        "VERIFIED_TRUST_MODE is {mode}, so {} belongs to a mode that was not selected; a variable for an unselected authority is a configuration error, not a value to ignore",
+        "VERIFIERD_TRUST_MODE is {mode}, so {} belongs to a mode that was not selected; a variable for an unselected authority is a configuration error, not a value to ignore",
         present.join(", ")
     )))
 }
@@ -680,9 +682,9 @@ mod tests {
 
     fn trust_pack_env(collateral_key: &str, workload_key: &str) -> BTreeMap<String, String> {
         env(&[
-            ("VERIFIED_TRUST_MODE", "trust-pack"),
-            ("VERIFIED_COLLATERAL_PUBLISHER_PUBKEY", collateral_key),
-            ("VERIFIED_WORKLOAD_PUBLISHER_PUBKEY", workload_key),
+            ("VERIFIERD_TRUST_MODE", "trust-pack"),
+            ("VERIFIERD_COLLATERAL_PUBLISHER_PUBKEY", collateral_key),
+            ("VERIFIERD_WORKLOAD_PUBLISHER_PUBKEY", workload_key),
         ])
     }
 
@@ -711,9 +713,9 @@ mod tests {
         assert!(load(&env(&[]), dir.path(), 1_786_000_000)
             .unwrap_err()
             .to_string()
-            .contains("VERIFIED_TRUST_MODE"));
+            .contains("VERIFIERD_TRUST_MODE"));
         assert!(load(
-            &env(&[("VERIFIED_TRUST_MODE", "whatever")]),
+            &env(&[("VERIFIERD_TRUST_MODE", "whatever")]),
             dir.path(),
             1_786_000_000,
         )
@@ -723,19 +725,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_verified_name_is_never_ignored() {
+    fn an_unknown_verifierd_name_is_never_ignored() {
         let dir = empty_dir();
         for typo in [
-            "VERIFIED_CHAIN_IDD",
-            "VERIFIED_WORKLOAD_TRUST_PACK_SHA25",
-            "VERIFIED_PCSS_URL",
+            "VERIFIERD_CHAIN_IDD",
+            "VERIFIERD_WORKLOAD_TRUST_PACK_SHA25",
+            "VERIFIERD_PCSS_URL",
         ] {
             let error = load(
-                &env(&[("VERIFIED_TRUST_MODE", "explicit"), (typo, "value")]),
+                &env(&[("VERIFIERD_TRUST_MODE", "explicit"), (typo, "value")]),
                 dir.path(),
                 1_786_000_000,
             )
-            .expect_err("a misspelled VERIFIED_* variable must stop startup");
+            .expect_err("a misspelled VERIFIERD_* variable must stop startup");
             assert!(error.to_string().contains(typo), "{error}");
         }
     }
@@ -744,18 +746,18 @@ mod tests {
     fn variables_from_an_unselected_mode_are_refused() {
         let dir = empty_dir();
         let cases = [
-            ("chain", "VERIFIED_COLLATERAL_PUBLISHER_PUBKEY"),
-            ("chain", "VERIFIED_MEASUREMENTS"),
-            ("explicit", "VERIFIED_RPC_URL"),
-            ("trust-pack", "VERIFIED_SESSION_REGISTRY"),
+            ("chain", "VERIFIERD_COLLATERAL_PUBLISHER_PUBKEY"),
+            ("chain", "VERIFIERD_MEASUREMENTS"),
+            ("explicit", "VERIFIERD_RPC_URL"),
+            ("trust-pack", "VERIFIERD_SESSION_REGISTRY"),
         ];
         for (mode, foreign) in cases {
-            let mut values = vec![("VERIFIED_TRUST_MODE", mode), (foreign, "value")];
+            let mut values = vec![("VERIFIERD_TRUST_MODE", mode), (foreign, "value")];
             if mode == "chain" {
                 values.extend([
-                    ("VERIFIED_RPC_URL", "https://rpc.example"),
+                    ("VERIFIERD_RPC_URL", "https://rpc.example"),
                     (
-                        "VERIFIED_SESSION_REGISTRY",
+                        "VERIFIERD_SESSION_REGISTRY",
                         "0x1111111111111111111111111111111111111111",
                     ),
                 ]);
@@ -772,10 +774,10 @@ mod tests {
         std::fs::write(dir.path().join("collateral.atatp"), b"not a pack").unwrap();
         let error = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "chain"),
-                ("VERIFIED_RPC_URL", "https://rpc.example"),
+                ("VERIFIERD_TRUST_MODE", "chain"),
+                ("VERIFIERD_RPC_URL", "https://rpc.example"),
                 (
-                    "VERIFIED_SESSION_REGISTRY",
+                    "VERIFIERD_SESSION_REGISTRY",
                     "0x1111111111111111111111111111111111111111",
                 ),
             ]),
@@ -791,19 +793,19 @@ mod tests {
         let dir = empty_dir();
         let error = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "chain"),
-                ("VERIFIED_RPC_URL", "https://rpc.example"),
+                ("VERIFIERD_TRUST_MODE", "chain"),
+                ("VERIFIERD_RPC_URL", "https://rpc.example"),
                 (
-                    "VERIFIED_SESSION_REGISTRY",
+                    "VERIFIERD_SESSION_REGISTRY",
                     "0x1111111111111111111111111111111111111111",
                 ),
-                ("VERIFIED_PEER_BETA", "203.0.113.10:2024"),
+                ("VERIFIERD_PEER_BETA", "203.0.113.10:2024"),
             ]),
             dir.path(),
             NOW,
         )
         .expect_err("the removed peer allowlist must not be accepted");
-        assert!(error.to_string().contains("unknown VERIFIED_PEER_BETA"));
+        assert!(error.to_string().contains("unknown VERIFIERD_PEER_BETA"));
     }
 
     #[test]
@@ -816,9 +818,9 @@ mod tests {
     #[test]
     fn destination_policy_parses_optional_ports_and_cidrs_strictly() {
         let policy = portal_destination_policy(&env(&[
-            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[2024,12024]"),
+            ("VERIFIERD_PORTAL_ALLOWED_PORTS", "[2024,12024]"),
             (
-                "VERIFIED_PORTAL_ALLOWED_CIDRS",
+                "VERIFIERD_PORTAL_ALLOWED_CIDRS",
                 r#"["10.0.0.0/8","2001:db8::/32"]"#,
             ),
         ]))
@@ -835,11 +837,11 @@ mod tests {
         );
 
         for (key, value) in [
-            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[]"),
-            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[0]"),
-            ("VERIFIED_PORTAL_ALLOWED_PORTS", "[\"2024\"]"),
-            ("VERIFIED_PORTAL_ALLOWED_CIDRS", "[]"),
-            ("VERIFIED_PORTAL_ALLOWED_CIDRS", "[\"bad\"]"),
+            ("VERIFIERD_PORTAL_ALLOWED_PORTS", "[]"),
+            ("VERIFIERD_PORTAL_ALLOWED_PORTS", "[0]"),
+            ("VERIFIERD_PORTAL_ALLOWED_PORTS", "[\"2024\"]"),
+            ("VERIFIERD_PORTAL_ALLOWED_CIDRS", "[]"),
+            ("VERIFIERD_PORTAL_ALLOWED_CIDRS", "[\"bad\"]"),
         ] {
             assert!(
                 portal_destination_policy(&env(&[(key, value)])).is_err(),
@@ -853,10 +855,10 @@ mod tests {
         let dir = empty_dir();
         let error = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "chain"),
-                ("VERIFIED_RPC_URL", ""),
+                ("VERIFIERD_TRUST_MODE", "chain"),
+                ("VERIFIERD_RPC_URL", ""),
                 (
-                    "VERIFIED_SESSION_REGISTRY",
+                    "VERIFIERD_SESSION_REGISTRY",
                     "0x1111111111111111111111111111111111111111",
                 ),
             ]),
@@ -872,13 +874,13 @@ mod tests {
         let dir = empty_dir();
         let loaded = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "chain"),
-                ("VERIFIED_RPC_URL", "https://rpc.example"),
+                ("VERIFIERD_TRUST_MODE", "chain"),
+                ("VERIFIERD_RPC_URL", "https://rpc.example"),
                 (
-                    "VERIFIED_SESSION_REGISTRY",
+                    "VERIFIERD_SESSION_REGISTRY",
                     "0x1111111111111111111111111111111111111111",
                 ),
-                ("VERIFIED_PCCS_URL", "https://pccs.example/v4"),
+                ("VERIFIERD_PCCS_URL", "https://pccs.example/v4"),
             ]),
             dir.path(),
             NOW,
@@ -904,18 +906,18 @@ mod tests {
         let (measurement_path, measurement_public_key) = write_measurement_pack(dir.path());
         let loaded = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "explicit"),
-                ("VERIFIED_MEASUREMENTS", &measurement_path),
+                ("VERIFIERD_TRUST_MODE", "explicit"),
+                ("VERIFIERD_MEASUREMENTS", &measurement_path),
                 (
-                    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
+                    "VERIFIERD_MEASUREMENT_PUBLISHER_PUBKEYS",
                     &format!(r#"["{measurement_public_key}"]"#),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA256",
                     &format!("0x{}", "11".repeat(32)),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA384",
                     &format!("0x{}", "22".repeat(48)),
                 ),
             ]),
@@ -938,33 +940,33 @@ mod tests {
         std::fs::write(&collateral, b"{}").expect("collateral placeholder");
         let error = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "explicit"),
-                ("VERIFIED_MEASUREMENTS", &measurement_path),
+                ("VERIFIERD_TRUST_MODE", "explicit"),
+                ("VERIFIERD_MEASUREMENTS", &measurement_path),
                 (
-                    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
+                    "VERIFIERD_MEASUREMENT_PUBLISHER_PUBKEYS",
                     &format!(r#"["{measurement_public_key}"]"#),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA256",
                     &format!("0x{}", "11".repeat(32)),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA384",
                     &format!("0x{}", "22".repeat(48)),
                 ),
                 (
-                    "VERIFIED_TDX_DCAP_COLLATERAL",
+                    "VERIFIERD_TDX_DCAP_COLLATERAL",
                     &collateral.display().to_string(),
                 ),
-                ("VERIFIED_PCCS_URL", "https://pccs.example/v4"),
+                ("VERIFIERD_PCCS_URL", "https://pccs.example/v4"),
             ]),
             dir.path(),
             NOW,
         )
         .expect_err("two Intel TDX collateral sources must be refused");
         let message = error.to_string();
-        assert!(message.contains("VERIFIED_TDX_DCAP_COLLATERAL"));
-        assert!(message.contains("VERIFIED_PCCS_URL"));
+        assert!(message.contains("VERIFIERD_TDX_DCAP_COLLATERAL"));
+        assert!(message.contains("VERIFIERD_PCCS_URL"));
     }
 
     #[test]
@@ -994,35 +996,35 @@ mod tests {
 
         let loaded = load(
             &env(&[
-                ("VERIFIED_TRUST_MODE", "explicit"),
-                ("VERIFIED_MEASUREMENTS", &measurement_path),
+                ("VERIFIERD_TRUST_MODE", "explicit"),
+                ("VERIFIERD_MEASUREMENTS", &measurement_path),
                 (
-                    "VERIFIED_MEASUREMENT_PUBLISHER_PUBKEYS",
+                    "VERIFIERD_MEASUREMENT_PUBLISHER_PUBKEYS",
                     &format!(r#"["{measurement_public_key}"]"#),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA256",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA256",
                     &format!("0x{}", "11".repeat(32)),
                 ),
                 (
-                    "VERIFIED_TRUSTED_WORKLOAD_PCR23_SHA384",
+                    "VERIFIERD_TRUSTED_WORKLOAD_PCR23_SHA384",
                     &format!("0x{}", "22".repeat(48)),
                 ),
                 (
-                    "VERIFIED_AWS_NITRO_ROOT_CERTS",
+                    "VERIFIERD_AWS_NITRO_ROOT_CERTS",
                     &format!(r#"["{}"]"#, aws_root.display()),
                 ),
                 (
-                    "VERIFIED_AMD_ARK_ROOT_CERTS",
+                    "VERIFIERD_AMD_ARK_ROOT_CERTS",
                     &format!(r#"["{}"]"#, amd_ark.display()),
                 ),
                 (
-                    "VERIFIED_AMD_SNP_SECURITY_POLICY",
+                    "VERIFIERD_AMD_SNP_SECURITY_POLICY",
                     &amd_policy.display().to_string(),
                 ),
-                ("VERIFIED_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS", "300"),
+                ("VERIFIERD_AWS_DOCUMENT_MAXIMUM_AGE_SECONDS", "300"),
                 (
-                    "VERIFIED_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
+                    "VERIFIERD_AWS_DOCUMENT_ALLOWED_FUTURE_CLOCK_DIFFERENCE_SECONDS",
                     "60",
                 ),
             ]),
@@ -1187,17 +1189,17 @@ mod tests {
 
         let mut pinned = trust_pack_env(&collateral_public_key, &workload_public_key);
         pinned.insert(
-            "VERIFIED_COLLATERAL_TRUST_PACK_SHA256".to_string(),
+            "VERIFIERD_COLLATERAL_TRUST_PACK_SHA256".to_string(),
             collateral_digest,
         );
         pinned.insert(
-            "VERIFIED_WORKLOAD_TRUST_PACK_SHA256".to_string(),
+            "VERIFIERD_WORKLOAD_TRUST_PACK_SHA256".to_string(),
             workload_digest,
         );
         load(&pinned, dir.path(), NOW).expect("matching pins");
 
         pinned.insert(
-            "VERIFIED_WORKLOAD_TRUST_PACK_SHA256".to_string(),
+            "VERIFIERD_WORKLOAD_TRUST_PACK_SHA256".to_string(),
             format!("0x{}", "00".repeat(32)),
         );
         let error = load(&pinned, dir.path(), NOW).expect_err("a mismatched pin must fail");

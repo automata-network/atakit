@@ -189,7 +189,7 @@ impl RuntimeRunner {
             } => {
                 if base_image != configured_base_image {
                     return Err(ApiError::bad_request(format!(
-                        "base_image is {base_image}, but VERIFIED_MEASUREMENTS is for {configured_base_image}"
+                        "base_image is {base_image}, but VERIFIERD_MEASUREMENTS is for {configured_base_image}"
                     )));
                 }
                 let workload_policy = TrustedWorkloadSessionPolicy::from_manifest_pcr23(

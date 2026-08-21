@@ -202,9 +202,9 @@ pub enum DestinationError {
     ResolutionFailed,
     #[error("the resolved portal address is always forbidden")]
     AddressForbidden,
-    #[error("the resolved portal address is outside VERIFIED_PORTAL_ALLOWED_CIDRS")]
+    #[error("the resolved portal address is outside VERIFIERD_PORTAL_ALLOWED_CIDRS")]
     AddressOutsidePolicy,
-    #[error("loopback and link-local portal addresses require an explicit VERIFIED_PORTAL_ALLOWED_CIDRS entry")]
+    #[error("loopback and link-local portal addresses require an explicit VERIFIERD_PORTAL_ALLOWED_CIDRS entry")]
     LocalAddressNeedsExplicitPolicy,
 }
 

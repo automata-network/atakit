@@ -395,7 +395,7 @@ pub fn parse_unmeasured_env_file_names(
                 message: format!("invalid environment variable name {key:?}"),
             });
         }
-        if key.starts_with("ATAKIT_") || key.starts_with("VERIFIED_") {
+        if key.starts_with("ATAKIT_") || key.starts_with("VERIFIERD_") {
             return Err(WorkloadError::EnvFileParse {
                 path: path.to_path_buf(),
                 line: i + 1,
@@ -1087,7 +1087,7 @@ mod tests {
             "TOKEN=one\nTOKEN=two\n",
             "BAD-NAME=value\n",
             "ATAKIT_PUBLIC_IP=value\n",
-            "VERIFIED_PORTAL_ALLOWED_PORTS=[2024]\n",
+            "VERIFIERD_PORTAL_ALLOWED_PORTS=[2024]\n",
         ] {
             assert!(parse_unmeasured_env_file_names(path, content).is_err());
         }
@@ -1124,6 +1124,28 @@ mod tests {
         let result = resolve_environment(&env_file, &explicit, tmp.path()).unwrap();
         assert_eq!(result["A"], "from_file");
         assert_eq!(result["B"], "from_explicit"); // explicit wins
+    }
+
+    #[test]
+    fn measured_environment_sources_allow_verifierd_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("verifierd.env");
+        std::fs::write(
+            &env_path,
+            "VERIFIERD_RPC_URL=https://rpc.example\nVERIFIERD_CHAIN_ID=560048\n",
+        )
+        .unwrap();
+
+        let env_file = Some(StringOrArray::Single("verifierd.env".into()));
+        let explicit = BTreeMap::from([
+            ("VERIFIERD_TRUST_MODE".into(), "chain".into()),
+            ("VERIFIERD_CHAIN_ID".into(), "1".into()),
+        ]);
+
+        let result = resolve_environment(&env_file, &explicit, tmp.path()).unwrap();
+        assert_eq!(result["VERIFIERD_RPC_URL"], "https://rpc.example");
+        assert_eq!(result["VERIFIERD_TRUST_MODE"], "chain");
+        assert_eq!(result["VERIFIERD_CHAIN_ID"], "1");
     }
 
     #[test]
