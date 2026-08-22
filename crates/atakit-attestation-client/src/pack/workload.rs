@@ -38,7 +38,7 @@ const ES256K_TYPE_ID: u8 = 3;
 ///
 /// Keys are `snake_case`, matching `trust-pack.json` and measurement pack
 /// version 4.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedWorkloadSpec {
     /// Owner fingerprint, `0x` and 64 lowercase hexadecimal characters.
@@ -80,7 +80,7 @@ impl BaseImageMode {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedAttributeRequirement {
     pub key: String,
@@ -89,7 +89,7 @@ pub struct PackedAttributeRequirement {
     pub allowed_values: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedPcrSpec {
     pub pcr_index: u8,
@@ -262,6 +262,77 @@ pub(crate) fn packed_workload_policy(
             })
             .collect::<Result<Vec<_>, TrustPackError>>()?,
     })
+}
+
+/// Validate every base-image measurement artifact and its relation to the
+/// workload policy in one completed workload trust pack.
+///
+/// A whitelist must be fully covered. `any` and `blacklist` packs cover the
+/// explicit measurement packs they carry, but every carried image still has
+/// to be permitted by the policy.
+pub fn validate_workload_trust_pack(
+    pack: &TrustPack,
+    expected_workload: &AppRef,
+) -> Result<Vec<[u8; 32]>, TrustPackError> {
+    require_workload_kind(pack)?;
+    let spec: PackedWorkloadSpec =
+        serde_json::from_slice(pack.entry("payload/workload-spec.json")?).map_err(|error| {
+            TrustPackError::Payload {
+                path: "payload/workload-spec.json".to_string(),
+                message: error.to_string(),
+            }
+        })?;
+
+    let mut selected = std::collections::BTreeSet::new();
+    for (path, bytes) in pack.entries_under("payload/measurement-packs/") {
+        if !path.ends_with(".json") {
+            continue;
+        }
+        let subject = peek_subject(path, bytes)?;
+        let publisher = parse_fingerprint(path, "subject.publisher", &subject.publisher)?;
+        let reference = AppRef::new(publisher.0, subject.name, subject.version);
+        let base_image_id = atakit_cvm_encoding::base_image_id(&reference);
+        if !selected.insert(base_image_id) {
+            return Err(TrustPackError::Authority {
+                message: format!(
+                    "more than one measurement pack describes base image 0x{}",
+                    hex::encode(base_image_id)
+                ),
+            });
+        }
+        packed_measurement_policy(pack, base_image_id)?;
+        packed_workload_policy(pack, expected_workload, base_image_id)?;
+    }
+    if selected.is_empty() {
+        return Err(TrustPackError::MissingEntry {
+            path: "payload/measurement-packs/<base-image-id>.json".to_string(),
+        });
+    }
+
+    if spec.base_image_mode == BaseImageMode::Whitelist {
+        let declared = spec
+            .base_image_ids
+            .iter()
+            .map(|value| {
+                parse_fingerprint("payload/workload-spec.json", "base_image_ids[]", value)
+                    .map(|value| value.0)
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let missing = declared
+            .difference(&selected)
+            .map(|id| format!("0x{}", hex::encode(id)))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(TrustPackError::Authority {
+                message: format!(
+                    "the workload whitelist is missing measurement packs for {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(selected.into_iter().collect())
 }
 
 /// Find the measurement pack describing the selected base image, and establish
@@ -515,6 +586,10 @@ mod tests {
             inputs.measurement_policy.pack.subject.id,
             format!("0x{}", hex::encode(base_image_id))
         );
+        assert_eq!(
+            validate_workload_trust_pack(&pack, &workload_ref(&workload_publisher)).unwrap(),
+            vec![base_image_id]
+        );
     }
 
     /// **The attack this kind was blocked on.**
@@ -692,9 +767,7 @@ mod tests {
         let other_publisher = Publisher::new(0x41);
         let base_publisher = Publisher::new(0x32);
 
-        let (_, base_image_id) =
-            consistent_measurement_pack(&base_publisher, "automata-linux", "v0.2.8-debug");
-        let (mut builder, _) = workload_builder(
+        let (builder, base_image_id) = workload_builder(
             &other_publisher,
             &base_publisher,
             WORKLOAD_NAME,
@@ -702,18 +775,6 @@ mod tests {
         );
         // The spec names `other_publisher`, but `signer` signs the archive and
         // is the key the verifier is configured with.
-        builder
-            .insert(
-                "payload/workload-spec.json",
-                workload_spec_json(
-                    &other_publisher,
-                    WORKLOAD_NAME,
-                    WORKLOAD_VERSION,
-                    &[base_image_id],
-                ),
-            )
-            .unwrap();
-
         let pack = round_trip(&builder, TrustPackKind::WorkloadTrust, &signer)
             .expect("the archive verifies under the configured key");
         let error = workload_trust_inputs(&pack, &workload_ref(&other_publisher), base_image_id)
@@ -818,11 +879,14 @@ mod tests {
         let (_, absent_id) =
             consistent_measurement_pack(&other_base, "automata-linux", "v0.2.9-debug");
 
-        let (mut builder, present_id) = workload_builder(
-            &workload_publisher,
-            &base_publisher,
-            WORKLOAD_NAME,
-            WORKLOAD_VERSION,
+        let (present_pack, present_id) =
+            consistent_measurement_pack(&base_publisher, "automata-linux", "v0.2.8-debug");
+        let mut builder = TrustPackBuilder::new(
+            TrustPackKind::WorkloadTrust,
+            "example-workload-publisher",
+            1,
+            crate::pack::fixture::NOT_BEFORE,
+            crate::pack::fixture::NOT_AFTER,
         );
         builder
             .insert(
@@ -835,6 +899,12 @@ mod tests {
                 ),
             )
             .unwrap();
+        insert_measurement_triple(
+            &mut builder,
+            "automata-linux",
+            &present_pack,
+            &base_publisher,
+        );
 
         let pack = round_trip(&builder, TrustPackKind::WorkloadTrust, &workload_publisher).unwrap();
         let error = workload_trust_inputs(&pack, &workload_ref(&workload_publisher), absent_id)
@@ -844,6 +914,9 @@ mod tests {
             message.contains(&hex::encode(absent_id)),
             "the failure must name the missing base image; got {message}"
         );
+        let error = validate_workload_trust_pack(&pack, &workload_ref(&workload_publisher))
+            .expect_err("production validation must require complete whitelist coverage");
+        assert!(error.to_string().contains(&hex::encode(absent_id)));
     }
 
     /// The `.pubkey` grammar is exactly what the specification states.

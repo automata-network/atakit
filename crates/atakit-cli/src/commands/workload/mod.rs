@@ -7,6 +7,7 @@ pub mod import;
 pub mod info;
 pub mod init;
 pub mod ls;
+pub mod policy;
 pub mod publish;
 pub mod pull;
 pub mod push;

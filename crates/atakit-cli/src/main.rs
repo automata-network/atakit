@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
         },
         Command::TrustPack(cmd) => match cmd {
             commands::trustpack::TrustPackCommand::Build(args) => {
-                commands::trustpack::build(args, &config)
+                commands::trustpack::build(args, &config).await
             }
             commands::trustpack::TrustPackCommand::Inspect(args) => {
                 commands::trustpack::inspect(args)

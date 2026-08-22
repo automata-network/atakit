@@ -75,119 +75,11 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     let result = atakit_workload::inspect_workload(&opts).await?;
     let manifest = &result.manifest;
-
-    // Final PCR23 register value (computed by inspect).
-    let pcr23_hex = result
-        .pcr23_sha256
-        .strip_prefix("0x")
-        .unwrap_or(&result.pcr23_sha256);
-    let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
-        .context("invalid PCR23 hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let pcr23_sha384_hex = result
-        .pcr23_sha384
-        .strip_prefix("0x")
-        .unwrap_or(&result.pcr23_sha384);
-    let pcr23_sha384: [u8; 48] = hex::decode(pcr23_sha384_hex)
-        .context("invalid SHA-384 PCR23 hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("SHA-384 PCR23 must be 48 bytes"))?;
-
-    // Derive base image IDs from manifest's base-image list (name:version -> on-chain ID).
-    // --base-image-id CLI args override if provided.
-    let base_image_ids = if !args.base_image_id.is_empty() {
-        let mut ids = Vec::new();
-        for id_str in &args.base_image_id {
-            let hex_str = id_str.strip_prefix("0x").unwrap_or(id_str);
-            let bytes: [u8; 32] = hex::decode(hex_str)
-                .context(format!("invalid base image ID hex: {id_str}"))?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("base image ID must be 32 bytes: {id_str}"))?;
-            ids.push(alloy_ext::core::primitives::B256::from(bytes));
-        }
-        ids
-    } else {
-        manifest
-            .config
-            .base_image
-            .iter()
-            .map(|entry| {
-                // Manifest base-image entries are canonical, publisher-qualified
-                // references: the manifest is measured, so an alias can never
-                // appear here.
-                let app_ref: automata_tee_workload_measurement::types::AppRef =
-                    entry.parse().map_err(|error| {
-                        anyhow::anyhow!("invalid base-image entry '{entry}': {error}")
-                    })?;
-                Ok(super::compute_base_image_id(&app_ref))
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    // Map base-image-mode string to AccessMode enum value
-    // Solidity: ANY=0, BLACKLIST=1, WHITELIST=2
-    let base_image_mode = match manifest.config.base_image_mode.as_str() {
-        "any" => 0u8,
-        "blacklist" => 1u8,
-        "whitelist" => 2u8,
-        other => bail!("unknown base-image-mode: {other}"),
-    };
-
-    // WorkloadRegistry rejects this on-chain (EmptyBaseImageWhitelist). Catch it here so the
-    // operator sees the reason instead of a decoded revert, and does not burn the name/version
-    // pair: workload specs are immutable and the identifier stays claimed after deactivation.
-    if base_image_mode == 2 && base_image_ids.is_empty() {
-        bail!(
-            "base-image-mode is \"whitelist\" but no base images are listed; \
-             an empty whitelist denies every base image and the workload could never \
-             register a session. Add entries to `base-image` in the workload manifest, \
-             pass --base-image-id, or use base-image-mode \"any\"."
-        );
-    }
-
-    // Build WorkloadSpec using the contract's generated types
-    use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{
-        AttributeRequirement, PcrPolicyBlock, PcrSpec256, PcrSpec384, WorkloadSpec,
-    };
-
-    let requirements = manifest
-        .config
-        .attributes
-        .iter()
-        .map(|(name, allowed_values)| {
-            let (key, allowed_values) =
-                atakit_core::tee_attributes::encode_requirement(name, allowed_values)
-                    .map_err(anyhow::Error::msg)?;
-            Ok(AttributeRequirement {
-                key: alloy_ext::core::primitives::B256::from(key),
-                allowedValues: allowed_values
-                    .into_iter()
-                    .map(alloy_ext::core::primitives::B256::from)
-                    .collect(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let spec = WorkloadSpec {
-        name: manifest.meta.name.clone(),
-        version: manifest.meta.version.clone(),
-        sessionTtl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
-        baseImageMode: base_image_mode,
-        baseImageIds: base_image_ids,
-        requirements,
-        workloadPcrPolicy: PcrPolicyBlock {
-            pcrSpecs256: vec![PcrSpec256 {
-                pcrIndex: 23,
-                comparison: encode_static256(pcr23_bytes).into(),
-            }],
-            pcrSpecs384: vec![PcrSpec384 {
-                pcrIndex: 23,
-                comparison: encode_static384(pcr23_sha384).into(),
-            }],
-        },
-    };
+    let publisher = super::owner_fingerprint(&private_key_raw)?;
+    let resolved =
+        super::policy::resolve(&result, publisher, args.session_ttl, &args.base_image_id)?;
+    let spec = resolved.chain;
+    let base_image_mode = spec.baseImageMode;
 
     // Resolve relay key for transaction submission.
     let relay_key_raw = super::resolve_relay_key(args.relay_key.as_deref(), config)?;
@@ -217,7 +109,6 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // The workload is published as whoever signs the registration, so the
     // owner key's fingerprint is its publisher and therefore part of its
     // identifier.
-    let publisher = super::owner_fingerprint(&private_key_raw)?;
     let publisher_hex = format!("{publisher:#x}");
     let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
         publisher,

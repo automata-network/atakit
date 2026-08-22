@@ -85,6 +85,12 @@ impl TrustPackBuilder {
                 actual: bytes.len() as u64,
             });
         }
+        if self.payload.contains_key(&path) {
+            return Err(TrustPackError::UnacceptableEntry {
+                path,
+                kind: "a duplicate path".to_string(),
+            });
+        }
         self.payload.insert(path, bytes);
         Ok(())
     }
@@ -435,4 +441,25 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_rejects_duplicate_payload_paths() {
+        let mut builder =
+            TrustPackBuilder::new(TrustPackKind::CollateralTrust, "publisher", 1, 1, 2);
+        builder
+            .insert("payload/roots/gcp-ak-root.pem", b"first".to_vec())
+            .unwrap();
+
+        let error = builder
+            .insert("payload/roots/gcp-ak-root.pem", b"second".to_vec())
+            .expect_err("a second entry must not silently replace the first");
+
+        assert!(matches!(error, TrustPackError::UnacceptableEntry { .. }));
+        assert_eq!(builder.payload()["payload/roots/gcp-ak-root.pem"], b"first");
+    }
 }

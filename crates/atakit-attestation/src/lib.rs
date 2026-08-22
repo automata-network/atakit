@@ -9,7 +9,9 @@ use aws_lc_rs::signature::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256VerifyingKey};
+use k256::ecdsa::{
+    Signature as K256Signature, SigningKey as K256SigningKey, VerifyingKey as K256VerifyingKey,
+};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::EncodedPoint;
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
@@ -18,7 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest as Sha2Digest, Sha256, Sha384};
 use sha3::Keccak256;
-use signature::Verifier;
+use signature::{Signer, Verifier};
 use thiserror::Error;
 use x509_parser::parse_x509_crl;
 use x509_parser::prelude::{FromDer, X509Certificate, X509Version};
@@ -695,6 +697,97 @@ impl MeasurementPack {
         }
         serde_json::from_value(self.measurements.clone())
             .map_err(|e| AttestationError::MeasurementPack(format!("measurements: {e}")))
+    }
+}
+
+/// The complete portable form of one signed measurement pack.
+///
+/// The JSON remains the measurement-pack artifact. The detached signature and
+/// publisher key travel beside it so a workload trust-pack producer can carry
+/// the base-image publisher's statement without holding that publisher's
+/// private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasurementPackArtifact {
+    /// Canonical RFC 8785 JSON covered by `signature`.
+    pub json: Vec<u8>,
+    /// Detached fixed-width ES256K signature over `json`.
+    pub signature: Vec<u8>,
+    /// Uncompressed SEC1 secp256k1 public key, beginning with `0x04` on disk.
+    pub publisher_key: Vec<u8>,
+}
+
+impl MeasurementPackArtifact {
+    /// Canonicalize and sign a measurement pack and derive its public key.
+    pub fn sign(pack: &MeasurementPack, signing_key: &K256SigningKey) -> Result<Self> {
+        let value = serde_json::to_value(pack)
+            .map_err(|error| AttestationError::MeasurementPack(error.to_string()))?;
+        let json = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+            AttestationError::MeasurementPack(format!("canonicalization failed: {error}"))
+        })?;
+        let signature: K256Signature = signing_key.sign(&json);
+        let publisher_key = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        Ok(Self {
+            json,
+            signature: signature.to_bytes().to_vec(),
+            publisher_key,
+        })
+    }
+
+    /// Verify the detached signature and parse the signed measurement pack.
+    pub fn verify(&self) -> Result<MeasurementPack> {
+        verify_measurement_pack(
+            &self.json,
+            &self.signature,
+            std::slice::from_ref(&self.publisher_key),
+        )
+    }
+
+    /// Canonical text written to `measurement-pack.pubkey`.
+    pub fn publisher_key_text(&self) -> String {
+        format!("0x{}", hex::encode(&self.publisher_key))
+    }
+}
+
+#[cfg(test)]
+mod measurement_pack_artifact_tests {
+    use super::*;
+
+    #[test]
+    fn signed_artifact_uses_canonical_json_and_an_uncompressed_public_key() {
+        let signing_key = K256SigningKey::from_slice(&[0x37; 32]).unwrap();
+        let pack = MeasurementPack {
+            schema: BASE_IMAGE_MEASUREMENT_PACK_SCHEMA.to_string(),
+            revision: 1,
+            published_at: 1_787_356_800,
+            subject: Subject {
+                publisher: format!("0x{}", "11".repeat(32)),
+                name: "base-image".to_string(),
+                version: "v1".to_string(),
+                id: format!("0x{}", "22".repeat(32)),
+                uri: None,
+                archive_sha256: None,
+            },
+            measurements: serde_json::to_value(BaseImageMeasurements {
+                profiles: Vec::new(),
+            })
+            .unwrap(),
+        };
+
+        let artifact = MeasurementPackArtifact::sign(&pack, &signing_key).unwrap();
+
+        assert_eq!(artifact.publisher_key.len(), 65);
+        assert_eq!(artifact.publisher_key[0], 0x04);
+        assert_eq!(artifact.publisher_key_text().len(), 132);
+        assert_eq!(artifact.verify().unwrap().schema, pack.schema);
+        let value: serde_json::Value = serde_json::from_slice(&artifact.json).unwrap();
+        assert_eq!(
+            artifact.json,
+            serde_json_canonicalizer::to_vec(&value).unwrap()
+        );
     }
 }
 

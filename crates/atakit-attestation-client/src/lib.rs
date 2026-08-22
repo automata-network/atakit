@@ -58,7 +58,9 @@ pub use collateral::intel_tdx::{
 // them would give a caller a way to use an expired pack's contents without
 // passing any of the boundaries that check the window. The public surface is
 // `PackTrustSource` and the two verification modes, all of which check.
+pub use pack::collateral::{validate_collateral_trust_pack, CollateralTrustInputs};
 pub use pack::read::{read_trust_pack, read_trust_pack_file, TrustPack, TrustPackReadOptions};
+pub use pack::workload::validate_workload_trust_pack;
 pub use pack::write::TrustPackBuilder;
 pub use pack::{ArchiveLimits, TrustPackError, TrustPackIndex, TrustPackKind};
 pub use portal::status::read_untrusted_portal_base_image_id;

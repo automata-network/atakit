@@ -58,6 +58,17 @@ pub(crate) fn collateral_trust_inputs_from_all(
     Ok(inputs)
 }
 
+/// Parse and validate every typed input in one collateral trust pack.
+///
+/// Pack production calls this after verifying the outer signature so a bad
+/// certificate, policy, limit document, or duplicate claim fails where the
+/// archive is built rather than at verifier startup.
+pub fn validate_collateral_trust_pack(
+    pack: &TrustPack,
+) -> Result<CollateralTrustInputs, TrustPackError> {
+    collateral_trust_inputs_from_all(std::slice::from_ref(pack))
+}
+
 fn merge_collateral_pack(
     inputs: &mut CollateralTrustInputs,
     pack: &TrustPack,
