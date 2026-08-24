@@ -179,6 +179,29 @@ pub struct SessionEvidenceBundle {
     pub session_id: String,
     pub policy: SessionPolicy,
     pub owner: SessionOwner,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_binding: Option<SessionProviderBindingEvidence>,
+}
+
+/// Launch-time TPM evidence retained across `rotateKey`.
+///
+/// Rotation has no new TEE report and therefore no new generated provider
+/// PCR15 rule. This bounded projection keeps the last full-attestation quote
+/// that bound the provider TEE report to the TPM. It is not recursive, so
+/// repeated rotations cannot grow the evidence bundle without bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProviderBindingEvidence {
+    pub binding: SessionBinding,
+    pub tpm_quote: TpmQuoteEvidence,
+    pub tpm_certify: TpmCertifyEvidence,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub pcr_values: Vec<SessionPcrValue>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub event_log_hashes: Vec<SessionEventHashes>,
+    pub tpm_signing_key: SessionPublicKey,
+    pub session_id: String,
+    pub policy: SessionPolicy,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +223,8 @@ struct SessionEvidenceBundleWire {
     session_id: String,
     policy: SessionPolicy,
     owner: SessionOwner,
+    #[serde(default)]
+    provider_binding: Option<SessionProviderBindingEvidence>,
 }
 
 impl<'de> Deserialize<'de> for SessionEvidenceBundle {
@@ -208,11 +233,16 @@ impl<'de> Deserialize<'de> for SessionEvidenceBundle {
         D: Deserializer<'de>,
     {
         let wire = SessionEvidenceBundleWire::deserialize(deserializer)?;
-        if !total_session_event_hash_count_is_valid(
-            wire.event_log_hashes
-                .iter()
-                .flat_map(|hashes| [hashes.sha256.len(), hashes.sha384.len()]),
-        ) {
+        let event_hash_counts = wire
+            .event_log_hashes
+            .iter()
+            .chain(
+                wire.provider_binding
+                    .iter()
+                    .flat_map(|binding| binding.event_log_hashes.iter()),
+            )
+            .flat_map(|hashes| [hashes.sha256.len(), hashes.sha384.len()]);
+        if !total_session_event_hash_count_is_valid(event_hash_counts) {
             return Err(D::Error::custom(format!(
                 "event_log_hashes contains more than {MAX_SESSION_EVENT_HASHES_TOTAL} hashes in total"
             )));
@@ -232,6 +262,7 @@ impl<'de> Deserialize<'de> for SessionEvidenceBundle {
             session_id: wire.session_id,
             policy: wire.policy,
             owner: wire.owner,
+            provider_binding: wire.provider_binding,
         })
     }
 }
@@ -791,6 +822,13 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
+    verify_provider_binding_evidence(
+        bundle,
+        &inputs.trust,
+        verified_tdx_tcb_status_bit,
+        &mut checks,
+        &mut errors,
+    );
     let authenticated_pcrs = verify_raw_quote(bundle, &mut checks, &mut errors);
     verify_quote_projection(
         bundle,
@@ -807,13 +845,19 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
-    let resolved_policy = resolve_provider_pcr_rules(
-        bundle,
-        &inputs.trust.platform,
-        &inputs.trust.policy,
-        &mut checks,
-        &mut errors,
-    );
+    let resolved_policy = if bundle.provider_binding.is_some() {
+        let mut policy = inputs.trust.policy.clone();
+        policy.provider_pcr_policy = SessionPcrPolicyBlock::default();
+        policy
+    } else {
+        resolve_provider_pcr_rules(
+            bundle,
+            &inputs.trust.platform,
+            &inputs.trust.policy,
+            &mut checks,
+            &mut errors,
+        )
+    };
     verify_policies(
         bundle,
         &resolved_policy,
@@ -845,6 +889,134 @@ pub fn verify_session_bundle_at(
     } else {
         Err(SessionVerificationFailure { checks, errors })
     }
+}
+
+fn verify_provider_binding_evidence(
+    bundle: &SessionEvidenceBundle,
+    trust: &SessionTrust,
+    verified_tdx_tcb_status_bit: Option<u16>,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    let Some(provider_binding) = &bundle.provider_binding else {
+        return;
+    };
+
+    let mut binding_checks = Vec::new();
+    let mut binding_errors = Vec::new();
+    record(
+        &mut binding_checks,
+        &mut binding_errors,
+        "chain-mode",
+        bundle.binding.mode == BindingMode::Chain
+            && provider_binding.binding.mode == BindingMode::Chain,
+        "provider-binding evidence is allowed only for chain-bound key rotation",
+    );
+    record(
+        &mut binding_checks,
+        &mut binding_errors,
+        "tpm-signing-key-type",
+        provider_binding.tpm_signing_key.type_id == 2,
+        "provider-binding TPM signing key must use ES256",
+    );
+    let signing_key = decode_hex(
+        &provider_binding.tpm_signing_key.bytes,
+        "provider_binding.tpm_signing_key.bytes",
+        &mut binding_errors,
+    );
+    let signing_key_fingerprint = decode_hex_32(
+        &provider_binding.tpm_signing_key.fingerprint,
+        "provider_binding.tpm_signing_key.fingerprint",
+        &mut binding_errors,
+    );
+    if let (Some(key), Some(expected)) = (signing_key.as_ref(), signing_key_fingerprint) {
+        record(
+            &mut binding_checks,
+            &mut binding_errors,
+            "tpm-signing-key-fingerprint",
+            compute_key_fingerprint(provider_binding.tpm_signing_key.type_id, key) == expected,
+            "provider-binding TPM signing-key fingerprint mismatch",
+        );
+    }
+
+    let mut projected = bundle.clone();
+    projected.binding = provider_binding.binding.clone();
+    projected.tpm_quote = provider_binding.tpm_quote.clone();
+    projected.tpm_certify = provider_binding.tpm_certify.clone();
+    projected.pcr_values = provider_binding.pcr_values.clone();
+    projected.event_log_hashes = provider_binding.event_log_hashes.clone();
+    projected.session_key_delegation.tpm_signing_key = provider_binding.tpm_signing_key.clone();
+    projected.session_id = provider_binding.session_id.clone();
+    projected.policy = provider_binding.policy.clone();
+    projected.provider_binding = None;
+
+    let session_id = decode_hex_32(
+        &projected.session_id,
+        "provider_binding.session_id",
+        &mut binding_errors,
+    );
+    let tpm_signature = decode_b64(
+        &projected.tpm_quote.tpm_signature,
+        "provider_binding.tpm_quote.tpm_signature",
+        &mut binding_errors,
+    );
+    let tee_report = decode_b64(
+        &projected.tee_evidence.report,
+        "tee_evidence.report",
+        &mut binding_errors,
+    );
+    if let (Some(signature), Some(report), Some(expected_id)) =
+        (tpm_signature.as_ref(), tee_report.as_ref(), session_id)
+    {
+        let signature_hash: [u8; 32] = Keccak256::digest(signature).into();
+        let tee_hash: [u8; 32] = Keccak256::digest(report).into();
+        record(
+            &mut binding_checks,
+            &mut binding_errors,
+            "session-id",
+            compute_session_id(signature_hash, tee_hash) == expected_id,
+            "provider-binding session ID does not match its Quote signature and TEE report hash",
+        );
+    }
+
+    let authenticated_pcrs = verify_raw_quote(&projected, &mut binding_checks, &mut binding_errors);
+    verify_quote_projection(
+        &projected,
+        authenticated_pcrs.as_deref(),
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    verify_raw_certify(&projected, &mut binding_checks, &mut binding_errors);
+    verify_binding(
+        &projected,
+        trust.binding.as_ref(),
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    let resolved_policy = resolve_provider_pcr_rules(
+        &projected,
+        &trust.platform,
+        &trust.policy,
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    verify_policies(
+        &projected,
+        &resolved_policy,
+        verified_tdx_tcb_status_bit,
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+
+    checks.extend(binding_checks.into_iter().map(|mut check| {
+        check.name = format!("provider-binding-{}", check.name);
+        check
+    }));
+    errors.extend(
+        binding_errors
+            .into_iter()
+            .map(|error| format!("provider binding: {error}")),
+    );
 }
 
 fn verify_key_types(
@@ -3625,6 +3797,7 @@ mod tests {
                 fingerprint: format!("0x{}", "00".repeat(32)),
                 contract_authorization: None,
             },
+            provider_binding: None,
         }
     }
 

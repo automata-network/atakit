@@ -57,7 +57,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Blockchain
 alloy-ext = "1.7.4"
 alloy = { version = "1.7.3", default-features = false }
-automata-tee-workload-measurement = { version = "0.2.0", git = "https://github.com/automata-network/automata-tee-workload-measurement", rev = "0d3248743ac1746be30622d615da47ae488b6595" }
+automata-tee-workload-measurement = { version = "0.2.0", git = "https://github.com/automata-network/automata-tee-workload-measurement", rev = "cc4951ebb41724ea089126fc8eef86229c038972" }
 aws-lc-rs = "1"
 ciborium = "0.2"
 hex = "0.4"

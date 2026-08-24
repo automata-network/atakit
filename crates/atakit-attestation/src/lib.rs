@@ -6370,8 +6370,9 @@ mod tests {
             CertificateTrust, RawEvidence, SessionAttestationMode, SessionBinding,
             SessionCloudProvider, SessionEventHashes, SessionEvidenceBundle, SessionKeyDelegation,
             SessionOwner, SessionPcrPolicy, SessionPcrValue, SessionPlatform, SessionPlatformTrust,
-            SessionPolicy, SessionPublicKey, SessionRequestBinding, SessionTrust,
-            SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence, TrustedSessionPolicy,
+            SessionPolicy, SessionProviderBindingEvidence, SessionPublicKey, SessionRequestBinding,
+            SessionTrust, SessionVerificationInputs, TpmCertifyEvidence, TpmQuoteEvidence,
+            TrustedSessionBinding, TrustedSessionPolicy,
         };
 
         let (snp_report, amd_ark, snp_cert_table) = fixture_gcp_snp_report_and_certs();
@@ -6379,9 +6380,10 @@ mod tests {
         let pcr15 = expected_gcp_snp_pcr15(&snp_report).expect("fixture SNP PCR15");
         let owner_fingerprint = [0x11u8; 32];
         let owner_nonce = [0x22u8; 32];
-        let registry = [0u8; 20];
+        let chain_id = 31_337u64;
+        let registry = [0x33u8; 20];
         let qualifying_data =
-            compute_session_qualifying_data(0, registry, owner_fingerprint, owner_nonce);
+            compute_session_qualifying_data(chain_id, registry, owner_fingerprint, owner_nonce);
 
         let quote = fake_tpm_quote(&qualifying_data, &[(4, pcr4), (15, pcr15)]);
         let (ak_signing_key, ak_public, ak_chain, ak_roots) = fake_gcp_ak_chain();
@@ -6422,6 +6424,7 @@ mod tests {
             atakit_cvm_encoding::variant_id(platform_profile_id, "n2d-standard-4");
         let mut delegation_abi = [0u8; 224];
         delegation_abi[..32].copy_from_slice(&Keccak256::digest(b"CVM_SESSION_KEY_DELEGATION"));
+        delegation_abi[56..64].copy_from_slice(&chain_id.to_be_bytes());
         delegation_abi[76..96].copy_from_slice(&registry);
         delegation_abi[96..128].copy_from_slice(&base_image_id);
         delegation_abi[128..160].copy_from_slice(&workload_id);
@@ -6454,8 +6457,8 @@ mod tests {
         let bundle = SessionEvidenceBundle {
             format: 2,
             binding: SessionBinding {
-                mode: BindingMode::Local,
-                chain_id: 0,
+                mode: BindingMode::Chain,
+                chain_id,
                 registry: hex0x(&registry),
                 owner_nonce: hex0x(&owner_nonce),
                 qualifying_data: hex0x(&qualifying_data),
@@ -6551,6 +6554,7 @@ mod tests {
                 fingerprint: hex0x(&owner_fingerprint),
                 contract_authorization: None,
             },
+            provider_binding: None,
         };
 
         let challenge = [0x55u8; 32];
@@ -6612,11 +6616,50 @@ mod tests {
                         required_current_mitigation_vector: 0,
                     }],
                 },
-                binding: None,
+                binding: Some(TrustedSessionBinding { chain_id, registry }),
             },
         };
         crate::session::verify_session_bundle_at(inputs.clone(), snp_fixture_time())
             .expect("all-0xff SNP REPORT_ID_MA must mean no migration-agent association");
+
+        let mut rotation_bundle = bundle.clone();
+        rotation_bundle.provider_binding = Some(SessionProviderBindingEvidence {
+            binding: bundle.binding.clone(),
+            tpm_quote: bundle.tpm_quote.clone(),
+            tpm_certify: bundle.tpm_certify.clone(),
+            pcr_values: bundle.pcr_values.clone(),
+            event_log_hashes: bundle.event_log_hashes.clone(),
+            tpm_signing_key: bundle.session_key_delegation.tpm_signing_key.clone(),
+            session_id: bundle.session_id.clone(),
+            policy: bundle.policy.clone(),
+        });
+        rotation_bundle.policy.provider_pcr_policy = SessionPcrPolicyBlock::default();
+        let rotation_canonical =
+            serde_json_canonicalizer::to_vec(&rotation_bundle).expect("canonical rotation bundle");
+        let rotation_binding_digest = request_binding_digest(
+            "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_EVIDENCE_BUNDLE_V1",
+            challenge,
+            &rotation_canonical,
+        );
+        let (rotation_signature, rotation_recovery_id) = session_signing_key
+            .sign_prehash_recoverable(&rotation_binding_digest)
+            .expect("rotation request-binding signature");
+        let mut rotation_signature = rotation_signature.to_bytes().to_vec();
+        rotation_signature.push(rotation_recovery_id.to_byte() + 27);
+        let mut rotation_inputs = inputs.clone();
+        rotation_inputs.bundle = serde_json::to_value(&rotation_bundle).unwrap();
+        rotation_inputs.request_binding.signature = hex0x(&rotation_signature);
+        crate::session::verify_session_bundle_at(rotation_inputs.clone(), snp_fixture_time())
+            .expect("rotation must retain and verify its provider-binding quote");
+
+        rotation_inputs.bundle["provider_binding"]["pcr_values"][1]["sha256"] =
+            serde_json::json!(hex0x(&[0u8; 32]));
+        let failure = crate::session::verify_session_bundle_at(rotation_inputs, snp_fixture_time())
+            .expect_err("tampered provider-binding PCR15 must fail");
+        assert!(failure
+            .checks
+            .iter()
+            .any(|check| check.name.starts_with("provider-binding-") && !check.valid));
 
         let mut no_possession = inputs.clone();
         no_possession.bundle["session_key_delegation"]["session_key_possession_signature"] =
