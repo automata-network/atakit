@@ -12,6 +12,8 @@ pub enum CloudCommand {
     Destroy(DestroyArgs),
     /// Show deployment status
     Status(StatusArgs),
+    /// Reboot a saved AWS deployment
+    Reboot(RebootArgs),
     /// List all deployments
     #[command(alias = "list")]
     Ls(ListArgs),
@@ -76,6 +78,11 @@ pub enum CloudProviderCommand {
 /// Arguments for `cloud deploy`.
 #[derive(Args, Clone)]
 pub struct DeployArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
 
@@ -191,35 +198,61 @@ pub struct DeployArgs {
     #[arg(long, value_name = "PORT")]
     pub status_port: Option<u16>,
 
-    /// Expected base image for TLS attestation measurement policy (name:version).
+    /// Optional expected base-image assertion for portal TLS attestation.
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,
 
-    /// Signed measurement pack JSON file or directory.
+    /// Explicit signed measurement pack for offline portal TLS verification.
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
 
     /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
-    #[arg(long, value_name = "HEX")]
-    pub azure_maa_key: Vec<String>,
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
 
-    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub gcp_ak_root_cert: Vec<String>,
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_ark_root_cert: Vec<String>,
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
 
-    /// AMD SEV-SNP certificate revocation list, as hex DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_snp_crl: Vec<String>,
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -304,6 +337,21 @@ pub struct StatusArgs {
     pub live: bool,
 }
 
+/// Arguments for `cloud reboot`.
+#[derive(Args)]
+pub struct RebootArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
 /// Arguments for `cloud list`.
 #[derive(Args)]
 pub struct ListArgs {
@@ -381,6 +429,11 @@ pub struct CloudImageGcArgs {
 /// Arguments for `cloud init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 
@@ -439,35 +492,61 @@ pub struct InitArgs {
     #[arg(long, value_name = "NAME=VALUE")]
     pub disk_passphrase: Vec<String>,
 
-    /// Expected base image for TLS attestation measurement policy (name:version).
+    /// Optional expected base-image assertion for portal TLS attestation.
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,
 
-    /// Signed measurement pack JSON file or directory.
+    /// Explicit signed measurement pack for offline portal TLS verification.
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
 
     /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
-    #[arg(long, value_name = "HEX")]
-    pub azure_maa_key: Vec<String>,
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
 
-    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub gcp_ak_root_cert: Vec<String>,
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_ark_root_cert: Vec<String>,
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
 
-    /// AMD SEV-SNP certificate revocation list, as hex DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_snp_crl: Vec<String>,
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -546,10 +625,23 @@ pub struct SessionVerificationArgs {
     #[arg(long)]
     pub chain: Option<String>,
 
-    /// Manually trusted final PCR23 value for the workload manifest.
-    /// For verify-session, this selects an explicit PCR23-only workload policy.
-    #[arg(long, value_name = "0xBYTES32")]
-    pub trusted_workload_pcr23: Option<String>,
+    /// Manually trusted SHA-256 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha384.
+    #[arg(
+        long,
+        value_name = "0xBYTES32",
+        requires = "trusted_workload_pcr23_sha384"
+    )]
+    pub trusted_workload_pcr23_sha256: Option<String>,
+
+    /// Manually trusted SHA-384 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha256.
+    #[arg(
+        long,
+        value_name = "0xBYTES48",
+        requires = "trusted_workload_pcr23_sha256"
+    )]
+    pub trusted_workload_pcr23_sha384: Option<String>,
 
     /// Expected base image for the signed measurement policy.
     #[arg(long, value_name = "NAME:VERSION")]
@@ -563,23 +655,45 @@ pub struct SessionVerificationArgs {
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
-    #[arg(long, value_name = "HEX")]
-    pub azure_maa_key: Vec<String>,
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
 
-    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub gcp_ak_root_cert: Vec<String>,
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_ark_root_cert: Vec<String>,
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
 
-    /// AMD SEV-SNP certificate revocation list, as hex DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_snp_crl: Vec<String>,
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
 
-    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
     #[arg(long, value_name = "PATH")]
     pub amd_snp_security_policy: Option<PathBuf>,
 
@@ -702,14 +816,69 @@ mod tests {
     }
 
     #[test]
+    fn reboot_accepts_exact_instance_target_and_confirmation_arguments() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "reboot",
+            "aws-vm",
+            "--target",
+            "aws-m6a-large",
+            "--yes",
+        ])
+        .expect("reboot arguments");
+
+        let CloudCommand::Reboot(args) = cli.command else {
+            panic!("expected reboot command");
+        };
+        assert_eq!(args.instance, "aws-vm");
+        assert_eq!(args.target.as_deref(), Some("aws-m6a-large"));
+        assert!(args.yes);
+    }
+
+    #[test]
+    fn cloud_init_accepts_complete_aws_explicit_trust_inputs() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-nitro-root-cert",
+            "root.pem",
+            "--aws-document-maximum-age-seconds",
+            "300",
+            "--aws-document-allowed-future-clock-difference-seconds",
+            "60",
+        ])
+        .expect("AWS explicit trust arguments");
+
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected cloud init command");
+        };
+        assert_eq!(args.aws_nitro_root_cert, [PathBuf::from("root.pem")]);
+        assert_eq!(args.aws_document_maximum_age_seconds, Some(300));
+        assert_eq!(
+            args.aws_document_allowed_future_clock_difference_seconds,
+            Some(60)
+        );
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-document-maximum-age-seconds",
+            "300",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn verify_session_accepts_repeatable_manual_azure_maa_keys() {
         let cli = TestCli::try_parse_from([
             "test",
             "verify-session",
             "azure-vm",
-            "--azure-maa-key",
+            "--azure-maa-cert",
             "aa",
-            "--azure-maa-key",
+            "--azure-maa-cert",
             "bb",
         ])
         .expect("verify-session arguments");
@@ -717,7 +886,10 @@ mod tests {
         let CloudCommand::VerifySession(args) = cli.command else {
             panic!("expected verify-session command");
         };
-        assert_eq!(args.verification.azure_maa_key, ["aa", "bb"]);
+        assert_eq!(
+            args.verification.azure_maa_cert,
+            [PathBuf::from("aa"), PathBuf::from("bb")]
+        );
     }
 
     #[test]
@@ -779,22 +951,29 @@ mod tests {
     }
 
     #[test]
-    fn trusted_workload_pcr23_is_shared_by_verification_and_lifecycle_commands() {
-        let value = format!("0x{}", "55".repeat(32));
+    fn trusted_workload_pcr23_banks_are_shared_by_verification_and_lifecycle_commands() {
+        let sha256 = format!("0x{}", "55".repeat(32));
+        let sha384 = format!("0x{}", "66".repeat(48));
         let cli = TestCli::try_parse_from([
             "test",
             "verify-session",
             "gcp-vm",
-            "--trusted-workload-pcr23",
-            &value,
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
         ])
         .expect("verify-session arguments");
         let CloudCommand::VerifySession(args) = cli.command else {
             panic!("expected verify-session command");
         };
         assert_eq!(
-            args.verification.trusted_workload_pcr23.as_deref(),
-            Some(value.as_str())
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
         );
 
         let cli = TestCli::try_parse_from([
@@ -802,24 +981,30 @@ mod tests {
             "session",
             "renew",
             "gcp-vm",
-            "--trusted-workload-pcr23",
-            &value,
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
         ])
         .expect("session renew arguments");
         let CloudCommand::Session(SessionCommand::Renew(args)) = cli.command else {
             panic!("expected session renew command");
         };
         assert_eq!(
-            args.verification.trusted_workload_pcr23.as_deref(),
-            Some(value.as_str())
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
         );
 
         let help = TestCli::try_parse_from(["test", "verify-session", "--help"])
             .err()
             .expect("verify-session help response")
             .to_string();
-        assert!(help.contains("--trusted-workload-pcr23 <0xBYTES32>"));
-        assert!(help.contains("final PCR23 value for the workload manifest"));
+        assert!(help.contains("--trusted-workload-pcr23-sha256 <0xBYTES32>"));
+        assert!(help.contains("--trusted-workload-pcr23-sha384 <0xBYTES48>"));
     }
 
     #[test]

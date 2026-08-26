@@ -14,6 +14,10 @@ use crate::config::Config;
 struct DisplayEntry {
     name: String,
     version: String,
+    /// The publisher-qualified identifier, when it is known. A remote entry
+    /// whose repository reports no owner has none, because the identifier
+    /// cannot be derived from a name and version alone.
+    workload_id: Option<String>,
     status: Status,
     revoked: bool,
     sha256: Option<String>,
@@ -68,6 +72,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
             entries.push(DisplayEntry {
                 name: e.meta.name.clone(),
                 version: e.meta.version.clone(),
+                workload_id: Some(e.meta.workload_id.clone()),
                 status: match (e.has_blob, e.meta.on_chain_spec.is_some()) {
                     (true, true) => Status::LocalTracked,
                     (true, false) => Status::Local,
@@ -275,7 +280,7 @@ pub async fn run(args: LsArgs, env: &Env, config: &Config) -> Result<()> {
 /// 1. Compute the expected final PCR23 from that sha256 (event hash):
 ///    `SHA-256(zeros_32 || event_hash)`.
 /// 2. Query the on-chain workload spec for `(name, version)` in parallel.
-/// 3. If the spec exists and contains a PCR23 matchData entry, compare
+/// 3. If the spec contains a STATIC PCR23 `comparison`, compare
 ///    the computed value to the on-chain value.
 /// 4. On mismatch: mark the entry as `divergent` (rendered red) and emit
 ///    a stderr warning.
@@ -299,7 +304,8 @@ async fn verify_entries_against_chain(entries: &mut [DisplayEntry], config: &Con
         .enumerate()
         .filter_map(|(i, e)| {
             let sha256 = e.sha256.as_ref()?;
-            let id = compute_workload_id(&e.name, &e.version);
+            // Only entries with a known identifier can be looked up on chain.
+            let id: alloy_ext::core::primitives::B256 = e.workload_id.as_ref()?.parse().ok()?;
             Some((i, id, sha256.clone()))
         })
         .collect();
@@ -353,17 +359,33 @@ async fn verify_entries_against_chain(entries: &mut [DisplayEntry], config: &Con
 /// for the same workload: identical workload IDs should have identical
 /// content.
 fn merge_remote(entries: &mut Vec<DisplayEntry>, rm: &RepositoryArchiveMeta, repo_name: &str) {
-    // Canonical workload_id is deterministic from (name, version).
-    // Every honest repository must report this exact value. If a
-    // repository advertises a different one, flag the entry as
-    // divergent so the user notices -- this could indicate a bug in
-    // the repository backend, a stale sidecar, or an adversarial
-    // response trying to smuggle a different workload under a known
-    // name/version.
-    let canonical_id = compute_workload_id(&rm.name, &rm.version);
-    let canonical_id_hex = format!("0x{}", hex::encode(canonical_id));
-    let workload_id_matches_canonical =
-        rm.workload_id.is_empty() || hex_equal(&rm.workload_id, &canonical_id_hex);
+    // The canonical workload_id is deterministic from (publisher, name,
+    // version). Every honest repository reporting an owner must report the
+    // matching identifier; a different one indicates a bug in the repository
+    // backend, a stale sidecar, or an adversarial response trying to smuggle a
+    // different workload under a known name and version.
+    //
+    // A repository that reports no owner cannot be checked this way at all:
+    // the identifier is not derivable from a name and version alone. That is
+    // recorded as unknown rather than silently treated as agreement.
+    let canonical_id_hex = if rm.owner.is_empty() {
+        None
+    } else {
+        rm.owner.parse().ok().map(|publisher| {
+            let app_ref = automata_tee_workload_measurement::types::AppRef::new(
+                publisher,
+                rm.name.clone(),
+                rm.version.clone(),
+            );
+            format!("{:#x}", compute_workload_id(&app_ref))
+        })
+    };
+    let workload_id_matches_canonical = match (&canonical_id_hex, rm.workload_id.is_empty()) {
+        (_, true) => true,
+        (Some(canonical), false) => hex_equal(&rm.workload_id, canonical),
+        // No owner reported, so there is nothing to check against.
+        (None, false) => true,
+    };
     if !workload_id_matches_canonical {
         eprintln!(
             "{} repository {} reported workload_id {} for {}:{}, but canonical is {}",
@@ -372,7 +394,7 @@ fn merge_remote(entries: &mut Vec<DisplayEntry>, rm: &RepositoryArchiveMeta, rep
             shorten(&rm.workload_id),
             rm.name,
             rm.version,
-            shorten(&canonical_id_hex),
+            canonical_id_hex.as_deref().map(shorten).unwrap_or_default(),
         );
     }
 
@@ -421,6 +443,7 @@ fn merge_remote(entries: &mut Vec<DisplayEntry>, rm: &RepositoryArchiveMeta, rep
     entries.push(DisplayEntry {
         name: rm.name.clone(),
         version: rm.version.clone(),
+        workload_id: canonical_id_hex.clone(),
         status: Status::Remote,
         revoked: false,
         sha256: if rm.sha256.is_empty() {

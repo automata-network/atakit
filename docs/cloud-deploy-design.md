@@ -232,9 +232,11 @@ appended to the effective base-image profile and variant rules, including when
 both policies constrain the same PCR. Deployment-management verification with
 `registration = "off"` and no `WorkloadRegistry` hashes and inspects the saved
 `.atawl` and uses its PCR23. For `atakit cloud verify-session`,
-`--trusted-workload-pcr23` is an explicit verifier-owned alternative to
-`WorkloadRegistry`; the command never reads a saved `.atawl` as trusted
-collateral.
+`--trusted-workload-pcr23-sha256` and `--trusted-workload-pcr23-sha384` select
+explicit trust mode, in which the verifier owns the workload policy and
+`WorkloadRegistry` is not read at all; the command never reads a saved `.atawl`
+as trusted collateral. A verification resolves every trust input from one
+source, so those flags cannot be combined with `--chain`.
 
 TLS bootstrap applies the same verified TEE attribute policy before any
 `POST /init` data is sent. The verifier extracts the Intel TDX debug state and
@@ -249,8 +251,9 @@ applies only the resolved base-image policy. Missing Boolean base-image values
 mean disabled, and a missing Intel TDX base-image TCB status means `ok` only.
 For AMD SEV-SNP, the verifier either receives the exact-CPUID registry default
 as an explicit trust input or reads it
-from the `AmdSnpSecurityPolicyRegistry` derived from the selected
-`SessionRegistry`. Custom attributes and all six reserved TEE attributes use
+from the `AmdSnpSecurityPolicyRegistry` reached through the
+`TeeSecurityPolicyVerifier` derived from the selected `SessionRegistry`.
+Custom attributes and all six reserved TEE attributes use
 measurement-variant-first lookup. The variant value replaces the matching
 profile value. With a workload, an explicit workload packed value replaces its
 registry default; without a workload, the resolved base-image value applies by
@@ -290,16 +293,19 @@ A single-target deploy performs these logical stages:
 
 1. Resolve and validate the workload archive, manifest policy, image, target,
    provider, CC type, disk secrets, registration policy, keys, and prover.
-2. Resolve the TLS measurement policy before provisioning unless
-   `--unsafe-skip-tls-attestation` is explicitly set.
+2. Validate any explicit offline TLS measurement policy before provisioning.
 3. Create and persist a provider-specific deployment plan and resource state.
 4. Upload/register the image when it is not already present.
 5. Create firewall/security-group rules, data disks, and the VM.
 6. Wait for `GET /status` on the configured status port.
-7. Verify the portal TLS certificate against fresh attestation and the selected
-   measurement policy.
+7. Unless `--unsafe-skip-tls-attestation` is explicitly set, read the portal's
+   unauthenticated `GET /status.base_image_id` as an untrusted lookup key. Fetch
+   that exact base-image policy from `BaseImageRegistry`, verify the portal TLS
+   certificate and fresh attestation against the fetched policy, and accept the
+   claimed base-image identity only after verification succeeds. An explicit
+   `--measurements` value selects the offline policy path instead.
 8. Unless `--skip-init` or `--image-only` is set, require `GET /status` to
-   report `init_schema_version = 2`, send the one-shot multipart `POST /init`
+   report `init_schema_version = 3`, send the one-shot multipart `POST /init`
    request, and poll portal state.
 
 The init upload timeout is controlled by `--init-upload-timeout`. Portal

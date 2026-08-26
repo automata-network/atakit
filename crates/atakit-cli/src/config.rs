@@ -7,8 +7,8 @@ use atakit_cloud::CloudConfig;
 #[cfg(test)]
 use atakit_config::CredentialSpec;
 pub use atakit_config::{
-    repo_local_name, BuildConfig, ChainConfig, ContainerEngine, GithubConfig, ImageConfig,
-    ImageRepositorySpec, KeyMode, KeySpec, KeyType, OwnerOperationsConfig, ProverSpec,
+    repo_local_name, AliasConfig, BuildConfig, ChainConfig, ContainerEngine, GithubConfig,
+    ImageConfig, ImageRepositorySpec, KeyMode, KeySpec, KeyType, OwnerOperationsConfig, ProverSpec,
     PublishConfig,
 };
 use atakit_workload::{GithubWorkloadRepository, HttpWorkloadRepository, WorkloadRepository};
@@ -23,6 +23,11 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub chains: IndexMap<String, ChainConfig>,
+    /// Operator-facing aliases, so a command line can say
+    /// `automata/name:version` or `name:version` instead of 66 hexadecimal
+    /// characters. Expanded before a reference is parsed; an alias can never
+    /// reach anything measured or persisted.
+    pub alias: AliasConfig,
     pub owner_operations: OwnerOperationsConfig,
     pub provers: IndexMap<String, ProverSpec>,
     pub keys: IndexMap<String, KeySpec>,
@@ -835,11 +840,20 @@ fn check_legacy_fields(content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write a template `config.toml` if one doesn't exist yet.
+/// Write a template `config.toml` if one doesn't exist yet, and restrict it to
+/// its owner.
+///
+/// The file sits in the directory that holds private keys and is filled in with
+/// credential paths, so it is restricted whenever it exists rather than only
+/// when freshly written — a config left world-readable by an older version is
+/// corrected on the next run, the same way the directory itself is.
 pub fn ensure_template(config_dir: &Path) {
     let path = config_dir.join("config.toml");
     if !path.exists() {
         let _ = fs::write(&path, include_str!("config_template.toml"));
+    }
+    if path.exists() {
+        let _ = atakit_core::restrict_to_owner(&path);
     }
 }
 
@@ -2716,6 +2730,71 @@ mod tests {
         assert!(
             msg.contains("owner_operations"),
             "expected migration target: {msg}"
+        );
+    }
+
+    // ── shipped template ─────────────────────────────────────────
+
+    /// The template is written verbatim into every new operator's config
+    /// directory, so a malformed one ships as a broken first run.
+    #[test]
+    fn shipped_template_parses() {
+        Config::load_from_str(include_str!("config_template.toml"))
+            .expect("the shipped config template must parse");
+    }
+
+    /// The alias example the template documents has to be one an operator can
+    /// uncomment and use, not merely prose.
+    #[test]
+    fn template_alias_example_resolves() {
+        const FINGERPRINT: &str =
+            "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f";
+
+        let config = Config::load_from_str(&format!(
+            r#"
+            [alias.publishers]
+            automata = "{FINGERPRINT}"
+
+            [alias.apps]
+            fedora-oci = "automata"
+            spelled-out = "{FINGERPRINT}"
+            "#
+        ))
+        .unwrap();
+
+        // A publisher-qualified reference resolves its publisher.
+        assert_eq!(
+            config.alias.expand("automata/fedora-oci:v0.0.16").unwrap(),
+            format!("{FINGERPRINT}/fedora-oci:v0.0.16")
+        );
+        // A bare name takes its publisher from [alias.apps], by name...
+        assert_eq!(
+            config.alias.expand("fedora-oci:v0.0.16").unwrap(),
+            format!("{FINGERPRINT}/fedora-oci:v0.0.16")
+        );
+        // ...or by a fingerprint written out in full.
+        assert_eq!(
+            config.alias.expand("spelled-out:v1").unwrap(),
+            format!("{FINGERPRINT}/spelled-out:v1")
+        );
+    }
+
+    /// A publisher table value that is not a fingerprint is refused when the
+    /// file loads, naming the entry, rather than at the moment it is used.
+    #[test]
+    fn publisher_alias_must_be_a_fingerprint() {
+        let err = Config::load_from_str(
+            r#"
+            [alias.publishers]
+            automata = "not-a-fingerprint"
+            "#,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not-a-fingerprint"),
+            "expected the value: {msg}"
         );
     }
 }

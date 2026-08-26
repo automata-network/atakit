@@ -16,9 +16,7 @@ pub use client::ReleasesClient;
 pub use download::{download_asset, DownloadOptions};
 pub use error::ImageError;
 pub use store::{ImageStore, ReleaseStatus};
-pub use types::{
-    encode_image_ref_path_segment, Asset, AssetKind, ImageRef, Platform, Release, VersionSelector,
-};
+pub use types::{Asset, AssetKind, ImageRef, Platform, Release, VersionSelector};
 
 #[cfg(feature = "cli")]
 pub use cli::{ExportArgs, ImageCommand, ImportArgs, LsArgs, PullArgs, RmArgs};

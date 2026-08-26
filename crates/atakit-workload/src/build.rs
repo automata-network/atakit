@@ -16,6 +16,14 @@ use crate::WorkloadError;
 pub struct BuildOptions {
     /// Directory containing `atakit-workload.toml`.
     pub workload_dir: PathBuf,
+    /// Fingerprint of the publishing key: `0x` followed by 64 lowercase
+    /// hexadecimal characters.
+    ///
+    /// Required rather than optional. It is written into the measured manifest
+    /// and so into PCR23, and the workload's identifier cannot be computed
+    /// without it; a build that defaulted it would produce an archive whose
+    /// identifier is registered to nobody.
+    pub publisher: String,
     /// Output directory for the `.atawl` file. Defaults to `workload_dir`.
     pub output_dir: Option<PathBuf>,
     /// Explicit container engine override.
@@ -234,6 +242,7 @@ pub async fn build_workload(
         manifest::resolve_unmeasured_env_allowlists(&config, &data_roots.unmeasured)?;
     let m = manifest::build_manifest(
         &config,
+        &opts.publisher,
         &resolved_image,
         environment,
         dep_environments,

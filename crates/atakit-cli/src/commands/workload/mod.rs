@@ -7,18 +7,21 @@ pub mod import;
 pub mod info;
 pub mod init;
 pub mod ls;
+pub mod policy;
 pub mod publish;
 pub mod pull;
 pub mod push;
 pub mod rm;
 pub mod spec;
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
-use alloy_ext::core::primitives::{keccak256, B256};
-use alloy_ext::core::sol_types::SolValue;
+use alloy_ext::core::primitives::B256;
+use atakit_cvm_encoding::pcr_comparison::{decode256, PcrComparison256};
 use atakit_workload::store::CachedPcrSpec;
-use atakit_workload::{CachedChainSpec, WorkloadStore};
+use atakit_workload::CachedChainSpec;
+use automata_tee_workload_measurement::types::AppRef;
 use sha2::{Digest, Sha256};
 
 /// Look for a single `.atawl` file in the directory.
@@ -56,83 +59,85 @@ pub fn find_versioned_archive(dir: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Compute the on-chain workload ID: `keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))`
-/// where `WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")`.
-pub fn compute_workload_id(name: &str, version: &str) -> B256 {
-    let domain = keccak256("CVM_WORKLOAD_V1");
-    let encoded = (domain, name.to_string(), version.to_string()).abi_encode_params();
-    keccak256(&encoded)
+/// The specification-defined workload identifier for a publisher-qualified reference.
+pub fn compute_workload_id(app_ref: &AppRef) -> B256 {
+    B256::from(atakit_cvm_encoding::workload_id(&shared_app_ref(app_ref)))
 }
 
-/// Compute the on-chain base image ID: `keccak256(abi.encode(BASEIMAGE_DOMAIN, name, version))`
-/// where `BASEIMAGE_DOMAIN = keccak256("CVM_BASEIMAGE_V1")`.
-pub fn compute_base_image_id(name: &str, version: &str) -> B256 {
-    let domain = keccak256("CVM_BASEIMAGE_V1");
-    let encoded = (domain, name.to_string(), version.to_string()).abi_encode_params();
-    keccak256(&encoded)
+/// The specification-defined base-image identifier for a publisher-qualified reference.
+pub fn compute_base_image_id(app_ref: &AppRef) -> B256 {
+    B256::from(atakit_cvm_encoding::base_image_id(&shared_app_ref(app_ref)))
+}
+
+fn shared_app_ref(app_ref: &AppRef) -> atakit_cvm_types::AppRef {
+    atakit_cvm_types::AppRef::new(
+        app_ref.publisher.into(),
+        app_ref.name.clone(),
+        app_ref.version.clone(),
+    )
+}
+
+pub(crate) fn static_pcr256_value(comparison: &[u8]) -> Option<[u8; 32]> {
+    match decode256(comparison).ok()? {
+        PcrComparison256::Static(value) => Some(value),
+        _ => None,
+    }
 }
 
 /// Parsed workload reference: either `name:version` or a hex workload ID.
 #[derive(Clone)]
 pub enum WorkloadRef {
-    NameVersion { name: String, version: String },
+    /// A publisher-qualified reference, from which the identifier is derived.
+    Ref(AppRef),
+    /// An identifier supplied directly.
     Id(String),
 }
 
-/// Parse a workload reference string.
-///
-/// Accepts `name:version` or `0x<64-hex-chars>` (workload ID).
-/// Name must be alphanumeric + hyphens, no leading hyphen.
-/// Version must start with `v` and contain no path separators.
-pub fn parse_workload_ref(s: &str) -> anyhow::Result<WorkloadRef> {
-    if s.starts_with("0x") && s.len() == 66 {
-        Ok(WorkloadRef::Id(s.to_string()))
-    } else if let Some((name, version)) = s.split_once(':') {
-        if name.is_empty() || version.is_empty() {
-            anyhow::bail!(
-                "invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'"
-            );
+impl WorkloadRef {
+    /// The workload identifier this reference denotes.
+    ///
+    /// Both forms yield one, so every caller keys the store the same way and
+    /// none of them re-derives the identifier itself.
+    pub fn workload_id(&self) -> String {
+        match self {
+            Self::Ref(app_ref) => format!("{:#x}", compute_workload_id(app_ref)),
+            Self::Id(id) => id.clone(),
         }
-        // Validate name: alphanumeric + hyphens, no leading hyphen
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || name.starts_with('-') {
-            anyhow::bail!(
-                "invalid workload name in reference: must be alphanumeric + hyphens, got '{name}'"
-            );
-        }
-        // Validate version: starts with 'v', at least 2 chars, only [A-Za-z0-9._-] after 'v'
-        if version.len() < 2 || !version.starts_with('v') {
-            anyhow::bail!(
-                "invalid workload version in reference: must start with 'v' and be at least 2 characters, got '{version}'"
-            );
-        }
-        if !version[1..]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        {
-            anyhow::bail!(
-                "invalid workload version in reference: only alphanumeric, '.', '-', '_' allowed after 'v', got '{version}'"
-            );
-        }
-        Ok(WorkloadRef::NameVersion {
-            name: name.to_string(),
-            version: version.to_string(),
-        })
-    } else {
-        anyhow::bail!("invalid workload reference: expected 'name:version' or '0x<id>', got '{s}'")
     }
 }
 
-/// Resolve a WorkloadRef to (name, version), using the store for ID lookups.
-pub fn resolve_ref(r: &WorkloadRef, store: &WorkloadStore) -> anyhow::Result<(String, String)> {
-    match r {
-        WorkloadRef::NameVersion { name, version } => Ok((name.clone(), version.clone())),
-        WorkloadRef::Id(id) => {
-            let entry = store
-                .get_by_id(id)?
-                .ok_or_else(|| anyhow::anyhow!("workload ID not found in store: {id}"))?;
-            Ok((entry.meta.name, entry.meta.version))
-        }
+/// Parse a workload reference from command-line input.
+///
+/// Accepts an identifier (`0x` plus 64 lowercase hexadecimal characters) or a
+/// publisher-qualified `<publisher>/<name>:<version>`, where `<publisher>` may
+/// be a name from the `[publishers]` configuration section. Alias expansion
+/// happens here, before parsing, so an alias can never reach a manifest: the
+/// parsed reference holds a fingerprint and has no representation for an
+/// unresolved name.
+pub fn parse_workload_ref(
+    s: &str,
+    alias: &atakit_config::AliasConfig,
+) -> anyhow::Result<WorkloadRef> {
+    if atakit_core::is_canonical_id(s) {
+        return Ok(WorkloadRef::Id(s.to_string()));
     }
+    let expanded = alias.expand(s)?;
+    let app_ref: AppRef = expanded
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid workload reference '{s}': {error}"))?;
+    if !atakit_core::is_valid_ref_name(&app_ref.name) {
+        anyhow::bail!(
+            "invalid workload name in reference: must be alphanumeric and '-', not starting with '-', got '{}'",
+            app_ref.name
+        );
+    }
+    if !atakit_core::is_valid_ref_version(&app_ref.version) {
+        anyhow::bail!(
+            "invalid workload version in reference: must start with 'v' and may contain only alphanumeric, '.', '-', '_' after it, got '{}'",
+            app_ref.version
+        );
+    }
+    Ok(WorkloadRef::Ref(app_ref))
 }
 
 /// Resolved chain config for workload on-chain commands.
@@ -226,7 +231,7 @@ pub struct ChainData {
     pub owner: Option<String>,
     pub revoked: bool,
     pub spec: Option<CachedChainSpec>,
-    /// PCR23 from on-chain matchData (STATIC).
+    /// PCR23 decoded from an on-chain STATIC `comparison`.
     pub pcr23: Option<String>,
 }
 
@@ -281,14 +286,15 @@ pub async fn query_chain_data(
         .unwrap_or(false);
 
     let pcr23 = spec
-        .pcrs
+        .workloadPcrPolicy
+        .pcrSpecs256
         .iter()
         .find(|p| p.pcrIndex == 23)
-        .and_then(|p| p.matchData.first())
-        .map(|b| format!("0x{}", hex::encode(b)));
+        .and_then(|p| static_pcr256_value(&p.comparison))
+        .map(|value| format!("0x{}", hex::encode(value)));
 
     let cached = CachedChainSpec {
-        session_ttl: spec.ttl,
+        session_ttl: spec.sessionTtl,
         base_image_mode: spec.baseImageMode,
         base_image_ids: spec
             .baseImageIds
@@ -296,16 +302,12 @@ pub async fn query_chain_data(
             .map(|b| format!("0x{}", hex::encode(b)))
             .collect(),
         pcrs: spec
-            .pcrs
+            .workloadPcrPolicy
+            .pcrSpecs256
             .iter()
             .map(|p| CachedPcrSpec {
                 pcr_index: p.pcrIndex,
-                verify_type: p.verifyType,
-                match_data: p
-                    .matchData
-                    .iter()
-                    .map(|b| format!("0x{}", hex::encode(b)))
-                    .collect(),
+                comparison: format!("0x{}", hex::encode(&p.comparison)),
             })
             .collect(),
     };
@@ -369,6 +371,31 @@ pub fn compute_final_pcr23(event_hash_hex: &str) -> Option<String> {
     Some(format!("0x{}", hex::encode(hasher.finalize())))
 }
 
+/// The publisher a command is acting as, from its configured identity.
+///
+/// A file path records a name and version but never who published it, and the
+/// identifier is derived from the publisher — so a path form takes its identity
+/// from the signing key, defaulting to `[publish] owner_key`. A reference names
+/// its publisher and never reaches here.
+pub fn configured_publisher(
+    signing_key: Option<&str>,
+    config: &crate::config::Config,
+) -> anyhow::Result<B256> {
+    owner_fingerprint(&resolve_owner_key(signing_key, config)?)
+}
+
+/// The owner fingerprint of a resolved ES256K key.
+///
+/// This is the publisher component of every identifier the key can register, so
+/// deriving it is how a command that holds a key learns which name space it is
+/// writing into. The derivation lives beside the fingerprint definition in the
+/// registry crate, so `atakit` and `atakit-imgbuild` cannot drift into giving
+/// one key two publishers.
+pub fn owner_fingerprint(private_key_hex: &str) -> anyhow::Result<B256> {
+    automata_tee_workload_measurement::stubs::es256k_fingerprint(private_key_hex)
+        .context("owner key is not a valid ES256K key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,14 +424,20 @@ mod tests {
     }
 
     /// Cross-check vector against atakit-portal's hand-rolled abi.encode + keccak256.
-    /// If this assertion changes, the matching test in atakit-portal must change too,
-    /// or the on-chain workload IDs the portal reports will silently diverge.
+    /// Pinned against the publisher-qualified derivation. The vectors changed
+    /// with the grammar: the previous ones were computed from name and version
+    /// alone and no longer describe any identifier the registries produce.
+    ///
+    /// If this assertion changes, the matching test in atakit-portal must change
+    /// too, or the on-chain workload IDs the portal reports will silently
+    /// diverge. **atakit-portal has not been updated yet.**
     #[test]
     fn compute_workload_id_known_vector() {
-        let id = compute_workload_id("test-workload", "v1.0.0");
+        let publisher = alloy_ext::core::primitives::B256::repeat_byte(0x11);
+        let id = compute_workload_id(&AppRef::new(publisher, "test-workload", "v1.0.0"));
         assert_eq!(
-            format!("0x{}", hex::encode(id)),
-            "0xc6025b180ebd852412a9e3490b9759239995d1e0741a9ffd2ada596e1094e608"
+            format!("{id:#x}"),
+            "0x56454a28816eeb5c79ea820b3ce24e28151f360e642929d8b526640e0f623e35"
         );
     }
 
@@ -412,10 +445,11 @@ mod tests {
     /// vector above isn't an artifact of `test-workload`/`v1.0.0` specifically.
     #[test]
     fn compute_workload_id_fedora_oci_v0_0_9() {
-        let id = compute_workload_id("fedora-oci", "v0.0.9");
+        let publisher = alloy_ext::core::primitives::B256::repeat_byte(0x22);
+        let id = compute_workload_id(&AppRef::new(publisher, "fedora-oci", "v0.0.9"));
         assert_eq!(
-            format!("0x{}", hex::encode(id)),
-            "0x45504f5c32f3da742031f059f8aea265a3ed840d19fc27f66aaea0215ae82181"
+            format!("{id:#x}"),
+            "0x9649362cd5dec505d90b11afee0a7d52746555b41997eae2f0a9d603ac2f21bf"
         );
     }
 
@@ -424,10 +458,11 @@ mod tests {
     /// or the on-chain base-image IDs the portal reports will silently diverge.
     #[test]
     fn compute_base_image_id_known_vector() {
-        let id = compute_base_image_id("test-image", "v1.0.0");
+        let publisher = alloy_ext::core::primitives::B256::repeat_byte(0x33);
+        let id = compute_base_image_id(&AppRef::new(publisher, "test-image", "v1.0.0"));
         assert_eq!(
-            format!("0x{}", hex::encode(id)),
-            "0xe1a0a8f3eb93a84d2c524e46e6604d6dea9f5254e5b2eefb07134fa47f7173a5"
+            format!("{id:#x}"),
+            "0x1e088ca5f3c20fc773870ebd578a49a340ce8714d84b4d539f0afee47229a3c8"
         );
     }
 }

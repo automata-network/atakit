@@ -273,7 +273,7 @@ pub(super) fn verify_gcp_ak_cert_chain_der(
     pass(report, "gcp-ak-cert-chain");
 }
 
-fn verify_ca_certificate_role(
+pub(super) fn verify_ca_certificate_role(
     cert: &X509Certificate<'_>,
     label: &str,
     ca_certificates_below: usize,
@@ -306,7 +306,7 @@ fn verify_ca_certificate_role(
     Ok(())
 }
 
-fn verify_end_entity_certificate_role(
+pub(super) fn verify_end_entity_certificate_role(
     cert: &X509Certificate<'_>,
     label: &str,
 ) -> std::result::Result<(), String> {
@@ -721,13 +721,13 @@ fn verify_tdx_vendor_report(
         );
         return None;
     }
-    if quote_bytes.iter().any(|byte| *byte != 0) {
+    if !quote_bytes.is_empty() {
         fail(
             report,
             errors,
             check_name,
             format!(
-                "{provider_name} TDX DCAP quote has {} non-zero trailing bytes",
+                "{provider_name} TDX DCAP quote has {} trailing bytes",
                 quote_bytes.len()
             ),
         );
@@ -816,6 +816,28 @@ pub(super) fn verify_azure_snp_vendor_report(
         current_time,
         "azure-tee-vendor-report",
         "Azure",
+    );
+}
+
+pub(super) fn verify_aws_snp_vendor_report(
+    report: &mut VerificationReport,
+    errors: &mut Vec<VerificationError>,
+    evidence: Option<&TeeEvidence>,
+    collateral: Option<&AmdSnpVerificationCollateral>,
+    amd_snp_trust: AmdSnpTrust<'_>,
+    current_time: SystemTime,
+) {
+    verify_snp_vendor_report(
+        report,
+        errors,
+        evidence,
+        AmdSnpVerificationContext {
+            collateral,
+            trust: amd_snp_trust,
+        },
+        current_time,
+        "aws-tee-vendor-report",
+        "AWS",
     );
 }
 
@@ -1518,23 +1540,36 @@ pub(super) fn check_snp_octet_extension(
     else {
         return Err(format!("SNP VEK is missing required {name} extension"));
     };
-    let actual = if ext.value.len() >= 2 && ext.value[0] == 0x04 {
-        let len = usize::from(ext.value[1]);
-        if ext.value.len() != len + 2 {
-            return Err(format!(
-                "SNP VEK {name} extension OCTET STRING length is malformed"
-            ));
-        }
-        &ext.value[2..]
-    } else {
-        ext.value
-    };
+    let actual = snp_octet_extension_value(ext.value, expected.len(), name)?;
     if actual != expected {
         return Err(format!(
             "SNP VEK {name} extension does not match report value"
         ));
     }
     Ok(())
+}
+
+pub(super) fn snp_octet_extension_value<'a>(
+    value: &'a [u8],
+    expected_len: usize,
+    name: &str,
+) -> std::result::Result<&'a [u8], String> {
+    // x509-parser normally exposes the extension payload after removing the
+    // X.509 OCTET STRING wrapper. Treat an expected-length payload as raw
+    // first: a chip ID may itself begin with 0x04 and a length-like byte.
+    if value.len() == expected_len {
+        return Ok(value);
+    }
+    if value.first().copied() != Some(0x04) {
+        return Ok(value);
+    }
+    let (content_offset, content_len) = der_tlv(value, 0x04, &format!("SNP VEK {name} extension"))?;
+    if content_len != expected_len {
+        return Err(format!(
+            "SNP VEK {name} extension OCTET STRING length is malformed"
+        ));
+    }
+    Ok(&value[content_offset..content_offset + content_len])
 }
 
 fn check_snp_product_extension(
@@ -1917,7 +1952,7 @@ pub(super) fn verify_azure_maa_jwt_binding(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    trusted_maa_keys: &[Vec<u8>],
+    trusted_maa_keys: &[AzureMaaTrustCertificate],
     tee: &str,
     verification_time: SystemTime,
 ) {
@@ -2040,9 +2075,23 @@ pub(super) fn verify_azure_maa_jwt_binding(
         return;
     }
 
+    let verification_timestamp = match verification_time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(error) => {
+            fail(
+                report,
+                errors,
+                "azure-maa-jwt",
+                format!("verification time is before Unix epoch: {error}"),
+            );
+            return;
+        }
+    };
+
     let mut key_errors = Vec::new();
-    for key_bytes in trusted_maa_keys {
-        let key = match parse_rsa_public_key(key_bytes) {
+    let mut expired_at = None;
+    for certificate in trusted_maa_keys {
+        let key = match parse_rsa_public_key(&certificate.public_key) {
             Ok(key) => key,
             Err(detail) => {
                 key_errors.push(detail);
@@ -2050,13 +2099,24 @@ pub(super) fn verify_azure_maa_jwt_binding(
             }
         };
         if key.verify_sig(signing_input.as_bytes(), &signature).is_ok() {
+            // Expiry is checked on the certificate that actually signed this
+            // token, not on one selected by the token's `kid` header. `kid` is
+            // attacker-supplied; the signature is what binds a key to a token.
+            if verification_timestamp > certificate.not_after {
+                expired_at.get_or_insert(certificate.not_after);
+                continue;
+            }
             pass(report, "azure-maa-jwt");
             return;
         }
     }
 
     let kid = header.kid.unwrap_or_else(|| "<missing>".to_string());
-    let detail = if key_errors.is_empty() {
+    let detail = if let Some(not_after) = expired_at {
+        format!(
+            "MAA JWT verified under a trusted Azure MAA signing certificate that expired at {not_after}; kid={kid}"
+        )
+    } else if key_errors.is_empty() {
         format!("MAA JWT signature did not verify under any trusted key; kid={kid}")
     } else {
         format!(
@@ -2150,11 +2210,17 @@ pub(super) fn verify_azure_maa_session_binding(
         return;
     }
     pass(report, "azure-maa-trust-selection");
+    // The chain path has already selected by kid and issuer and checked this
+    // key's expiry above, so hand the signature check a certificate whose
+    // expiry cannot fire again.
     verify_azure_maa_jwt_binding(
         report,
         errors,
         binding,
-        std::slice::from_ref(&key.public_key),
+        &[AzureMaaTrustCertificate {
+            public_key: key.public_key.clone(),
+            not_after: key.not_after,
+        }],
         tee,
         verification_time,
     );
@@ -2416,7 +2482,7 @@ pub(super) fn verify_azure_hclak_quote_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
     if binding.kind != "azure-maa-jwt" {
@@ -2431,7 +2497,7 @@ pub(super) fn verify_azure_hclak_quote_signature(
         );
         return;
     }
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-quote-signature", detail);
@@ -2468,10 +2534,10 @@ pub(super) fn verify_azure_hclak_certify_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     binding: &AkBinding,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-certify-signature", detail);
@@ -2554,11 +2620,11 @@ pub(super) fn rsa_public_key_from_jwk(
 pub(super) fn verify_tpm_quote(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     expected_qualifying_data: &[u8; 32],
     pcrs: &[PcrEvidence],
 ) -> Option<Vec<PcrEvidence>> {
-    let parsed = match parse_tpm_quote(tpm2b_attest) {
+    let parsed = match parse_tpm_quote(tpms_attest) {
         Ok(parsed) => {
             pass(report, "tpm-quote-structure");
             parsed
@@ -2649,6 +2715,20 @@ pub(super) fn verify_tpm_quote(
             return None;
         }
         selected_indices.extend(selection.indices.iter().copied());
+    }
+    let canonical_bank_order = match parsed.pcr_selections.as_slice() {
+        [selection] => matches!(selection.hash_alg, TPM_ALG_SHA256 | TPM_ALG_SHA384),
+        [first, second] => first.hash_alg == TPM_ALG_SHA256 && second.hash_alg == TPM_ALG_SHA384,
+        _ => false,
+    };
+    if !canonical_bank_order {
+        fail(
+            report,
+            errors,
+            "tpm-quote-pcr-selection",
+            "TPM quote must select one bank or select SHA-256 before SHA-384".to_string(),
+        );
+        return None;
     }
     let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
     if supplied_indices != selected_indices {
@@ -2748,10 +2828,10 @@ pub(super) fn verify_tpm_quote_signature(
     report: &mut VerificationReport,
     errors: &mut Vec<VerificationError>,
     ak_public: &[u8],
-    tpm2b_attest: &[u8],
+    tpms_attest: &[u8],
     tpm_signature: &[u8],
 ) {
-    let body = match tpm2b_attest_body(tpm2b_attest) {
+    let body = match tpms_attest_body(tpms_attest) {
         Ok(body) => body,
         Err(detail) => {
             fail(report, errors, "tpm-quote-signature", detail);
@@ -2784,22 +2864,22 @@ pub(super) fn verify_tpm_quote_signature(
     }
 }
 
-pub(super) fn tpm2b_attest_body(tpm2b_attest: &[u8]) -> std::result::Result<&[u8], String> {
-    if tpm2b_attest.len() >= 4
+pub(super) fn tpms_attest_body(tpms_attest: &[u8]) -> std::result::Result<&[u8], String> {
+    if tpms_attest.len() >= 4
         && u32::from_be_bytes([
-            tpm2b_attest[0],
-            tpm2b_attest[1],
-            tpm2b_attest[2],
-            tpm2b_attest[3],
+            tpms_attest[0],
+            tpms_attest[1],
+            tpms_attest[2],
+            tpms_attest[3],
         ]) == TPM_GENERATED_VALUE
     {
-        return Ok(tpm2b_attest);
+        return Ok(tpms_attest);
     }
-    if tpm2b_attest.len() < 2 {
+    if tpms_attest.len() < 2 {
         return Err("TPM2B_ATTEST is shorter than its size prefix".to_string());
     }
-    let declared = u16::from_be_bytes([tpm2b_attest[0], tpm2b_attest[1]]) as usize;
-    let body = &tpm2b_attest[2..];
+    let declared = u16::from_be_bytes([tpms_attest[0], tpms_attest[1]]) as usize;
+    let body = &tpms_attest[2..];
     if declared != body.len() {
         return Err(format!(
             "TPM2B_ATTEST size prefix declares {declared} bytes, got {}",
@@ -2936,19 +3016,20 @@ pub(super) fn parse_tpmt_signature_rsassa_sha256(
 
 #[derive(Debug)]
 pub(super) struct ParsedTpmQuote {
-    extra_data: Vec<u8>,
-    pcr_selections: Vec<ParsedPcrSelection>,
-    pcr_digest: Vec<u8>,
+    pub(super) extra_data: Vec<u8>,
+    pub(super) pcr_selections: Vec<ParsedPcrSelection>,
+    pub(super) pcr_digest: Vec<u8>,
 }
 
 #[derive(Debug)]
-struct ParsedPcrSelection {
-    hash_alg: u16,
-    indices: Vec<u8>,
+pub(super) struct ParsedPcrSelection {
+    pub(super) hash_alg: u16,
+    pub(super) select: [u8; 3],
+    pub(super) indices: Vec<u8>,
 }
 
-pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
-    let body = tpm2b_attest_body(tpm2b_attest)?;
+pub(super) fn parse_tpm_quote(tpms_attest: &[u8]) -> std::result::Result<ParsedTpmQuote, String> {
+    let body = tpms_attest_body(tpms_attest)?;
 
     let mut reader = ByteReader::new(body);
     let magic = reader.read_u32("magic")?;
@@ -2970,26 +3051,45 @@ pub(super) fn parse_tpm_quote(tpm2b_attest: &[u8]) -> std::result::Result<Parsed
     reader.read_exact("firmwareVersion", 8)?;
 
     let selection_count = reader.read_u32("attested.quote.pcrSelect.count")?;
+    if !matches!(selection_count, 1 | 2) {
+        return Err(format!(
+            "TPM Quote must select one or two PCR banks, got {selection_count}"
+        ));
+    }
     let mut pcr_selections = Vec::new();
     for selection_idx in 0..selection_count {
         let hash_alg = reader.read_u16("attested.quote.pcrSelect.hash")?;
         let select_len = reader.read_u8("attested.quote.pcrSelect.sizeofSelect")? as usize;
+        if select_len != 3 {
+            return Err(format!(
+                "TPM Quote PCR selection sizeofSelect must equal 3, got {select_len}"
+            ));
+        }
         let select = reader.read_exact("attested.quote.pcrSelect.pcrSelect", select_len)?;
         let mut indices = Vec::new();
         for (byte_idx, byte) in select.iter().enumerate() {
             for bit in 0..8 {
                 if byte & (1 << bit) != 0 {
                     let index = byte_idx * 8 + bit;
-                    if index > 23 {
+                    if index > 16 && index != 23 {
                         return Err(format!(
-                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected 0..=23"
+                            "PCR selection {selection_idx} contains unsupported PCR index {index}; expected PCR0 through PCR16 or PCR23"
                         ));
                     }
                     indices.push(index as u8);
                 }
             }
         }
-        pcr_selections.push(ParsedPcrSelection { hash_alg, indices });
+        if indices.is_empty() {
+            return Err(format!(
+                "PCR selection {selection_idx} for bank 0x{hash_alg:04x} is empty"
+            ));
+        }
+        pcr_selections.push(ParsedPcrSelection {
+            hash_alg,
+            select: select.try_into().expect("select length checked"),
+            indices,
+        });
     }
     let pcr_digest = reader.read_tpm2b("attested.quote.pcrDigest")?.to_vec();
     if !reader.is_empty() {
@@ -3067,96 +3167,6 @@ impl<'a> ByteReader<'a> {
         self.offset = end;
         Ok(out)
     }
-}
-pub(super) fn evaluate_pcr_policy(
-    policy: &SessionPcrPolicy,
-    measured_value: [u8; 32],
-    measured_events: &[[u8; 32]],
-) -> std::result::Result<(), String> {
-    let expected = policy
-        .match_data
-        .iter()
-        .map(|value| decode_policy_hash(value))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    match policy.verify_type {
-        SessionPcrVerifyType::Static => {
-            if expected.len() != 1 {
-                return Err(format!(
-                    "STATIC policy requires exactly one match_data entry, got {}",
-                    expected.len()
-                ));
-            }
-            let value = &expected[0];
-            if measured_value != *value {
-                return Err("STATIC PCR value mismatch".into());
-            }
-        }
-        SessionPcrVerifyType::DynamicSubset => {
-            if expected.is_empty() {
-                return Err("DYNAMIC_SUBSET policy has no required landmarks".into());
-            }
-            if measured_events.is_empty() {
-                return Err("DYNAMIC_SUBSET measured event log is empty".into());
-            }
-            if let Some((index, _)) = expected
-                .iter()
-                .enumerate()
-                .find(|(_, required)| !measured_events.contains(required))
-            {
-                return Err(format!(
-                    "DYNAMIC_SUBSET required landmark {index} is missing"
-                ));
-            }
-            verify_event_replay(measured_value, measured_events)?;
-        }
-        SessionPcrVerifyType::DynamicSubsequence => {
-            if expected.is_empty() {
-                return Err("DYNAMIC_SUBSEQUENCE policy has no required landmarks".into());
-            }
-            if measured_events.is_empty() {
-                return Err("DYNAMIC_SUBSEQUENCE measured event log is empty".into());
-            }
-            let mut landmark = 0;
-            for event in measured_events {
-                if expected.get(landmark) == Some(event) {
-                    landmark += 1;
-                }
-            }
-            if landmark != expected.len() {
-                return Err(format!(
-                    "DYNAMIC_SUBSEQUENCE matched {landmark} of {} landmarks",
-                    expected.len()
-                ));
-            }
-            verify_event_replay(measured_value, measured_events)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_event_replay(
-    final_value: [u8; 32],
-    events: &[[u8; 32]],
-) -> std::result::Result<(), String> {
-    let mut pcr = [0u8; 32];
-    for event in events {
-        let mut input = [0u8; 64];
-        input[..32].copy_from_slice(&pcr);
-        input[32..].copy_from_slice(event);
-        pcr = Sha256::digest(input).into();
-    }
-    if pcr != final_value {
-        return Err("event replay does not produce the measured PCR value".into());
-    }
-    Ok(())
-}
-
-fn decode_policy_hash(value: &str) -> std::result::Result<[u8; 32], String> {
-    let raw = value.strip_prefix("0x").ok_or("missing 0x prefix")?;
-    let bytes = hex::decode(raw).map_err(|error| error.to_string())?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, got {}", bytes.len()))
 }
 
 #[cfg(test)]

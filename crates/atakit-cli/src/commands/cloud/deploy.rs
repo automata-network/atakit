@@ -19,10 +19,10 @@ use owo_colors::OwoColorize;
 
 use super::{
     effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
-    init_key_from_config, parse_metadata, portal_endpoints, registration_is_off, resolve_image,
-    resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
-    synthesize_off_init_chain, synthesize_self_generated_key, terminal_initialization_error,
-    validate_base_image, InitEnvResolver,
+    init_key_from_config, parse_metadata, portal_endpoints, registration_is_off,
+    resolve_explicit_tls_measurement_policy, resolve_image, resolve_unmeasured_tar,
+    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
+    terminal_initialization_error, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -217,6 +217,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     let archive_sha256: Option<[u8; 32]>;
     let (
         archive_path,
+        workload_publisher,
         workload_name,
         workload_version,
         archive_hash,
@@ -235,6 +236,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         _,
         _,
         _,
+        _,
         Option<String>,
         _,
         _,
@@ -244,6 +246,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     );
     if image_only {
         archive_path = String::new();
+        workload_publisher = String::new();
         workload_name = String::new();
         workload_version = String::new();
         archive_hash = String::new();
@@ -259,7 +262,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         // No workload in image-only mode; reject any stray --disk-passphrase.
         disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &BTreeMap::new())?;
     } else {
-        let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+        let resolved = resolve_workload(
+            &args.source,
+            &args.dir,
+            env,
+            config,
+            args.signing_key.as_deref(),
+            args.skip_freshness_check,
+        )?;
+        workload_publisher = format!("{:#x}", resolved.publisher);
         workload_name = resolved.name;
         workload_version = resolved.version;
         archive_sha256 = Some(resolved.archive_sha256);
@@ -450,7 +461,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
 
     let resolved_image = resolve_image(image_arg, &provider_config.platform, env)?;
     let image_ref = &resolved_image.display_name;
-    let base_image_ref = canonical_base_image_ref(image_ref, args.base_image.as_deref());
+    let measured_base_image_ref = resolved_image
+        .measured_base_image_ref
+        .as_deref()
+        .unwrap_or(image_ref);
+    let base_image_ref =
+        canonical_base_image_ref(measured_base_image_ref, args.base_image.as_deref());
 
     // 8b. Validate image against workload's base-image policy.
     if !image_only {
@@ -767,6 +783,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // 13. Create initial state.
     let mut state = DeployState::new(atakit_cloud::NewDeployParams {
         instance_name: instance_name.clone(),
+        workload_publisher: workload_publisher.clone(),
         workload_name: workload_name.clone(),
         workload_version: workload_version.clone(),
         target_name: target_name.to_string(),
@@ -919,15 +936,19 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     }
                 };
 
-                let init_config = InitConfig {
+                let mut init_config = InitConfig {
                     platform: provider_config.platform.to_string(),
                     chain: init_chain,
                     owner_operations: config.owner_operations.clone(),
                     owner_key: owner_init,
                     gas_wallet: gas_init,
                     prover_credential: prover_init,
+                    pcr_policy: None,
                     disks: disk_passphrases.clone(),
                 };
+                if !registration_off && args.pcr_policy.is_some() {
+                    bail!("--pcr-policy requires effective chain registration = \"off\"");
+                }
                 let initialization_timeout_secs = init::initialization_timeout_seconds(
                     args.init_timeout,
                     init_config.owner_operations.op_expiry_seconds,
@@ -940,22 +961,37 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     super::warn_unsafe_skip_tls_attestation();
                     None
                 } else {
-                    let measurement_policy = resolve_tls_measurement_policy(
+                    let untrusted_portal_base_image_id = if args.measurements.is_none() {
+                        Some(
+                            init::read_untrusted_portal_base_image_id(&ip, status_port)
+                                .await
+                                .map_err(|error| anyhow::anyhow!("{error}"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    let measurement_policy = resolve_explicit_tls_measurement_policy(
                         args.measurements.as_deref(),
                         args.base_image.as_deref(),
+                        untrusted_portal_base_image_id,
                         &args.measurement_publisher_key,
                         &env.data_dir,
                         &init_config.chain,
                     )
                     .await?;
-                    let tls_verification_trust = init::load_tls_verification_trust(
-                        &args.gcp_ak_root_cert,
-                        &args.azure_maa_key,
-                        &args.amd_ark_root_cert,
-                        &args.amd_snp_crl,
-                        args.amd_snp_security_policy.as_deref(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let tls_verification_trust =
+                        init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+                            gcp_ak_root_certs: &args.gcp_ak_root_cert,
+                            azure_maa_certs: &args.azure_maa_cert,
+                            aws_nitro_root_certs: &args.aws_nitro_root_cert,
+                            amd_ark_root_certs: &args.amd_ark_root_cert,
+                            amd_snp_crls: &args.amd_snp_crl,
+                            amd_snp_security_policy: args.amd_snp_security_policy.as_deref(),
+                            aws_document_maximum_age_seconds: args.aws_document_maximum_age_seconds,
+                            aws_document_allowed_future_clock_difference_seconds: args
+                                .aws_document_allowed_future_clock_difference_seconds,
+                        })
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
                         &args.tdx_dcap_automata_read_strategy,
                         args.tdx_dcap_automata_multicall3_address.clone(),
@@ -969,14 +1005,20 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         automata_read_strategy,
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let verified_tls = init::bootstrap_portal_tls_with_trust_config(
+                    let tls_mode = init::portal_tls_mode_for_init_chain(
+                        &init_config.chain,
+                        tls_verification_trust,
+                        tdx_dcap_collateral,
+                        measurement_policy,
+                        untrusted_portal_base_image_id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let verified_tls = init::bootstrap_portal_tls(
                         &ip,
                         status_port,
-                        measurement_policy,
+                        &tls_mode,
                         Some(workload_attributes.clone()),
-                        tls_verification_trust,
-                        init::azure_maa_trust_config_from_init_chain(&init_config.chain),
-                        tdx_dcap_collateral,
                         args.trust_tls_cert_sha256.as_deref(),
                         Some(&init::cloud_tls_attestation_report_path(
                             &env.data_dir,
@@ -992,12 +1034,27 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     Some(verified_tls)
                 };
                 let portal_client = match &verified_tls {
-                    Some(verified) => verified.client.clone(),
+                    Some(verified) => verified.client().clone(),
                     None => init::unsafe_portal_client(std::time::Duration::from_secs(
                         init::PORTAL_READINESS_TIMEOUT_SECONDS,
                     ))
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
+                let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+                    workload_publisher
+                        .parse()
+                        .context("invalid workload publisher")?,
+                    workload_name.clone(),
+                    workload_version.clone(),
+                );
+                init_config.pcr_policy = super::resolve_init_pcr_policy(
+                    args.pcr_policy.as_deref(),
+                    &init_config,
+                    registration_off,
+                    verified_tls.as_ref(),
+                    &workload_app_ref,
+                )
+                .await?;
 
                 match init::post_portal_init_with_client(
                     &portal_client,

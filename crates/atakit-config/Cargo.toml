@@ -2,8 +2,10 @@
 name = "atakit-config"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
+atakit-core.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 libc.workspace = true
 serde.workspace = true

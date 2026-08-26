@@ -1,0 +1,18 @@
+[package]
+name = "atakit-cvm-encoding"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Canonical CVM identifier and policy encodings for the atakit suite"
+repository = "https://github.com/automata-network/atakit-ng"
+readme = "README.md"
+publish = ["crates-io"]
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+atakit-cvm-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

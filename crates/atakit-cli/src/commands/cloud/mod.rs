@@ -4,6 +4,7 @@ pub mod image;
 pub mod init;
 pub mod list;
 pub mod provider;
+pub mod reboot;
 pub mod serial;
 pub mod session;
 mod session_access;
@@ -15,18 +16,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy_ext::core::primitives::Address;
+use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
-use atakit_attestation::{
-    BaseImage, MeasurementPack, MeasurementPolicy, MeasurementProfile, MeasurementVariant, PcrSpec,
-};
+use atakit_attestation::MeasurementPolicy;
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{InitChainConfig, InitKeyConfig, InitProverConfig, PortalTerminalState};
+use atakit_cloud::init::{
+    InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig, PortalTerminalState,
+};
+use atakit_cloud::pcr_policy::{
+    resolve_init_pcr_policy as resolve_pcr_policy_for_init, PcrPolicyIdentifiers,
+    ResolvedPcrPolicyConfig,
+};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
@@ -36,9 +41,6 @@ use atakit_cloud::{
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
-use automata_tee_workload_measurement::base_image_registry::{
-    BaseImageHierarchy, BaseImageRegistry,
-};
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
 use automata_tee_workload_measurement::types::AppRef;
 use owo_colors::OwoColorize;
@@ -267,6 +269,32 @@ pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
     registration == Some("off")
 }
 
+pub(crate) async fn resolve_init_pcr_policy(
+    path: Option<&Path>,
+    config: &InitConfig,
+    registration_off: bool,
+    verified_tls: Option<&atakit_cloud::init::VerifiedPortalTls>,
+    workload_ref: &AppRef,
+) -> Result<Option<ResolvedPcrPolicyConfig>> {
+    let identifiers = verified_tls.and_then(|verified| {
+        Some(PcrPolicyIdentifiers {
+            workload_id: crate::commands::workload::compute_workload_id(workload_ref).0,
+            base_image_id: verified.identity().base_image_id?,
+            platform_profile_id: verified.identity().platform_profile_id?,
+            measurement_variant_id: verified.identity().variant_id?,
+        })
+    });
+    resolve_pcr_policy_for_init(
+        registration_off,
+        path,
+        &config.chain,
+        identifiers,
+        &config.platform,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+}
+
 pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
     InitKeyConfig {
         mode: "self_generated".to_string(),
@@ -283,9 +311,18 @@ pub(crate) fn warn_unsafe_skip_tls_attestation() {
     );
 }
 
-pub(crate) async fn resolve_tls_measurement_policy(
+/// The operator-supplied base-image measurement policy, if there is one.
+///
+/// Returns `None` when no `--measurements` was given, which means the chain is
+/// the authority and [`atakit_cloud::init::portal_tls_mode_for_init_chain`]
+/// resolves the policy from the registry instead. It no longer resolves the
+/// chain policy itself: that was the "explicit wins, otherwise chain"
+/// precedence the exclusive-source rule withdrew, and it applied to every
+/// command except `atakit cloud verify-session`.
+pub(crate) async fn resolve_explicit_tls_measurement_policy(
     measurements: Option<&std::path::Path>,
-    base_image: Option<&str>,
+    expected_base_image: Option<&str>,
+    untrusted_portal_base_image_id: Option<[u8; 32]>,
     measurement_publisher_keys: &[String],
     data_dir: &std::path::Path,
     init_chain: &InitChainConfig,
@@ -293,42 +330,48 @@ pub(crate) async fn resolve_tls_measurement_policy(
     if measurements.is_some() {
         return atakit_cloud::init::load_measurement_policy(
             measurements,
-            base_image,
+            expected_base_image,
             measurement_publisher_keys,
             Some(data_dir),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"));
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"))
+        .map(Some);
+    }
+    if !measurement_publisher_keys.is_empty() {
+        bail!("--measurement-publisher-key requires --measurements");
     }
 
-    let Some(base_image_ref) = base_image else {
-        return Ok(None);
-    };
+    if !chain_measurement_policy_available(init_chain) {
+        bail!(
+            "normal portal TLS attestation requires a configured chain with BaseImageRegistry or SessionRegistry; select a chain or provide --measurements for explicit offline verification"
+        );
+    }
 
-    if atakit_cloud::init::local_measurement_pack_exists(data_dir, base_image_ref)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+    // The portal's claimed identifier selects which registry record is read, so
+    // when the operator also named a base image the two must agree. Without
+    // this a portal could steer the verifier at another image's policy.
+    if let (Some(expected_base_image), Some(reported)) =
+        (expected_base_image, untrusted_portal_base_image_id)
     {
-        return atakit_cloud::init::load_measurement_policy(
-            None,
-            Some(base_image_ref),
-            measurement_publisher_keys,
-            Some(data_dir),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"));
-    }
-
-    if chain_measurement_policy_available(init_chain) {
-        return Ok(Some(
-            load_measurement_policy_from_chain(base_image_ref, init_chain).await?,
+        let expected_ref: AppRef = expected_base_image.parse()?;
+        let expected_id = B256::from(atakit_cvm_encoding::base_image_id(
+            &atakit_cvm_types::AppRef::new(
+                expected_ref.publisher.into(),
+                expected_ref.name,
+                expected_ref.version,
+            ),
         ));
+        let reported_id = B256::from(reported);
+        if expected_id != reported_id {
+            bail!(
+                "GET /status claimed base_image_id {} but --base-image {expected_base_image} resolves to {}",
+                hex0x(reported_id),
+                hex0x(expected_id)
+            );
+        }
     }
-
-    atakit_cloud::init::load_measurement_policy(
-        None,
-        Some(base_image_ref),
-        measurement_publisher_keys,
-        Some(data_dir),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    Ok(None)
 }
 
 /// Resolve base-image measurement collateral from sources selected by the
@@ -366,170 +409,8 @@ pub(crate) async fn resolve_verifier_tls_measurement_policy(
 }
 
 fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
-    init_chain.base_image_registry != ZERO_ADDR && !init_chain.rpc_url.trim().is_empty()
-}
-
-async fn load_measurement_policy_from_chain(
-    base_image: &str,
-    init_chain: &InitChainConfig,
-) -> Result<MeasurementPolicy> {
-    let app_ref: AppRef = base_image.parse()?;
-    let base_image_id = BaseImageRegistry::get_image_id(&app_ref);
-    let registry_addr: Address = init_chain.base_image_registry.parse().with_context(|| {
-        format!(
-            "invalid base_image_registry address for TLS measurement lookup: {}",
-            init_chain.base_image_registry
-        )
-    })?;
-    let provider = NetworkProvider::with_http(
-        &init_chain.rpc_url,
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(37)),
-        100,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to connect to rpc_url for TLS measurement lookup: {}",
-            init_chain.rpc_url
-        )
-    })?;
-    let hierarchy = BaseImageRegistry::new(registry_addr, provider)
-        .get_hierarchy(base_image_id)
-        .await
-        .with_context(|| format!("failed to fetch BaseImageRegistry hierarchy for {base_image}"))?;
-
-    chain_hierarchy_to_measurement_policy(&hierarchy, &init_chain.base_image_registry)
-}
-
-fn chain_hierarchy_to_measurement_policy(
-    hierarchy: &BaseImageHierarchy,
-    registry: &str,
-) -> Result<MeasurementPolicy> {
-    let profiles = hierarchy
-        .profiles
-        .iter()
-        .map(|profile| {
-            let (cloud, tee) = infer_cloud_tee_from_profile_name(&profile.profile.name)?;
-            let variants = profile
-                .variants
-                .iter()
-                .map(|(variant_id, variant)| MeasurementVariant {
-                    name: variant.name.clone(),
-                    id: hex0x(variant_id),
-                    machine_types: vec![variant.name.clone()],
-                    override_pcrs: variant
-                        .overridePcrs
-                        .iter()
-                        .map(chain_pcr_spec_to_measurement)
-                        .collect(),
-                    attributes: variant
-                        .attributes
-                        .iter()
-                        .map(|attr| {
-                            serde_json::json!({
-                                "key": hex0x(attr.key),
-                                "value": hex0x(attr.value),
-                            })
-                        })
-                        .collect(),
-                })
-                .collect();
-            Ok(MeasurementProfile {
-                name: profile.profile.name.clone(),
-                id: hex0x(profile.profile_id),
-                cloud: cloud.to_string(),
-                tee: tee.to_string(),
-                invariants: profile
-                    .profile
-                    .invariants
-                    .iter()
-                    .map(chain_pcr_spec_to_measurement)
-                    .collect(),
-                variants,
-                attributes: profile
-                    .profile
-                    .attributes
-                    .iter()
-                    .map(|attr| {
-                        serde_json::json!({
-                            "key": hex0x(attr.key),
-                            "value": hex0x(attr.value),
-                        })
-                    })
-                    .collect(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(MeasurementPolicy {
-        source: format!("chain:{registry}:{}", hex0x(hierarchy.base_image_id)),
-        pack: MeasurementPack {
-            schema: "atakit.measurement-pack.v1".to_string(),
-            revision: 1,
-            published_at: chrono::Utc::now().to_rfc3339(),
-            base_image: BaseImage {
-                name: hierarchy.spec.name.clone(),
-                version: hierarchy.spec.version.clone(),
-                id: hex0x(hierarchy.base_image_id),
-                uri: if hierarchy.spec.uri.is_empty() {
-                    None
-                } else {
-                    Some(hierarchy.spec.uri.clone())
-                },
-                archive_sha256: None,
-            },
-            profiles,
-        },
-    })
-}
-
-fn chain_pcr_spec_to_measurement(
-    spec: &automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec,
-) -> PcrSpec {
-    PcrSpec {
-        pcr_index: spec.pcrIndex,
-        verify_type: match spec.verifyType {
-            0 => "static".to_string(),
-            1 => "dynamicSubset".to_string(),
-            2 => "dynamicSubsequence".to_string(),
-            other => format!("unknown-{other}"),
-        },
-        match_data: spec.matchData.iter().map(hex0x).collect(),
-        event_indices: Vec::new(),
-        total_events: None,
-    }
-}
-
-fn infer_cloud_tee_from_profile_name(name: &str) -> Result<(&'static str, &'static str)> {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
-    let cloud = if normalized.starts_with("gcp-") || normalized.contains("-gcp-") {
-        "gcp"
-    } else if normalized.starts_with("azure-") || normalized.contains("-azure-") {
-        "azure"
-    } else if normalized.starts_with("aws-") || normalized.contains("-aws-") {
-        "aws"
-    } else {
-        bail!(
-            "cannot infer cloud from BaseImageRegistry platform profile name {:?}; \
-             expected names like gcp-tdx, gcp-sev-snp, azure-tdx, azure-sev-snp, or aws-sev-snp",
-            name
-        );
-    };
-    let tee = if normalized.contains("tdx") {
-        "tdx"
-    } else if normalized.contains("sev-snp") || normalized.contains("snp") {
-        "sev-snp"
-    } else if normalized.contains("nitro") {
-        "nitro"
-    } else {
-        bail!(
-            "cannot infer TEE from BaseImageRegistry platform profile name {:?}; \
-             expected names containing tdx, sev-snp, snp, or nitro",
-            name
-        );
-    };
-    Ok((cloud, tee))
+    !init_chain.rpc_url.trim().is_empty()
+        && (init_chain.base_image_registry != ZERO_ADDR || init_chain.session_registry != ZERO_ADDR)
 }
 
 fn hex0x(bytes: impl AsRef<[u8]>) -> String {
@@ -743,6 +624,8 @@ pub(super) struct ResolvedImage {
     pub source_path: Option<String>,
     /// Local secure-boot cert directory from the image store, if available.
     pub certs_dir: Option<String>,
+    /// Publisher-qualified identity measured inside a stored base image.
+    pub measured_base_image_ref: Option<String>,
 }
 
 /// Resolve the `--image` argument into a display name and optional source path.
@@ -793,6 +676,7 @@ pub(super) fn resolve_image(
         display_name: image_arg.to_string(),
         source_path: None,
         certs_dir: None,
+        measured_base_image_ref: None,
     })
 }
 
@@ -829,7 +713,32 @@ fn resolve_store_image(
         display_name: image_ref.to_string(),
         source_path: Some(disk_path.display().to_string()),
         certs_dir: Some(store.certs_dir(image_ref).display().to_string()),
+        measured_base_image_ref: Some(read_measured_base_image_ref(store, image_ref)?),
     })
+}
+
+fn read_measured_base_image_ref(store: &ImageStore, image_ref: &ImageRef) -> Result<String> {
+    let path = store
+        .base_dir()
+        .join(&image_ref.repository)
+        .join(&image_ref.tag)
+        .join("baseimage.toml");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let document: toml::Value =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let value = document
+        .get("meta")
+        .and_then(|meta| meta.get("base-image-ref"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{} does not define meta.base-image-ref", path.display()))?;
+    let measured: AppRef = value.parse().with_context(|| {
+        format!(
+            "{}.meta.base-image-ref is not a publisher-qualified base-image reference",
+            path.display()
+        )
+    })?;
+    Ok(measured.to_string())
 }
 
 /// Resolved workload source: archive path + name/version + declared ports + disks.
@@ -858,6 +767,9 @@ pub(crate) struct ResolvedWorkload {
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
+    /// Owner fingerprint of the workload's publisher. A store reference names
+    /// it; a path or directory takes it from the configured signing key.
+    pub publisher: alloy_ext::core::primitives::B256,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -865,19 +777,28 @@ pub(crate) fn resolve_workload(
     source: &Option<String>,
     dir: &Option<PathBuf>,
     env: &Env,
+    config: &Config,
+    signing_key: Option<&str>,
     skip_freshness_check: bool,
 ) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
-        // Store reference: name:version
+        // Store reference: <publisher>/<name>:<version>
         if crate::commands::workload::looks_like_store_ref(src) {
-            let (name, version) = src
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
+            let workload_ref = crate::commands::workload::parse_workload_ref(src, &config.alias)?;
             let store = WorkloadStore::new(&env.workload_dir);
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = workload_ref.workload_id();
+            let entry = store
+                .get(&workload_id)?
+                .ok_or_else(|| anyhow::anyhow!("workload not found in store: {src}"))?;
+            let (name, version) = (entry.meta.name.clone(), entry.meta.version.clone());
+            let publisher = entry
+                .meta
+                .publisher
+                .parse()
+                .context("store entry has an invalid publisher")?;
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
+                bail!("no archive blob for {src} in store");
             }
             let (result, archive_sha256) = inspect_workload_archive_snapshot(&blob)
                 .context("failed to inspect store archive")?;
@@ -897,6 +818,7 @@ pub(crate) fn resolve_workload(
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 archive_sha256,
+                publisher,
                 name,
                 version,
                 ports,
@@ -930,9 +852,12 @@ pub(crate) fn resolve_workload(
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+        // A path records no publisher; the identity comes from the signing key.
+        let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
         return Ok(ResolvedWorkload {
             archive_path: path,
             archive_sha256,
+            publisher,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
             ports,
@@ -990,7 +915,10 @@ pub(crate) fn resolve_workload(
     // The declared unmeasured-data set comes from the manifest (committed to
     // PCR23), not the source TOML, so every deploy mode resolves the same set.
     let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+    // A workload directory records no publisher either.
+    let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
     Ok(ResolvedWorkload {
+        publisher,
         archive_path,
         archive_sha256,
         name: result.manifest.meta.name,
@@ -1117,7 +1045,7 @@ pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)
 
 /// Validate that the given image ref is allowed by the workload's base-image policy.
 pub(super) fn validate_base_image(
-    image_display_name: &str,
+    selected_base_image_ref: &str,
     base_image_mode: &str,
     base_image: &[String],
 ) -> Result<()> {
@@ -1125,40 +1053,45 @@ pub(super) fn validate_base_image(
         return Ok(());
     }
 
-    // Every entry must parse as a valid ImageRef (repository:tag).
-    for entry in base_image {
-        if entry.parse::<ImageRef>().is_err() {
-            bail!(
-                "invalid base-image entry '{}': must be repository:tag format \
-                 (e.g. 'automata-linux:v0.2.6-debug')",
-                entry,
-            );
-        }
-    }
+    let allowed: Vec<AppRef> = base_image
+        .iter()
+        .map(|entry| {
+            entry
+                .parse()
+                .with_context(|| format!("invalid publisher-qualified base-image entry {entry:?}"))
+        })
+        .collect::<Result<_>>()?;
+    let selected: AppRef = selected_base_image_ref.parse().with_context(|| {
+        format!(
+            "selected base image {selected_base_image_ref:?} has no publisher-qualified \
+             measured identity; pass --base-image <publisher>/<name>:<version>"
+        )
+    })?;
+    let selected_is_listed = allowed.iter().any(|entry| entry == &selected);
 
     match base_image_mode {
         "whitelist" => {
             // Empty whitelist = nothing allowed.
-            if !base_image.iter().any(|b| b == image_display_name) {
+            if !selected_is_listed {
                 if base_image.is_empty() {
                     bail!(
                         "image '{}' rejected: base-image-mode is 'whitelist' but \
                          base-image list is empty (no images are allowed)",
-                        image_display_name,
+                        selected_base_image_ref,
                     );
                 }
                 bail!(
                     "image '{}' is not in the workload's base-image whitelist: [{}]",
-                    image_display_name,
+                    selected_base_image_ref,
                     base_image.join(", "),
                 );
             }
         }
         "blacklist" => {
-            if base_image.iter().any(|b| b == image_display_name) {
+            if selected_is_listed {
                 bail!(
                     "image '{}' is blacklisted by the workload",
-                    image_display_name,
+                    selected_base_image_ref,
                 );
             }
         }
@@ -1170,6 +1103,119 @@ pub(super) fn validate_base_image(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod base_image_validation_tests {
+    use super::*;
+
+    const PUBLISHER_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUBLISHER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn stored_image_uses_its_measured_publisher_qualified_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            format!("[meta]\nformat = 2\nbase-image-ref = \"{PUBLISHER_A}/automata-linux:v1\"\n"),
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        assert_eq!(
+            read_measured_base_image_ref(&store, &image_ref).unwrap(),
+            format!("{PUBLISHER_A}/automata-linux:v1")
+        );
+    }
+
+    #[test]
+    fn stored_image_rejects_a_base_image_reference_without_a_publisher() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            "[meta]\nformat = 2\nbase-image-ref = \"automata-linux:v1\"\n",
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        let error = read_measured_base_image_ref(&store, &image_ref).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_whitelist_entry() {
+        validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bare_store_image_ref_cannot_discard_the_publisher() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("has no publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_base_image_assertion_matches_the_publisher_too() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_B}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not in"), "{error}");
+    }
+
+    #[test]
+    fn malformed_policy_entry_is_rejected() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &["automata-linux:v1".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid publisher-qualified base-image entry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_blacklist_entry() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "blacklist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("blacklisted"), "{error}");
+    }
 }
 
 /// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
@@ -1741,8 +1787,10 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
-            format: 1,
+            format: 3,
             instance_name: "test-instance".to_string(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "test-workload".to_string(),
             workload_version: "v0.0.1".to_string(),
             target_name: "test-target".to_string(),
@@ -1818,53 +1866,6 @@ mod portal_endpoint_tests {
 #[cfg(test)]
 mod tls_measurement_policy_tests {
     use super::*;
-    use alloy_ext::core::primitives::B256;
-
-    #[test]
-    fn infers_cloud_and_tee_from_supported_profile_names() {
-        assert_eq!(
-            infer_cloud_tee_from_profile_name("gcp-tdx").unwrap(),
-            ("gcp", "tdx")
-        );
-        assert_eq!(
-            infer_cloud_tee_from_profile_name("gcp-sev-snp").unwrap(),
-            ("gcp", "sev-snp")
-        );
-        assert_eq!(
-            infer_cloud_tee_from_profile_name("azure_snp_westus").unwrap(),
-            ("azure", "sev-snp")
-        );
-        assert_eq!(
-            infer_cloud_tee_from_profile_name("aws-nitro").unwrap(),
-            ("aws", "nitro")
-        );
-    }
-
-    #[test]
-    fn rejects_unmappable_chain_profile_names() {
-        let err = infer_cloud_tee_from_profile_name("production-profile").unwrap_err();
-        assert!(err.to_string().contains("cannot infer cloud"), "{err}");
-
-        let err = infer_cloud_tee_from_profile_name("gcp-production").unwrap_err();
-        assert!(err.to_string().contains("cannot infer TEE"), "{err}");
-    }
-
-    #[test]
-    fn converts_chain_pcr_spec_to_measurement_pack_shape() {
-        let spec = automata_tee_workload_measurement::stubs::BaseImageRegistry::PcrSpec {
-            pcrIndex: 4,
-            verifyType: 0,
-            matchData: vec![B256::repeat_byte(0xaa)],
-        };
-
-        let got = chain_pcr_spec_to_measurement(&spec);
-
-        assert_eq!(got.pcr_index, 4);
-        assert_eq!(got.verify_type, "static");
-        assert_eq!(got.match_data, vec![format!("0x{}", "aa".repeat(32))]);
-        assert!(got.event_indices.is_empty());
-        assert_eq!(got.total_events, None);
-    }
 
     #[test]
     fn chain_measurement_policy_is_available_with_registration_off() {
@@ -1874,32 +1875,88 @@ mod tls_measurement_policy_tests {
         chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
 
         assert!(chain_measurement_policy_available(&chain));
+
+        chain.base_image_registry = ZERO_ADDR.to_string();
+        chain.session_registry = "0x2222222222222222222222222222222222222222".to_string();
+        assert!(chain_measurement_policy_available(&chain));
     }
 
     #[tokio::test]
-    async fn incomplete_local_pack_does_not_fallback_to_chain() {
+    async fn default_tls_policy_does_not_read_local_measurement_cache() {
         let data_dir = tempfile::tempdir().unwrap();
         let pack_dir = data_dir
             .path()
             .join("baseimage")
             .join("measurements")
-            .join(atakit_image::encode_image_ref_path_segment("base"))
-            .join(atakit_image::encode_image_ref_path_segment("v1"));
+            .join("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
 
+        let chain = synthesize_off_init_chain();
+
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured chain with BaseImageRegistry or SessionRegistry"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_image_flag_is_only_an_assertion_against_status_id() {
+        let data_dir = tempfile::tempdir().unwrap();
         let mut chain = synthesize_off_init_chain();
         chain.rpc_url = "https://rpc.example.com".to_string();
         chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
 
-        let error =
-            resolve_tls_measurement_policy(None, Some("base:v1"), &[], data_dir.path(), &chain)
-                .await
-                .unwrap_err();
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            Some("0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/base:v1"),
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
 
+        assert!(error.to_string().contains("--base-image"), "{error}");
         assert!(
-            error.to_string().contains("measurement-pack.sig"),
+            error
+                .to_string()
+                .contains("GET /status claimed base_image_id"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_publisher_key_requires_explicit_measurements() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chain = synthesize_off_init_chain();
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &["0x02".to_string()],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--measurement-publisher-key requires --measurements"
         );
     }
 }

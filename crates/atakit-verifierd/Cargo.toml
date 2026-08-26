@@ -1,0 +1,28 @@
+[package]
+name = "atakit-verifierd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+atakit-attestation.workspace = true
+atakit-attestation-client.workspace = true
+atakit-cvm-encoding.workspace = true
+atakit-cvm-types.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+hex.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+k256.workspace = true
+tempfile.workspace = true
+tower = "0.5"

@@ -8,8 +8,8 @@ use owo_colors::OwoColorize;
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
-    resolve_tls_measurement_policy, resolve_unmeasured_tar, resolve_workload,
-    synthesize_off_init_chain, synthesize_self_generated_key,
+    resolve_explicit_tls_measurement_policy, resolve_init_pcr_policy, resolve_unmeasured_tar,
+    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -22,9 +22,17 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("init port {init_port} + 1000 overflows u16"))?;
 
     // 2. Resolve workload.
-    let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+    let resolved = resolve_workload(
+        &args.source,
+        &args.dir,
+        env,
+        config,
+        args.signing_key.as_deref(),
+        args.skip_freshness_check,
+    )?;
     let archive_path = resolved.archive_path;
     let archive_sha256 = resolved.archive_sha256;
+    let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
     let workload_attributes = resolved.attributes;
@@ -121,15 +129,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .collect();
     let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
 
-    let init_config = InitConfig {
+    let mut init_config = InitConfig {
         platform: args.platform.clone(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
         prover_credential: prover_init,
+        pcr_policy: None,
         disks: disk_passphrases,
     };
+    if !registration_off && args.pcr_policy.is_some() {
+        bail!("--pcr-policy requires effective chain registration = \"off\"");
+    }
     let initialization_timeout_secs = init::initialization_timeout_seconds(
         args.init_timeout,
         init_config.owner_operations.op_expiry_seconds,
@@ -188,30 +200,42 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!("{}", "done".green());
 
     eprint!("  [2/{step_count}] Verify portal TLS... ");
-    let portal_client = if args.unsafe_skip_tls_attestation {
+    let verified_tls = if args.unsafe_skip_tls_attestation {
         eprintln!("{}", "unsafe bypass".yellow());
         crate::commands::cloud::warn_unsafe_skip_tls_attestation();
-        init::unsafe_portal_client(std::time::Duration::from_secs(
-            init::PORTAL_READINESS_TIMEOUT_SECONDS,
-        ))
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        None
     } else {
-        let measurement_policy = resolve_tls_measurement_policy(
+        let untrusted_portal_base_image_id = if args.measurements.is_none() {
+            Some(
+                init::read_untrusted_portal_base_image_id(&host, status_port)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+            )
+        } else {
+            None
+        };
+        let measurement_policy = resolve_explicit_tls_measurement_policy(
             args.measurements.as_deref(),
             args.base_image.as_deref(),
+            untrusted_portal_base_image_id,
             &args.measurement_publisher_key,
             &env.data_dir,
             &init_config.chain,
         )
         .await?;
-        let tls_verification_trust = init::load_tls_verification_trust(
-            &args.gcp_ak_root_cert,
-            &args.azure_maa_key,
-            &args.amd_ark_root_cert,
-            &args.amd_snp_crl,
-            args.amd_snp_security_policy.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tls_verification_trust =
+            init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+                gcp_ak_root_certs: &args.gcp_ak_root_cert,
+                azure_maa_certs: &args.azure_maa_cert,
+                aws_nitro_root_certs: &args.aws_nitro_root_cert,
+                amd_ark_root_certs: &args.amd_ark_root_cert,
+                amd_snp_crls: &args.amd_snp_crl,
+                amd_snp_security_policy: args.amd_snp_security_policy.as_deref(),
+                aws_document_maximum_age_seconds: args.aws_document_maximum_age_seconds,
+                aws_document_allowed_future_clock_difference_seconds: args
+                    .aws_document_allowed_future_clock_difference_seconds,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
             &args.tdx_dcap_automata_read_strategy,
             args.tdx_dcap_automata_multicall3_address.clone(),
@@ -225,14 +249,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
             automata_read_strategy,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let verified_tls = init::bootstrap_portal_tls_with_trust_config(
+        let tls_mode = init::portal_tls_mode_for_init_chain(
+            &init_config.chain,
+            tls_verification_trust,
+            tdx_dcap_collateral,
+            measurement_policy,
+            untrusted_portal_base_image_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let verified_tls = init::bootstrap_portal_tls(
             &host,
             status_port,
-            measurement_policy,
+            &tls_mode,
             Some(workload_attributes),
-            tls_verification_trust,
-            init::azure_maa_trust_config_from_init_chain(&init_config.chain),
-            tdx_dcap_collateral,
             args.trust_tls_cert_sha256.as_deref(),
             Some(&init::workload_tls_attestation_report_path(
                 &env.cache_dir,
@@ -248,8 +278,30 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         } else {
             eprintln!("{}", "done".green());
         }
-        verified_tls.client
+        Some(verified_tls)
     };
+    let portal_client = match &verified_tls {
+        Some(verified) => verified.client().clone(),
+        None => init::unsafe_portal_client(std::time::Duration::from_secs(
+            init::PORTAL_READINESS_TIMEOUT_SECONDS,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
+    init_config.pcr_policy = resolve_init_pcr_policy(
+        args.pcr_policy.as_deref(),
+        &init_config,
+        registration_off,
+        verified_tls.as_ref(),
+        &workload_app_ref,
+    )
+    .await?;
 
     // 7. Initialize workload.
     eprintln!("  [3/{step_count}] Initialize workload...");

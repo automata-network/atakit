@@ -109,9 +109,68 @@ pub enum CloudError {
     Json(#[from] serde_json::Error),
 }
 
+/// Verification errors raised by `atakit-attestation-client` re-enter this
+/// vocabulary unchanged.
+///
+/// Each variant maps onto the `CloudError` variant carrying the identical
+/// message, so relocating that code did not change what any `atakit cloud`
+/// command prints. Wrapping instead of mapping would have.
+impl From<atakit_attestation_client::PortalVerificationError> for CloudError {
+    fn from(error: atakit_attestation_client::PortalVerificationError) -> Self {
+        use atakit_attestation_client::PortalVerificationError as Source;
+        match error {
+            Source::Config { message } => CloudError::Config { message },
+            Source::Http { message } => CloudError::Http { message },
+            Source::PortalTlsAttestationFailed { message } => {
+                CloudError::PortalTlsAttestationFailed { message }
+            }
+            Source::PortalSessionVerificationFailed { message } => {
+                CloudError::PortalSessionVerificationFailed { message }
+            }
+            Source::SessionVerification { failure } => {
+                let message = serde_json::to_string_pretty(&failure)
+                    .unwrap_or_else(|_| failure.errors.join("; "));
+                CloudError::PortalSessionVerificationFailed { message }
+            }
+            Source::IoPath { path, source } => CloudError::IoPath { path, source },
+            Source::Json(source) => CloudError::Json(source),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CloudError;
+
+    /// The conversion must preserve the rendered message exactly. A caller that
+    /// formats the error sees no difference between the pre-relocation and
+    /// post-relocation build.
+    #[test]
+    fn verification_errors_convert_without_changing_their_message() {
+        use atakit_attestation_client::PortalVerificationError as Source;
+
+        for source in [
+            Source::Config {
+                message: "bad input".to_string(),
+            },
+            Source::Http {
+                message: "connection reset".to_string(),
+            },
+            Source::PortalTlsAttestationFailed {
+                message: "quote mismatch".to_string(),
+            },
+            Source::PortalSessionVerificationFailed {
+                message: "invalid session evidence".to_string(),
+            },
+            Source::IoPath {
+                path: "/dev/urandom".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        ] {
+            let expected = source.to_string();
+            assert_eq!(CloudError::from(source).to_string(), expected);
+        }
+    }
 
     #[test]
     fn portal_session_verification_error_keeps_message_field() {

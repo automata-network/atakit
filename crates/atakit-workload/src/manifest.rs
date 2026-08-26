@@ -59,6 +59,15 @@ pub struct ManifestImage {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestMeta {
     pub format: u32,
+    /// Fingerprint of the key that publishes this workload: `0x` followed by 64
+    /// lowercase hexadecimal characters.
+    ///
+    /// The identifier is `keccak256(abi.encode(domain, publisher, name,
+    /// version))`, so a workload cannot be identified by name and version
+    /// alone. Recording the publisher here places it inside the measured
+    /// manifest, which is what lets the portal derive the identifier it reports
+    /// rather than be told what to claim.
+    pub publisher: String,
     pub name: String,
     pub version: String,
 }
@@ -386,7 +395,7 @@ pub fn parse_unmeasured_env_file_names(
                 message: format!("invalid environment variable name {key:?}"),
             });
         }
-        if key.starts_with("ATAKIT_") {
+        if key.starts_with("ATAKIT_") || key.starts_with("VERIFIERD_") {
             return Err(WorkloadError::EnvFileParse {
                 path: path.to_path_buf(),
                 line: i + 1,
@@ -630,11 +639,14 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 /// `images` contains per-service image metadata (archive path + image ID).
 /// `environment` is the already-resolved (env_file merged) environment.
 /// `dep_environments` contains resolved environments for each dependency.
+/// `publisher` is the fingerprint of the publishing key; it is measured, so it
+/// is validated here rather than trusted.
 // Keep each measured manifest section explicit at this deterministic build
 // boundary. Grouping them would hide which inputs affect the canonical bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn build_manifest(
     config: &WorkloadConfig,
+    publisher: &str,
     resolved_image: &str,
     environment: BTreeMap<String, String>,
     dep_environments: BTreeMap<String, BTreeMap<String, String>>,
@@ -643,6 +655,15 @@ pub fn build_manifest(
     unmeasured_env_files: BTreeMap<String, Vec<String>>,
     images: BTreeMap<String, ManifestImage>,
 ) -> Result<Manifest, WorkloadError> {
+    // A malformed publisher would be measured into PCR23 and would derive an
+    // identifier registered to nobody, so it is rejected at the boundary rather
+    // than baked into the archive.
+    if !atakit_core::is_canonical_id(publisher) {
+        return Err(WorkloadError::Validation(format!(
+            "publisher must be '0x' followed by 64 lowercase hexadecimal \
+             characters, got '{publisher}'"
+        )));
+    }
     let w = &config.workload;
     let attributes = crate::validate::normalize_attributes(&w.attributes)?;
     let measured_data = measured_data_from_hashes(&hashes);
@@ -858,6 +879,7 @@ pub fn build_manifest(
     Ok(Manifest {
         meta: ManifestMeta {
             format: crate::FORMAT_VERSION,
+            publisher: publisher.to_string(),
             name: w.name.clone(),
             version: w.version.clone(),
         },
@@ -990,6 +1012,11 @@ fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &O
 mod tests {
     use super::*;
 
+    /// Fixed publisher for tests that are not about the publisher itself, so
+    /// every manifest they build is identified consistently.
+    const TEST_PUBLISHER: &str =
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     #[allow(clippy::too_many_arguments)]
     fn build_manifest(
         config: &WorkloadConfig,
@@ -1003,6 +1030,7 @@ mod tests {
     ) -> Manifest {
         super::build_manifest(
             config,
+            TEST_PUBLISHER,
             resolved_image,
             environment,
             dep_environments,
@@ -1059,6 +1087,7 @@ mod tests {
             "TOKEN=one\nTOKEN=two\n",
             "BAD-NAME=value\n",
             "ATAKIT_PUBLIC_IP=value\n",
+            "VERIFIERD_PORTAL_ALLOWED_PORTS=[2024]\n",
         ] {
             assert!(parse_unmeasured_env_file_names(path, content).is_err());
         }
@@ -1098,6 +1127,28 @@ mod tests {
     }
 
     #[test]
+    fn measured_environment_sources_allow_verifierd_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("verifierd.env");
+        std::fs::write(
+            &env_path,
+            "VERIFIERD_RPC_URL=https://rpc.example\nVERIFIERD_CHAIN_ID=560048\n",
+        )
+        .unwrap();
+
+        let env_file = Some(StringOrArray::Single("verifierd.env".into()));
+        let explicit = BTreeMap::from([
+            ("VERIFIERD_TRUST_MODE".into(), "chain".into()),
+            ("VERIFIERD_CHAIN_ID".into(), "1".into()),
+        ]);
+
+        let result = resolve_environment(&env_file, &explicit, tmp.path()).unwrap();
+        assert_eq!(result["VERIFIERD_RPC_URL"], "https://rpc.example");
+        assert_eq!(result["VERIFIERD_TRUST_MODE"], "chain");
+        assert_eq!(result["VERIFIERD_CHAIN_ID"], "1");
+    }
+
+    #[test]
     fn minimal_manifest_serializes() {
         let toml_str = r#"
 format = 2
@@ -1134,7 +1185,10 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":6"));
+        assert!(output.contains("\"format\":7"));
+        // The publisher is measured: it is part of the canonical bytes PCR23
+        // covers, not metadata carried alongside them.
+        assert!(output.contains(&format!("\"publisher\":\"{TEST_PUBLISHER}\"")));
         assert!(output.contains("\"attributes\":{}"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
@@ -1199,6 +1253,86 @@ image = "my-app:latest"
         );
     }
 
+    fn minimal_config() -> WorkloadConfig {
+        WorkloadConfig::load_from_str(
+            r#"
+format = 7
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn build_with_publisher(publisher: &str) -> Result<Manifest, WorkloadError> {
+        super::build_manifest(
+            &minimal_config(),
+            publisher,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// The publisher is part of the workload's identity, so it has to be part of
+    /// what PCR23 covers. If it were carried outside the measured bytes, an
+    /// operator could run one publisher's workload and attest another's
+    /// identity.
+    #[test]
+    fn publisher_changes_the_measured_bytes() {
+        let a = serialize_canonical_json(
+            &build_with_publisher(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let b = serialize_canonical_json(
+            &build_with_publisher(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            a, b,
+            "two publishers must not produce the same measured manifest"
+        );
+    }
+
+    /// A malformed publisher would be measured and would derive an identifier
+    /// registered to nobody, so it is refused at the build boundary rather than
+    /// written into an archive.
+    #[test]
+    fn build_manifest_rejects_a_malformed_publisher() {
+        for bad in [
+            "",
+            "automata",
+            "0xNOTHEX",
+            // Correct length, but uppercase: two spellings of one identifier
+            // would compare unequal.
+            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            // Missing the 0x prefix.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let error = build_with_publisher(bad)
+                .expect_err(&format!("expected publisher '{bad}' to be refused"));
+            assert!(
+                error.to_string().contains("publisher must be"),
+                "unexpected error for '{bad}': {error}"
+            );
+        }
+    }
+
     #[test]
     fn build_manifest_returns_invalid_attribute_error() {
         let config = WorkloadConfig::load_from_str(
@@ -1219,6 +1353,7 @@ image = "my-app:latest"
 
         let error = super::build_manifest(
             &config,
+            TEST_PUBLISHER,
             "my-app:latest",
             BTreeMap::new(),
             BTreeMap::new(),

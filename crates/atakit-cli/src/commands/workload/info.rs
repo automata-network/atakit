@@ -19,20 +19,23 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
         None => None,
     };
 
+    // Only a store reference names a publisher, so only that form yields an
+    // identifier to query the chain with. Inspecting an archive by path gives a
+    // name and version and no way to know whose they are.
+    let mut store_workload_id: Option<String> = None;
     let opts = if let Some(ref archive_arg) = args.archive {
         // Check if it looks like a store reference (name:version)
         let archive_str = archive_arg.to_string_lossy();
         if looks_like_store_ref(&archive_str) {
             let store = WorkloadStore::new(&env.workload_dir);
-            let (name, version) = archive_str
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = super::parse_workload_ref(&archive_str, &config.alias)?.workload_id();
+            store_workload_id = Some(workload_id.clone());
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                anyhow::bail!("no archive blob for {name}:{version} in store");
+                anyhow::bail!("no archive blob for {archive_str} in store");
             }
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(blob),
                 workload_dir: None,
                 engine,
@@ -42,6 +45,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(archive_arg.clone()),
                 workload_dir: None,
                 engine,
@@ -60,6 +64,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
         let archive = find_archive(&dir);
         if archive.is_some() {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive,
                 workload_dir: None,
                 engine,
@@ -69,6 +74,7 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: None,
                 workload_dir: Some(dir),
                 engine,
@@ -80,29 +86,31 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
     };
 
     let result = atakit_workload::inspect_workload(&opts).await?;
-    let name = &result.manifest.meta.name;
-    let version = &result.manifest.meta.version;
-
-    // Check on-chain status if RPC is configured
-    let chain_data = refresh_chain(name, version, env, config).await;
+    // Check on-chain status if RPC is configured and the input identified a
+    // publisher.
+    let chain_data = match store_workload_id.as_deref() {
+        Some(workload_id) => refresh_chain(workload_id, env, config).await,
+        None => None,
+    };
 
     print_info(
         &result.manifest,
         &result.sha256,
-        &result.pcr23,
+        &result.pcr23_sha256,
+        store_workload_id.as_deref(),
         chain_data.as_ref(),
     );
     Ok(())
 }
 
 /// Query on-chain data and update local store. Returns None if chain not configured.
-async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) -> Option<ChainData> {
+async fn refresh_chain(workload_id_hex: &str, env: &Env, config: &Config) -> Option<ChainData> {
     // Best-effort: resolve publish chain, skip if not configured.
     let chain_name = config.publish.chain.as_deref()?;
     let chain_config = config.chains.get(chain_name)?;
     let rpc_url = &chain_config.rpc_url;
     let session_registry = &chain_config.session_registry;
-    let workload_id = super::compute_workload_id(name, version);
+    let workload_id: alloy_ext::core::primitives::B256 = workload_id_hex.parse().ok()?;
 
     let chain = query_chain_data(workload_id, rpc_url, session_registry)
         .await
@@ -110,7 +118,7 @@ async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) ->
 
     // Update store with chain data
     let store = WorkloadStore::new(&env.workload_dir);
-    if let Ok(Some(entry)) = store.get(name, version) {
+    if let Ok(Some(entry)) = store.get(workload_id_hex) {
         let mut meta = entry.meta;
         apply_chain_data_to_meta(&mut meta, &chain);
         let _ = store.save_meta(&meta);
@@ -129,7 +137,13 @@ fn section_header(name: &str) {
     println!("{}", format!("{prefix}{pad}").cyan().bold());
 }
 
-fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&ChainData>) {
+fn print_info(
+    m: &Manifest,
+    sha256: &str,
+    pcr23: &str,
+    workload_id: Option<&str>,
+    chain_info: Option<&ChainData>,
+) {
     // Title
     println!(
         "{}",
@@ -320,14 +334,17 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         }
     }
 
-    // Compute workload ID: keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))
-    // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
-    let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
-    println!(
-        "  {:<18}{}",
-        "Workload ID:",
-        format!("0x{}", hex::encode(workload_id)).dimmed()
-    );
+    // A manifest cannot know its own identifier: the identifier is derived from
+    // the publisher, and nothing in the archive records who that is. It is
+    // shown only when the caller named one.
+    match workload_id {
+        Some(workload_id) => println!("  {:<18}{}", "Workload ID:", workload_id.dimmed()),
+        None => println!(
+            "  {:<18}{}",
+            "Workload ID:",
+            "unknown without a publisher".dimmed()
+        ),
+    }
     match chain_info {
         Some(info) => match info.status.as_str() {
             "active" => println!("  {:<18}{}", "On-chain:", "active".green().bold()),

@@ -7,13 +7,13 @@ pub mod exec;
 pub mod gcp;
 pub mod init;
 pub mod naming;
+pub mod pcr_policy;
 pub mod plan;
 pub mod provider;
 pub mod qemu;
 pub mod session;
 pub mod session_lifecycle;
 pub mod state;
-mod tdx_dcap;
 
 #[cfg(feature = "cli")]
 pub mod cli;

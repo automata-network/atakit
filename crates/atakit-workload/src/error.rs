@@ -73,14 +73,17 @@ pub enum WorkloadError {
     Io(#[from] std::io::Error),
 
     // ── store ────────────────────────────────────────────
-    #[error("workload not found in store: {name}:{version}")]
-    StoreNotFound { name: String, version: String },
+    // Entries are keyed by publisher-qualified workload identifier, so these
+    // name the identifier. A name and version alone no longer identifies an
+    // entry: two publishers may hold the same one.
+    #[error("workload not found in store: {workload_id}")]
+    StoreNotFound { workload_id: String },
 
-    #[error("workload already exists in store: {name}:{version}")]
-    StoreExists { name: String, version: String },
+    #[error("workload already exists in store: {workload_id}")]
+    StoreExists { workload_id: String },
 
-    #[error("no archive blob for workload: {name}:{version}")]
-    NoBlobInStore { name: String, version: String },
+    #[error("no archive blob for workload: {workload_id}")]
+    NoBlobInStore { workload_id: String },
 
     #[error("store path escapes base directory: {path}")]
     StorePathTraversal { path: PathBuf },
@@ -90,6 +93,13 @@ pub enum WorkloadError {
 
     #[error("failed to parse metadata {path}: {reason}")]
     ParseMeta { path: PathBuf, reason: String },
+
+    #[error("unsupported local workload metadata {path}: {reason}\nRecovery: {recovery}")]
+    UnsupportedMeta {
+        path: PathBuf,
+        reason: String,
+        recovery: String,
+    },
 
     // ── repository ───────────────────────────────────────
     #[error("repository error: {message}")]

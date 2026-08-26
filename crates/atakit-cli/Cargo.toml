@@ -2,6 +2,7 @@
 name = "atakit-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "atakit"
@@ -9,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 atakit-core.workspace = true
+atakit-cvm-encoding.workspace = true
+atakit-cvm-types.workspace = true
 atakit-config.workspace = true
 atakit-image = { workspace = true, features = ["cli"] }
 atakit-workload = { workspace = true, features = ["cli"] }
@@ -37,6 +40,7 @@ automata-tee-workload-measurement.workspace = true
 hex.workspace = true
 sha2.workspace = true
 k256.workspace = true
+serde_json_canonicalizer.workspace = true
 tar.workspace = true
 flate2.workspace = true
 futures-util.workspace = true

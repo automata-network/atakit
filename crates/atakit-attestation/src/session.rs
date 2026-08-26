@@ -10,28 +10,160 @@
 //! authorization, and registry state are separate concerns and are neither
 //! required nor inferred here.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
+use std::{fmt, marker::PhantomData};
 
+use atakit_cvm_encoding::pcr_comparison::{
+    decode256, decode384, encode_extend_from_zero256, encode_extend_from_zero384, PcrComparison256,
+    PcrComparison384,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256, Sha384};
 use sha3::Keccak256;
 use signature::{hazmat::PrehashVerifier, Verifier};
 
-use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral};
+use crate::{AmdSnpVerificationCollateral, IntelTdxDcapCollateral, PcrBankSelection};
 
 const SESSION_DOMAIN: &str = "CVM_SESSION_V1";
-const KEY_DOMAIN: &str = "KEY_RESOLVER_V1";
 const SESSION_NONCE_DOMAIN: &str = "CVM_SESSION_REG_NONCE_V1";
 const DELEGATION_DOMAIN: &str = "CVM_SESSION_KEY_DELEGATION";
 const EVIDENCE_BINDING_DOMAIN: &str = "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_EVIDENCE_BUNDLE_V1";
 const CHAIN_SUBMISSION_BINDING_DOMAIN: &str =
     "ATAKIT_PORTAL_SESSION_REQUEST_BINDING_CHAIN_SUBMISSION_V1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const MAX_SESSION_PCRS: usize = 24;
+const MAX_SESSION_EVENT_HASHES_PER_BANK: usize = u16::MAX as usize;
+const MAX_SESSION_EVENT_HASHES_TOTAL: usize = 2 * u16::MAX as usize;
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "an array containing at most {MAX} entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|length| length > MAX) {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX} entries"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+fn deserialize_session_pcrs<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_bounded_vec::<D, T, MAX_SESSION_PCRS>(deserializer)
+}
+
+fn deserialize_session_event_hashes<'de, D, const HASH_BYTES: usize>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct EventHashesVisitor<const HASH_BYTES: usize>;
+
+    impl<'de, const HASH_BYTES: usize> Visitor<'de> for EventHashesVisitor<HASH_BYTES> {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "an array containing at most {MAX_SESSION_EVENT_HASHES_PER_BANK} 0x-prefixed {HASH_BYTES}-byte hashes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|length| length > MAX_SESSION_EVENT_HASHES_PER_BANK)
+            {
+                return Err(A::Error::custom(format!(
+                    "array contains more than {MAX_SESSION_EVENT_HASHES_PER_BANK} entries"
+                )));
+            }
+            let mut values = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_SESSION_EVENT_HASHES_PER_BANK),
+            );
+            while let Some(value) = sequence.next_element::<String>()? {
+                if values.len() == MAX_SESSION_EVENT_HASHES_PER_BANK {
+                    return Err(A::Error::custom(format!(
+                        "array contains more than {MAX_SESSION_EVENT_HASHES_PER_BANK} entries"
+                    )));
+                }
+                let encoded = value.strip_prefix("0x").ok_or_else(|| {
+                    A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    ))
+                })?;
+                if encoded.len() != HASH_BYTES * 2
+                    || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(A::Error::custom(format!(
+                        "event hash must be 0x-prefixed and encode exactly {HASH_BYTES} bytes"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(EventHashesVisitor::<HASH_BYTES>)
+}
+
+fn total_session_event_hash_count_is_valid(counts: impl IntoIterator<Item = usize>) -> bool {
+    matches!(
+        counts
+            .into_iter()
+            .try_fold(0usize, |total, count| total.checked_add(count)),
+        Some(total) if total <= MAX_SESSION_EVENT_HASHES_TOTAL
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionEvidenceBundle {
     pub format: u8,
     pub binding: SessionBinding,
@@ -47,9 +179,96 @@ pub struct SessionEvidenceBundle {
     pub session_id: String,
     pub policy: SessionPolicy,
     pub owner: SessionOwner,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_binding: Option<SessionProviderBindingEvidence>,
+}
+
+/// Launch-time TPM evidence retained across `rotateKey`.
+///
+/// Rotation has no new TEE report and therefore no new generated provider
+/// PCR15 rule. This bounded projection keeps the last full-attestation quote
+/// that bound the provider TEE report to the TPM. It is not recursive, so
+/// repeated rotations cannot grow the evidence bundle without bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProviderBindingEvidence {
+    pub binding: SessionBinding,
+    pub tpm_quote: TpmQuoteEvidence,
+    pub tpm_certify: TpmCertifyEvidence,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub pcr_values: Vec<SessionPcrValue>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub event_log_hashes: Vec<SessionEventHashes>,
+    pub tpm_signing_key: SessionPublicKey,
+    pub session_id: String,
+    pub policy: SessionPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionEvidenceBundleWire {
+    format: u8,
+    binding: SessionBinding,
+    platform: SessionPlatform,
+    tee_evidence: RawEvidence,
+    ak_evidence: AkEvidence,
+    tpm_quote: TpmQuoteEvidence,
+    tpm_certify: TpmCertifyEvidence,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pcr_values: Vec<SessionPcrValue>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    event_log_hashes: Vec<SessionEventHashes>,
+    session_key: SessionPublicKey,
+    session_key_delegation: SessionKeyDelegation,
+    session_id: String,
+    policy: SessionPolicy,
+    owner: SessionOwner,
+    #[serde(default)]
+    provider_binding: Option<SessionProviderBindingEvidence>,
+}
+
+impl<'de> Deserialize<'de> for SessionEvidenceBundle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SessionEvidenceBundleWire::deserialize(deserializer)?;
+        let event_hash_counts = wire
+            .event_log_hashes
+            .iter()
+            .chain(
+                wire.provider_binding
+                    .iter()
+                    .flat_map(|binding| binding.event_log_hashes.iter()),
+            )
+            .flat_map(|hashes| [hashes.sha256.len(), hashes.sha384.len()]);
+        if !total_session_event_hash_count_is_valid(event_hash_counts) {
+            return Err(D::Error::custom(format!(
+                "event_log_hashes contains more than {MAX_SESSION_EVENT_HASHES_TOTAL} hashes in total"
+            )));
+        }
+        Ok(Self {
+            format: wire.format,
+            binding: wire.binding,
+            platform: wire.platform,
+            tee_evidence: wire.tee_evidence,
+            ak_evidence: wire.ak_evidence,
+            tpm_quote: wire.tpm_quote,
+            tpm_certify: wire.tpm_certify,
+            pcr_values: wire.pcr_values,
+            event_log_hashes: wire.event_log_hashes,
+            session_key: wire.session_key,
+            session_key_delegation: wire.session_key_delegation,
+            session_id: wire.session_id,
+            policy: wire.policy,
+            owner: wire.owner,
+            provider_binding: wire.provider_binding,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionBinding {
     pub mode: BindingMode,
     pub chain_id: u64,
@@ -66,11 +285,110 @@ pub enum BindingMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPlatform {
     pub cloud: String,
+    pub cloud_provenance: SessionCloudProvenance,
     pub attestation_mode: SessionAttestationMode,
     pub tee: String,
     pub machine_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloudProvenance {
+    pub source: SessionCloudSource,
+    pub detection: SessionCloudDetectionObservation,
+    pub user_provided: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloudSource {
+    Dmi,
+    Metadata,
+    UserProvided,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloudProvider {
+    Gcp,
+    Azure,
+    Aws,
+    Qemu,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloudDetectionObservation {
+    pub dmi: SessionDmiCloudObservation,
+    pub metadata: SessionMetadataCloudObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDmiCloudObservation {
+    pub sys_vendor: Option<String>,
+    pub product_name: Option<String>,
+    pub bios_vendor: Option<String>,
+    pub detected_cloud: SessionCloudProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadataCloudObservation {
+    pub gcp: SessionMetadataProbeObservation,
+    pub azure: SessionMetadataProbeObservation,
+    pub aws: SessionMetadataProbeObservation,
+    pub detected_cloud: SessionCloudProvider,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadataProbeObservation {
+    pub attempted: bool,
+    pub matched: bool,
+    pub http_status: Option<u16>,
+    pub response_headers: BTreeMap<String, String>,
+    pub response_body: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_session_cloud_provenance(
+    detected_cloud: SessionCloudProvider,
+) -> SessionCloudProvenance {
+    let probe = SessionMetadataProbeObservation {
+        attempted: false,
+        matched: false,
+        http_status: None,
+        response_headers: BTreeMap::new(),
+        response_body: None,
+        error: None,
+    };
+    SessionCloudProvenance {
+        source: SessionCloudSource::Dmi,
+        detection: SessionCloudDetectionObservation {
+            dmi: SessionDmiCloudObservation {
+                sys_vendor: None,
+                product_name: None,
+                bios_vendor: None,
+                detected_cloud,
+            },
+            metadata: SessionMetadataCloudObservation {
+                gcp: probe.clone(),
+                azure: probe.clone(),
+                aws: probe,
+                detected_cloud: SessionCloudProvider::Unknown,
+                conflict: false,
+            },
+        },
+        user_provided: None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +400,7 @@ pub enum SessionAttestationMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawEvidence {
     pub kind: String,
     pub report: String,
@@ -89,6 +408,7 @@ pub struct RawEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AkEvidence {
     pub kind: String,
     pub ak_public: String,
@@ -96,33 +416,42 @@ pub struct AkEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TpmQuoteEvidence {
-    pub tpm2b_attest: String,
+    pub tpms_attest: String,
     pub tpm_signature: String,
     pub signature_hash: String,
+    pub pcr0_startup_locality: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TpmCertifyEvidence {
-    pub tpm2b_attest: String,
+    pub tpms_attest: String,
     pub tpm_signature: String,
     pub tpmt_public: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrValue {
     pub index: u8,
-    pub sha256: String,
+    pub sha256: Option<String>,
     pub sha384: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEventHashes {
     pub pcr_index: u8,
+    #[serde(deserialize_with = "deserialize_session_event_hashes::<_, 32>")]
     pub sha256: Vec<String>,
+    #[serde(deserialize_with = "deserialize_session_event_hashes::<_, 48>")]
+    pub sha384: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPublicKey {
     pub type_id: u8,
     pub bytes: String,
@@ -130,6 +459,7 @@ pub struct SessionPublicKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionKeyDelegation {
     pub tpm_signing_key: SessionPublicKey,
     pub digest: String,
@@ -138,38 +468,63 @@ pub struct SessionKeyDelegation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPolicy {
     pub workload_id: String,
     pub base_image_id: String,
     pub platform_profile_id: String,
     pub measurement_variant_id: String,
-    pub pcr_specs: Vec<SessionPcrPolicy>,
+    pub pcr_bank_selection: PcrBankSelection,
+    pub invariant_pcr_policy: SessionPcrPolicyBlock,
+    pub variant_pcr_policy: SessionPcrPolicyBlock,
+    pub workload_pcr_policy: SessionPcrPolicyBlock,
+    pub provider_pcr_policy: SessionPcrPolicyBlock,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPcrPolicyBlock {
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub pcr_specs256: Vec<SessionPcrPolicy>,
+    #[serde(deserialize_with = "deserialize_session_pcrs")]
+    pub pcr_specs384: Vec<SessionPcrPolicy384>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionPcrPolicy {
     pub pcr_index: u8,
-    pub verify_type: SessionPcrVerifyType,
-    pub match_data: Vec<String>,
+    pub comparison: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SessionPcrVerifyType {
-    Static,
-    DynamicSubset,
-    DynamicSubsequence,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPcrPolicy384 {
+    pub pcr_index: u8,
+    pub comparison: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionOwner {
     pub fingerprint: String,
     /// Optional on-chain transaction projection. It remains request-bound as
     /// part of the bundle JSON but is not an offline session-validity input.
-    pub contract_authorization: Option<serde_json::Value>,
+    pub contract_authorization: Option<SessionContractAuthorization>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionContractAuthorization {
+    pub op_expires_at: u64,
+    pub payload: String,
+    pub signature: String,
+    #[serde(default)]
+    pub calldata_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRequestBinding {
     pub challenge: String,
     pub signature: String,
@@ -241,7 +596,10 @@ pub enum SessionPlatformTrust {
     },
     AwsSnp {
         aws_nitro_roots: CertificateTrust,
+        aws_document_maximum_age_seconds: u64,
+        aws_document_allowed_future_clock_difference_seconds: u64,
         amd_ark_roots: CertificateTrust,
+        amd_snp_collateral: AmdSnpVerificationCollateral,
     },
 }
 
@@ -254,6 +612,26 @@ pub struct AzureMaaTrustKey {
     pub public_key: Vec<u8>,
 }
 
+/// A verifier-supplied Azure MAA signing certificate, reduced to the two values
+/// a certificate actually carries.
+///
+/// There is deliberately no `kid` or `issuer` here. Both are JSON Web Token
+/// concepts that do not exist in X.509: `kid` names a key in a JWT header and
+/// `issuer` is the token's `iss` claim, an attestation instance URL. A verifier
+/// takes them from the token under verification, and the signature check is
+/// what binds a key to that token — a `kid` in the header is attacker-supplied
+/// and authenticates nothing on its own.
+#[derive(Debug, Clone)]
+pub struct AzureMaaTrustCertificate {
+    /// PKCS#1 DER or a supported RSA public-key encoding, taken from the
+    /// certificate's `SubjectPublicKeyInfo`.
+    pub public_key: Vec<u8>,
+    /// Unix seconds, taken from the certificate's validity period. A bare
+    /// public key cannot supply this, which is why the verifier takes a
+    /// certificate.
+    pub not_after: u64,
+}
+
 /// Policy selected by the verifier's caller. The policy projection in the
 /// evidence bundle is untrusted; its IDs and any non-empty PCR projection must
 /// match this value.
@@ -263,12 +641,42 @@ pub struct TrustedSessionPolicy {
     pub base_image_id: [u8; 32],
     pub platform_profile_id: [u8; 32],
     pub measurement_variant_id: [u8; 32],
-    pub pcr_specs: Vec<SessionPcrPolicy>,
+    pub pcr_bank_selection: PcrBankSelection,
+    pub invariant_pcr_policy: SessionPcrPolicyBlock,
+    pub variant_pcr_policy: SessionPcrPolicyBlock,
+    pub workload_pcr_policy: SessionPcrPolicyBlock,
+    pub provider_pcr_policy: SessionPcrPolicyBlock,
     pub effective_attributes: Vec<SessionAttribute>,
     pub attribute_requirements: Vec<SessionAttributeRequirement>,
     /// AMD SEV-SNP registry defaults supplied by the verifier or read from
     /// AmdSnpSecurityPolicyRegistry.
     pub amd_snp_security_policies: Vec<super::AmdSnpSecurityPolicy>,
+}
+
+impl TrustedSessionPolicy {
+    fn complete_pcr_specs256(&self) -> Vec<SessionPcrPolicy> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs256.iter().cloned())
+        .collect()
+    }
+
+    fn complete_pcr_specs384(&self) -> Vec<SessionPcrPolicy384> {
+        [
+            &self.invariant_pcr_policy,
+            &self.variant_pcr_policy,
+            &self.workload_pcr_policy,
+            &self.provider_pcr_policy,
+        ]
+        .into_iter()
+        .flat_map(|block| block.pcr_specs384.iter().cloned())
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +696,15 @@ pub struct SessionAttributeRequirement {
 pub struct VerifiedSession {
     pub session_id: [u8; 32],
     pub session_key_fingerprint: [u8; 32],
+    /// Algorithm identifier of the verified session public key. `verify_key_types`
+    /// requires ES256K (`3`) for the session request binding.
+    pub session_key_type_id: u8,
+    /// The verified session public key itself. `session_key_fingerprint` is
+    /// recomputed from these bytes and checked against the bundle's claim, and
+    /// `session_key_delegation.session_key_possession_signature` is verified
+    /// against it, so this surfaces an already-verified value rather than
+    /// introducing a new check.
+    pub session_public_key: Vec<u8>,
     pub binding_mode: BindingMode,
     pub binding_chain_id: u64,
     pub binding_registry: [u8; 20],
@@ -405,6 +822,13 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
+    verify_provider_binding_evidence(
+        bundle,
+        &inputs.trust,
+        verified_tdx_tcb_status_bit,
+        &mut checks,
+        &mut errors,
+    );
     let authenticated_pcrs = verify_raw_quote(bundle, &mut checks, &mut errors);
     verify_quote_projection(
         bundle,
@@ -421,9 +845,22 @@ pub fn verify_session_bundle_at(
         &mut checks,
         &mut errors,
     );
+    let resolved_policy = if bundle.provider_binding.is_some() {
+        let mut policy = inputs.trust.policy.clone();
+        policy.provider_pcr_policy = SessionPcrPolicyBlock::default();
+        policy
+    } else {
+        resolve_provider_pcr_rules(
+            bundle,
+            &inputs.trust.platform,
+            &inputs.trust.policy,
+            &mut checks,
+            &mut errors,
+        )
+    };
     verify_policies(
         bundle,
-        &inputs.trust.policy,
+        &resolved_policy,
         verified_tdx_tcb_status_bit,
         &mut checks,
         &mut errors,
@@ -441,6 +878,8 @@ pub fn verify_session_bundle_at(
         Ok(VerifiedSession {
             session_id: session_id.expect("validated session id"),
             session_key_fingerprint: session_key_fingerprint.expect("validated session key"),
+            session_key_type_id: bundle.session_key.type_id,
+            session_public_key: session_key.expect("validated session key"),
             binding_mode: bundle.binding.mode,
             binding_chain_id: bundle.binding.chain_id,
             binding_registry: binding_registry.expect("validated binding registry"),
@@ -450,6 +889,134 @@ pub fn verify_session_bundle_at(
     } else {
         Err(SessionVerificationFailure { checks, errors })
     }
+}
+
+fn verify_provider_binding_evidence(
+    bundle: &SessionEvidenceBundle,
+    trust: &SessionTrust,
+    verified_tdx_tcb_status_bit: Option<u16>,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    let Some(provider_binding) = &bundle.provider_binding else {
+        return;
+    };
+
+    let mut binding_checks = Vec::new();
+    let mut binding_errors = Vec::new();
+    record(
+        &mut binding_checks,
+        &mut binding_errors,
+        "chain-mode",
+        bundle.binding.mode == BindingMode::Chain
+            && provider_binding.binding.mode == BindingMode::Chain,
+        "provider-binding evidence is allowed only for chain-bound key rotation",
+    );
+    record(
+        &mut binding_checks,
+        &mut binding_errors,
+        "tpm-signing-key-type",
+        provider_binding.tpm_signing_key.type_id == 2,
+        "provider-binding TPM signing key must use ES256",
+    );
+    let signing_key = decode_hex(
+        &provider_binding.tpm_signing_key.bytes,
+        "provider_binding.tpm_signing_key.bytes",
+        &mut binding_errors,
+    );
+    let signing_key_fingerprint = decode_hex_32(
+        &provider_binding.tpm_signing_key.fingerprint,
+        "provider_binding.tpm_signing_key.fingerprint",
+        &mut binding_errors,
+    );
+    if let (Some(key), Some(expected)) = (signing_key.as_ref(), signing_key_fingerprint) {
+        record(
+            &mut binding_checks,
+            &mut binding_errors,
+            "tpm-signing-key-fingerprint",
+            compute_key_fingerprint(provider_binding.tpm_signing_key.type_id, key) == expected,
+            "provider-binding TPM signing-key fingerprint mismatch",
+        );
+    }
+
+    let mut projected = bundle.clone();
+    projected.binding = provider_binding.binding.clone();
+    projected.tpm_quote = provider_binding.tpm_quote.clone();
+    projected.tpm_certify = provider_binding.tpm_certify.clone();
+    projected.pcr_values = provider_binding.pcr_values.clone();
+    projected.event_log_hashes = provider_binding.event_log_hashes.clone();
+    projected.session_key_delegation.tpm_signing_key = provider_binding.tpm_signing_key.clone();
+    projected.session_id = provider_binding.session_id.clone();
+    projected.policy = provider_binding.policy.clone();
+    projected.provider_binding = None;
+
+    let session_id = decode_hex_32(
+        &projected.session_id,
+        "provider_binding.session_id",
+        &mut binding_errors,
+    );
+    let tpm_signature = decode_b64(
+        &projected.tpm_quote.tpm_signature,
+        "provider_binding.tpm_quote.tpm_signature",
+        &mut binding_errors,
+    );
+    let tee_report = decode_b64(
+        &projected.tee_evidence.report,
+        "tee_evidence.report",
+        &mut binding_errors,
+    );
+    if let (Some(signature), Some(report), Some(expected_id)) =
+        (tpm_signature.as_ref(), tee_report.as_ref(), session_id)
+    {
+        let signature_hash: [u8; 32] = Keccak256::digest(signature).into();
+        let tee_hash: [u8; 32] = Keccak256::digest(report).into();
+        record(
+            &mut binding_checks,
+            &mut binding_errors,
+            "session-id",
+            compute_session_id(signature_hash, tee_hash) == expected_id,
+            "provider-binding session ID does not match its Quote signature and TEE report hash",
+        );
+    }
+
+    let authenticated_pcrs = verify_raw_quote(&projected, &mut binding_checks, &mut binding_errors);
+    verify_quote_projection(
+        &projected,
+        authenticated_pcrs.as_deref(),
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    verify_raw_certify(&projected, &mut binding_checks, &mut binding_errors);
+    verify_binding(
+        &projected,
+        trust.binding.as_ref(),
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    let resolved_policy = resolve_provider_pcr_rules(
+        &projected,
+        &trust.platform,
+        &trust.policy,
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+    verify_policies(
+        &projected,
+        &resolved_policy,
+        verified_tdx_tcb_status_bit,
+        &mut binding_checks,
+        &mut binding_errors,
+    );
+
+    checks.extend(binding_checks.into_iter().map(|mut check| {
+        check.name = format!("provider-binding-{}", check.name);
+        check
+    }));
+    errors.extend(
+        binding_errors
+            .into_iter()
+            .map(|error| format!("provider binding: {error}")),
+    );
 }
 
 fn verify_key_types(
@@ -580,13 +1147,26 @@ fn verify_platform_attestation(
                 errors,
             )
         }
-        SessionPlatformTrust::AwsSnp { .. } => {
-            record(
+        SessionPlatformTrust::AwsSnp {
+            aws_nitro_roots,
+            aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds,
+            amd_ark_roots,
+            amd_snp_collateral,
+        } => {
+            if !require_platform(bundle, "aws", "sev-snp", checks, errors) {
+                return None;
+            }
+            verify_aws_platform(
+                bundle,
+                aws_nitro_roots,
+                *aws_document_maximum_age_seconds,
+                *aws_document_allowed_future_clock_difference_seconds,
+                amd_ark_roots,
+                amd_snp_collateral,
+                current_time,
                 checks,
                 errors,
-                "platform-attestation",
-                false,
-                "AWS session-bundle verification is unsupported until Nitro attestation and raw SNP evidence are verified as one chain",
             );
             None
         }
@@ -644,8 +1224,8 @@ fn verify_gcp_platform(
         errors,
     );
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let quote_signature = decode_b64(
@@ -693,22 +1273,6 @@ fn verify_gcp_platform(
         report: bundle.tee_evidence.report.clone(),
         auxiliary: bundle.tee_evidence.auxiliary.clone(),
     };
-    let pcrs = bundle
-        .pcr_values
-        .iter()
-        .map(|pcr| super::PcrEvidence {
-            index: pcr.index,
-            sha256: Some(pcr.sha256.clone()),
-            sha384: pcr.sha384.clone(),
-        })
-        .collect::<Vec<_>>();
-    super::verification_core::verify_gcp_tee_vtpm_binding(
-        &mut report,
-        &mut core_errors,
-        Some(&tee_evidence),
-        &bundle.platform.tee,
-        &pcrs,
-    );
     let tdx_tcb_status_bit = match (amd_snp_trust, dcap_collateral) {
         (Some((amd, collateral)), None) => {
             super::verification_core::verify_gcp_snp_vendor_report(
@@ -746,6 +1310,120 @@ fn verify_gcp_platform(
     tdx_tcb_status_bit
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_aws_platform(
+    bundle: &SessionEvidenceBundle,
+    aws_nitro_roots: &CertificateTrust,
+    aws_document_maximum_age_seconds: u64,
+    aws_document_allowed_future_clock_difference_seconds: u64,
+    amd_ark_roots: &CertificateTrust,
+    amd_snp_collateral: &AmdSnpVerificationCollateral,
+    current_time: SystemTime,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    if bundle.tee_evidence.kind != "configfs_tsm" {
+        record(
+            checks,
+            errors,
+            "aws-nitrotpm-binding",
+            false,
+            "AWS session verification requires tee_evidence.kind=configfs_tsm",
+        );
+        return;
+    }
+    if bundle.ak_evidence.kind != "aws_nitro_doc" {
+        record(
+            checks,
+            errors,
+            "aws-nitrotpm-binding",
+            false,
+            "AWS session verification requires ak_evidence.kind=aws_nitro_doc",
+        );
+        return;
+    }
+    let Some(ak_public) = decode_b64(
+        &bundle.ak_evidence.ak_public,
+        "ak_evidence.ak_public",
+        errors,
+    ) else {
+        return;
+    };
+    let Some(tpms_attest) = decode_b64(
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
+        errors,
+    ) else {
+        return;
+    };
+    let Some(qualifying_data) = decode_hex_32(
+        &bundle.binding.qualifying_data,
+        "binding.qualifying_data",
+        errors,
+    ) else {
+        return;
+    };
+    let evidence = super::TeeEvidence {
+        kind: "configfs-tsm".to_string(),
+        report: bundle.tee_evidence.report.clone(),
+        auxiliary: bundle.tee_evidence.auxiliary.clone(),
+    };
+    let binding = super::AkBinding {
+        kind: "aws-nitro-doc".to_string(),
+        data: bundle.ak_evidence.collateral.clone(),
+    };
+    let pcrs = bundle
+        .pcr_values
+        .iter()
+        .map(|pcr| super::PcrEvidence {
+            index: pcr.index,
+            sha256: pcr.sha256.clone(),
+            sha384: pcr.sha384.clone(),
+        })
+        .collect::<Vec<_>>();
+    let trust = super::TrustAnchors {
+        amd_ark_roots: amd_ark_roots.certificates.clone(),
+        amd_ark_root_hashes: amd_ark_roots.hashes.clone(),
+        aws_nitro_roots: aws_nitro_roots.certificates.clone(),
+        aws_nitro_root_hashes: aws_nitro_roots.hashes.clone(),
+        aws_document_maximum_age_seconds: Some(aws_document_maximum_age_seconds),
+        aws_document_allowed_future_clock_difference_seconds: Some(
+            aws_document_allowed_future_clock_difference_seconds,
+        ),
+        ..super::TrustAnchors::default()
+    };
+    let mut report = super::VerificationReport {
+        checks: Vec::new(),
+        evidence: super::EvidenceSummary::default(),
+    };
+    let mut core_errors = Vec::new();
+    super::aws_nitrotpm::verify_aws_tls_attestation(
+        &mut report,
+        &mut core_errors,
+        &binding,
+        &evidence,
+        &ak_public,
+        &tpms_attest,
+        &pcrs,
+        &qualifying_data,
+        true,
+        &trust,
+        current_time,
+    );
+    super::verification_core::verify_aws_snp_vendor_report(
+        &mut report,
+        &mut core_errors,
+        Some(&evidence),
+        Some(amd_snp_collateral),
+        super::verification_core::AmdSnpTrust {
+            ark_roots: &amd_ark_roots.certificates,
+            ark_root_hashes: &amd_ark_roots.hashes,
+        },
+        current_time,
+    );
+    import_core_checks(report, checks, errors);
+}
+
 struct AzureSnpTrust<'a> {
     amd_ark_roots: &'a CertificateTrust,
     amd_snp_collateral: &'a AmdSnpVerificationCollateral,
@@ -762,8 +1440,8 @@ fn verify_azure_platform(
 ) -> Option<u16> {
     let binding = azure_ak_binding(bundle, errors)?;
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let quote_signature = decode_b64(
@@ -911,6 +1589,50 @@ pub fn azure_maa_binding_from_session_bundle(
     })
 }
 
+/// Return the GCP attestation-key root certificate carried by a committed
+/// session evidence bundle.
+///
+/// The bundle stores the certificate chain as canonical `abi.encode(bytes[])`.
+/// Trust resolution needs the root before the full session verifier runs, so
+/// this helper uses the same strict decoder as the verification path.
+pub fn gcp_ak_root_from_session_bundle(bundle: &SessionEvidenceBundle) -> Result<Vec<u8>, String> {
+    if bundle.ak_evidence.kind != "gcp_cert_chain" {
+        return Err(format!(
+            "GCP session verification requires ak_evidence.kind=gcp_cert_chain, got {}",
+            bundle.ak_evidence.kind
+        ));
+    }
+    let mut errors = Vec::new();
+    let collateral = decode_b64(
+        &bundle.ak_evidence.collateral,
+        "ak_evidence.collateral",
+        &mut errors,
+    )
+    .ok_or_else(|| errors.join("; "))?;
+    let mut chain = decode_abi_bytes_array(&collateral)?;
+    chain
+        .pop()
+        .ok_or_else(|| "GCP AK collateral certificate chain is empty".to_string())
+}
+
+/// Project the AWS NitroTPM document from a committed session evidence bundle.
+/// Callers use this to resolve the document's root certificate before the full
+/// session verification runs.
+pub fn aws_nitro_binding_from_session_bundle(
+    bundle: &SessionEvidenceBundle,
+) -> Result<super::AkBinding, String> {
+    if bundle.ak_evidence.kind != "aws_nitro_doc" {
+        return Err(format!(
+            "AWS session verification requires ak_evidence.kind=aws_nitro_doc, got {}",
+            bundle.ak_evidence.kind
+        ));
+    }
+    Ok(super::AkBinding {
+        kind: "aws-nitro-doc".to_string(),
+        data: bundle.ak_evidence.collateral.clone(),
+    })
+}
+
 fn import_core_checks(
     report: super::VerificationReport,
     checks: &mut Vec<SessionVerificationCheck>,
@@ -1052,8 +1774,8 @@ fn verify_raw_quote(
     errors: &mut Vec<String>,
 ) -> Option<Vec<super::PcrEvidence>> {
     let quote = decode_b64(
-        &bundle.tpm_quote.tpm2b_attest,
-        "tpm_quote.tpm2b_attest",
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
         errors,
     );
     let signature = decode_b64(
@@ -1089,7 +1811,7 @@ fn verify_raw_quote(
         .iter()
         .map(|pcr| super::PcrEvidence {
             index: pcr.index,
-            sha256: Some(pcr.sha256.clone()),
+            sha256: pcr.sha256.clone(),
             sha384: pcr.sha384.clone(),
         })
         .collect::<Vec<_>>();
@@ -1151,10 +1873,17 @@ fn verify_quote_projection(
                     .iter()
                     .zip(&bundle.pcr_values)
                     .all(|(authenticated, supplied)| {
-                        authenticated.index == supplied.index && authenticated.sha256.is_some()
+                        authenticated.index == supplied.index
+                            && match bundle.policy.pcr_bank_selection {
+                                PcrBankSelection::Sha256 => authenticated.sha256.is_some(),
+                                PcrBankSelection::Sha384 => authenticated.sha384.is_some(),
+                                PcrBankSelection::Sha256AndSha384 => {
+                                    authenticated.sha256.is_some() && authenticated.sha384.is_some()
+                                }
+                            }
                     })
         }),
-        "session policy requires the Quote to select an authenticated SHA-256 value for every supplied PCR; the Quote may also select SHA-384",
+        "the Quote did not authenticate every supplied PCR in every policy-selected bank",
     );
 }
 
@@ -1164,8 +1893,8 @@ fn verify_raw_certify(
     errors: &mut Vec<String>,
 ) {
     let attest = decode_b64(
-        &bundle.tpm_certify.tpm2b_attest,
-        "tpm_certify.tpm2b_attest",
+        &bundle.tpm_certify.tpms_attest,
+        "tpm_certify.tpms_attest",
         errors,
     );
     let signature = decode_b64(
@@ -1187,7 +1916,7 @@ fn verify_raw_certify(
     else {
         return;
     };
-    let body = match super::verification_core::tpm2b_attest_body(&attest) {
+    let body = match super::verification_core::tpms_attest_body(&attest) {
         Ok(body) => body,
         Err(detail) => {
             record(checks, errors, "tpm-certify-structure", false, &detail);
@@ -1508,7 +2237,280 @@ pub fn evaluate_session_pcr_policy(
     measured_value: [u8; 32],
     measured_events: &[[u8; 32]],
 ) -> std::result::Result<(), String> {
-    super::verification_core::evaluate_pcr_policy(policy, measured_value, measured_events)
+    evaluate_session_pcr_policy_with_startup_locality(policy, measured_value, measured_events, 0xff)
+}
+
+pub(crate) fn evaluate_session_pcr_policy_with_startup_locality(
+    policy: &SessionPcrPolicy,
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    let comparison = decode_policy_comparison_hex(&policy.comparison)?;
+    let comparison = decode256(&comparison).map_err(|error| error.to_string())?;
+    evaluate_comparison256(
+        &comparison,
+        measured_value,
+        measured_events,
+        policy.pcr_index,
+        startup_locality,
+    )
+}
+
+pub(crate) fn evaluate_session_pcr_policy384(
+    policy: &SessionPcrPolicy384,
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    let comparison = decode_policy_comparison_hex(&policy.comparison)?;
+    let comparison = decode384(&comparison).map_err(|error| error.to_string())?;
+    evaluate_comparison384(
+        &comparison,
+        measured_value,
+        measured_events,
+        policy.pcr_index,
+        startup_locality,
+    )
+}
+
+fn decode_policy_comparison_hex(value: &str) -> std::result::Result<Vec<u8>, String> {
+    let clean = value.strip_prefix("0x").unwrap_or(value);
+    hex::decode(clean).map_err(|error| format!("invalid PCR comparison hex: {error}"))
+}
+
+fn evaluate_comparison256(
+    comparison: &PcrComparison256,
+    measured_value: [u8; 32],
+    measured_events: &[[u8; 32]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    match comparison {
+        PcrComparison256::Static(expected) => {
+            if expected.as_slice() != measured_value {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison256::ExtendFromZero(extend_value) => {
+            let mut input = [0u8; 64];
+            input[32..].copy_from_slice(extend_value.as_slice());
+            let expected: [u8; 32] = Sha256::digest(input).into();
+            if expected != measured_value {
+                return Err("EXTEND_FROM_ZERO PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison256::DynamicSubset(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSET")?;
+            if expected.is_empty()
+                || expected.iter().any(|required| {
+                    !measured_events
+                        .iter()
+                        .any(|event| required.as_slice() == event)
+                })
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+        }
+        PcrComparison256::DynamicSubsequence(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSEQUENCE")?;
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected
+                    .get(landmark)
+                    .is_some_and(|required| required.as_slice() == event)
+                {
+                    landmark += 1;
+                }
+            }
+            if expected.is_empty() || landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+        }
+        PcrComparison256::DynamicIndexedEventSets(rule) => {
+            require_dynamic_events(measured_events, "DYNAMIC_INDEXED_EVENT_SETS")?;
+            if measured_events.len() != usize::from(rule.expected_event_count) {
+                return Err("DYNAMIC_INDEXED_EVENT_SETS event count mismatch".to_string());
+            }
+            validate_indexed_events(
+                rule.checked_events
+                    .iter()
+                    .map(|checked| {
+                        (
+                            checked.event_index,
+                            checked.allowed_values.len(),
+                            checked
+                                .allowed_values
+                                .windows(2)
+                                .all(|pair| pair[0] < pair[1]),
+                            measured_events
+                                .get(usize::from(checked.event_index))
+                                .is_some_and(|measured| {
+                                    checked
+                                        .allowed_values
+                                        .iter()
+                                        .any(|allowed| allowed.as_slice() == measured)
+                                }),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                rule.expected_event_count,
+            )?;
+        }
+    }
+    verify_event_replay(
+        measured_value,
+        measured_events,
+        pcr_index,
+        startup_locality,
+        |input| Sha256::digest(input).into(),
+    )
+}
+
+fn evaluate_comparison384(
+    comparison: &PcrComparison384,
+    measured_value: [u8; 48],
+    measured_events: &[[u8; 48]],
+    pcr_index: u8,
+    startup_locality: u8,
+) -> std::result::Result<(), String> {
+    match comparison {
+        PcrComparison384::Static(expected) => {
+            if expected != &measured_value {
+                return Err("STATIC PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison384::ExtendFromZero(extend_value) => {
+            let mut input = [0u8; 96];
+            input[48..].copy_from_slice(extend_value);
+            let expected: [u8; 48] = Sha384::digest(input).into();
+            if expected != measured_value {
+                return Err("EXTEND_FROM_ZERO PCR value mismatch".to_string());
+            }
+            return Ok(());
+        }
+        PcrComparison384::DynamicSubset(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSET")?;
+            if expected.is_empty()
+                || expected
+                    .iter()
+                    .any(|required| !measured_events.contains(required))
+            {
+                return Err("DYNAMIC_SUBSET required landmark is missing".to_string());
+            }
+        }
+        PcrComparison384::DynamicSubsequence(expected) => {
+            require_dynamic_events(measured_events, "DYNAMIC_SUBSEQUENCE")?;
+            let mut landmark = 0;
+            for event in measured_events {
+                if expected.get(landmark) == Some(event) {
+                    landmark += 1;
+                }
+            }
+            if expected.is_empty() || landmark != expected.len() {
+                return Err("DYNAMIC_SUBSEQUENCE required landmark is missing".to_string());
+            }
+        }
+        PcrComparison384::DynamicIndexedEventSets(rule) => {
+            require_dynamic_events(measured_events, "DYNAMIC_INDEXED_EVENT_SETS")?;
+            if measured_events.len() != usize::from(rule.expected_event_count) {
+                return Err("DYNAMIC_INDEXED_EVENT_SETS event count mismatch".to_string());
+            }
+            validate_indexed_events(
+                rule.checked_events
+                    .iter()
+                    .map(|checked| {
+                        (
+                            checked.event_index,
+                            checked.allowed_values.len(),
+                            checked
+                                .allowed_values
+                                .windows(2)
+                                .all(|pair| pair[0] < pair[1]),
+                            measured_events
+                                .get(usize::from(checked.event_index))
+                                .is_some_and(|measured| checked.allowed_values.contains(measured)),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                rule.expected_event_count,
+            )?;
+        }
+    }
+    verify_event_replay(
+        measured_value,
+        measured_events,
+        pcr_index,
+        startup_locality,
+        |input| Sha384::digest(input).into(),
+    )
+}
+
+fn require_dynamic_events<const N: usize>(
+    measured_events: &[[u8; N]],
+    comparison_type: &str,
+) -> std::result::Result<(), String> {
+    if measured_events.is_empty() {
+        Err(format!("{comparison_type} measured event log is empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_indexed_events(
+    checks: Vec<(u16, usize, bool, bool)>,
+    expected_event_count: u16,
+) -> std::result::Result<(), String> {
+    if checks.is_empty() {
+        return Err("DYNAMIC_INDEXED_EVENT_SETS has no checked events".to_string());
+    }
+    let mut previous = None;
+    for (event_index, allowed_count, allowed_sorted, matched) in checks {
+        if event_index >= expected_event_count {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked index is out of range".to_string());
+        }
+        if previous.is_some_and(|previous| event_index <= previous) {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked indexes are not sorted".to_string());
+        }
+        if allowed_count == 0 || !allowed_sorted {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS allowed set is not canonical".to_string());
+        }
+        if !matched {
+            return Err("DYNAMIC_INDEXED_EVENT_SETS checked event mismatch".to_string());
+        }
+        previous = Some(event_index);
+    }
+    Ok(())
+}
+
+fn verify_event_replay<const N: usize>(
+    measured_value: [u8; N],
+    measured_events: &[[u8; N]],
+    pcr_index: u8,
+    startup_locality: u8,
+    hash: impl Fn(&[u8]) -> [u8; N],
+) -> std::result::Result<(), String> {
+    if startup_locality != 0xff && startup_locality > 4 {
+        return Err(format!("invalid PCR0 StartupLocality {startup_locality}"));
+    }
+    let mut replay = [0u8; N];
+    if pcr_index == 0 && startup_locality != 0xff {
+        replay[N - 1] = startup_locality;
+    }
+    for event in measured_events {
+        let mut input = Vec::with_capacity(N * 2);
+        input.extend_from_slice(&replay);
+        input.extend_from_slice(event);
+        replay = hash(&input);
+    }
+    if replay == measured_value {
+        Ok(())
+    } else {
+        Err("PCR event replay does not match measured value".to_string())
+    }
 }
 fn verify_binding(
     bundle: &SessionEvidenceBundle,
@@ -1597,6 +2599,129 @@ fn verify_trusted_binding(
     );
 }
 
+fn resolve_provider_pcr_rules(
+    bundle: &SessionEvidenceBundle,
+    platform: &SessionPlatformTrust,
+    trusted: &TrustedSessionPolicy,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) -> TrustedSessionPolicy {
+    let mut resolved = trusted.clone();
+    let result = (|| -> std::result::Result<(), String> {
+        let mut decode_errors = Vec::new();
+        let report = decode_b64(
+            &bundle.tee_evidence.report,
+            "tee_evidence.report",
+            &mut decode_errors,
+        )
+        .ok_or_else(|| decode_errors.join("; "))?;
+
+        match platform {
+            SessionPlatformTrust::AzureTdx { .. } | SessionPlatformTrust::AzureSnp { .. } => {}
+            SessionPlatformTrust::GcpTdx { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384) {
+                    return Err("GCP provider PCR15 requires the SHA-256 PCR bank".to_string());
+                }
+                let report_start = super::verification_core::tdx_quote_report_start(&report)?;
+                let uuid_start = report_start + super::TDX_REPORT_REPORT_DATA_OFFSET;
+                let uuid = report
+                    .get(uuid_start..uuid_start + super::GCP_TDX_UUID_LEN)
+                    .ok_or_else(|| {
+                        "GCP TDX quote is too short for the REPORT_DATA UUID".to_string()
+                    })?;
+                let mut extend_value = [0u8; 32];
+                extend_value[16..].copy_from_slice(uuid);
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs256
+                    .push(SessionPcrPolicy {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero256(extend_value))
+                        ),
+                    });
+            }
+            SessionPlatformTrust::GcpSnp { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384) {
+                    return Err("GCP provider PCR15 requires the SHA-256 PCR bank".to_string());
+                }
+                if report.len() != super::SNP_REPORT_SIZE {
+                    return Err(format!(
+                        "AMD SEV-SNP report must contain {} bytes, got {}",
+                        super::SNP_REPORT_SIZE,
+                        report.len()
+                    ));
+                }
+                let report_id = report[super::SNP_REPORT_REPORT_ID_OFFSET
+                    ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN]
+                    .try_into()
+                    .expect("fixed report ID length");
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs256
+                    .push(SessionPcrPolicy {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero256(report_id))
+                        ),
+                    });
+            }
+            SessionPlatformTrust::AwsSnp { .. } => {
+                if matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256) {
+                    return Err("AWS provider PCR15 requires the SHA-384 PCR bank".to_string());
+                }
+                if report.len() != super::SNP_REPORT_SIZE {
+                    return Err(format!(
+                        "AMD SEV-SNP report must contain {} bytes, got {}",
+                        super::SNP_REPORT_SIZE,
+                        report.len()
+                    ));
+                }
+                let report_id = &report[super::SNP_REPORT_REPORT_ID_OFFSET
+                    ..super::SNP_REPORT_REPORT_ID_OFFSET + super::SNP_REPORT_REPORT_ID_LEN];
+                let mut extend_value384 = [0u8; 48];
+                extend_value384[16..].copy_from_slice(report_id);
+                resolved
+                    .provider_pcr_policy
+                    .pcr_specs384
+                    .push(SessionPcrPolicy384 {
+                        pcr_index: 15,
+                        comparison: format!(
+                            "0x{}",
+                            hex::encode(encode_extend_from_zero384(extend_value384))
+                        ),
+                    });
+                if matches!(
+                    trusted.pcr_bank_selection,
+                    PcrBankSelection::Sha256AndSha384
+                ) {
+                    resolved
+                        .provider_pcr_policy
+                        .pcr_specs256
+                        .push(SessionPcrPolicy {
+                            pcr_index: 15,
+                            comparison: format!(
+                                "0x{}",
+                                hex::encode(encode_extend_from_zero256(
+                                    report_id.try_into().expect("fixed report ID length")
+                                ))
+                            ),
+                        });
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => record(checks, errors, "provider-pcr15-rule", true, ""),
+        Err(detail) => record(checks, errors, "provider-pcr15-rule", false, &detail),
+    }
+    resolved
+}
+
 fn verify_policies(
     bundle: &SessionEvidenceBundle,
     trusted: &TrustedSessionPolicy,
@@ -1632,27 +2757,51 @@ fn verify_policies(
         checks,
         errors,
     );
+    let bundle_projection_is_empty = [
+        &bundle.policy.invariant_pcr_policy,
+        &bundle.policy.variant_pcr_policy,
+        &bundle.policy.workload_pcr_policy,
+        &bundle.policy.provider_pcr_policy,
+    ]
+    .into_iter()
+    .all(|block| block.pcr_specs256.is_empty() && block.pcr_specs384.is_empty());
+    let bundle_projection_matches = bundle_projection_is_empty
+        || (bundle.policy.pcr_bank_selection == trusted.pcr_bank_selection
+            && bundle.policy.invariant_pcr_policy == trusted.invariant_pcr_policy
+            && bundle.policy.variant_pcr_policy == trusted.variant_pcr_policy
+            && bundle.policy.workload_pcr_policy == trusted.workload_pcr_policy
+            && bundle.policy.provider_pcr_policy == trusted.provider_pcr_policy);
     record(
         checks,
         errors,
         "trusted-pcr-policy-projection",
-        bundle.policy.pcr_specs.is_empty() || bundle.policy.pcr_specs == trusted.pcr_specs,
-        "non-empty bundle PCR policy projection differs from the caller-supplied trusted policy",
+        bundle_projection_matches,
+        "bundle PCR policy blocks differ from the caller-supplied trusted policy blocks",
     );
+    let pcr_specs256 = trusted.complete_pcr_specs256();
+    let pcr_specs384 = trusted.complete_pcr_specs384();
     verify_attribute_policy(bundle, trusted, verified_tdx_tcb_status_bit, checks, errors);
-    if trusted.pcr_specs.is_empty() {
+    let selected_policy_is_empty = match trusted.pcr_bank_selection {
+        PcrBankSelection::Sha256 => pcr_specs256.is_empty(),
+        PcrBankSelection::Sha384 => pcr_specs384.is_empty(),
+        PcrBankSelection::Sha256AndSha384 => pcr_specs256.is_empty() && pcr_specs384.is_empty(),
+    };
+    if selected_policy_is_empty {
         record(
             checks,
             errors,
             "trusted-pcr-policy",
             false,
-            "caller-supplied trusted PCR policy is empty",
+            "caller-supplied trusted PCR policy has no rule in a selected bank",
         );
         return;
     }
 
-    for policy in &trusted.pcr_specs {
-        let name = format!("pcr-policy-{}", policy.pcr_index);
+    for policy in pcr_specs256
+        .iter()
+        .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha384))
+    {
+        let name = format!("pcr-policy-sha256-{}", policy.pcr_index);
         let Some(value) = bundle
             .pcr_values
             .iter()
@@ -1661,7 +2810,11 @@ fn verify_policies(
             record(checks, errors, &name, false, "PCR value is absent");
             continue;
         };
-        let Some(measured) = decode_hex_32(&value.sha256, "pcr_values.sha256", errors) else {
+        let Some(measured_value) = value.sha256.as_deref() else {
+            record(checks, errors, &name, false, "SHA-256 PCR value is absent");
+            continue;
+        };
+        let Some(measured) = decode_hex_32(measured_value, "pcr_values.sha256", errors) else {
             continue;
         };
         let events = bundle
@@ -1677,10 +2830,61 @@ fn verify_policies(
             })
             .transpose();
         match events {
-            Ok(events) => match evaluate_session_pcr_policy(
+            Ok(events) => match evaluate_session_pcr_policy_with_startup_locality(
                 policy,
                 measured,
                 events.as_deref().unwrap_or_default(),
+                bundle.tpm_quote.pcr0_startup_locality,
+            ) {
+                Ok(()) => record(checks, errors, &name, true, ""),
+                Err(detail) => record(checks, errors, &name, false, &detail),
+            },
+            Err(detail) => record(checks, errors, &name, false, &detail),
+        }
+    }
+
+    for policy in pcr_specs384
+        .iter()
+        .filter(|_| !matches!(trusted.pcr_bank_selection, PcrBankSelection::Sha256))
+    {
+        let name = format!("pcr-policy-sha384-{}", policy.pcr_index);
+        let Some(value) = bundle
+            .pcr_values
+            .iter()
+            .find(|value| value.index == policy.pcr_index)
+        else {
+            record(checks, errors, &name, false, "PCR value is absent");
+            continue;
+        };
+        let Some(measured_value) = value.sha384.as_deref() else {
+            record(checks, errors, &name, false, "SHA-384 PCR value is absent");
+            continue;
+        };
+        let measured = match decode_hex_48(measured_value) {
+            Ok(value) => value,
+            Err(detail) => {
+                record(checks, errors, &name, false, &detail);
+                continue;
+            }
+        };
+        let events = bundle
+            .event_log_hashes
+            .iter()
+            .find(|events| events.pcr_index == policy.pcr_index)
+            .map(|events| {
+                events
+                    .sha384
+                    .iter()
+                    .map(|event| decode_hex_48(event))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .transpose();
+        match events {
+            Ok(events) => match evaluate_session_pcr_policy384(
+                policy,
+                measured,
+                events.as_deref().unwrap_or_default(),
+                bundle.tpm_quote.pcr0_startup_locality,
             ) {
                 Ok(()) => record(checks, errors, &name, true, ""),
                 Err(detail) => record(checks, errors, &name, false, &detail),
@@ -2181,14 +3385,7 @@ pub fn compute_session_id(tpm_signature_hash: [u8; 32], tee_hash: [u8; 32]) -> [
 }
 
 pub fn compute_key_fingerprint(type_id: u8, key: &[u8]) -> [u8; 32] {
-    let padded = key.len().div_ceil(32) * 32;
-    let mut encoded = vec![0u8; 128 + padded];
-    encoded[..32].copy_from_slice(&keccak(KEY_DOMAIN.as_bytes()));
-    encoded[63] = type_id;
-    encoded[95] = 96;
-    encoded[112..128].copy_from_slice(&(key.len() as u128).to_be_bytes());
-    encoded[128..128 + key.len()].copy_from_slice(key);
-    keccak(&encoded)
+    atakit_cvm_encoding::key_fingerprint(type_id, key)
 }
 
 pub fn compute_session_qualifying_data(
@@ -2309,6 +3506,14 @@ fn decode_hex_array(value: &str) -> Result<[u8; 32], String> {
         .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, got {}", bytes.len()))
 }
 
+fn decode_hex_48(value: &str) -> Result<[u8; 48], String> {
+    let raw = value.strip_prefix("0x").ok_or("missing 0x prefix")?;
+    let bytes = hex::decode(raw).map_err(|error| error.to_string())?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("expected 48 bytes, got {}", bytes.len()))
+}
+
 fn keccak(bytes: &[u8]) -> [u8; 32] {
     Keccak256::digest(bytes).into()
 }
@@ -2316,6 +3521,9 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atakit_cvm_encoding::pcr_comparison::{
+        encode_dynamic256, encode_static256, encode_static384, DYNAMIC_SUBSEQUENCE, DYNAMIC_SUBSET,
+    };
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use k256::ecdsa::SigningKey;
 
@@ -2536,6 +3744,7 @@ mod tests {
             },
             platform: SessionPlatform {
                 cloud: "qemu".into(),
+                cloud_provenance: test_session_cloud_provenance(SessionCloudProvider::Qemu),
                 attestation_mode: SessionAttestationMode::Emulation,
                 tee: "emulation".into(),
                 machine_type: "qemu".into(),
@@ -2551,18 +3760,19 @@ mod tests {
                 collateral: String::new(),
             },
             tpm_quote: TpmQuoteEvidence {
-                tpm2b_attest: String::new(),
+                tpms_attest: String::new(),
                 tpm_signature: String::new(),
                 signature_hash: format!("0x{}", "00".repeat(32)),
+                pcr0_startup_locality: 0,
             },
             tpm_certify: TpmCertifyEvidence {
-                tpm2b_attest: String::new(),
+                tpms_attest: String::new(),
                 tpm_signature: String::new(),
                 tpmt_public: String::new(),
             },
             pcr_values: vec![SessionPcrValue {
                 index: 7,
-                sha256: format!("0x{}", "11".repeat(32)),
+                sha256: Some(format!("0x{}", "11".repeat(32))),
                 sha384: None,
             }],
             event_log_hashes: Vec::new(),
@@ -2587,7 +3797,155 @@ mod tests {
                 fingerprint: format!("0x{}", "00".repeat(32)),
                 contract_authorization: None,
             },
+            provider_binding: None,
         }
+    }
+
+    #[test]
+    fn session_evidence_json_bounds_collections_and_rejects_unknown_fields() {
+        let policy = SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        };
+        let value = serde_json::to_value(bundle_for_policy(policy)).expect("serialize bundle");
+
+        let mut without_cloud_provenance = value.clone();
+        without_cloud_provenance["platform"]
+            .as_object_mut()
+            .expect("platform object")
+            .remove("cloud_provenance");
+        let error = serde_json::from_value::<SessionEvidenceBundle>(without_cloud_provenance)
+            .expect_err("cloud_provenance must be required");
+        assert!(error.to_string().contains("missing field"), "{error}");
+
+        let mut with_cloud_provenance = value.clone();
+        with_cloud_provenance["platform"]["cloud_provenance"] = serde_json::json!({
+            "source": "dmi",
+            "detection": {
+                "dmi": {
+                    "sys_vendor": "Amazon EC2",
+                    "product_name": "m6a.large",
+                    "bios_vendor": "Amazon EC2",
+                    "detected_cloud": "aws"
+                },
+                "metadata": {
+                    "gcp": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "azure": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "aws": {
+                        "attempted": false,
+                        "matched": false,
+                        "http_status": null,
+                        "response_headers": {},
+                        "response_body": null,
+                        "error": null
+                    },
+                    "detected_cloud": "unknown",
+                    "conflict": false
+                }
+            },
+            "user_provided": null
+        });
+        let decoded = serde_json::from_value::<SessionEvidenceBundle>(with_cloud_provenance)
+            .expect("current portal cloud_provenance must decode");
+        let provenance = decoded.platform.cloud_provenance;
+        assert_eq!(provenance.source, SessionCloudSource::Dmi);
+        assert_eq!(
+            provenance.detection.dmi.detected_cloud,
+            SessionCloudProvider::Aws
+        );
+
+        let mut too_many_pcrs = value.clone();
+        too_many_pcrs["pcr_values"] = serde_json::Value::Array(
+            (0..=MAX_SESSION_PCRS)
+                .map(|index| {
+                    serde_json::json!({
+                        "index": index,
+                        "sha256": null,
+                        "sha384": null
+                    })
+                })
+                .collect(),
+        );
+        let error = serde_json::from_value::<SessionEvidenceBundle>(too_many_pcrs)
+            .expect_err("more than 24 PCR entries must fail");
+        assert!(
+            error.to_string().contains("more than 24 entries"),
+            "{error}"
+        );
+
+        let valid_sha256_hash = format!("0x{}", "00".repeat(32));
+        let mut invalid_event_hash = value.clone();
+        invalid_event_hash["event_log_hashes"] = serde_json::json!([{
+            "pcr_index": 10,
+            "sha256": [""],
+            "sha384": []
+        }]);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(invalid_event_hash)
+            .expect_err("an empty event hash must fail during parsing");
+        assert!(
+            error
+                .to_string()
+                .contains("event hash must be 0x-prefixed and encode exactly 32 bytes"),
+            "{error}"
+        );
+
+        let mut too_many_event_hashes = value.clone();
+        too_many_event_hashes["event_log_hashes"] = serde_json::json!([{
+            "pcr_index": 10,
+            "sha256": vec![valid_sha256_hash; MAX_SESSION_EVENT_HASHES_PER_BANK + 1],
+            "sha384": []
+        }]);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(too_many_event_hashes)
+            .expect_err("more than 65535 event hashes must fail");
+        assert!(
+            error.to_string().contains("more than 65535 entries"),
+            "{error}"
+        );
+
+        assert!(total_session_event_hash_count_is_valid([
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+        ]));
+        assert!(!total_session_event_hash_count_is_valid([
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            MAX_SESSION_EVENT_HASHES_PER_BANK,
+            1,
+        ]));
+
+        let mut unknown_field = value;
+        unknown_field["unexpected"] = serde_json::Value::Bool(true);
+        let error = serde_json::from_value::<SessionEvidenceBundle>(unknown_field)
+            .expect_err("unknown bundle fields must fail");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let error = serde_json::from_value::<SessionRequestBinding>(serde_json::json!({
+            "challenge": URL_SAFE_NO_PAD.encode([0x55; 32]),
+            "signature": "0x",
+            "unexpected": true
+        }))
+        .expect_err("unknown request-binding fields must fail");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     fn tdx_bundle_for_policy(policy: SessionPolicy) -> SessionEvidenceBundle {
@@ -2636,63 +3994,66 @@ mod tests {
     fn all_policy_modes_and_ordered_landmarks() {
         let events = [[1u8; 32], [2u8; 32], [3u8; 32]];
         let final_value = replay(&events);
-        let hex = |value: [u8; 32]| format!("0x{}", hex::encode(value));
+        let comparison = |value: &[u8]| format!("0x{}", hex::encode(value));
 
         let static_policy = SessionPcrPolicy {
             pcr_index: 0,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![hex(final_value)],
+            comparison: comparison(&encode_static256(final_value)),
         };
         evaluate_session_pcr_policy(&static_policy, final_value, &events).unwrap();
-        for malformed in [Vec::new(), vec![hex(final_value), hex(final_value)]] {
+        for malformed in ["0x".to_string(), format!("{}00", static_policy.comparison)] {
             let policy = SessionPcrPolicy {
-                match_data: malformed,
+                comparison: malformed,
                 ..static_policy.clone()
             };
-            assert!(evaluate_session_pcr_policy(&policy, final_value, &events)
-                .unwrap_err()
-                .contains("requires exactly one match_data entry"));
+            assert!(evaluate_session_pcr_policy(&policy, final_value, &events).is_err());
         }
 
         let subset = SessionPcrPolicy {
             pcr_index: 10,
-            verify_type: SessionPcrVerifyType::DynamicSubset,
-            match_data: vec![hex(events[2]), hex(events[0])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[2], events[0]]).unwrap(),
+            ),
         };
         evaluate_session_pcr_policy(&subset, final_value, &events).unwrap();
         let empty_subset = SessionPcrPolicy {
-            match_data: Vec::new(),
+            comparison: comparison(&encode_dynamic256(DYNAMIC_SUBSET, Vec::new()).unwrap()),
             ..subset.clone()
         };
         assert_eq!(
             evaluate_session_pcr_policy(&empty_subset, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSET policy has no required landmarks"
+            "DYNAMIC_SUBSET required landmark is missing"
         );
         let missing_subset = SessionPcrPolicy {
-            match_data: vec![hex(events[0]), hex([4u8; 32])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSET, vec![events[0], [4u8; 32]]).unwrap(),
+            ),
             ..subset
         };
         assert_eq!(
             evaluate_session_pcr_policy(&missing_subset, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSET required landmark 1 is missing"
+            "DYNAMIC_SUBSET required landmark is missing"
         );
 
         let subsequence = SessionPcrPolicy {
             pcr_index: 10,
-            verify_type: SessionPcrVerifyType::DynamicSubsequence,
-            match_data: vec![hex(events[0]), hex(events[2])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![events[0], events[2]]).unwrap(),
+            ),
         };
         evaluate_session_pcr_policy(&subsequence, final_value, &events).unwrap();
         let empty_subsequence = SessionPcrPolicy {
-            match_data: Vec::new(),
+            comparison: comparison(&encode_dynamic256(DYNAMIC_SUBSEQUENCE, Vec::new()).unwrap()),
             ..subsequence.clone()
         };
         assert_eq!(
             evaluate_session_pcr_policy(&empty_subsequence, final_value, &events).unwrap_err(),
-            "DYNAMIC_SUBSEQUENCE policy has no required landmarks"
+            "DYNAMIC_SUBSEQUENCE required landmark is missing"
         );
         let reversed = SessionPcrPolicy {
-            match_data: vec![hex(events[2]), hex(events[0])],
+            comparison: comparison(
+                &encode_dynamic256(DYNAMIC_SUBSEQUENCE, vec![events[2], events[0]]).unwrap(),
+            ),
             ..subsequence
         };
         assert!(evaluate_session_pcr_policy(&reversed, final_value, &events).is_err());
@@ -2729,15 +4090,21 @@ mod tests {
     fn trusted_policy_must_match_bundle_projection_and_drives_evaluation() {
         let pcr = SessionPcrPolicy {
             pcr_index: 7,
-            verify_type: SessionPcrVerifyType::Static,
-            match_data: vec![format!("0x{}", "11".repeat(32))],
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32]))),
         };
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: vec![pcr.clone()],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs384: Vec::new(),
+                pcr_specs256: vec![pcr.clone()],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let bundle = bundle_for_policy(policy);
         let trusted = TrustedSessionPolicy {
@@ -2745,7 +4112,14 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: vec![pcr],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs384: Vec::new(),
+                pcr_specs256: vec![pcr],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key: [0x10; 32],
                 value: [0x20; 32],
@@ -2819,13 +4193,175 @@ mod tests {
     }
 
     #[test]
+    fn trusted_policy_projection_preserves_named_azure_blocks() {
+        let rule = |pcr_index| SessionPcrPolicy {
+            pcr_index,
+            comparison: format!("0x{}", hex::encode(encode_static256([pcr_index; 32]))),
+        };
+        let invariant_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: [4, 9, 11].into_iter().map(rule).collect(),
+            pcr_specs384: Vec::new(),
+        };
+        let variant_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: [0, 2, 3, 7].into_iter().map(rule).collect(),
+            pcr_specs384: Vec::new(),
+        };
+        let workload_pcr_policy = SessionPcrPolicyBlock {
+            pcr_specs256: vec![rule(23)],
+            pcr_specs384: Vec::new(),
+        };
+        let bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: invariant_pcr_policy.clone(),
+            variant_pcr_policy: variant_pcr_policy.clone(),
+            workload_pcr_policy: workload_pcr_policy.clone(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy,
+            variant_pcr_policy,
+            workload_pcr_policy,
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+            effective_attributes: Vec::new(),
+            attribute_requirements: Vec::new(),
+            amd_snp_security_policies: Vec::new(),
+        };
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(&bundle, &trusted, None, &mut checks, &mut errors);
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && check.valid }));
+
+        let empty_projection = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            // An empty projection supplies no policy. Its bank selection is
+            // only the shape of the Quote the portal collected, so it is not
+            // a second trusted policy input.
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(&empty_projection, &trusted, None, &mut checks, &mut errors);
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && check.valid }));
+
+        let mut moved_between_blocks = trusted.clone();
+        let moved_rule = moved_between_blocks
+            .variant_pcr_policy
+            .pcr_specs256
+            .remove(0);
+        moved_between_blocks
+            .invariant_pcr_policy
+            .pcr_specs256
+            .push(moved_rule);
+        assert_eq!(
+            trusted.complete_pcr_specs256(),
+            moved_between_blocks.complete_pcr_specs256(),
+            "the flattened rule sequence is deliberately unchanged"
+        );
+
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        verify_policies(
+            &bundle,
+            &moved_between_blocks,
+            None,
+            &mut checks,
+            &mut errors,
+        );
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "trusted-pcr-policy-projection" && !check.valid }));
+    }
+
+    #[test]
+    fn sha384_session_does_not_evaluate_committed_sha256_rules() {
+        let pcr256 = SessionPcrPolicy {
+            pcr_index: 7,
+            comparison: format!("0x{}", hex::encode(encode_static256([0x11; 32]))),
+        };
+        let pcr384 = SessionPcrPolicy384 {
+            pcr_index: 7,
+            comparison: format!("0x{}", hex::encode(encode_static384([0x22; 48]))),
+        };
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs256: vec![pcr256.clone()],
+                pcr_specs384: vec![pcr384.clone()],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        bundle.pcr_values[0].sha256 = None;
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let trusted = TrustedSessionPolicy {
+            workload_id: [1; 32],
+            base_image_id: [2; 32],
+            platform_profile_id: [3; 32],
+            measurement_variant_id: [4; 32],
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            invariant_pcr_policy: SessionPcrPolicyBlock {
+                pcr_specs256: vec![pcr256],
+                pcr_specs384: vec![pcr384],
+            },
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+            effective_attributes: Vec::new(),
+            attribute_requirements: Vec::new(),
+            amd_snp_security_policies: Vec::new(),
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_policies(&bundle, &trusted, None, &mut checks, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!checks
+            .iter()
+            .any(|check| check.name == "pcr-policy-sha256-7"));
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "pcr-policy-sha384-7" && check.valid));
+    }
+
+    #[test]
     fn verified_tdx_debug_drives_base_image_and_workload_policy() {
         let policy = SessionPolicy {
             workload_id: format!("0x{}", "01".repeat(32)),
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -2837,7 +4373,11 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key: atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY,
                 value: atakit_core::tee_attributes::ATTRIBUTE_TRUE,
@@ -2899,7 +4439,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let bundle = tdx_bundle_for_policy(policy);
         let key = atakit_core::tee_attributes::INTEL_TDX_TCB_STATUS_ALLOWED_KEY;
@@ -2909,7 +4453,11 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![SessionAttribute {
                 key,
                 value: relaxed_mask,
@@ -2968,7 +4516,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -2990,7 +4542,11 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3029,7 +4585,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3048,7 +4608,11 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: Vec::new(),
             attribute_requirements: Vec::new(),
             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3106,7 +4670,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = snp_bundle_for_policy(policy);
         let mut report = URL_SAFE_NO_PAD.decode(&bundle.tee_evidence.report).unwrap();
@@ -3133,7 +4701,11 @@ mod tests {
             base_image_id: [2; 32],
             platform_profile_id: [3; 32],
             measurement_variant_id: [4; 32],
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
             effective_attributes: vec![
                 SessionAttribute {
                     key: atakit_core::tee_attributes::AMD_SEV_SNP_TCB_MINIMUM_KEY,
@@ -3206,7 +4778,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
 
         for attribute in atakit_core::tee_attributes::VerifiedTeeAttribute::BOOLEAN {
@@ -3279,7 +4855,11 @@ mod tests {
                             base_image_id: [2; 32],
                             platform_profile_id: [3; 32],
                             measurement_variant_id: [4; 32],
-                            pcr_specs: Vec::new(),
+                            pcr_bank_selection: PcrBankSelection::Sha256,
+                            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+                            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+                            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+                            provider_pcr_policy: SessionPcrPolicyBlock::default(),
                             effective_attributes,
                             attribute_requirements,
                             amd_snp_security_policies: vec![crate::AmdSnpSecurityPolicy {
@@ -3326,7 +4906,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         };
         let mut bundle = tdx_bundle_for_policy(policy);
         let mut quote = vec![0u8; crate::TDX_QUOTE_HEADER_LEN + 6 + 648];
@@ -3391,7 +4975,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.platform.cloud = "gcp".into();
         bundle.platform.tee = "sev-snp".into();
@@ -3434,7 +5022,11 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         let mut checks = Vec::new();
         let mut errors = Vec::new();
@@ -3471,16 +5063,54 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
             sha256: Vec::new(),
+            sha384: Vec::new(),
         }];
         bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
         let authenticated = vec![crate::PcrEvidence {
             index: 7,
-            sha256: Some(bundle.pcr_values[0].sha256.clone()),
+            sha256: bundle.pcr_values[0].sha256.clone(),
+            sha384: bundle.pcr_values[0].sha384.clone(),
+        }];
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+
+        verify_quote_projection(&bundle, Some(&authenticated), &mut checks, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn session_projection_accepts_sha384_only_authentication_for_sha384_policy() {
+        let mut bundle = bundle_for_policy(SessionPolicy {
+            workload_id: format!("0x{}", "01".repeat(32)),
+            base_image_id: format!("0x{}", "02".repeat(32)),
+            platform_profile_id: format!("0x{}", "03".repeat(32)),
+            measurement_variant_id: format!("0x{}", "04".repeat(32)),
+            pcr_bank_selection: PcrBankSelection::Sha384,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
+        });
+        bundle.event_log_hashes = vec![SessionEventHashes {
+            pcr_index: 7,
+            sha256: Vec::new(),
+            sha384: Vec::new(),
+        }];
+        bundle.pcr_values[0].sha256 = None;
+        bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
+        let authenticated = vec![crate::PcrEvidence {
+            index: 7,
+            sha256: None,
             sha384: bundle.pcr_values[0].sha384.clone(),
         }];
         let mut checks = Vec::new();
@@ -3498,11 +5128,16 @@ mod tests {
             base_image_id: format!("0x{}", "02".repeat(32)),
             platform_profile_id: format!("0x{}", "03".repeat(32)),
             measurement_variant_id: format!("0x{}", "04".repeat(32)),
-            pcr_specs: Vec::new(),
+            pcr_bank_selection: PcrBankSelection::Sha256,
+            invariant_pcr_policy: SessionPcrPolicyBlock::default(),
+            variant_pcr_policy: SessionPcrPolicyBlock::default(),
+            workload_pcr_policy: SessionPcrPolicyBlock::default(),
+            provider_pcr_policy: SessionPcrPolicyBlock::default(),
         });
         bundle.event_log_hashes = vec![SessionEventHashes {
             pcr_index: 7,
             sha256: Vec::new(),
+            sha384: Vec::new(),
         }];
         bundle.pcr_values[0].sha384 = Some(format!("0x{}", "22".repeat(48)));
         let authenticated = vec![crate::PcrEvidence {

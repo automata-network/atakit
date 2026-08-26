@@ -200,6 +200,57 @@ pub async fn get_instance_public_ip(
     }
 }
 
+/// Request an EC2 instance reboot, then require both current AWS instance
+/// status checks to pass.
+///
+/// AWS can keep both status checks at `ok` throughout an operating-system
+/// reboot. A status-check transition is therefore not proof that a reboot was
+/// accepted or completed and must not be required here.
+pub async fn reboot_instance(
+    region: &str,
+    instance_id: &str,
+    runner: &dyn CommandRunner,
+) -> Result<(), CloudError> {
+    runner
+        .run_capture(
+            "aws",
+            &[
+                "ec2",
+                "reboot-instances",
+                "--region",
+                region,
+                "--instance-ids",
+                instance_id,
+            ],
+        )
+        .await
+        .map_err(|e| CloudError::InstanceError {
+            message: format!("failed to reboot instance '{instance_id}': {e}"),
+        })?;
+
+    runner
+        .run_capture(
+            "aws",
+            &[
+                "ec2",
+                "wait",
+                "instance-status-ok",
+                "--region",
+                region,
+                "--instance-ids",
+                instance_id,
+            ],
+        )
+        .await
+        .map_err(|e| CloudError::InstanceError {
+            message: format!(
+                "instance '{instance_id}' did not pass AWS status checks after reboot: {e}"
+            ),
+        })?;
+
+    Ok(())
+}
+
 /// Terminate an instance and wait for it to fully terminate, so dependent
 /// resources (e.g. the security group) can be deleted afterwards.
 pub async fn terminate_instance(
@@ -282,4 +333,98 @@ pub async fn get_console_output(
         )
         .await?;
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::exec::CommandOutput;
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+        outputs: Mutex<VecDeque<String>>,
+    }
+
+    impl RecordingRunner {
+        fn with_outputs(outputs: &[&str]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                outputs: Mutex::new(outputs.iter().map(|output| output.to_string()).collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run_capture(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<CommandOutput, CloudError> {
+            self.calls.lock().expect("calls lock").push((
+                program.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            ));
+            let stdout = self
+                .outputs
+                .lock()
+                .expect("outputs lock")
+                .pop_front()
+                .unwrap_or_default();
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+
+        async fn run_stream(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _verbose: bool,
+        ) -> Result<CommandOutput, CloudError> {
+            panic!("run_stream must not be called")
+        }
+    }
+
+    #[tokio::test]
+    async fn reboot_accepts_request_without_requiring_status_transition() {
+        let runner = RecordingRunner::with_outputs(&["", ""]);
+        reboot_instance("us-east-2", "i-0123456789abcdef0", &runner)
+            .await
+            .expect("reboot instance");
+
+        let calls = runner.calls.lock().expect("calls lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "aws");
+        assert_eq!(
+            calls[0].1,
+            [
+                "ec2",
+                "reboot-instances",
+                "--region",
+                "us-east-2",
+                "--instance-ids",
+                "i-0123456789abcdef0",
+            ]
+        );
+        assert_eq!(calls[1].0, "aws");
+        assert_eq!(
+            calls[1].1,
+            [
+                "ec2",
+                "wait",
+                "instance-status-ok",
+                "--region",
+                "us-east-2",
+                "--instance-ids",
+                "i-0123456789abcdef0",
+            ]
+        );
+    }
 }

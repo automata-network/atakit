@@ -2,6 +2,7 @@
 name = "atakit-cloud"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 cli = ["clap"]
@@ -11,11 +12,7 @@ atakit-core.workspace = true
 atakit-config.workspace = true
 atakit-attestation.workspace = true
 atakit-attestation-client.workspace = true
-atakit-image.workspace = true
 alloy.workspace = true
-automata-dcap-network-registry.workspace = true
-dcap-rs.workspace = true
-pccs-reader-rs.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,10 +26,7 @@ sha2.workspace = true
 sha3.workspace = true
 hex.workspace = true
 k256.workspace = true
-pem.workspace = true
 tempfile.workspace = true
-urlencoding.workspace = true
-x509-cert.workspace = true
 zstd.workspace = true
 
 async-trait.workspace = true

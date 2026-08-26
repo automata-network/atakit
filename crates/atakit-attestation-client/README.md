@@ -1,15 +1,22 @@
 # atakit-attestation-client
 
-`atakit-attestation-client` is the read-only network client for atakit
-attestation verification. The caller selects an RPC endpoint and a
+`atakit-attestation-client` implements the complete atakit attestation
+verification workflow. The caller selects an RPC endpoint and a
 `SessionRegistry` address. Portal evidence cannot select or replace either
 value.
 
 The client:
 
+- collects and verifies portal TLS attestation, returning a pinned client;
+- loads verifier-supplied trust inputs from certificate, revocation-list, and
+  policy files;
+- resolves Intel TDX DCAP collateral and AMD SEV-SNP collateral for the
+  presented evidence;
+- states which trust inputs each `(cloud, tee)` pair requires;
 - checks the RPC-reported chain ID;
 - derives `BaseImageRegistry`, `WorkloadRegistry`, and
-  `AmdSnpSecurityPolicyRegistry` from `SessionRegistry`;
+  `TeeSecurityPolicyVerifier` from `SessionRegistry`, then derives
+  `AmdSnpSecurityPolicyRegistry` from `TeeSecurityPolicyVerifier`;
 - checks optional expected registry addresses;
 - loads the registered base-image measurement policy;
 - loads and validates the registered `WorkloadSpec`;
@@ -73,7 +80,18 @@ floor.
 
 ## Verify a current session
 
-After obtaining `VerifiedPortalTls`, call:
+`verified_portal_tls` fixes the trust authority before the portal is contacted.
+The current-session workflow uses the workload policy and trust inputs from
+that same authority. Session binding is separate. Chain authority also supplies
+verifier-selected chain coordinates for checking a chain-bound session, while
+a local-bound session does not use those coordinates. The caller may use
+`required_binding` to add an independent local-versus-chain policy. The current
+trust-pack and explicit inputs contain no trusted chain coordinates, so a
+chain-bound session fails closed under those authorities.
+
+References are publisher-qualified: `<publisher>/<name>:<version>`, where the
+publisher is the owner fingerprint as `0x` and 64 lowercase hexadecimal
+characters. A two-part `name:version` reference is rejected.
 
 ```rust,ignore
 let result = client
@@ -81,7 +99,7 @@ let result = client
         &verified_portal_tls,
         "203.0.113.10",
         2024,
-        "storage-service:v0.1.0",
+        "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/storage-service:v0.1.0",
         None,
     )
     .await?;
@@ -90,12 +108,59 @@ let result = client
 This method resolves the `WorkloadSpec`, generates a fresh 32-byte challenge,
 fetches `GET /session/evidence-bundle`, resolves the committed Azure MAA key
 when required, constructs `SessionVerificationInputs`, and calls
-`atakit_attestation::verify_session_bundle`.
+`atakit_attestation::verify_session_bundle` on a blocking worker. The success
+response from `GET /session/evidence-bundle` is limited to 8 MiB. An error
+response is limited to 64 KiB.
 
-The concrete portal TLS plus current-session workflow lives in
-`atakit_cloud::session::verify_portal_session`. This client starts from
-`VerifiedPortalTls`, so platform-specific portal TLS collection remains
-outside this crate.
+The complete portal TLS plus current-session workflow is
+`atakit_attestation_client::workflow::verify_portal_session`. Services that
+must retain their own resource permit after an HTTP timeout can use the exposed
+preparation phases. After `prepare_portal_session_tls_verification`, move the
+prepared portal TLS verification and the permit into a blocking worker. Then
+call `VerifiedPortalSessionTls::fetch_session`, move the fetched response and
+the permit into a blocking worker for
+`FetchedPortalSessionVerification::parse`, call
+`ParsedPortalSessionVerification::prepare`, and finally move the prepared
+session verification and permit into its blocking worker.
+
+When the caller already holds the exact response from
+`GET /session/evidence-bundle`, use
+`atakit_attestation_client::verify_supplied_session_bundle`. This workflow
+resolves policy and collateral from one `SessionVerificationMode`, verifies the
+caller-supplied 32-byte challenge, applies the request's optional
+`required_binding` policy after normal binding verification, and makes no
+portal network request. `required_binding = None` accepts either valid binding
+mode and does not skip cryptographic binding checks. It runs
+the final synchronous cryptographic verification on a blocking worker. Services
+that must retain their own resource permit after an HTTP timeout can call
+`prepare_supplied_session_bundle`, then move both the prepared verification and
+that permit into their bounded blocking worker.
 
 Use `atakit_attestation::verify_session_bundle` directly when all typed inputs
 are already available and no network access is required.
+
+## Boundary decision, 2026-08-08
+
+Portal TLS collection lives in this crate. This reverses the boundary set on
+2026-08-03 in `atakit-ng` pull request 58 (merge
+`0dafb670dbca18920b1e143ca7a2d2d87c0a0a0c`, topic
+`e68c0245cba0d3c418d3be38d7dd4b20780b2abd`), which stated that
+`atakit_cloud::session::verify_portal_session` owned the complete order and
+that platform-specific portal TLS collection remained outside this crate.
+
+This is a recorded change of mind, not the old rule failing to apply. The
+operator authored both the topic commit and the merge, and directed the
+reversal five days later.
+
+The reason: a consumer that wants the complete verification workflow needed
+exactly one function from `atakit-cloud` and received `aws/`, `azure/`, `gcp/`,
+`qemu/`, disk-image handling, and their dependencies with it. The platform
+branching involved is not cloud deployment code — it reads
+`response.platform.cloud` and `response.platform.tee` to decide which
+collateral a given piece of evidence requires, and uses no cloud provider SDK,
+no credentials, and no deployment module.
+
+`atakit-cloud` keeps deployment — the `POST /init` upload and portal lifecycle
+waiting — and re-exports every moved name, so `atakit cloud verify-session`,
+`atakit cloud deploy`, and `atakit cloud session status` are unchanged.
+`atakit-attestation` remains free of network access.

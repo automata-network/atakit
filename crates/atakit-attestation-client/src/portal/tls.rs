@@ -1,0 +1,1102 @@
+//! Portal TLS attestation collection: fetch `/tls-attestation`, resolve the
+//! trust inputs the presented platform requires, verify, and return a client
+//! pinned to the attested certificate.
+
+use std::io::Read;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use atakit_attestation::{
+    verify_tls_attestation, verify_tls_attestation_with_workload_attributes, CheckResult,
+    EvidenceSummary, MeasurementPolicy, TlsAttestationResponse, VerificationCheck,
+    VerificationInputs, VerificationReport, VerifiedTlsIdentity,
+};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use sha2::{Digest, Sha256};
+
+use crate::collateral::amd_snp::resolve_amd_snp_collateral;
+use crate::collateral::intel_tdx::{
+    resolve_tdx_dcap_collateral_for_quote, tdx_collateral_quote, IntelTdxDcapCollateralSource,
+};
+use crate::error::PortalVerificationError;
+use crate::http::read_response_bytes_limited;
+use crate::portal::session::{
+    PortalSessionVerificationContext, SessionAuthority, TlsManualOverride, VerifiedPortalTls,
+};
+use crate::trust::builder::TrustAnchorsBuilder;
+use crate::trust::measurement::write_tls_attestation_report;
+use crate::trust::request::CollateralRequest;
+use crate::trust::source::{ChainTrustSource, ExplicitTrustSource, PackTrustSource, TrustSource};
+use atakit_cvm_types::AppRef;
+
+const MAX_TLS_ATTESTATION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PORTAL_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Portal TLS inputs whose network and trust-data work is complete.
+///
+/// [`PreparedPortalTlsVerification::verify`] performs the remaining
+/// synchronous cryptographic verification. Callers running on Tokio must run
+/// it with `tokio::task::spawn_blocking`.
+pub struct PreparedPortalTlsVerification {
+    state: PreparedPortalTlsVerificationState,
+}
+
+enum PreparedPortalTlsVerificationState {
+    Complete(Box<VerifiedPortalTls>),
+    Pending(Box<PendingPortalTlsVerification>),
+}
+
+struct PendingPortalTlsVerification {
+    verification_inputs: VerificationInputs,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
+    live_peer_cert_der: Vec<u8>,
+    trust_tls_cert_sha256: Option<String>,
+    report_path: Option<PathBuf>,
+    host: String,
+    resolved_address: Option<SocketAddr>,
+    session_verification: Option<PortalSessionVerificationContext>,
+    trust_provenance: crate::trust::source::TrustProvenance,
+}
+
+impl PreparedPortalTlsVerification {
+    /// Complete synchronous portal TLS cryptographic verification.
+    pub fn verify(self) -> Result<VerifiedPortalTls, PortalVerificationError> {
+        let pending = match self.state {
+            PreparedPortalTlsVerificationState::Complete(verified) => return Ok(*verified),
+            PreparedPortalTlsVerificationState::Pending(pending) => pending,
+        };
+        let PendingPortalTlsVerification {
+            verification_inputs,
+            workload_attributes,
+            live_peer_cert_der,
+            trust_tls_cert_sha256,
+            report_path,
+            host,
+            resolved_address,
+            session_verification,
+            trust_provenance,
+        } = *pending;
+        let verification = match workload_attributes.as_ref() {
+            Some(attributes) => {
+                verify_tls_attestation_with_workload_attributes(verification_inputs, attributes)
+            }
+            None => verify_tls_attestation(verification_inputs),
+        };
+        match verification {
+            Ok(identity) => {
+                let client = pinned_client(
+                    &identity.cert_der,
+                    Duration::from_secs(300),
+                    &host,
+                    resolved_address,
+                )?;
+                Ok(VerifiedPortalTls {
+                    client,
+                    identity,
+                    manual_override: None,
+                    session_verification,
+                    trust_provenance,
+                })
+            }
+            Err(failure) => handle_tls_attestation_failure(
+                *failure.report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256.as_deref(),
+                report_path.as_deref(),
+                &host,
+                resolved_address,
+            ),
+        }
+    }
+
+    fn complete(verified: VerifiedPortalTls) -> Self {
+        Self {
+            state: PreparedPortalTlsVerificationState::Complete(Box::new(verified)),
+        }
+    }
+}
+
+/// One authority for portal TLS verification: the trust source, and the
+/// base-image measurement policy that same authority supplies.
+///
+/// This is the boundary every command crosses, so it is where the exclusive
+/// rule has to live. `bootstrap_portal_tls` previously took a
+/// `MeasurementPolicy` and a `TrustSource` as independent arguments, which made
+/// mixed authority representable for every caller that did not go through
+/// `verify_portal_session` — `atakit cloud init`, `deploy`, `workload init`,
+/// and every `atakit cloud session` subcommand. Closing it in the session
+/// workflow alone left the rule enforced in one command out of eight.
+///
+/// [`crate::workflow::SessionVerificationMode`] adds the workload policy on top
+/// of this, so one choice of authority covers both stages of a verification.
+#[derive(Debug, Clone)]
+pub enum PortalTlsVerificationMode {
+    /// The registry graph rooted at the verifier-selected `SessionRegistry`
+    /// supplies the measurement policy.
+    Chain {
+        source: ChainTrustSource,
+        base_image: ChainBaseImage,
+    },
+    /// The operator supplies the measurement policy directly.
+    Explicit {
+        source: ExplicitTrustSource,
+        measurement_policy: Box<MeasurementPolicy>,
+    },
+    /// The configured `workload-trust` pack supplies the measurement policy for
+    /// the named base image.
+    Packs {
+        source: PackTrustSource,
+        base_image_id: [u8; 32],
+    },
+}
+
+/// Which registry record chain mode reads its measurement policy from.
+///
+/// Two shapes because the commands differ. `verify-session` knows the
+/// base-image reference the operator asked about. `init`, `deploy`, and
+/// `workload init` reach a portal before a reference is necessarily known and
+/// take the identifier from the portal's untrusted `GET /status`.
+///
+/// The untrusted identifier selects which record is read; it never decides what
+/// that record says. The registry is still the authority, and the measured PCRs
+/// still have to match what it returns, so a portal claiming another image's
+/// identifier gets that image's policy applied to its own measurements and
+/// fails.
+#[derive(Debug, Clone)]
+pub enum ChainBaseImage {
+    /// The operator named it.
+    Reference(AppRef),
+    /// Taken from `GET /status`, optionally cross-checked against a reference
+    /// the operator did name.
+    PortalReported([u8; 32]),
+}
+
+impl PortalTlsVerificationMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Chain { .. } => "chain",
+            Self::Explicit { .. } => "explicit",
+            Self::Packs { .. } => "trust-pack",
+        }
+    }
+
+    /// The trust-anchor source for this mode.
+    pub fn trust_source(&self) -> TrustSource {
+        match self {
+            Self::Chain { source, .. } => TrustSource::Chain(source.clone()),
+            Self::Explicit { source, .. } => TrustSource::Explicit(source.clone()),
+            Self::Packs { source, .. } => TrustSource::Packs(source.clone()),
+        }
+    }
+
+    /// The base-image measurement policy, from this mode's own authority.
+    pub async fn measurement_policy(&self) -> Result<MeasurementPolicy, PortalVerificationError> {
+        match self {
+            Self::Chain { source, base_image } => {
+                let client = source.client();
+                match base_image {
+                    ChainBaseImage::Reference(app_ref) => {
+                        client
+                            .resolve_base_image_measurement_policy(&app_ref.to_string())
+                            .await
+                    }
+                    ChainBaseImage::PortalReported(id) => {
+                        client
+                            .resolve_base_image_measurement_policy_by_id(
+                                *id,
+                                "the base image the portal reported",
+                            )
+                            .await
+                    }
+                }
+                .map_err(|error| PortalVerificationError::Config {
+                    message: error.to_string(),
+                })
+            }
+            Self::Explicit {
+                measurement_policy, ..
+            } => Ok((**measurement_policy).clone()),
+            Self::Packs {
+                source,
+                base_image_id,
+            } => Ok(crate::pack::workload::packed_measurement_policy(
+                source.workload_pack()?,
+                *base_image_id,
+            )?),
+        }
+    }
+}
+
+/// Resolve Intel TDX DCAP collateral for the selected trust source.
+///
+/// In trust-pack mode the configured packs are consulted first, and only a
+/// genuine miss reaches the configured collateral source. Vendor collateral is
+/// self-authenticating, so fetching what a pack does not contain is an
+/// availability choice rather than a trust one — but an entry that is present
+/// and unusable fails the verification, because fetching past a broken pinned
+/// entry would make pinning advisory.
+///
+/// Every other mode resolves exactly as before.
+async fn resolve_tdx_dcap_for_source(
+    response: &TlsAttestationResponse,
+    trust_source: &TrustSource,
+) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
+    resolve_tdx_dcap_for_source_quote(tdx_collateral_quote(response)?, trust_source).await
+}
+
+pub(crate) async fn resolve_tdx_dcap_for_source_quote(
+    quote: Option<Vec<u8>>,
+    trust_source: &TrustSource,
+) -> Result<Option<atakit_attestation::IntelTdxDcapCollateral>, String> {
+    let Some(quote) = quote else {
+        return Ok(None);
+    };
+    if let TrustSource::Packs(packs) = trust_source {
+        match packs.select_tdx_dcap_collateral(&quote) {
+            Ok(Some(collateral)) => return Ok(Some(collateral)),
+            Err(error) => return Err(error.to_string()),
+            Ok(None) => {
+                if matches!(
+                    trust_source.tdx_dcap_collateral().source,
+                    IntelTdxDcapCollateralSource::None
+                ) {
+                    return Err(format!(
+                        "the configured trust packs carry no Intel TDX DCAP collateral for \
+                         this quote{}, and no fallback collateral source is configured",
+                        if packs.carries_tdx_dcap_collateral() {
+                            " — they carry collateral for other hardware, so this peer's \
+                             platform is not covered"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    resolve_tdx_dcap_collateral_for_quote(&quote, trust_source.tdx_dcap_collateral())
+        .await
+        .map(Some)
+}
+
+/// How the committed session's Azure MAA key will be trusted, given the
+/// authority this verification used and the anchors it resolved for TLS.
+///
+/// Chain mode carries the client, not the key. The key in `anchors` is the one
+/// that signed the *TLS* token; the committed session's token may be signed by
+/// a different registered key, and reusing the TLS key would both reject that
+/// legitimate case and skip re-checking revocation at session time.
+pub(crate) fn session_authority(
+    trust_source: &TrustSource,
+    anchors: &atakit_attestation::TrustAnchors,
+) -> SessionAuthority {
+    match trust_source {
+        TrustSource::Chain(source) => SessionAuthority::Chain(source.client().clone()),
+        TrustSource::Explicit(_) => SessionAuthority::Explicit {
+            azure_maa_keys: anchors.azure_maa_keys.clone(),
+        },
+        TrustSource::Packs(source) => SessionAuthority::Packs {
+            source: source.clone(),
+            azure_maa_keys: anchors.azure_maa_keys.clone(),
+        },
+    }
+}
+
+/// Fetch and verify the portal's TLS attestation, resolving every trust input
+/// from one selected authority, then return a client pinned to the attested
+/// self-signed certificate.
+pub async fn bootstrap_portal_tls(
+    host: &str,
+    status_port: u16,
+    mode: &PortalTlsVerificationMode,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
+    trust_tls_cert_sha256: Option<&str>,
+    report_path: Option<&Path>,
+) -> Result<VerifiedPortalTls, PortalVerificationError> {
+    let prepared = prepare_portal_tls_at_address(
+        host,
+        status_port,
+        None,
+        mode,
+        workload_attributes,
+        trust_tls_cert_sha256,
+        report_path,
+    )
+    .await?;
+    tokio::task::spawn_blocking(move || prepared.verify())
+        .await
+        .map_err(
+            |error| PortalVerificationError::PortalTlsAttestationFailed {
+                message: format!("portal TLS verification worker failed: {error}"),
+            },
+        )?
+}
+
+pub(crate) async fn prepare_portal_tls_at_address(
+    host: &str,
+    status_port: u16,
+    resolved_address: Option<SocketAddr>,
+    mode: &PortalTlsVerificationMode,
+    workload_attributes: Option<atakit_core::tee_attributes::AttributeRequirements>,
+    trust_tls_cert_sha256: Option<&str>,
+    report_path: Option<&Path>,
+) -> Result<PreparedPortalTlsVerification, PortalVerificationError> {
+    let trust_source = &mode.trust_source();
+    // The window is checked before anything else, including before the portal
+    // is contacted, because this is the boundary every caller crosses.
+    if let TrustSource::Packs(source) = trust_source {
+        source.ensure_valid_now()?;
+    }
+    let measurement_policy = Some(mode.measurement_policy().await?);
+    let amd_snp_crls = match trust_source {
+        TrustSource::Explicit(source) => source.amd_snp_crls().to_vec(),
+        TrustSource::Packs(source) => source.amd_snp_crls().to_vec(),
+        TrustSource::Chain(_) => Vec::new(),
+    };
+    let nonce = random_nonce()?;
+    let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
+    let url = crate::portal::portal_url(
+        host,
+        status_port,
+        &format!("/tls-attestation?nonce={nonce_b64}"),
+    );
+    let bootstrap = apply_resolution(
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_info(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30)),
+        host,
+        resolved_address,
+    )
+    .build()
+    .map_err(|e| PortalVerificationError::Http {
+        message: e.to_string(),
+    })?;
+
+    let resp = bootstrap.get(&url).send().await.map_err(|e| {
+        PortalVerificationError::PortalTlsAttestationFailed {
+            message: format!("request failed: {e}"),
+        }
+    })?;
+    let live_peer_cert_der = peer_cert_der(&resp)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_ERROR_RESPONSE_BYTES,
+            "portal TLS attestation error response",
+        )
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
+        let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+        let live_hash = format!("0x{}", hex::encode(live_sha));
+        let report = endpoint_failure_report(status.as_u16(), &body, &live_hash);
+        let written_report_path = if let Some(path) = report_path {
+            write_tls_attestation_report(&report, path)?;
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
+        if trust_tls_cert_sha256 == Some(live_hash.as_str()) {
+            let client = pinned_client(
+                &live_peer_cert_der,
+                Duration::from_secs(300),
+                host,
+                resolved_address,
+            )?;
+            return Ok(PreparedPortalTlsVerification::complete(VerifiedPortalTls {
+                client,
+                identity: VerifiedTlsIdentity {
+                    cert_der: live_peer_cert_der,
+                    cert_sha256: live_sha,
+                    base_image_id: None,
+                    platform_profile_id: None,
+                    variant_id: None,
+                },
+                trust_provenance: Default::default(),
+                manual_override: Some(TlsManualOverride {
+                    live_cert_sha256: live_hash,
+                    report,
+                    report_path: written_report_path,
+                }),
+                session_verification: None,
+            }));
+        }
+        let report_location = written_report_path
+            .as_ref()
+            .map(|path| format!("\nfailure report: {}", path.display()))
+            .unwrap_or_default();
+        return Err(PortalVerificationError::PortalTlsAttestationFailed {
+            message: format!(
+                "portal returned {status}: {body}{report_location}\nmanual override after inspection: --trust-tls-cert-sha256 {live_hash}"
+            ),
+        });
+    }
+
+    let response_body = read_response_bytes_limited(
+        resp,
+        MAX_TLS_ATTESTATION_RESPONSE_BYTES,
+        "portal TLS attestation response",
+    )
+    .await
+    .map_err(|message| PortalVerificationError::PortalTlsAttestationFailed { message })?;
+    let response =
+        serde_json::from_slice::<TlsAttestationResponse>(&response_body).map_err(|e| {
+            PortalVerificationError::PortalTlsAttestationFailed {
+                message: format!("invalid response JSON: {e}"),
+            }
+        })?;
+    let intel_tdx_dcap_collateral = match resolve_tdx_dcap_for_source(&response, trust_source).await
+    {
+        Ok(collateral) => collateral,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "tdx-dcap-collateral",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+                host,
+                resolved_address,
+            )
+            .map(PreparedPortalTlsVerification::complete);
+        }
+    };
+
+    let amd_snp_collateral = match resolve_amd_snp_collateral(&response, amd_snp_crls).await {
+        Ok(collateral) => collateral,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "amd-snp-collateral",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+                host,
+                resolved_address,
+            )
+            .map(PreparedPortalTlsVerification::complete);
+        }
+    };
+
+    let request = match CollateralRequest::from_response(&response, amd_snp_collateral.as_ref()) {
+        Ok(request) => request,
+        Err(detail) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "collateral-request",
+                detail,
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+                host,
+                resolved_address,
+            )
+            .map(PreparedPortalTlsVerification::complete);
+        }
+    };
+
+    // One source resolves everything. A required input the source cannot
+    // supply fails closed naming the input; it never falls through.
+    let builder = TrustAnchorsBuilder::new(trust_source.clone());
+    let (trust_anchors, trust_provenance) = match builder.resolve(&request).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+            let live_hash = format!("0x{}", hex::encode(live_sha));
+            let report = tls_preverification_failure_report(
+                &response,
+                &live_hash,
+                "trust-anchors",
+                error.to_string(),
+            );
+            return handle_tls_attestation_failure(
+                report,
+                live_peer_cert_der,
+                trust_tls_cert_sha256,
+                report_path,
+                host,
+                resolved_address,
+            )
+            .map(PreparedPortalTlsVerification::complete);
+        }
+    };
+    let authority = session_authority(trust_source, &trust_anchors);
+    let session_verification =
+        measurement_policy
+            .clone()
+            .map(|measurement_policy| PortalSessionVerificationContext {
+                platform: response.platform.clone(),
+                measurement_policy,
+                trust_anchors: trust_anchors.clone(),
+                authority: authority.clone(),
+                amd_snp_collateral: amd_snp_collateral.clone(),
+                intel_tdx_dcap_collateral: intel_tdx_dcap_collateral.clone(),
+            });
+    let verification_inputs = VerificationInputs {
+        nonce,
+        live_peer_cert_der: live_peer_cert_der.clone(),
+        response,
+        intel_tdx_dcap_collateral,
+        amd_snp_collateral,
+        measurement_policy,
+        trust_anchors,
+    };
+    Ok(PreparedPortalTlsVerification {
+        state: PreparedPortalTlsVerificationState::Pending(Box::new(
+            PendingPortalTlsVerification {
+                verification_inputs,
+                workload_attributes,
+                live_peer_cert_der,
+                trust_tls_cert_sha256: trust_tls_cert_sha256.map(ToOwned::to_owned),
+                report_path: report_path.map(Path::to_path_buf),
+                host: host.to_string(),
+                resolved_address,
+                session_verification,
+                trust_provenance,
+            },
+        )),
+    })
+}
+
+fn tls_preverification_failure_report(
+    response: &TlsAttestationResponse,
+    live_hash: &str,
+    check_name: &str,
+    detail: String,
+) -> VerificationReport {
+    VerificationReport {
+        checks: vec![VerificationCheck {
+            name: check_name.to_string(),
+            result: CheckResult::Fail,
+            detail: Some(detail),
+        }],
+        evidence: EvidenceSummary {
+            tls_cert_der: Some(response.tls_cert_der.clone()),
+            live_tls_cert_sha256: Some(live_hash.to_string()),
+            response_tls_cert_sha256: Some(response.tls_cert_sha256.clone()),
+            nonce: Some(response.nonce.clone()),
+            qualifying_data: Some(response.qualifying_data.clone()),
+            cloud: Some(response.platform.cloud.clone()),
+            tee: Some(response.platform.tee.clone()),
+            machine_type: Some(response.platform.machine_type.clone()),
+            tpm_ak_public: Some(response.tpm.ak_public.clone()),
+            tpm_quote: Some(response.tpm.quote.clone()),
+            tpm_signature: Some(response.tpm.signature.clone()),
+            pcrs: response.tpm.pcrs.clone(),
+            event_log_hashes: response.tpm.event_log_hashes.clone(),
+            tee_evidence_kind: response
+                .tee_evidence
+                .as_ref()
+                .map(|evidence| evidence.kind.clone()),
+            tee_evidence_report: response
+                .tee_evidence
+                .as_ref()
+                .map(|evidence| evidence.report.clone()),
+            tee_evidence_auxiliary: response
+                .tee_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.auxiliary.clone()),
+            ak_binding_kind: response
+                .ak_binding
+                .as_ref()
+                .map(|binding| binding.kind.clone()),
+            ak_binding_data: response
+                .ak_binding
+                .as_ref()
+                .map(|binding| binding.data.clone()),
+            collateral: response.collateral.clone(),
+            ..EvidenceSummary::default()
+        },
+    }
+}
+
+fn handle_tls_attestation_failure(
+    report: VerificationReport,
+    live_peer_cert_der: Vec<u8>,
+    trust_tls_cert_sha256: Option<&str>,
+    report_path: Option<&Path>,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
+) -> Result<VerifiedPortalTls, PortalVerificationError> {
+    let written_report_path = if let Some(path) = report_path {
+        write_tls_attestation_report(&report, path)?;
+        Some(path.to_path_buf())
+    } else {
+        None
+    };
+    let live_sha: [u8; 32] = Sha256::digest(&live_peer_cert_der).into();
+    let live_hash = format!("0x{}", hex::encode(live_sha));
+    if trust_tls_cert_sha256 == Some(live_hash.as_str()) {
+        let client = pinned_client(
+            &live_peer_cert_der,
+            Duration::from_secs(300),
+            host,
+            resolved_address,
+        )?;
+        return Ok(VerifiedPortalTls {
+            client,
+            identity: VerifiedTlsIdentity {
+                cert_der: live_peer_cert_der,
+                cert_sha256: live_sha,
+                base_image_id: None,
+                platform_profile_id: None,
+                variant_id: None,
+            },
+            trust_provenance: Default::default(),
+            manual_override: Some(TlsManualOverride {
+                live_cert_sha256: live_hash,
+                report,
+                report_path: written_report_path,
+            }),
+            session_verification: None,
+        });
+    }
+    let report_json = serde_json::to_string_pretty(&report)
+        .unwrap_or_else(|_| "<failed to render report>".to_string());
+    let report_location = written_report_path
+        .as_ref()
+        .map(|path| format!("\nfailure report: {}", path.display()))
+        .unwrap_or_default();
+    Err(PortalVerificationError::PortalTlsAttestationFailed {
+        message: format!(
+            "{report_json}{report_location}\nmanual override after inspection: --trust-tls-cert-sha256 {live_hash}"
+        ),
+    })
+}
+
+fn peer_cert_der(resp: &reqwest::Response) -> Result<Vec<u8>, PortalVerificationError> {
+    resp.extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .map(|der| der.to_vec())
+        .ok_or_else(|| PortalVerificationError::PortalTlsAttestationFailed {
+            message: "bootstrap connection did not expose a peer certificate".to_string(),
+        })
+}
+
+fn endpoint_failure_report(status: u16, body: &str, live_hash: &str) -> VerificationReport {
+    VerificationReport {
+        checks: vec![atakit_attestation::VerificationCheck {
+            name: "tls-attestation-endpoint".to_string(),
+            result: atakit_attestation::CheckResult::Fail,
+            detail: Some(format!("portal returned HTTP {status}: {body}")),
+        }],
+        evidence: atakit_attestation::EvidenceSummary {
+            live_tls_cert_sha256: Some(live_hash.to_string()),
+            ..atakit_attestation::EvidenceSummary::default()
+        },
+    }
+}
+
+pub fn tls_manual_override_message(verified: &VerifiedPortalTls) -> Option<String> {
+    let override_info = verified.manual_override.as_ref()?;
+    let report_json = serde_json::to_string_pretty(&override_info.report)
+        .unwrap_or_else(|_| "<failed to render report>".to_string());
+    Some(format!(
+        "TLS attestation failed, but manual override accepted for live certificate {}.{}\n{}",
+        override_info.live_cert_sha256,
+        override_info
+            .report_path
+            .as_ref()
+            .map(|path| format!("\nFailure report: {}", path.display()))
+            .unwrap_or_default(),
+        report_json
+    ))
+}
+
+fn pinned_client(
+    cert_der: &[u8],
+    timeout: Duration,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
+) -> Result<reqwest::Client, PortalVerificationError> {
+    let cert = reqwest::Certificate::from_der(cert_der).map_err(|e| {
+        PortalVerificationError::PortalTlsAttestationFailed {
+            message: format!("invalid attested TLS certificate: {e}"),
+        }
+    })?;
+    apply_resolution(
+        reqwest::Client::builder()
+            .add_root_certificate(cert)
+            // Portal certs are issued for `atakit-portal`, while clients usually
+            // connect by cloud IP. Cert validity is pinned by the attestation hash;
+            // only hostname verification is relaxed here.
+            .danger_accept_invalid_hostnames(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout),
+        host,
+        resolved_address,
+    )
+    .build()
+    .map_err(|e| PortalVerificationError::Http {
+        message: e.to_string(),
+    })
+}
+
+fn apply_resolution(
+    builder: reqwest::ClientBuilder,
+    host: &str,
+    resolved_address: Option<SocketAddr>,
+) -> reqwest::ClientBuilder {
+    let Some(address) = resolved_address else {
+        return builder;
+    };
+    let builder = builder.no_proxy();
+    match host.parse::<std::net::IpAddr>() {
+        Err(_) => builder.resolve(host, address),
+        Ok(_) => builder,
+    }
+}
+
+fn random_nonce() -> Result<[u8; 32], PortalVerificationError> {
+    let mut nonce = [0u8; 32];
+    let mut file =
+        std::fs::File::open("/dev/urandom").map_err(|e| PortalVerificationError::IoPath {
+            path: "/dev/urandom".into(),
+            source: e,
+        })?;
+    file.read_exact(&mut nonce)
+        .map_err(|e| PortalVerificationError::IoPath {
+            path: "/dev/urandom".into(),
+            source: e,
+        })?;
+    Ok(nonce)
+}
+
+#[cfg(test)]
+mod collateral_mode_tests {
+    use super::*;
+    use crate::collateral::intel_tdx::{
+        tdx_dcap_collateral_config, IntelTdxDcapCollateralConfig, IntelTdxDcapCollateralSource,
+        TdxDcapAutomataReadStrategy,
+    };
+    use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+
+    fn captured_response() -> TlsAttestationResponse {
+        serde_json::from_str(include_str!("../testdata/azure-tdx-tls-attestation.json"))
+            .expect("captured Azure TDX response")
+    }
+
+    fn automata_onchain(rpc_url: &str) -> IntelTdxDcapCollateralConfig {
+        IntelTdxDcapCollateralConfig {
+            source: IntelTdxDcapCollateralSource::AutomataOnchainPccs {
+                chain: Some("hoodi".to_string()),
+                rpc_url: Some(rpc_url.to_string()),
+                pcs_dao: None,
+                pck_dao: None,
+                fmspc_tcb_dao: None,
+                enclave_identity_dao: None,
+                read_strategy: TdxDcapAutomataReadStrategy::DirectConcurrent,
+            },
+        }
+    }
+
+    /// An AMD SEV-SNP response returns before the configured Intel TDX source
+    /// is constructed or queried. The reachable counter is the proof: a
+    /// request would be visible even if it later failed to decode.
+    #[tokio::test]
+    async fn amd_sev_snp_does_not_touch_an_unused_intel_tdx_collateral_source() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let mut response = captured_response();
+        response.platform.tee = "sev-snp".to_string();
+        let source = TrustSource::Explicit(
+            ExplicitTrustSource::new(
+                TlsVerificationTrust::default(),
+                automata_onchain(endpoint.url()),
+            )
+            .expect("explicit source"),
+        );
+
+        let collateral = resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("an AMD response does not need Intel collateral");
+        assert!(collateral.is_none());
+        assert_eq!(
+            endpoint.requests(),
+            0,
+            "AMD SEV-SNP verification queried an unused Intel TDX collateral source"
+        );
+    }
+
+    /// Network-backed integration proof for explicit policy authority plus
+    /// Automata on-chain PCCS Intel TDX collateral. Ignored in the normal
+    /// offline test run; the live validation command runs it explicitly.
+    #[tokio::test]
+    #[ignore = "requires the public Hoodi RPC endpoint"]
+    async fn explicit_mode_fetches_intel_tdx_collateral_from_automata_onchain_pccs() {
+        let response = captured_response();
+        let source = TrustSource::Explicit(
+            ExplicitTrustSource::new(
+                TlsVerificationTrust::default(),
+                tdx_dcap_collateral_config(None, None, None, None)
+                    .expect("default Automata PCCS source"),
+            )
+            .expect("explicit source"),
+        );
+        assert_eq!(source.mode(), "explicit");
+        assert!(resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("Automata on-chain collateral fetch")
+            .is_some());
+    }
+
+    /// The same network-backed proof for trust-pack policy authority. The
+    /// on-chain query supplies only Intel collateral; the selected authority
+    /// remains `trust-pack`.
+    #[tokio::test]
+    #[ignore = "requires the public Hoodi RPC endpoint"]
+    async fn trust_pack_mode_fetches_intel_tdx_collateral_from_automata_onchain_pccs() {
+        let response = captured_response();
+        let source = TrustSource::Packs(
+            PackTrustSource::new(
+                Vec::new(),
+                Vec::new(),
+                tdx_dcap_collateral_config(None, None, None, None)
+                    .expect("default Automata PCCS source"),
+            )
+            .expect("pack source"),
+        );
+        assert_eq!(source.mode(), "trust-pack");
+        assert!(resolve_tdx_dcap_for_source(&response, &source)
+            .await
+            .expect("Automata on-chain collateral fetch")
+            .is_some());
+    }
+}
+
+#[cfg(test)]
+mod session_authority_tests {
+    use super::*;
+    use crate::chain::{AttestationClient, AttestationClientConfig};
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+    use atakit_attestation::{AzureMaaTrustCertificate, TrustAnchors};
+
+    /// The key that signed the TLS token.
+    fn tls_key() -> TrustAnchors {
+        TrustAnchors {
+            azure_maa_keys: vec![AzureMaaTrustCertificate {
+                public_key: b"tls-signing-key-A".to_vec(),
+                not_after: u64::MAX,
+            }],
+            ..TrustAnchors::default()
+        }
+    }
+
+    /// Chain mode must not carry the TLS key forward as the committed-session
+    /// key. It carries the client instead, so the committed token's own `kid`
+    /// and `iss` are resolved against the registry at session time.
+    ///
+    /// This is the defect the type change removes: the TLS key used to be
+    /// copied into the context unconditionally and consulted first, which made
+    /// the registry lookup unreachable in chain mode.
+    #[tokio::test]
+    async fn chain_mode_carries_the_client_rather_than_the_tls_key() {
+        let endpoint = CountingRpcEndpoint::start().await;
+        let client = AttestationClient::connect(AttestationClientConfig {
+            rpc_url: endpoint.url().to_string(),
+            session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+            expected_chain_id: None,
+            expected_base_image_registry: None,
+            expected_workload_registry: None,
+        })
+        .await
+        .expect("connect");
+
+        let anchors = tls_key();
+        let source = TrustSource::Chain(crate::trust::source::ChainTrustSource::from_client(
+            client,
+            IntelTdxDcapCollateralConfig::default(),
+        ));
+
+        match session_authority(&source, &anchors) {
+            SessionAuthority::Chain(_) => {}
+            SessionAuthority::Explicit { azure_maa_keys }
+            | SessionAuthority::Packs { azure_maa_keys, .. } => panic!(
+                "chain mode must not carry offline keys; it carried {} of them, which is the \
+                 TLS key standing in for the committed-session key",
+                azure_maa_keys.len()
+            ),
+        }
+    }
+
+    /// Explicit and trust-pack modes have no registry to ask, so they keep the
+    /// keys their own authority supplied.
+    #[test]
+    fn offline_modes_retain_their_own_keys() {
+        let anchors = tls_key();
+        for source in [
+            TrustSource::Explicit(
+                crate::trust::source::ExplicitTrustSource::new(
+                    TlsVerificationTrust::default(),
+                    IntelTdxDcapCollateralConfig::default(),
+                )
+                .unwrap(),
+            ),
+            TrustSource::Packs(
+                crate::trust::source::PackTrustSource::new(
+                    Vec::new(),
+                    Vec::new(),
+                    IntelTdxDcapCollateralConfig::default(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            let mode = source.mode();
+            match session_authority(&source, &anchors) {
+                SessionAuthority::Explicit { azure_maa_keys }
+                | SessionAuthority::Packs { azure_maa_keys, .. } => {
+                    assert_eq!(
+                        azure_maa_keys.len(),
+                        1,
+                        "{mode} must retain its supplied key"
+                    );
+                }
+                SessionAuthority::Chain(_) => {
+                    panic!("{mode} has no registry to resolve a committed-session key from")
+                }
+            }
+        }
+    }
+}
+
+/// The workload policy must come from the authority that verified portal TLS.
+///
+/// These drive `authority_accepts`, which the single session entry point calls
+/// before resolving anything. The crossings they reject were each reachable
+/// through a public API at some point in this branch's history: a bare
+/// `TrustedWorkloadSessionPolicy` carries no evidence of its source, so every
+/// entry point that accepted one accepted a foreign policy with it.
+#[cfg(test)]
+mod session_authority_enforcement {
+    use super::*;
+    use crate::chain::{AttestationClient, AttestationClientConfig, TrustedWorkloadSessionPolicy};
+    use crate::collateral::intel_tdx::IntelTdxDcapCollateralConfig;
+    use crate::portal::session::{authority_accepts, SessionWorkloadSelector};
+    use crate::test_support::CountingRpcEndpoint;
+    use crate::trust::files::TlsVerificationTrust;
+    use atakit_cvm_types::AppRef;
+
+    async fn chain_authority() -> SessionAuthority {
+        let endpoint = Box::leak(Box::new(CountingRpcEndpoint::start().await));
+        SessionAuthority::Chain(
+            AttestationClient::connect(AttestationClientConfig {
+                rpc_url: endpoint.url().to_string(),
+                session_registry: "0x1111111111111111111111111111111111111111".to_string(),
+                expected_chain_id: None,
+                expected_base_image_registry: None,
+                expected_workload_registry: None,
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    fn explicit_authority() -> SessionAuthority {
+        SessionAuthority::Explicit {
+            azure_maa_keys: Vec::new(),
+        }
+    }
+
+    fn pack_authority() -> SessionAuthority {
+        SessionAuthority::Packs {
+            source: crate::trust::source::PackTrustSource::new(
+                Vec::new(),
+                Vec::new(),
+                IntelTdxDcapCollateralConfig::default(),
+            )
+            .expect("pack source"),
+            azure_maa_keys: Vec::new(),
+        }
+    }
+
+    fn reference() -> SessionWorkloadSelector {
+        SessionWorkloadSelector::Reference(AppRef::new([0x11; 32], "w", "v1"))
+    }
+
+    fn operator_policy() -> SessionWorkloadSelector {
+        SessionWorkloadSelector::OperatorPolicy(TrustedWorkloadSessionPolicy {
+            workload_id: [0u8; 32],
+            pcr_specs256: Vec::new(),
+            pcr_specs384: Vec::new(),
+            attribute_requirements: Vec::new(),
+        })
+    }
+
+    /// Each authority accepts exactly the selector it can resolve, which is the
+    /// control for the rejections below.
+    #[tokio::test]
+    async fn each_authority_accepts_only_its_own_workload_source() {
+        authority_accepts(&chain_authority().await, &reference())
+            .expect("chain resolves a reference");
+        authority_accepts(&pack_authority(), &reference()).expect("a pack resolves a reference");
+        authority_accepts(&explicit_authority(), &operator_policy())
+            .expect("the operator is the source in explicit mode");
+    }
+
+    /// An operator policy under chain or trust-pack authority is the crossing
+    /// that survived six earlier fixes, one call frame at a time.
+    #[tokio::test]
+    async fn a_resolving_authority_refuses_an_operator_supplied_policy() {
+        for authority in [chain_authority().await, pack_authority()] {
+            let name = authority.name();
+            let Err(error) = authority_accepts(&authority, &operator_policy()) else {
+                panic!("{name} authority must refuse an operator-supplied workload policy");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(name),
+                "the failure must name the authority; got {message}"
+            );
+            assert!(
+                message.contains("explicit verification only"),
+                "the failure must say where such a policy belongs; got {message}"
+            );
+        }
+    }
+
+    /// Explicit authority has nothing to resolve a reference from.
+    #[tokio::test]
+    async fn explicit_authority_refuses_a_workload_reference() {
+        let error = authority_accepts(&explicit_authority(), &reference())
+            .expect_err("explicit mode has no registry or pack");
+        assert!(
+            error.to_string().contains("no registry or pack"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn offline_authorities_stay_distinct() {
+        assert_eq!(explicit_authority().name(), "explicit");
+        assert_eq!(pack_authority().name(), "trust-pack");
+        let _ = TlsVerificationTrust::default();
+    }
+}

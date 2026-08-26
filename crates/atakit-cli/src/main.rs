@@ -34,6 +34,12 @@ enum Command {
     /// Manage cloud deployments
     #[command(subcommand)]
     Cloud(Box<CloudCommand>),
+    /// Inspect the signing keys declared in `[keys]`
+    #[command(subcommand)]
+    Keys(commands::keys::KeysCommand),
+    /// Produce and inspect `.atatp` trust packs
+    #[command(subcommand)]
+    TrustPack(commands::trustpack::TrustPackCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -120,10 +126,12 @@ async fn main() -> Result<()> {
             WorkloadCommand::Push(args) => {
                 commands::workload::push::run(args, &env, &config, cli.verbose).await
             }
-            WorkloadCommand::Import(args) => commands::workload::import::run(args, &env).await,
-            WorkloadCommand::Export(args) => commands::workload::export::run(args, &env),
+            WorkloadCommand::Import(args) => {
+                commands::workload::import::run(args, &env, &config).await
+            }
+            WorkloadCommand::Export(args) => commands::workload::export::run(args, &env, &config),
             WorkloadCommand::Add(args) => commands::workload::add::run(args, &env, &config).await,
-            WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env),
+            WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env, &config),
             WorkloadCommand::Init(args) => {
                 commands::workload::init::run(*args, &env, &config).await
             }
@@ -134,6 +142,7 @@ async fn main() -> Result<()> {
             }
             CloudCommand::Destroy(args) => commands::cloud::destroy::run(args, &env, &config).await,
             CloudCommand::Status(args) => commands::cloud::status::run(args, &env, &config).await,
+            CloudCommand::Reboot(args) => commands::cloud::reboot::run(args, &env, &config).await,
             CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
             CloudCommand::Ssh(args) => commands::cloud::ssh::run(args, &env, &config),
             CloudCommand::Serial(args) => commands::cloud::serial::run(args, &env, &config).await,
@@ -173,6 +182,18 @@ async fn main() -> Result<()> {
                     commands::cloud::session::run_status(args, &env, &config).await
                 }
             },
+        },
+        Command::Keys(cmd) => match cmd {
+            commands::keys::KeysCommand::Ls(args) => commands::keys::ls(args, &config),
+            commands::keys::KeysCommand::Show(args) => commands::keys::show(args, &config),
+        },
+        Command::TrustPack(cmd) => match cmd {
+            commands::trustpack::TrustPackCommand::Build(args) => {
+                commands::trustpack::build(args, &config).await
+            }
+            commands::trustpack::TrustPackCommand::Inspect(args) => {
+                commands::trustpack::inspect(args)
+            }
         },
         Command::External(args) => {
             let subcmd = &args[0];

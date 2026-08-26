@@ -14,7 +14,13 @@ const INTEL_PCK_PLATFORM_CA_CN: &str = "Intel SGX PCK Platform CA";
 const INTEL_PCK_PROCESSOR_CA_CN: &str = "Intel SGX PCK Processor CA";
 const MAX_TDX_QUOTE_BYTES: usize = 16 * 1024;
 const MAX_COLLATERAL_FILE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_COLLATERAL_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single Intel TDX DCAP collateral component this crate will parse.
+///
+/// Public because `.atatp` pins its single-entry archive limit to this value:
+/// a component a trust pack reader accepted but this parser rejected would be
+/// a wasted parse, so the two must agree. The `.atatp` reader asserts the
+/// equality in a test rather than restating the number.
+pub const MAX_COLLATERAL_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ISSUER_CHAIN_CERTIFICATES: usize = 8;
 
 #[derive(Debug, Error)]
@@ -462,10 +468,10 @@ pub fn intel_tdx_quote_collateral_identity(
             quote.header.version.get()
         )));
     }
-    let nonzero_trailing_bytes = quote_bytes.iter().filter(|byte| **byte != 0).count();
-    if nonzero_trailing_bytes != 0 {
+    if !quote_bytes.is_empty() {
         return Err(IntelTdxDcapCollateralError::Quote(format!(
-            "quote has {nonzero_trailing_bytes} non-zero trailing bytes"
+            "quote has {} trailing bytes",
+            quote_bytes.len()
         )));
     }
     let pck_data = quote.signature.get_pck_cert_chain().map_err(|error| {
@@ -593,6 +599,33 @@ fn display_identity(identity: IntelTdxQuoteCollateralIdentity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tdx_quote() -> Vec<u8> {
+        let mut provider_buffer = hex::decode(
+            include_str!("../../atakit-attestation-client/testdata/automata-dcap/quotev4.hex")
+                .trim(),
+        )
+        .expect("decode TDX quote fixture");
+        let mut unread = provider_buffer.as_slice();
+        Quote::read(&mut unread).expect("parse TDX quote fixture");
+        let exact_length = provider_buffer.len() - unread.len();
+        assert!(unread.iter().all(|byte| *byte == 0));
+        provider_buffer.truncate(exact_length);
+        provider_buffer
+    }
+
+    #[test]
+    fn collateral_identity_rejects_every_trailing_byte() {
+        let quote = tdx_quote();
+        intel_tdx_quote_collateral_identity(&quote).unwrap();
+
+        for trailing in [vec![0], vec![1], vec![0, 1]] {
+            let mut padded = quote.clone();
+            padded.extend_from_slice(&trailing);
+            let error = intel_tdx_quote_collateral_identity(&padded).unwrap_err();
+            assert!(error.to_string().contains("trailing bytes"), "{error}");
+        }
+    }
 
     #[test]
     fn rejects_unknown_versioned_file_fields_before_quote_parsing() {

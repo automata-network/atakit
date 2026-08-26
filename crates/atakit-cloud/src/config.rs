@@ -373,8 +373,25 @@ const GCP_TDX_ZONES: &[&str] = &[
 
 const AWS_SNP_REGIONS: &[&str] = &["us-east-2", "eu-west-1"];
 
-/// AWS instance type families supporting AMD SEV-SNP.
-const AWS_SNP_INSTANCE_FAMILIES: &[&str] = &["m6a", "c6a", "r6a", "m7a", "c7a", "r7a"];
+/// Exact AWS shared-tenancy instance types supporting AMD SEV-SNP.
+const AWS_SNP_INSTANCE_TYPES: &[&str] = &[
+    "m6a.large",
+    "m6a.xlarge",
+    "m6a.2xlarge",
+    "m6a.4xlarge",
+    "m6a.8xlarge",
+    "c6a.large",
+    "c6a.xlarge",
+    "c6a.2xlarge",
+    "c6a.4xlarge",
+    "c6a.8xlarge",
+    "c6a.12xlarge",
+    "c6a.16xlarge",
+    "r6a.large",
+    "r6a.xlarge",
+    "r6a.2xlarge",
+    "r6a.4xlarge",
+];
 
 // Azure ARM region IDs (lowercase, no spaces). Match the format passed to
 // `az --location`, which is what downstream image.rs / deploy.rs consume.
@@ -546,10 +563,10 @@ pub fn validate_target(
             if !is_aws_snp_instance(&target.vmtype) {
                 return Err(err(format!(
                     "unsupported AWS instance type '{}'. \
-                     Use an AMD SEV-SNP instance family: {}. \
+                     Use an AMD SEV-SNP instance type: {}. \
                      Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/sev-snp.html",
                     target.vmtype,
-                    AWS_SNP_INSTANCE_FAMILIES.join(", ")
+                    AWS_SNP_INSTANCE_TYPES.join(", ")
                 )));
             }
             if !AWS_SNP_REGIONS.contains(&provider.region.as_str()) {
@@ -568,10 +585,7 @@ pub fn validate_target(
 
 /// Match an AWS SEV-SNP-capable instance type (e.g. `m6a.large`).
 fn is_aws_snp_instance(vmtype: &str) -> bool {
-    match vmtype.split_once('.') {
-        Some((family, size)) => !size.is_empty() && AWS_SNP_INSTANCE_FAMILIES.contains(&family),
-        None => false,
-    }
+    AWS_SNP_INSTANCE_TYPES.contains(&vmtype)
 }
 
 /// Match `Standard_DC{2,4,8,16,32,64,96,128}es_v6`.
@@ -938,15 +952,34 @@ mod tests {
     }
 
     #[test]
-    fn aws_snp_all_families() {
+    fn aws_snp_all_instance_types() {
         let p = make_provider(PlatformKind::Aws, "eu-west-1");
-        for fam in AWS_SNP_INSTANCE_FAMILIES {
-            let vmtype = format!("{fam}.xlarge");
-            let t = make_target(&vmtype);
+        for vmtype in AWS_SNP_INSTANCE_TYPES {
+            let t = make_target(vmtype);
             assert!(
                 validate_target(&t, &p, "test").is_ok(),
                 "expected {vmtype} to be valid"
             );
+        }
+    }
+
+    #[test]
+    fn aws_snp_rejects_unsupported_instance_sizes() {
+        for vmtype in ["m6a.12xlarge", "r6a.8xlarge", "m6a.metal"] {
+            let err = infer_cc_type(PlatformKind::Aws, vmtype)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot infer CC type"), "{vmtype}: {err}");
+        }
+    }
+
+    #[test]
+    fn aws_snp_rejects_unsupported_instance_families() {
+        for vmtype in ["m7a.large", "c7a.large", "r7a.large"] {
+            let err = infer_cc_type(PlatformKind::Aws, vmtype)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot infer CC type"), "{vmtype}: {err}");
         }
     }
 

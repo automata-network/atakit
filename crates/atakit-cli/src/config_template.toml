@@ -132,6 +132,37 @@
 # owner_key = "owner"
 # relay_key = "relayer"
 
+# ─── Aliases ──────────────────────────────────────────────────────────
+#
+# Typing shorthand, and nothing more. A base image or workload is named
+# `<publisher>/<name>:<version>`, where `<publisher>` is the fingerprint of
+# the key that published it. That canonical form is what identifiers are
+# derived from.
+#
+# Aliases are expanded here, when a reference is read from the command line
+# or this file. They never reach a manifest, a measurement, or persisted
+# state, so no alias can change what a workload measures to.
+#
+# `[alias.publishers]` gives a fingerprint a name, so you can write
+# `automata/fedora-oci:v0.0.16` instead of the full 66-character form. Every
+# value must be a fingerprint; one that isn't is rejected when this file is
+# loaded, naming the offending entry, rather than at the moment you use it.
+#
+# [alias.publishers]
+# automata = "0x9f2c...e07d"
+#
+# `[alias.apps]` says which publisher owns a bare application name, so
+# `fedora-oci:v0.0.16` resolves with no publisher segment at all. One table
+# covers base images and workloads alike. The value is either a name from
+# `[alias.publishers]` or a fingerprint written out in full.
+#
+# [alias.apps]
+# fedora-oci = "automata"
+#
+# An unresolved name is always an error naming the table it was looked up
+# in. It never falls through to a literal, which would silently bind a
+# reference to a publisher you never named.
+
 # ─── Workload repositories ────────────────────────────────────────────
 #
 # Tagged inline tables: each entry is either `type = "http"` (in-house
@@ -219,7 +250,7 @@
 
 # [cloud.targets.my-aws-snp]
 # provider = "my-aws"
-# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP (AMD SEV-SNP families: m6a/c6a/r6a/m7a/c7a/r7a)
+# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP; exact supported shared-tenancy types are validated
 # image = "my-baseimage:v0.1.0"
 # boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"

@@ -49,6 +49,11 @@ pub struct BuildArgs {
     /// Workload directory (default: current directory)
     #[arg(short, long)]
     pub dir: Option<PathBuf>,
+    /// Named ES256K key whose owner fingerprint is the publisher. The workload
+    /// identifier is derived from it, so it cannot be computed without one.
+    /// Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Output directory for .atawl file (default: workload directory)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -86,6 +91,13 @@ pub struct InfoArgs {
     /// Root for logical unmeasured-data declarations in --dir mode
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_root: Option<PathBuf>,
+    /// Key whose fingerprint is the publisher, for --dir mode
+    ///
+    /// The publisher is measured, so PCR23 cannot be computed for a directory
+    /// without it. Defaults to `[publish] owner_key`. Ignored when inspecting
+    /// an archive, which already records its publisher.
+    #[arg(long, value_name = "KEY")]
+    pub signing_key: Option<String>,
 }
 
 /// Arguments for `workload deactivate`.
@@ -102,6 +114,7 @@ pub struct DeactivateArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
@@ -128,6 +141,7 @@ pub struct PublishArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
@@ -207,6 +221,11 @@ pub struct PullArgs {
 /// Arguments for `workload push`.
 #[derive(Args)]
 pub struct PushArgs {
+    /// Named ES256K key whose fingerprint is the publisher, when the source is
+    /// a file path rather than a publisher-qualified store reference. Defaults
+    /// to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Workload reference (name:version) or path to .atawl file
     pub source: Option<String>,
     /// Workload directory (for auto-detect)
@@ -223,6 +242,11 @@ pub struct PushArgs {
 /// Arguments for `workload import`.
 #[derive(Args)]
 pub struct ImportArgs {
+    /// Named ES256K key whose fingerprint is the publisher. An archive records
+    /// its name and version but not who published it, and the identifier is
+    /// derived from the publisher. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Path to .atawl file
     pub archive: PathBuf,
     /// Force overwrite if already in store
@@ -243,8 +267,14 @@ pub struct ExportArgs {
 /// Arguments for `workload add`.
 #[derive(Args)]
 pub struct AddArgs {
-    /// Workload reference (name:version or 0x<workload_id>), or path to .atawl file
+    /// Workload reference (<publisher>/<name>:<version> or 0x<workload_id>), or
+    /// path to a .atawl file
     pub reference: String,
+    /// Named ES256K key whose fingerprint is the publisher, when the reference
+    /// is a file path rather than a publisher-qualified reference. Defaults to
+    /// [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
@@ -270,6 +300,12 @@ pub struct InitArgs {
     /// status port = init port + 1000).
     pub address: String,
 
+    /// Named ES256K key whose fingerprint is the publisher, when the workload
+    /// source is a path or directory rather than a publisher-qualified store
+    /// reference. Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
+
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
 
@@ -278,12 +314,20 @@ pub struct InitArgs {
     pub dir: Option<PathBuf>,
 
     /// Platform string sent as `platform.declared` in the init payload
-    #[arg(long, value_parser = ["gcp", "azure", "qemu"], default_value = "qemu")]
+    #[arg(
+        long,
+        value_parser = ["gcp", "azure", "aws", "qemu"],
+        default_value = "qemu"
+    )]
     pub platform: String,
 
     /// Chain config name override (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
 
     /// Owner key name override (references [keys.<name>])
     #[arg(long)]
@@ -325,11 +369,11 @@ pub struct InitArgs {
     #[arg(long, value_name = "NAME=VALUE")]
     pub disk_passphrase: Vec<String>,
 
-    /// Expected base image for TLS attestation measurement policy (name:version).
+    /// Optional expected base-image assertion for portal TLS attestation.
     #[arg(long, value_name = "NAME:VERSION")]
     pub base_image: Option<String>,
 
-    /// Signed measurement pack JSON file or directory.
+    /// Explicit signed measurement pack for offline portal TLS verification.
     #[arg(long, value_name = "PATH")]
     pub measurements: Option<PathBuf>,
 
@@ -337,21 +381,42 @@ pub struct InitArgs {
     #[arg(long, value_name = "HEX")]
     pub measurement_publisher_key: Vec<String>,
 
-    /// Trusted Azure MAA RSA public key, as hex PKCS#1 DER or hex JWK JSON.
-    #[arg(long, value_name = "HEX")]
-    pub azure_maa_key: Vec<String>,
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
 
-    /// Trusted GCP vTPM AK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub gcp_ak_root_cert: Vec<String>,
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
 
-    /// Trusted AMD SEV-SNP ARK root certificate, as hex X.509 DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_ark_root_cert: Vec<String>,
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
 
-    /// AMD SEV-SNP certificate revocation list, as hex DER.
-    #[arg(long, value_name = "HEX")]
-    pub amd_snp_crl: Vec<String>,
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
 
     /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
     #[arg(long, value_name = "PATH")]
@@ -425,5 +490,15 @@ mod tests {
         assert!(
             TestCli::try_parse_from(["test", "init", "127.0.0.1", "--timeout", "1400",]).is_err()
         );
+    }
+
+    #[test]
+    fn workload_init_accepts_aws_as_the_declared_platform() {
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--platform", "aws"])
+            .expect("AWS workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.platform, "aws");
     }
 }
