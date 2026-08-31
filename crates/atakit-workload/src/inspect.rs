@@ -85,15 +85,19 @@ fn inspect_archive(archive_path: &std::path::Path) -> Result<InspectResult, Work
         path: archive_path.to_path_buf(),
         source: e,
     })?;
-    inspect_archive_reader(file)
+    inspect_workload_archive_reader(file)
 }
 
 /// Inspect an `.atawl` archive from one immutable byte snapshot.
 pub fn inspect_workload_archive_bytes(bytes: &[u8]) -> Result<InspectResult, WorkloadError> {
-    inspect_archive_reader(Cursor::new(bytes))
+    inspect_workload_archive_reader(Cursor::new(bytes))
 }
 
-fn inspect_archive_reader<R>(reader: R) -> Result<InspectResult, WorkloadError>
+/// Inspect an `.atawl` archive from an already opened, seekable reader.
+///
+/// Callers can hash and rewind the same open file before passing it here. This
+/// keeps large archives out of memory while retaining one file identity.
+pub fn inspect_workload_archive_reader<R>(reader: R) -> Result<InspectResult, WorkloadError>
 where
     R: Read + Seek,
 {

@@ -221,11 +221,6 @@ pub struct PullArgs {
 /// Arguments for `workload push`.
 #[derive(Args)]
 pub struct PushArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the source is
-    /// a file path rather than a publisher-qualified store reference. Defaults
-    /// to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Workload reference (name:version) or path to .atawl file
     pub source: Option<String>,
     /// Workload directory (for auto-detect)
@@ -242,11 +237,6 @@ pub struct PushArgs {
 /// Arguments for `workload import`.
 #[derive(Args)]
 pub struct ImportArgs {
-    /// Named ES256K key whose fingerprint is the publisher. An archive records
-    /// its name and version but not who published it, and the identifier is
-    /// derived from the publisher. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Path to .atawl file
     pub archive: PathBuf,
     /// Force overwrite if already in store
@@ -270,11 +260,6 @@ pub struct AddArgs {
     /// Workload reference (<publisher>/<name>:<version> or 0x<workload_id>), or
     /// path to a .atawl file
     pub reference: String,
-    /// Named ES256K key whose fingerprint is the publisher, when the reference
-    /// is a file path rather than a publisher-qualified reference. Defaults to
-    /// [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
@@ -300,14 +285,18 @@ pub struct InitArgs {
     /// status port = init port + 1000).
     pub address: String,
 
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
-
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Workload directory (default: current directory)
     #[arg(short, long, conflicts_with = "source")]
@@ -337,12 +326,12 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
@@ -500,5 +489,29 @@ mod tests {
             panic!("expected workload init command");
         };
         assert_eq!(args.platform, "aws");
+    }
+
+    #[test]
+    fn workload_init_remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--atawl-uri",
+            "http://repo.internal/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(
+            TestCli::try_parse_from(["test", "init", "127.0.0.1", "--atawl-sha256", &hash,])
+                .is_err()
+        );
     }
 }

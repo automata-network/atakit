@@ -126,9 +126,7 @@ async fn main() -> Result<()> {
             WorkloadCommand::Push(args) => {
                 commands::workload::push::run(args, &env, &config, cli.verbose).await
             }
-            WorkloadCommand::Import(args) => {
-                commands::workload::import::run(args, &env, &config).await
-            }
+            WorkloadCommand::Import(args) => commands::workload::import::run(args, &env).await,
             WorkloadCommand::Export(args) => commands::workload::export::run(args, &env, &config),
             WorkloadCommand::Add(args) => commands::workload::add::run(args, &env, &config).await,
             WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env, &config),

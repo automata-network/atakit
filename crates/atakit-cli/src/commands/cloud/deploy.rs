@@ -20,9 +20,10 @@ use owo_colors::OwoColorize;
 use super::{
     effective_unmeasured_data_root, ensure_cloud_image, init_chain_from_config,
     init_key_from_config, parse_metadata, portal_endpoints, registration_is_off,
-    resolve_explicit_tls_measurement_policy, resolve_image, resolve_unmeasured_tar,
-    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
-    terminal_initialization_error, validate_base_image, InitEnvResolver,
+    resolve_explicit_tls_measurement_policy, resolve_image, resolve_remote_atawl_source,
+    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    synthesize_self_generated_key, terminal_initialization_error, validate_base_image,
+    InitEnvResolver,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -208,6 +209,12 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
 
 async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let image_only = args.image_only;
+    if image_only && (args.atawl_uri.is_some() || args.atawl_sha256.is_some()) {
+        bail!("--atawl-uri and --atawl-sha256 cannot be used with --image-only");
+    }
+    if args.skip_init && (args.atawl_uri.is_some() || args.atawl_sha256.is_some()) {
+        bail!("--atawl-uri and --atawl-sha256 cannot be used with --skip-init");
+    }
     let portal_ports = resolve_portal_ports(args.status_port, args.init_port)?;
 
     // 1. Resolve workload source (unless --image-only).
@@ -215,6 +222,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     // (if any); the effective size is resolved later once the target is known.
     let workload_attributes: atakit_core::tee_attributes::AttributeRequirements;
     let archive_sha256: Option<[u8; 32]>;
+    let archive_size_bytes: Option<u64>;
     let (
         archive_path,
         workload_publisher,
@@ -251,6 +259,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         workload_version = String::new();
         archive_hash = String::new();
         archive_sha256 = None;
+        archive_size_bytes = None;
         workload_ports = Vec::new();
         workload_disks = Vec::new();
         workload_boot_min = None;
@@ -267,13 +276,13 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             &args.dir,
             env,
             config,
-            args.signing_key.as_deref(),
             args.skip_freshness_check,
         )?;
         workload_publisher = format!("{:#x}", resolved.publisher);
         workload_name = resolved.name;
         workload_version = resolved.version;
         archive_sha256 = Some(resolved.archive_sha256);
+        archive_size_bytes = Some(resolved.archive_size_bytes);
         workload_ports = resolved.ports;
         workload_disks = resolved
             .disks
@@ -311,6 +320,29 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         archive_hash = hex::encode(resolved.archive_sha256);
         archive_path = ap.display().to_string();
     }
+    let workload_app_ref = if image_only {
+        None
+    } else {
+        Some(automata_tee_workload_measurement::types::AppRef::new(
+            workload_publisher
+                .parse()
+                .context("invalid workload publisher")?,
+            workload_name.clone(),
+            workload_version.clone(),
+        ))
+    };
+    let remote_atawl_source = match (&archive_sha256, archive_size_bytes, &workload_app_ref) {
+        (Some(expected_archive_sha256), Some(archive_size_bytes), Some(workload_app_ref)) => {
+            resolve_remote_atawl_source(
+                args.atawl_uri.as_deref(),
+                args.atawl_sha256.as_deref(),
+                archive_size_bytes,
+                expected_archive_sha256,
+                workload_app_ref,
+            )?
+        }
+        _ => None,
+    };
 
     // 2. Resolve target. The dispatcher (`run`) guarantees exactly one entry here.
     let target_name = args.target.first().map(|s| s.as_str()).ok_or_else(|| {
@@ -701,6 +733,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             workload_name,
             workload_version
         );
+        eprintln!(
+            "  {:<15}{}",
+            "ATAWL transfer:".dimmed(),
+            if remote_atawl_source.is_some() {
+                "portal download"
+            } else {
+                "client upload"
+            }
+        );
     } else {
         eprintln!("  {:<15}image-only (no workload)", "Mode:".dimmed());
     }
@@ -1040,45 +1081,59 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     ))
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
-                let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
-                    workload_publisher
-                        .parse()
-                        .context("invalid workload publisher")?,
-                    workload_name.clone(),
-                    workload_version.clone(),
-                );
+                let workload_app_ref = workload_app_ref.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("workload initialization is missing its workload identity")
+                })?;
                 init_config.pcr_policy = super::resolve_init_pcr_policy(
                     args.pcr_policy.as_deref(),
                     &init_config,
                     registration_off,
                     verified_tls.as_ref(),
-                    &workload_app_ref,
+                    workload_app_ref,
                 )
                 .await?;
 
-                match init::post_portal_init_with_client(
-                    &portal_client,
-                    &ip,
-                    status_port,
-                    init_port,
-                    ap,
-                    expected_archive_sha256,
-                    unmeasured_tar.as_deref(),
-                    &init_config,
-                    std::time::Duration::from_secs(args.init_upload_timeout),
-                    &IndicatifReporter,
-                )
-                .await
-                {
-                    Ok(()) => {
+                let init_result = if let Some(source) = &remote_atawl_source {
+                    init::post_portal_init_remote_with_client(
+                        &portal_client,
+                        &ip,
+                        status_port,
+                        init_port,
+                        source,
+                        unmeasured_tar.as_deref(),
+                        &init_config,
+                        std::time::Duration::from_secs(args.init_upload_timeout),
+                        std::time::Duration::from_secs(initialization_timeout_secs),
+                        &IndicatifReporter,
+                    )
+                    .await
+                } else {
+                    init::post_portal_init_with_client(
+                        &portal_client,
+                        &ip,
+                        status_port,
+                        init_port,
+                        ap,
+                        expected_archive_sha256,
+                        unmeasured_tar.as_deref(),
+                        &init_config,
+                        std::time::Duration::from_secs(args.init_upload_timeout),
+                        std::time::Duration::from_secs(initialization_timeout_secs),
+                        &IndicatifReporter,
+                    )
+                    .await
+                };
+
+                match init_result {
+                    Ok(init_deadline) => {
                         eprintln!();
                         // Only Running means init and required registration
                         // both completed.
-                        let outcome = init::wait_for_portal_terminal_with_client(
+                        let outcome = init::wait_for_portal_terminal_until_with_client(
                             &portal_client,
                             &ip,
                             status_port,
-                            initialization_timeout_secs,
+                            init_deadline,
                             |s| eprintln!("      state: {s}"),
                         )
                         .await;

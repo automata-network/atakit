@@ -28,6 +28,7 @@ hex.workspace = true
 k256.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
+uuid.workspace = true
 
 async-trait.workspace = true
 

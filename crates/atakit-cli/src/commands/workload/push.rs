@@ -7,24 +7,24 @@ use atakit_workload::{UploadContext, WorkloadCoords, WorkloadStore};
 use owo_colors::OwoColorize;
 
 use super::{
-    compute_workload_id, find_versioned_archive, looks_like_store_ref, parse_workload_ref,
-    WorkloadRef,
+    compute_workload_id, find_versioned_archive, looks_like_store_ref, measured_workload_ref,
+    parse_workload_ref, WorkloadRef,
 };
 use crate::config::Config;
 
 pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
-    // Resolve source archive path. A store reference already names its
-    // publisher, so it determines the identifier by itself; a file path does
-    // not, which is what --publisher supplies.
-    let mut publisher_from_source: Option<String> = None;
+    // A publisher-qualified store reference is an assertion about the measured
+    // archive identity. File paths and directory archives need no external
+    // publisher input because format 7 records it in the manifest.
+    let mut expected_ref = None;
     let archive_path = if let Some(ref source) = args.source {
         if looks_like_store_ref(source) {
             let workload_ref = parse_workload_ref(source, &config.alias)?;
             let workload_id_hex = workload_ref.workload_id();
             if let WorkloadRef::Ref(ref app_ref) = workload_ref {
-                publisher_from_source = Some(format!("{:#x}", app_ref.publisher));
+                expected_ref = Some(app_ref.clone());
             }
             let path = store.blob_path(&workload_id_hex)?;
             if !path.exists() {
@@ -62,23 +62,19 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     };
     let result = atakit_workload::inspect_workload(&inspect_opts).await?;
     let manifest = &result.manifest;
-    let name = manifest.meta.name.clone();
-    let version = manifest.meta.version.clone();
+    let app_ref = measured_workload_ref(&manifest.meta)?;
+    if expected_ref
+        .as_ref()
+        .is_some_and(|expected| expected != &app_ref)
+    {
+        anyhow::bail!("store reference identity does not match the measured workload manifest");
+    }
+    let name = app_ref.name.clone();
+    let version = app_ref.version.clone();
     let archive_size = std::fs::metadata(&archive_path)
         .with_context(|| format!("failed to stat {}", archive_path.display()))?
         .len();
 
-    // A store reference already named its publisher; a path did not, so that
-    // form takes its identity from the configured signing key.
-    let publisher = match publisher_from_source {
-        Some(publisher) => publisher.parse().context("invalid publisher fingerprint")?,
-        None => super::configured_publisher(args.signing_key.as_deref(), config)?,
-    };
-    let app_ref = automata_tee_workload_measurement::types::AppRef::new(
-        publisher,
-        name.clone(),
-        version.clone(),
-    );
     let workload_id = compute_workload_id(&app_ref);
     let workload_id_hex = format!("{workload_id:#x}");
 

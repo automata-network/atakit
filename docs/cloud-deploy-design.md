@@ -305,12 +305,33 @@ A single-target deploy performs these logical stages:
    claimed base-image identity only after verification succeeds. An explicit
    `--measurements` value selects the offline policy path instead.
 8. Unless `--skip-init` or `--image-only` is set, require `GET /status` to
-   report `init_schema_version = 3`, send the one-shot multipart `POST /init`
-   request, and poll portal state.
+   report `init_schema_version = 3` and the required init timeout mode, send the
+   one-shot multipart `POST /init` request, and poll portal state.
 
-The init upload timeout is controlled by `--init-upload-timeout`. Portal
-readiness keeps a separate 300-second timeout. After `POST /init`,
-`atakit workload init <host> --init-timeout`,
+The client streams a local ATAWL from an open file instead of buffering it in
+memory. The remote-source client path first requires
+`application/vnd.atakit.atawl-source+json` in
+`GET /status.atawl_part_content_types`, then sends the small descriptor. Both
+paths generate `Atakit-Transfer-Id` and poll the matching
+`GET /status.atawl_transfer` byte counters. Before using the one-shot endpoint,
+the client also requires `GET /status.init_timeout_mode` to report
+`portal-enforced-non-transfer-v1`.
+
+`workload init`, `cloud init`, and `cloud deploy` select the remote path when
+the operator supplies both `--atawl-uri` and `--atawl-sha256`. The CLI still
+resolves the local ATAWL for manifest and policy planning. It requires the
+supplied hash to match that exact archive, derives the descriptor size and
+workload ID locally, and does not print or persist the URI.
+
+The ATAWL transfer timeout is controlled by `--init-upload-timeout`. The client
+sends it as `Atakit-Atawl-Transfer-Timeout-Seconds` for both local upload and
+remote download. It ends when the ATAWL transfer ends. Portal readiness keeps
+a separate 300-second timeout. The client sends `--init-timeout` as
+`Atakit-Init-Timeout-Seconds`. The portal applies one budget to every
+non-transfer part of `/init` and pauses it only for the measured ATAWL transfer.
+The response reports that transfer duration, so the client can continue the
+same absolute deadline while waiting for `Running` without depending on status
+polling. `atakit workload init <host> --init-timeout`,
 `atakit cloud init <instance> --init-timeout`, and
 `atakit cloud deploy <workload> --init-timeout` use the same completion-timeout
 calculation. The calculated default is the 900-second portal proof timeout plus

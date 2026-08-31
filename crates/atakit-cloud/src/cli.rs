@@ -78,13 +78,23 @@ pub enum CloudProviderCommand {
 /// Arguments for `cloud deploy`.
 #[derive(Args, Clone)]
 pub struct DeployArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(
+        long,
+        value_name = "URI",
+        requires = "atawl_sha256",
+        conflicts_with_all = ["image_only", "skip_init"]
+    )]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for cloud planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name(s) from [cloud.targets.<name>]. Repeatable, or comma-separated.
     /// Passing multiple targets fans out into a concurrent multi-target deploy
@@ -142,11 +152,11 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_init: bool,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
@@ -429,16 +439,21 @@ pub struct CloudImageGcArgs {
 /// Arguments for `cloud init`.
 #[derive(Args)]
 pub struct InitArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name (for disambiguation)
     #[arg(long)]
@@ -460,12 +475,12 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
@@ -1195,5 +1210,50 @@ mod tests {
         assert!(init_help.contains("--init-timeout <SECONDS>"));
         assert!(init_help.contains("proving, registration, and portal Running"));
         assert!(init_help.contains("--init-upload-timeout <SECONDS>"));
+    }
+
+    #[test]
+    fn remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let deploy = TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL deploy arguments");
+        let CloudCommand::Deploy(args) = deploy.command else {
+            panic!("expected deploy command");
+        };
+        assert!(args.atawl_uri.is_some());
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+        ])
+        .is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+            "--skip-init",
+        ])
+        .is_err());
     }
 }

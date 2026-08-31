@@ -19,7 +19,8 @@ pub use build::{build_workload, BuildOptions, BuildResult};
 pub use error::WorkloadError;
 pub use image::ContainerEngine;
 pub use inspect::{
-    inspect_workload, inspect_workload_archive_bytes, InspectOptions, InspectResult,
+    inspect_workload, inspect_workload_archive_bytes, inspect_workload_archive_reader,
+    InspectOptions, InspectResult,
 };
 pub use repository::{
     hex_equal, GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta,
