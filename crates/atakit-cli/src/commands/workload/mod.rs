@@ -64,7 +64,7 @@ pub fn compute_workload_id(app_ref: &AppRef) -> B256 {
     B256::from(atakit_cvm_encoding::workload_id(&shared_app_ref(app_ref)))
 }
 
-/// Publisher-qualified identity recorded in the measured format 7 manifest.
+/// Publisher-qualified identity recorded in the measured workload manifest.
 pub fn measured_workload_ref(
     meta: &atakit_workload::manifest::ManifestMeta,
 ) -> anyhow::Result<AppRef> {

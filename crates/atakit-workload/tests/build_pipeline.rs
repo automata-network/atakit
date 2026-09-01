@@ -67,7 +67,7 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(wl_dir.join("measured-data/config/cert.pem"), b"fake-cert").unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [package]
 measured-data = ["/config/cert.pem"]
@@ -97,7 +97,7 @@ fn setup_baby_container_workload_dir(tmp: &std::path::Path) -> std::path::PathBu
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "baby-workload"
@@ -205,7 +205,8 @@ async fn build_produces_valid_archive() {
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
     let manifest = read_manifest_json(&result.archive_path);
-    assert_eq!(manifest["meta"]["format"], 7);
+    assert_eq!(manifest["meta"]["format"], atakit_workload::FORMAT_VERSION);
+    assert_eq!(manifest["config"]["depends_on"], serde_json::json!([]));
     assert_eq!(manifest["meta"]["publisher"], TEST_PUBLISHER);
     assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
@@ -517,7 +518,7 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "multi-app"
@@ -525,6 +526,7 @@ version = "v0.2.0"
 base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 ports = ["3000:3000"]
+depends_on = ["redis"]
 
 [dependencies.redis]
 image = { file = "./sidecar.tar" }
@@ -606,6 +608,7 @@ async fn build_with_dependency() {
         .dependencies
         .as_ref()
         .expect("manifest should have dependencies");
+    assert_eq!(inspect_result.manifest.config.depends_on, vec!["redis"]);
     assert!(deps.contains_key("redis"));
     let redis = &deps["redis"];
     assert_eq!(redis.image, "redis:v0.2.0"); // auto-tagged from file source

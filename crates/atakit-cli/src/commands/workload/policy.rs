@@ -172,6 +172,7 @@ mod tests {
                 "image": "example-workload:v1",
                 "base-image-mode": "whitelist",
                 "base-image": [format!("{base_publisher}/automata-linux:v1")],
+                "depends_on": [],
                 "attributes": {
                     atakit_core::tee_attributes::INTEL_TDX_DEBUG_NAME: [false]
                 },

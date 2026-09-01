@@ -172,6 +172,8 @@ pub struct WorkloadSection {
     pub image: ImageSource,
     #[serde(default)]
     pub ports: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
     #[serde(default)]

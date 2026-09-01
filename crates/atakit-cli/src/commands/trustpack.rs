@@ -761,6 +761,7 @@ mod tests {
                 "image": "example-workload:v1",
                 "base-image-mode": "whitelist",
                 "base-image": [base_reference.to_string()],
+                "depends_on": [],
                 "gid-group": "workload",
                 "logging": {
                     "driver": "journald",

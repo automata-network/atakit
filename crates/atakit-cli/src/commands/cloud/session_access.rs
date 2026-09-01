@@ -551,7 +551,7 @@ mod tests {
         let mut archive = tar::Builder::new(encoder);
         let manifest = serde_json::json!({
             "meta": {
-                "format": 7,
+                "format": atakit_workload::FORMAT_VERSION,
                 "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "name": "test",
                 "version": "v0.0.1"
@@ -564,6 +564,7 @@ mod tests {
                     "atakit.attestation.v1.tee.intel-tdx.debug.enabled": [false, true]
                 },
                 "ports": [],
+                "depends_on": [],
                 "restart": "no",
                 "command": null,
                 "entrypoint": null,

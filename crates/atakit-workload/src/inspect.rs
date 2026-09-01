@@ -356,12 +356,13 @@ fn validate_json_manifest_format(value: &serde_json::Value) -> Result<(), Worklo
             crate::FORMAT_VERSION
         )));
     }
-    // No older manifest records a publisher, and none allows one to be derived,
-    // so an older archive cannot produce the identifier its workload is
-    // registered under. Rebuilding is the only correct answer; converting would
-    // invent a publisher.
+    let reason = if format == 7 {
+        "it predates the required config.depends_on startup graph"
+    } else {
+        "it predates the publisher-qualified identifier and records no publisher"
+    };
     Err(WorkloadError::Validation(format!(
-        "workload manifest format {format} predates the publisher-qualified identifier and cannot be converted, because it records no publisher; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
+        "workload manifest format {format} is no longer supported because {reason}; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
         crate::FORMAT_VERSION
     )))
 }
@@ -448,11 +449,11 @@ fn compute_pcr_result(
 mod tests {
     use super::*;
 
-    /// Minimal manifest JSON (v2) that parses successfully.
+    /// Minimal current manifest JSON that parses successfully.
     fn minimal_manifest_json() -> String {
         serde_json::json!({
             "meta": {
-                "format": 7,
+                "format": 8,
                 "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "name": "test",
                 "version": "v0.0.1"
@@ -462,6 +463,7 @@ mod tests {
                 "base-image-mode": "blacklist",
                 "base-image": [],
                 "ports": [],
+                "depends_on": [],
                 "restart": "no",
                 "command": null,
                 "entrypoint": null,
@@ -569,7 +571,7 @@ mod tests {
         assert!(message.contains("workload manifest format 1"));
         assert!(message.contains("records no publisher"));
         assert!(message.contains("atakit workload build <workload-directory>"));
-        assert!(message.contains("manifest format 7"));
+        assert!(message.contains("manifest format 8"));
     }
 
     /// Format 6 was the last format before `meta.publisher` and was accepted
@@ -593,14 +595,14 @@ mod tests {
     #[test]
     fn newer_json_format_reports_atakit_upgrade() {
         let mut value: serde_json::Value = serde_json::from_str(&minimal_manifest_json()).unwrap();
-        value["meta"]["format"] = serde_json::json!(8);
+        value["meta"]["format"] = serde_json::json!(9);
 
         let err = match build_result_json(value.to_string()) {
-            Ok(_) => panic!("expected manifest format 8 to fail"),
+            Ok(_) => panic!("expected manifest format 9 to fail"),
             Err(err) => err,
         };
         let message = err.to_string();
-        assert!(message.contains("workload manifest format 8 is newer"));
+        assert!(message.contains("workload manifest format 9 is newer"));
         assert!(message.contains("upgrade atakit"));
     }
 

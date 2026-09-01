@@ -83,6 +83,7 @@ pub struct ManifestConfig {
     pub attributes: AttributeRequirements,
     #[serde(default)]
     pub ports: Vec<String>,
+    pub depends_on: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
     #[serde(default)]
@@ -224,7 +225,6 @@ pub struct ManifestDependency {
     pub environment: BTreeMap<String, String>,
     #[serde(default, rename = "unmeasured-env-files")]
     pub unmeasured_env_files: Vec<String>,
-    #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
     pub measured_data: ManifestDataMount,
@@ -889,6 +889,7 @@ pub fn build_manifest(
             base_image: w.base_image.clone(),
             attributes,
             ports: w.ports.clone(),
+            depends_on: w.depends_on.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
             entrypoint: convert_string_or_array(&w.entrypoint),
@@ -1185,7 +1186,7 @@ image = "my-app:latest"
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":7"));
+        assert!(output.contains("\"format\":8"));
         // The publisher is measured: it is part of the canonical bytes PCR23
         // covers, not metadata carried alongside them.
         assert!(output.contains(&format!("\"publisher\":\"{TEST_PUBLISHER}\"")));
@@ -1193,6 +1194,7 @@ image = "my-app:latest"
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
+        assert!(output.contains("\"depends_on\":[]"));
         assert!(output.contains("images/my-app.tar"));
         // gid-group defaults to workload name
         assert!(output.contains("\"gid-group\":\"my-app\""));
@@ -1206,6 +1208,44 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn materializes_workload_depends_on() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+"#,
+        )
+        .unwrap();
+
+        let manifest = build_manifest(
+            &config,
+            "api:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(manifest.meta.format, 8);
+        assert_eq!(manifest.config.depends_on, vec!["db"]);
+        assert_eq!(
+            manifest.config.dependencies.unwrap()["db"].depends_on,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1256,7 +1296,7 @@ image = "my-app:latest"
     fn minimal_config() -> WorkloadConfig {
         WorkloadConfig::load_from_str(
             r#"
-format = 7
+format = 8
 
 [workload]
 name = "my-app"

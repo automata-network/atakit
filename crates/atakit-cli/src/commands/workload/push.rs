@@ -17,7 +17,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
 
     // A publisher-qualified store reference is an assertion about the measured
     // archive identity. File paths and directory archives need no external
-    // publisher input because format 7 records it in the manifest.
+    // publisher input because the current format records it in the manifest.
     let mut expected_ref = None;
     let archive_path = if let Some(ref source) = args.source {
         if looks_like_store_ref(source) {

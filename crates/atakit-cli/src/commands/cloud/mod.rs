@@ -886,7 +886,7 @@ pub(crate) struct ResolvedWorkload {
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
-    /// Owner fingerprint recorded in the measured format 7 manifest.
+    /// Owner fingerprint recorded in the measured workload manifest.
     pub publisher: alloy_ext::core::primitives::B256,
 }
 

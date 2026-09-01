@@ -196,6 +196,9 @@ fn print_info(
     if !m.config.ports.is_empty() {
         print_multi("Ports:", &m.config.ports);
     }
+    if !m.config.depends_on.is_empty() {
+        print_multi("Depends on:", &m.config.depends_on);
+    }
     if let Some(ref cmd) = m.config.command {
         println!("  {:<18}{}", "Command:", format_string_or_array(cmd));
     }
