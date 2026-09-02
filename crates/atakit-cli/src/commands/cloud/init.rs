@@ -466,8 +466,12 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // Save the workload identity and configuration references before the
     // one-shot POST /init. A process exit after the portal accepts /init must
     // not leave the deployment record describing the previous workload.
-    state.workload_name = workload_name.clone();
-    state.workload_version = workload_version.clone();
+    replace_workload_identity(
+        &mut state,
+        &workload_publisher,
+        &workload_name,
+        &workload_version,
+    );
     state.archive_path = archive_path.display().to_string();
     state.archive_hash = archive_hash;
     if let Some(base_image_ref) = &args.base_image {
@@ -564,6 +568,12 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+fn replace_workload_identity(state: &mut DeployState, publisher: &str, name: &str, version: &str) {
+    state.workload_publisher = publisher.to_owned();
+    state.workload_name = name.to_owned();
+    state.workload_version = version.to_owned();
 }
 
 fn require_deployed_for_init(
@@ -681,6 +691,21 @@ mod tests {
 
         DeployState::delete(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
         assert!(DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").is_err());
+    }
+
+    #[test]
+    fn replacing_workload_identity_updates_the_publisher() {
+        let data_dir = TempDir::new().unwrap();
+        let mut state = deployed_state();
+        let publisher = format!("0x{}", "42".repeat(32));
+
+        replace_workload_identity(&mut state, &publisher, "replacement-workload", "v3");
+        state.save(data_dir.path()).unwrap();
+
+        let loaded = DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
+        assert_eq!(loaded.workload_publisher, publisher);
+        assert_eq!(loaded.workload_name, "replacement-workload");
+        assert_eq!(loaded.workload_version, "v3");
     }
 
     #[test]
