@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Seek};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256, Sha384};
 
@@ -106,28 +107,76 @@ where
 
     let mut manifest_json = None;
     let mut manifest_toml = false;
+    let mut archive_root = None;
+    let mut seen_paths = BTreeSet::new();
     for entry in archive.entries().map_err(WorkloadError::Io)? {
         let mut entry = entry.map_err(WorkloadError::Io)?;
-        let path = entry.path().map_err(WorkloadError::Io)?;
-        if let Some(filename) = path.file_name() {
-            if filename == "manifest.json" {
-                let mut content = String::new();
-                entry
-                    .read_to_string(&mut content)
-                    .map_err(WorkloadError::Io)?;
-                manifest_json = Some(content);
-                break;
-            } else if filename == "manifest.toml" {
-                // A `manifest.toml` archive is format 1, which records no
-                // publisher. Note it so the failure can name what was found,
-                // and keep scanning in case a manifest.json follows.
-                manifest_toml = true;
+        let path = normalize_archive_path(&entry.path().map_err(WorkloadError::Io)?)?;
+        if !seen_paths.insert(path.clone()) {
+            return Err(WorkloadError::Validation(format!(
+                "workload archive contains duplicate path {}",
+                path.display()
+            )));
+        }
+
+        let mut components = path.components();
+        let root = components
+            .next()
+            .and_then(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                WorkloadError::Validation(
+                    "workload archive top-level directory name is not valid UTF-8".into(),
+                )
+            })?;
+        match archive_root.as_deref() {
+            Some(expected) if expected != root => {
+                return Err(WorkloadError::Validation(format!(
+                    "workload archive must contain exactly one top-level directory; found {expected:?} and {root:?}"
+                )));
             }
+            None => archive_root = Some(root.to_string()),
+            Some(_) => {}
+        }
+
+        if components.next().is_none() && !entry.header().entry_type().is_dir() {
+            return Err(WorkloadError::Validation(
+                "workload archive top-level entry is not a directory".into(),
+            ));
+        }
+
+        let root_manifest_json = Path::new(root).join("manifest.json");
+        if path == root_manifest_json {
+            if !entry.header().entry_type().is_file() {
+                return Err(WorkloadError::Validation(
+                    "workload archive manifest.json is not a regular file".into(),
+                ));
+            }
+            let mut content = String::new();
+            entry
+                .read_to_string(&mut content)
+                .map_err(WorkloadError::Io)?;
+            manifest_json = Some(content);
+        } else if path == Path::new(root).join("manifest.toml") {
+            // A `manifest.toml` archive is format 1, which records no
+            // publisher. Note it so the failure can name what was found,
+            // and keep scanning in case a root manifest.json follows.
+            manifest_toml = true;
         }
     }
 
     if let Some(raw) = manifest_json {
-        build_result_json(raw)
+        let result = build_result_json(raw)?;
+        let archive_root = archive_root.expect("a manifest has a top-level directory");
+        if result.manifest.meta.name != archive_root {
+            return Err(WorkloadError::Validation(format!(
+                "workload archive directory {archive_root:?} does not match manifest name {:?}",
+                result.manifest.meta.name
+            )));
+        }
+        Ok(result)
     } else if manifest_toml {
         Err(WorkloadError::Validation(format!(
             "archive contains a format-1 manifest.toml, which records no publisher and so cannot yield a publisher-qualified identifier; rebuild it from its source with `atakit workload build <workload-directory>` to create manifest format {}",
@@ -138,6 +187,28 @@ where
             "neither manifest.json nor manifest.toml found in archive".into(),
         ))
     }
+}
+
+fn normalize_archive_path(path: &Path) -> Result<PathBuf, WorkloadError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(WorkloadError::Validation(format!(
+                    "workload archive contains unsafe path {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(WorkloadError::Validation(
+            "workload archive contains an empty path".into(),
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Inspect from a workload source directory: parse config, build manifest, compute PCR23.
@@ -449,6 +520,22 @@ fn compute_pcr_result(
 mod tests {
     use super::*;
 
+    fn archive_bytes(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        let encoder = zstd::Encoder::new(Vec::new(), 0).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        for (path, entry_type, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*entry_type);
+            header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, Cursor::new(*contents))
+                .unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
     /// Minimal current manifest JSON that parses successfully.
     fn minimal_manifest_json() -> String {
         serde_json::json!({
@@ -493,6 +580,108 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn archive_inspection_accepts_one_root_manifest() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("test/", tar::EntryType::Directory, b""),
+            (
+                "test/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+        ]);
+
+        let result = inspect_workload_archive_bytes(&archive).unwrap();
+        assert_eq!(result.manifest.meta.name, "test");
+    }
+
+    #[test]
+    fn archive_inspection_rejects_a_nested_manifest_decoy() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("test/", tar::EntryType::Directory, b""),
+            (
+                "test/nested/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+        ]);
+
+        let error = match inspect_workload_archive_bytes(&archive) {
+            Ok(_) => panic!("expected a nested manifest to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("neither manifest.json"));
+    }
+
+    #[test]
+    fn archive_inspection_rejects_duplicate_manifest_paths() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("test/", tar::EntryType::Directory, b""),
+            (
+                "test/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+            (
+                "test/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+        ]);
+
+        let error = match inspect_workload_archive_bytes(&archive) {
+            Ok(_) => panic!("expected a duplicate manifest to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("duplicate path test/manifest.json"));
+    }
+
+    #[test]
+    fn archive_inspection_rejects_multiple_top_level_directories() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("test/", tar::EntryType::Directory, b""),
+            (
+                "test/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+            ("other/extra", tar::EntryType::Regular, b"extra"),
+        ]);
+
+        let error = match inspect_workload_archive_bytes(&archive) {
+            Ok(_) => panic!("expected multiple archive roots to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("exactly one top-level directory"));
+    }
+
+    #[test]
+    fn archive_inspection_rejects_a_root_that_does_not_match_the_manifest_name() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("other/", tar::EntryType::Directory, b""),
+            (
+                "other/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+        ]);
+
+        let error = match inspect_workload_archive_bytes(&archive) {
+            Ok(_) => panic!("expected the mismatched archive root to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match manifest name"));
     }
 
     #[test]

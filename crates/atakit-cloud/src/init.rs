@@ -1768,7 +1768,7 @@ mod tests {
             br#"{"code":"initialization_timeout"}"#
         ));
         assert!(!is_initialization_timeout_response(
-            br#"{"code":"atawl_download_timeout"}"#
+            br#"{"code":"atawl_transfer_timeout"}"#
         ));
     }
 
