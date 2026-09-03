@@ -771,12 +771,7 @@ fn validate_service_dependencies(config: &WorkloadConfig) -> Result<(), Workload
         graph.insert(name.clone(), dep.depends_on.clone());
     }
 
-    let mut states: BTreeMap<String, u8> = BTreeMap::new();
-    let mut stack = Vec::new();
-    for name in graph.keys() {
-        visit_dependency_graph(name, &graph, &mut states, &mut stack)?;
-    }
-    Ok(())
+    validate_dependency_graph(&graph)
 }
 
 fn validate_depends_on_entries(
@@ -806,35 +801,54 @@ fn validate_depends_on_entries(
     Ok(())
 }
 
-fn visit_dependency_graph(
-    name: &str,
-    graph: &BTreeMap<String, Vec<String>>,
-    states: &mut BTreeMap<String, u8>,
-    stack: &mut Vec<String>,
-) -> Result<(), WorkloadError> {
-    match states.get(name).copied() {
-        Some(2) => return Ok(()),
-        Some(1) => {
-            let start = stack.iter().position(|item| item == name).unwrap_or(0);
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(name.to_string());
-            return Err(WorkloadError::Validation(format!(
-                "depends_on cycle detected: {}",
-                cycle.join(" -> ")
-            )));
+fn validate_dependency_graph(graph: &BTreeMap<String, Vec<String>>) -> Result<(), WorkloadError> {
+    let mut states: BTreeMap<String, u8> = BTreeMap::new();
+
+    for root in graph.keys() {
+        if states.get(root).copied() == Some(2) {
+            continue;
         }
-        _ => {}
+
+        states.insert(root.clone(), 1);
+        let mut path = vec![root.clone()];
+        let mut frames = vec![(root.clone(), 0usize)];
+
+        while let Some((name, next_dependency)) = frames.last().cloned() {
+            let dependencies = graph
+                .get(&name)
+                .expect("validated dependency graph contains every service");
+
+            if let Some(dependency) = dependencies.get(next_dependency) {
+                frames
+                    .last_mut()
+                    .expect("dependency traversal frame exists")
+                    .1 += 1;
+
+                match states.get(dependency).copied() {
+                    Some(2) => {}
+                    Some(1) => {
+                        let start = path.iter().position(|item| item == dependency).unwrap_or(0);
+                        let mut cycle = path[start..].to_vec();
+                        cycle.push(dependency.clone());
+                        return Err(WorkloadError::Validation(format!(
+                            "depends_on cycle detected: {}",
+                            cycle.join(" -> ")
+                        )));
+                    }
+                    _ => {
+                        states.insert(dependency.clone(), 1);
+                        path.push(dependency.clone());
+                        frames.push((dependency.clone(), 0));
+                    }
+                }
+            } else {
+                let (finished, _) = frames.pop().expect("dependency traversal frame exists");
+                path.pop();
+                states.insert(finished, 2);
+            }
+        }
     }
 
-    states.insert(name.to_string(), 1);
-    stack.push(name.to_string());
-    if let Some(dependencies) = graph.get(name) {
-        for dependency in dependencies {
-            visit_dependency_graph(dependency, graph, states, stack)?;
-        }
-    }
-    stack.pop();
-    states.insert(name.to_string(), 2);
     Ok(())
 }
 
@@ -1995,6 +2009,22 @@ depends_on = ["api"]
         let tmp = tempfile::tempdir().unwrap();
         let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
         assert!(error.contains("depends_on cycle detected"), "{error}");
+    }
+
+    #[test]
+    fn validates_deep_dependency_chain_without_recursion() {
+        const SERVICE_COUNT: usize = 20_000;
+        let mut graph = BTreeMap::new();
+        for index in 0..SERVICE_COUNT {
+            let dependencies = if index + 1 < SERVICE_COUNT {
+                vec![format!("service-{:05}", index + 1)]
+            } else {
+                Vec::new()
+            };
+            graph.insert(format!("service-{index:05}"), dependencies);
+        }
+
+        assert!(validate_dependency_graph(&graph).is_ok());
     }
 
     #[test]

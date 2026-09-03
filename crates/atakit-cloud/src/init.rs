@@ -43,6 +43,11 @@ const INIT_TIMEOUT_HEADER: &str = "atakit-init-timeout-seconds";
 const INIT_TIMEOUT_MODE: &str = "portal-enforced-non-transfer-v1";
 const MAX_ATAWL_SOURCE_SIZE: usize = 16 * 1024;
 
+/// The portal may need the full five-minute container teardown budget after
+/// the initialization deadline. Keep the HTTP request alive long enough for
+/// that cleanup and the final state update to finish.
+const PORTAL_INIT_CLEANUP_GRACE: Duration = Duration::from_secs(6 * 60);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteAtawlSource {
     pub format: u32,
@@ -874,18 +879,14 @@ async fn submit_portal_init(
     // This is only a safety cap while the response is unavailable. The portal
     // enforces the non-transfer budget, and its response supplies the measured
     // transfer duration used to construct the exact client-side deadline.
-    let request_timeout = atawl_transfer_timeout
-        .checked_add(init_timeout)
-        .ok_or_else(|| CloudError::Config {
-            message: "ATAWL transfer timeout plus initialization timeout is too large".to_string(),
-        })?;
+    let request_timeout =
+        maximum_portal_init_request_timeout(atawl_transfer_timeout, init_timeout)?;
     let request_started_at = tokio::time::Instant::now();
     let maximum_request_deadline =
         request_started_at
             .checked_add(request_timeout)
             .ok_or_else(|| CloudError::Config {
-                message: "ATAWL transfer timeout plus initialization timeout is too large"
-                    .to_string(),
+                message: "portal initialization request timeout is too large".to_string(),
             })?;
     let progress_label = format!("{progress_message} [{transfer_id}]");
     let progress_handle: Arc<dyn ProgressHandle> =
@@ -1000,6 +1001,20 @@ async fn submit_portal_init(
 
     tracing::info!("workload initialized on CVM at {host}:{init_port}");
     Ok(init_deadline)
+}
+
+fn maximum_portal_init_request_timeout(
+    atawl_transfer_timeout: Duration,
+    init_timeout: Duration,
+) -> Result<Duration, CloudError> {
+    atawl_transfer_timeout
+        .checked_add(init_timeout)
+        .and_then(|timeout| timeout.checked_add(PORTAL_INIT_CLEANUP_GRACE))
+        .ok_or_else(|| CloudError::Config {
+            message:
+                "ATAWL transfer timeout plus initialization timeout and cleanup grace is too large"
+                    .to_string(),
+        })
 }
 
 fn atawl_transfer_timeout_header_value(
@@ -1644,6 +1659,15 @@ mod tests {
             Duration::from_secs(45)
         );
         assert_eq!(deadline.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn portal_init_request_timeout_includes_cleanup_grace() {
+        assert_eq!(
+            maximum_portal_init_request_timeout(Duration::from_secs(20), Duration::from_secs(60),)
+                .unwrap(),
+            Duration::from_secs(20 + 60 + 6 * 60),
+        );
     }
 
     #[test]
