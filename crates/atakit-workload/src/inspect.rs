@@ -141,15 +141,23 @@ where
             Some(_) => {}
         }
 
-        if components.next().is_none() && !entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        if components.next().is_none() && !entry_type.is_dir() {
             return Err(WorkloadError::Validation(
                 "workload archive top-level entry is not a directory".into(),
             ));
         }
 
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(WorkloadError::Validation(format!(
+                "workload archive path {} has an unsupported type; only regular files and directories are allowed",
+                path.display()
+            )));
+        }
+
         let root_manifest_json = Path::new(root).join("manifest.json");
         if path == root_manifest_json {
-            if !entry.header().entry_type().is_file() {
+            if !entry_type.is_file() {
                 return Err(WorkloadError::Validation(
                     "workload archive manifest.json is not a regular file".into(),
                 ));
@@ -527,7 +535,14 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(*entry_type);
             header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
-            header.set_size(contents.len() as u64);
+            header.set_size(if entry_type.is_file() {
+                contents.len() as u64
+            } else {
+                0
+            });
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                header.set_link_name(".").unwrap();
+            }
             header.set_cksum();
             archive
                 .append_data(&mut header, path, Cursor::new(*contents))
@@ -682,6 +697,28 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("does not match manifest name"));
+    }
+
+    #[test]
+    fn archive_inspection_rejects_links() {
+        let manifest = minimal_manifest_json();
+        let archive = archive_bytes(&[
+            ("test/", tar::EntryType::Directory, b""),
+            (
+                "test/manifest.json",
+                tar::EntryType::Regular,
+                manifest.as_bytes(),
+            ),
+            ("test/alias", tar::EntryType::Symlink, b""),
+        ]);
+
+        let error = match inspect_workload_archive_bytes(&archive) {
+            Ok(_) => panic!("expected an archive link to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("only regular files and directories"));
     }
 
     #[test]
