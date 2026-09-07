@@ -779,9 +779,14 @@ mod tests {
         header.set_size(manifest.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, "manifest.json", manifest.as_slice())
-            .unwrap();
+        tar.append_data(
+            &mut header,
+            "example-workload/manifest.json",
+            manifest.as_slice(),
+        )
+        .unwrap();
         let tar = tar.into_inner().unwrap();
+        // Legacy gzip archives remain inspectable; new workload builds use zstd.
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&tar).unwrap();
         std::fs::write(&archive_path, encoder.finish().unwrap()).unwrap();

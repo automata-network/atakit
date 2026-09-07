@@ -172,6 +172,34 @@ fn read_manifest_json(archive_path: &std::path::Path) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn legacy_gzip_option_builds_zstd_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = build_workload(
+        &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
+            workload_dir: setup_workload_dir(tmp.path()),
+            output_dir: None,
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::Gz,
+            measured_data_root: None,
+            unmeasured_data_root: None,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let bytes = std::fs::read(&result.archive_path).unwrap();
+    assert_eq!(&bytes[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    assert_eq!(
+        read_manifest_json(&result.archive_path)["meta"]["name"],
+        "my-workload"
+    );
+    assert!(inspect_workload_archive_bytes(&bytes).is_ok());
+}
+
+#[tokio::test]
 async fn build_produces_valid_archive() {
     let tmp = tempfile::tempdir().unwrap();
     let wl_dir = setup_workload_dir(tmp.path());

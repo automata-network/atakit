@@ -69,7 +69,7 @@ pub struct BuildArgs {
     /// Skip importing the built archive into the local workload store
     #[arg(long)]
     pub no_store: bool,
-    /// Use gzip compression instead of zstd
+    /// Deprecated compatibility flag; workload archives always use zstd
     #[arg(long)]
     pub gz: bool,
 }
@@ -458,6 +458,15 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: WorkloadCommand,
+    }
+
+    #[test]
+    fn workload_build_still_accepts_legacy_gzip_flag() {
+        let cli = TestCli::try_parse_from(["test", "build", "--gz"]).unwrap();
+        let WorkloadCommand::Build(args) = cli.command else {
+            panic!("expected workload build command");
+        };
+        assert!(args.gz);
     }
 
     #[test]
