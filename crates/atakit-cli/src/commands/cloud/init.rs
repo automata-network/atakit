@@ -149,6 +149,12 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // Resolve chain config. Registration is target-owned. When it is off,
     // /init has no chain interaction and can omit chain entirely.
     let registration = target.registration.as_deref();
+    super::validate_init_prover(
+        config,
+        chain_name.as_deref().unwrap_or_default(),
+        target.resolved_cc_type(state.platform)?,
+        registration_is_off(registration),
+    )?;
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
             Some(chain) => {

@@ -473,6 +473,12 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         if init_env.owner_key.is_empty() && !registration_off {
             bail!("owner_key must be set on target or via --owner-key");
         }
+        super::validate_init_prover(
+            config,
+            &init_env.chain,
+            target.resolved_cc_type(provider_config.platform)?,
+            registration_off,
+        )?;
     }
 
     // 7. Parse metadata.
@@ -619,6 +625,15 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
+    eprintln!(
+        "  {:<15}{}",
+        "Init mode:".dimmed(),
+        if args.unauthenticated_init {
+            "unsigned"
+        } else {
+            "authenticated"
+        }
+    );
     eprintln!(
         "  {:<15}{}",
         "Instance:".dimmed(),
@@ -886,6 +901,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     state.init_auth_key_file = init_auth_key_file
         .as_ref()
         .map(|path| path.display().to_string());
+    state.init_auth_required = Some(!args.unauthenticated_init);
     state.save(&env.data_dir)?;
     pending_credential.0 = None;
 

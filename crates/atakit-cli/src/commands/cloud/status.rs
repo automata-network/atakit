@@ -58,6 +58,7 @@ pub async fn run(args: StatusArgs, env: &Env, _config: &Config) -> Result<()> {
     );
     eprintln!("  Platform:  {}", state.platform);
     eprintln!("  Image:     {}", state.image_ref);
+    eprintln!("  Init mode: {} (saved)", state.init_auth_mode());
     eprintln!(
         "  Created:   {}",
         state.created_at.format("%Y-%m-%d %H:%M:%S UTC")

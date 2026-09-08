@@ -252,6 +252,33 @@ impl<'a> InitEnvResolver<'a> {
     }
 }
 
+/// Check the selected prover before provisioning or sending /init.
+pub(crate) fn validate_init_prover(
+    config: &Config,
+    chain_name: &str,
+    cc_type: atakit_cloud::config::CcType,
+    registration_off: bool,
+) -> Result<()> {
+    if registration_off {
+        return Ok(());
+    }
+    let chain = config
+        .chains
+        .get(chain_name)
+        .with_context(|| format!("chain '{chain_name}' not found in [chains]"))?;
+    let uses_zk = chain.tee_backend == "zk"
+        || (chain.tee_backend == "auto" && cc_type == atakit_cloud::config::CcType::SevSnp);
+    if uses_zk && chain.prover.is_none() {
+        bail!("[chains.{chain_name}] requires a prover because the effective TEE backend is ZK; set prover = \"<profile-name>\" to select an existing [provers.<profile-name>] profile");
+    }
+    if let Some(name) = &chain.prover {
+        if !config.provers.contains_key(name) {
+            bail!("[chains.{chain_name}] selects undefined prover '{name}'; define [provers.{name}] or select an existing prover profile");
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the separately named credential used by a prover. A chain profile
 /// takes precedence over the persisted or target value. The gas wallet is not
 /// a prover credential.
@@ -283,6 +310,40 @@ pub(crate) fn effective_prover_credential(
 #[cfg(test)]
 mod prover_credential_tests {
     use super::*;
+
+    #[test]
+    fn init_prover_checks_effective_backend_and_profile() {
+        use atakit_cloud::config::CcType;
+        let mut config = config();
+        for (backend, cc, required) in [
+            ("auto", CcType::SevSnp, true),
+            ("auto", CcType::Tdx, false),
+            ("zk", CcType::SevSnp, true),
+            ("zk", CcType::Tdx, true),
+            ("solidity", CcType::Tdx, false),
+        ] {
+            let chain = config.chains.get_mut("primary").unwrap();
+            chain.tee_backend = backend.into();
+            chain.prover = None;
+            let result = validate_init_prover(&config, "primary", cc, false);
+            assert_eq!(result.is_err(), required, "{backend}/{cc}");
+            if let Err(error) = result {
+                assert!(error
+                    .to_string()
+                    .contains("[chains.primary] requires a prover"));
+            }
+            assert!(validate_init_prover(&config, "primary", cc, true).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("sp1".into());
+            assert!(validate_init_prover(&config, "primary", cc, false).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("missing".into());
+            assert!(validate_init_prover(&config, "primary", cc, false)
+                .unwrap_err()
+                .to_string()
+                .contains("undefined prover 'missing'"));
+        }
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, true).is_ok());
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, false).is_err());
+    }
 
     fn config() -> Config {
         Config::load_from_str(
@@ -1939,6 +2000,7 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
+            init_auth_required: None,
             init_auth_key_file: None,
             format: 3,
             instance_name: "test-instance".to_string(),

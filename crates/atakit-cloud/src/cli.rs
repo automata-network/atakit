@@ -1221,7 +1221,7 @@ mod tests {
             .expect("deploy help response")
             .to_string();
         assert!(deploy_help.contains("--init-timeout <SECONDS>"));
-        assert!(deploy_help.contains("proving, registration, and portal Running"));
+        assert!(deploy_help.contains("non-transfer /init work and waiting for portal Running"));
         assert!(deploy_help.contains("--init-upload-timeout <SECONDS>"));
 
         let init_help = TestCli::try_parse_from(["test", "init", "--help"])
@@ -1229,7 +1229,7 @@ mod tests {
             .expect("init help response")
             .to_string();
         assert!(init_help.contains("--init-timeout <SECONDS>"));
-        assert!(init_help.contains("proving, registration, and portal Running"));
+        assert!(init_help.contains("non-transfer /init work and waiting for portal Running"));
         assert!(init_help.contains("--init-upload-timeout <SECONDS>"));
     }
 

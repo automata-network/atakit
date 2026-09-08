@@ -45,6 +45,9 @@ impl Default for PortalPorts {
 /// Persistent deployment state stored as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployState {
+    /// Launch-time choice, retained after the private credential is removed.
+    #[serde(default)]
+    pub init_auth_required: Option<bool>,
     #[serde(default)]
     pub init_auth_key_file: Option<String>,
     pub format: u32,
@@ -266,10 +269,21 @@ pub struct NewDeployParams {
 }
 
 impl DeployState {
+    /// Saved launch mode, not a live query of the portal.
+    pub fn init_auth_mode(&self) -> &'static str {
+        match self.init_auth_required {
+            Some(true) => "authenticated",
+            Some(false) => "unsigned",
+            None if self.init_auth_key_file.is_some() => "authenticated",
+            None => "unknown (not recorded)",
+        }
+    }
+
     /// Create a new deploy state in "deploying" status.
     pub fn new(params: NewDeployParams) -> Self {
         let now = Utc::now();
         Self {
+            init_auth_required: None,
             init_auth_key_file: None,
             format: FORMAT_VERSION,
             instance_name: params.instance_name,
@@ -696,6 +710,25 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn init_auth_mode_survives_credential_removal_and_serialization() {
+        let mut state = test_state();
+        assert_eq!(state.init_auth_mode(), "unknown (not recorded)");
+        state.init_auth_key_file = Some("credential.json".into());
+        assert_eq!(state.init_auth_mode(), "authenticated");
+        state.init_auth_required = Some(true);
+        state.init_auth_key_file = None;
+        let encoded = serde_json::to_string(&state).unwrap();
+        let mut decoded: DeployState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.init_auth_mode(), "authenticated");
+        decoded.init_auth_required = Some(false);
+        assert_eq!(decoded.init_auth_mode(), "unsigned");
+        let mut legacy = serde_json::to_value(&decoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("init_auth_required");
+        let decoded: DeployState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.init_auth_mode(), "unknown (not recorded)");
     }
 
     #[test]
