@@ -299,6 +299,31 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    #[tokio::test]
+    async fn init_bootstrap_preserves_json_in_instance_metadata() {
+        let runner = MockRunner::new(vec![output("203.0.113.30")]);
+        let public = r#"{"format":1,"public_key":"public","deployment_id":"test"}"#;
+        create_instance(
+            "proj",
+            "zone",
+            "vm",
+            "c3-standard-4",
+            "img",
+            CcType::Tdx,
+            &[("atakit-init-auth".into(), public.into())],
+            &[],
+            None,
+            None,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls();
+        assert!(calls[0]
+            .1
+            .contains(&format!("--metadata=^;^atakit-init-auth={public}")));
+    }
+
     struct MockRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
         responses: Mutex<VecDeque<CommandOutput>>,

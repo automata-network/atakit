@@ -281,6 +281,13 @@ pub struct RmArgs {
 /// Arguments for `workload init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Private initialization credential for a VM created outside cloud deploy.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "unsafe_skip_tls_attestation"
+    )]
+    pub init_auth_key_file: Option<PathBuf>,
     /// Portal address: "host" or "host:port" (default port 1024;
     /// status port = init port + 1000).
     pub address: String,

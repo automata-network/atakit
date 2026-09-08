@@ -1939,6 +1939,7 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
+            init_auth_key_file: None,
             format: 3,
             instance_name: "test-instance".to_string(),
             workload_publisher:

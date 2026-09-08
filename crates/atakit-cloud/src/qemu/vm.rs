@@ -305,7 +305,7 @@ pub fn build_qemu_argv(
     // best-effort and a no-op if unused.
     for (k, v) in metadata {
         args.push("-smbios".into());
-        args.push(format!("type=11,value={k}={v}"));
+        args.push(format!("type=11,value={k}={}", v.replace(',', ",,")));
     }
 
     // Serial console: a unix-socket chardev that ALSO logs to a file
@@ -490,7 +490,14 @@ mod tests {
             Path::new("/f"),
             Path::new("/s"),
             &[],
-            &[("k1".into(), "v1".into()), ("k2".into(), "v=2".into())],
+            &[
+                ("k1".into(), "v1".into()),
+                ("k2".into(), "v=2".into()),
+                (
+                    "atakit-init-auth".into(),
+                    r#"{"format":1,"public_key":"public"}"#.into(),
+                ),
+            ],
             PortalPorts::default(),
             &ports(),
             &BTreeMap::new(),
@@ -500,6 +507,8 @@ mod tests {
         let joined = argv.join(" ");
         assert!(joined.contains("type=11,value=k1=v1"));
         assert!(joined.contains("type=11,value=k2=v=2"));
+        assert!(joined
+            .contains(r#"type=11,value=atakit-init-auth={"format":1,,"public_key":"public"}"#));
     }
 
     #[test]

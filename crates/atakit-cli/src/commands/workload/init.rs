@@ -145,6 +145,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
 
     let mut init_config = InitConfig {
+        init_auth: None,
         platform: args.platform.clone(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
@@ -321,6 +322,19 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     .await?;
 
     // 7. Initialize workload.
+    if let Some(key_file) = &args.init_auth_key_file {
+        let verified = verified_tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("authenticated init requires verified portal TLS"))?;
+        init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+            key_file: key_file.clone(),
+            workload_id: format!(
+                "{:#x}",
+                crate::commands::workload::compute_workload_id(&workload_app_ref)
+            ),
+            tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+        });
+    }
     eprintln!("  [3/{step_count}] Initialize workload...");
     let init_result = if let Some(source) = &remote_atawl_source {
         init::post_portal_init_remote_with_client(

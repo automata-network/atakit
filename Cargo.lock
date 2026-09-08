@@ -1364,12 +1364,14 @@ dependencies = [
  "atakit-attestation-client",
  "atakit-config",
  "atakit-core",
+ "atakit-init-auth",
  "base64",
  "chrono",
  "clap",
  "futures-util",
  "hex",
  "k256",
+ "libc",
  "rcgen",
  "reqwest",
  "serde",
@@ -1461,6 +1463,17 @@ dependencies = [
  "toml",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "atakit-init-auth"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

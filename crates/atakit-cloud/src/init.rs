@@ -152,6 +152,7 @@ const MAX_PORTAL_STATUS_RESPONSE_BYTES: usize = 64 * 1024;
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
 pub struct InitConfig {
+    pub init_auth: Option<crate::init_auth::ClientAuth>,
     /// Sent verbatim as `platform.declared` in the init JSON (e.g. "gcp", "azure", "qemu").
     pub platform: String,
     pub chain: InitChainConfig,
@@ -395,7 +396,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     portal_config
 }
 
-async fn read_response_bytes_limited(
+pub(crate) async fn read_response_bytes_limited(
     response: reqwest::Response,
     maximum_bytes: usize,
     label: &str,
@@ -692,6 +693,9 @@ pub async fn post_portal_init(
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
 ) -> Result<(), CloudError> {
+    if init_config.init_auth.is_some() {
+        return Err(CloudError::Config { message: "authenticated initialization requires post_portal_init_with_client with a verified, certificate-pinned client".into() });
+    }
     let archive_sha256 = hash_workload_archive(archive_path).await?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -776,6 +780,8 @@ pub async fn post_portal_init_with_client(
         init_timeout,
         progress,
         "upload",
+        hex::encode(expected_archive_sha256),
+        None,
     )
     .await
 }
@@ -802,6 +808,7 @@ pub async fn post_portal_init_remote_with_client(
     if reqwest::Url::parse(&source.uri).is_ok_and(|uri| uri.scheme() == "http") {
         tracing::warn!("remote ATAWL uses HTTP; archive confidentiality is not protected");
     }
+    let source_sha256 = atakit_init_auth::hash(&descriptor);
     let atawl_part = reqwest::multipart::Part::bytes(descriptor)
         .file_name("atawl-source.json")
         .mime_str(ATAWL_SOURCE_CONTENT_TYPE)
@@ -822,6 +829,8 @@ pub async fn post_portal_init_remote_with_client(
         init_timeout,
         progress,
         "download",
+        source.archive_sha256.trim_start_matches("0x").to_string(),
+        Some(source_sha256),
     )
     .await
 }
@@ -841,6 +850,8 @@ async fn submit_portal_init(
     init_timeout: Duration,
     progress: &dyn ProgressReporter,
     method: &'static str,
+    archive_sha256: String,
+    source_sha256: Option<String>,
 ) -> Result<PortalInitDeadline, CloudError> {
     let url = format!("https://{host}:{init_port}/init");
     let transfer_id = uuid::Uuid::new_v4().to_string();
@@ -851,6 +862,29 @@ async fn submit_portal_init(
     let config_bytes = build_portal_config_json(init_config)
         .to_string()
         .into_bytes();
+    let authorization = if let Some(auth) = &init_config.init_auth {
+        let intent = crate::init_auth::Intent {
+            deployment_id: String::new(),
+            tls_fingerprint: String::new(),
+            challenge: String::new(),
+            transfer_id: transfer_id.clone(),
+            archive_sha256,
+            archive_size: atawl_size,
+            workload_id: String::new(),
+            config_sha256: atakit_init_auth::hash(&config_bytes),
+            unmeasured_sha256: unmeasured_tar.map(atakit_init_auth::hash),
+            source_sha256,
+            transfer_timeout: atawl_transfer_timeout.as_secs(),
+            init_timeout: init_timeout.as_secs(),
+        };
+        Some(
+            crate::init_auth::authorize(client, host, status_port, auth, intent)
+                .await
+                .map_err(|message| CloudError::PortalInitFailed { message })?,
+        )
+    } else {
+        None
+    };
     let mut form = reqwest::multipart::Form::new()
         .part("atawl", atawl_part)
         .part(
@@ -898,8 +932,11 @@ async fn submit_portal_init(
         transfer_id.clone(),
         Arc::clone(&progress_handle),
     ));
-    let send_result = client
-        .post(&url)
+    let mut request = client.post(&url);
+    if let Some(authorization) = authorization {
+        request = request.header(atakit_init_auth::HEADER, authorization);
+    }
+    let send_result = request
         .timeout(request_timeout)
         .header(
             reqwest::header::CONTENT_TYPE,
@@ -914,9 +951,26 @@ async fn submit_portal_init(
     poll_task.abort();
     progress_handle.finish();
 
-    let resp = send_result.map_err(|e| CloudError::PortalInitFailed {
-        message: format!("request failed: {e}"),
-    })?;
+    let resp = match send_result {
+        Ok(resp) => resp,
+        Err(error) => {
+            if let Some(auth) = &init_config.init_auth {
+                return reconcile_init_response(
+                    client,
+                    host,
+                    status_port,
+                    auth,
+                    &transfer_id,
+                    maximum_request_deadline,
+                    request_timeout,
+                )
+                .await;
+            }
+            return Err(CloudError::PortalInitFailed {
+                message: format!("request failed: {error}"),
+            });
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -950,7 +1004,7 @@ async fn submit_portal_init(
         });
     }
 
-    let response_body = tokio::time::timeout_at(
+    let response_body_result = tokio::time::timeout_at(
         maximum_request_deadline,
         read_response_bytes_limited(
             resp,
@@ -958,12 +1012,29 @@ async fn submit_portal_init(
             "portal init response",
         ),
     )
-    .await
-    .map_err(|_| CloudError::PortalTimeout {
-        address: format!("{host}:{init_port}"),
-        timeout_secs: request_timeout.as_secs(),
-    })?
-    .map_err(|message| CloudError::PortalInitFailed { message })?;
+    .await;
+    let response_body = match response_body_result {
+        Ok(Ok(body)) => body,
+        _ if init_config.init_auth.is_some() => {
+            return reconcile_init_response(
+                client,
+                host,
+                status_port,
+                init_config.init_auth.as_ref().unwrap(),
+                &transfer_id,
+                maximum_request_deadline,
+                request_timeout,
+            )
+            .await;
+        }
+        Ok(Err(message)) => return Err(CloudError::PortalInitFailed { message }),
+        Err(_) => {
+            return Err(CloudError::PortalTimeout {
+                address: format!("{host}:{init_port}"),
+                timeout_secs: request_timeout.as_secs(),
+            })
+        }
+    };
     let response: serde_json::Value =
         serde_json::from_slice(&response_body).map_err(|error| CloudError::PortalInitFailed {
             message: format!("parse portal init response: {error}"),
@@ -1001,6 +1072,53 @@ async fn submit_portal_init(
 
     tracing::info!("workload initialized on CVM at {host}:{init_port}");
     Ok(init_deadline)
+}
+
+/// A lost response never causes a second POST. Ask the same pinned portal
+/// whether it accepted this exact transfer before continuing status polling.
+async fn reconcile_init_response(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+    auth: &crate::init_auth::ClientAuth,
+    transfer_id: &str,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<PortalInitDeadline, CloudError> {
+    let (_, bootstrap) = crate::init_auth::load(&auth.key_file)
+        .map_err(|message| CloudError::PortalInitFailed { message })?;
+    if let Ok(Ok(status)) = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_portal_status(client, host, status_port),
+    )
+    .await
+    {
+        if status_accepts_init_transfer(&status, &bootstrap, transfer_id) {
+            if status["state"] == "Running" {
+                return PortalInitDeadline::starting_now(Duration::from_secs(5));
+            }
+            if tokio::time::Instant::now() < deadline {
+                return Ok(PortalInitDeadline { deadline, timeout });
+            }
+        }
+    }
+    Err(CloudError::PortalInitFailed {
+        message: "initialization response was lost; the request was not sent again. Check `atakit cloud status` before retrying. The saved initialization credential remains available.".into(),
+    })
+}
+
+fn status_accepts_init_transfer(
+    status: &serde_json::Value,
+    bootstrap: &atakit_init_auth::Bootstrap,
+    transfer_id: &str,
+) -> bool {
+    let Ok(fingerprint) = bootstrap.fingerprint() else {
+        return false;
+    };
+    let accepted = &status["init_auth"];
+    accepted["deployment_id"].as_str() == Some(&bootstrap.deployment_id)
+        && accepted["accepted_transfer_id"].as_str() == Some(transfer_id)
+        && accepted["key_fingerprint"].as_str() == Some(&fingerprint)
 }
 
 fn maximum_portal_init_request_timeout(
@@ -1349,8 +1467,54 @@ fn validate_portal_init_schema(status: &serde_json::Value) -> Result<(), CloudEr
 mod tests {
     use super::*;
 
+    #[test]
+    fn lost_response_recovery_requires_the_exact_deployment_key_and_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, bootstrap) = crate::init_auth::create(dir.path()).unwrap();
+        let status = serde_json::json!({"state":"Running","init_auth":{
+            "deployment_id":bootstrap.deployment_id,"key_fingerprint":bootstrap.fingerprint().unwrap(),
+            "accepted_transfer_id":"accepted-transfer"}});
+        assert!(status_accepts_init_transfer(
+            &status,
+            &bootstrap,
+            "accepted-transfer"
+        ));
+        assert!(!status_accepts_init_transfer(
+            &status,
+            &bootstrap,
+            "different-transfer"
+        ));
+        assert!(!status_accepts_init_transfer(
+            &serde_json::json!({"state":"Running"}),
+            &bootstrap,
+            "accepted-transfer"
+        ));
+        for name in ["deployment_id", "key_fingerprint", "accepted_transfer_id"] {
+            let mut changed = status.clone();
+            changed["init_auth"][name] = serde_json::json!("different");
+            assert!(
+                !status_accepts_init_transfer(&changed, &bootstrap, "accepted-transfer"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn initialization_credential_never_enters_portal_config() {
+        let mut config = sample_config();
+        config.init_auth = Some(crate::init_auth::ClientAuth {
+            key_file: "/private/operator-init-key.json".into(),
+            workload_id: "11".repeat(32),
+            tls_fingerprint: "22".repeat(32),
+        });
+        let encoded = build_portal_config_json(&config).to_string();
+        assert!(!encoded.contains("init_auth"));
+        assert!(!encoded.contains("operator-init-key"));
+    }
+
     fn sample_config() -> InitConfig {
         InitConfig {
+            init_auth: None,
             platform: "gcp".to_string(),
             chain: InitChainConfig {
                 rpc_url: "https://rpc.example.com".to_string(),

@@ -309,6 +309,7 @@ async fn run_one(args: DestroyArgs, env: &Env, _config: &Config) -> Result<()> {
         );
     }
 
+    atakit_cloud::init_auth::retire(&mut state, &env.data_dir).map_err(anyhow::Error::msg)?;
     DeployState::delete(&env.data_dir, &target_name, &instance_name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
             },
         },
         Command::Keys(cmd) => match cmd {
+            commands::keys::KeysCommand::CreateInit => commands::keys::create_init(&env),
             commands::keys::KeysCommand::Ls(args) => commands::keys::ls(args, &config),
             commands::keys::KeysCommand::Show(args) => commands::keys::show(args, &config),
         },

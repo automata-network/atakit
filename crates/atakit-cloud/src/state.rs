@@ -45,6 +45,8 @@ impl Default for PortalPorts {
 /// Persistent deployment state stored as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployState {
+    #[serde(default)]
+    pub init_auth_key_file: Option<String>,
     pub format: u32,
     pub instance_name: String,
     /// Owner fingerprint of the workload's publisher. Stored rather than the
@@ -268,6 +270,7 @@ impl DeployState {
     pub fn new(params: NewDeployParams) -> Self {
         let now = Utc::now();
         Self {
+            init_auth_key_file: None,
             format: FORMAT_VERSION,
             instance_name: params.instance_name,
             workload_publisher: params.workload_publisher,

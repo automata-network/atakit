@@ -22,8 +22,7 @@ use super::{
     init_key_from_config, parse_metadata, portal_endpoints, registration_is_off,
     resolve_explicit_tls_measurement_policy, resolve_image, resolve_remote_atawl_source,
     resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
-    synthesize_self_generated_key, terminal_initialization_error, validate_base_image,
-    InitEnvResolver,
+    synthesize_self_generated_key, validate_base_image, InitEnvResolver,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -209,6 +208,9 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
 
 async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let image_only = args.image_only;
+    if !image_only && !args.skip_init && args.unsafe_skip_tls_attestation {
+        bail!("initialization requires verified portal TLS; remove --unsafe-skip-tls-attestation");
+    }
     if image_only && (args.atawl_uri.is_some() || args.atawl_sha256.is_some()) {
         bail!("--atawl-uri and --atawl-sha256 cannot be used with --image-only");
     }
@@ -556,7 +558,24 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
     };
 
     // 10. Generate plan.
+    anyhow::ensure!(
+        !metadata.contains_key("atakit-init-auth"),
+        "atakit-init-auth is reserved for initialization authentication"
+    );
+    let credential = if args.unauthenticated_init {
+        eprintln!("warning: initialization authentication is disabled; anyone who can reach /init can initialize this VM");
+        None
+    } else {
+        Some(atakit_cloud::init_auth::create(&env.data_dir).map_err(anyhow::Error::msg)?)
+    };
+    let init_auth_key_file = credential.as_ref().map(|(path, _)| path.clone());
+    let mut pending_credential =
+        atakit_cloud::init_auth::PendingCredential(init_auth_key_file.clone());
     let deploy_opts = DeployOptions {
+        init_auth: credential
+            .as_ref()
+            .map(|(_, bootstrap)| serde_json::to_string(bootstrap))
+            .transpose()?,
         instance_name: instance_name.clone(),
         target_name: target_name.to_string(),
         target: target.clone(),
@@ -864,7 +883,11 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             state.resources.qemu = Some(QemuResources::default());
         }
     }
+    state.init_auth_key_file = init_auth_key_file
+        .as_ref()
+        .map(|path| path.display().to_string());
     state.save(&env.data_dir)?;
+    pending_credential.0 = None;
 
     // 15. Execute steps.
     let runner = ProcessRunner::new(verbose);
@@ -978,6 +1001,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 };
 
                 let mut init_config = InitConfig {
+                    init_auth: None,
                     platform: provider_config.platform.to_string(),
                     chain: init_chain,
                     owner_operations: config.owner_operations.clone(),
@@ -1093,6 +1117,21 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 )
                 .await?;
 
+                if let Some(key_file) = &init_auth_key_file {
+                    let verified = verified_tls.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "authenticated init requires verified or explicitly pinned portal TLS"
+                        )
+                    })?;
+                    init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+                        key_file: key_file.clone(),
+                        workload_id: format!(
+                            "{:#x}",
+                            crate::commands::workload::compute_workload_id(workload_app_ref)
+                        ),
+                        tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+                    });
+                }
                 let init_result = if let Some(source) = &remote_atawl_source {
                     init::post_portal_init_remote_with_client(
                         &portal_client,
@@ -1139,7 +1178,11 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         .await;
                         eprint!("  ");
                         match outcome {
-                            Ok(PortalTerminalState::Running) => eprintln!("{}", "done".green()),
+                            Ok(PortalTerminalState::Running) => {
+                                atakit_cloud::init_auth::retire(&mut state, &env.data_dir)
+                                    .map_err(anyhow::Error::msg)?;
+                                eprintln!("{}", "done".green());
+                            }
                             Ok(terminal @ PortalTerminalState::Failed { .. })
                             | Ok(terminal @ PortalTerminalState::CleanHalt { .. }) => {
                                 let error = super::persist_portal_terminal_failure(
@@ -1153,31 +1196,14 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                                 return Err(error);
                             }
                             Err(e) => {
-                                let error =
-                                    terminal_initialization_error(target_name, &instance_name, e);
-                                eprintln!("{}", "failed".red());
-                                state.set_status(
-                                    DeployStatus::Failed {
-                                        step: step.to_string(),
-                                        message: error.to_string(),
-                                    },
-                                    &env.data_dir,
-                                )?;
-                                return Err(error);
+                                // A transport error does not prove the portal failed.
+                                // Keep the deployed instance and its credential available.
+                                bail!("{e}; initialization outcome is unknown. Check `atakit cloud status {instance_name} --target {target_name}`. Initialization was not sent again.");
                             }
                         }
                     }
                     Err(e) => {
-                        let error = terminal_initialization_error(target_name, &instance_name, e);
-                        eprintln!("{}", "failed".red());
-                        state.set_status(
-                            DeployStatus::Failed {
-                                step: step.to_string(),
-                                message: error.to_string(),
-                            },
-                            &env.data_dir,
-                        )?;
-                        return Err(error);
+                        bail!("{e}; deployment and initialization credential retained. Check `atakit cloud status {instance_name} --target {target_name}` before retrying.");
                     }
                 }
                 continue;
@@ -1867,7 +1893,8 @@ mod tests {
     #[test]
     fn failed_initial_registration_requires_destroy_then_deploy() {
         let error =
-            terminal_initialization_error("azure", "example", "registration failed").to_string();
+            super::super::terminal_initialization_error("azure", "example", "registration failed")
+                .to_string();
         assert!(error.contains("registration failed"));
         assert!(error.contains("atakit cloud destroy example --target azure"));
         assert!(error.contains("atakit cloud deploy"));

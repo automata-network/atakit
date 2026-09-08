@@ -96,6 +96,11 @@ impl CloudProvider for GcpProvider {
             .metadata
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .chain(
+                opts.init_auth
+                    .iter()
+                    .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+            )
             .collect();
         steps.push(DeployStep::CreateInstance {
             instance_name: names.instance.clone(),

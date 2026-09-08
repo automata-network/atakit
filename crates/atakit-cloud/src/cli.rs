@@ -152,6 +152,10 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_init: bool,
 
+    /// Provision without an initialization key; anyone who can reach /init can initialize the VM
+    #[arg(long)]
+    pub unauthenticated_init: bool,
+
     /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
@@ -1144,6 +1148,23 @@ mod tests {
             let mut single_target_args = args.clone();
             single_target_args.target = vec![target];
             assert_eq!(single_target_args.init_timeout, Some(1500));
+        }
+    }
+
+    #[test]
+    fn unauthenticated_init_is_an_explicit_deploy_choice() {
+        for (extra, expected) in [
+            (vec![], false),
+            (vec!["--unauthenticated-init"], true),
+            (vec!["--unauthenticated-init", "--skip-init"], true),
+        ] {
+            let mut argv = vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"];
+            argv.extend(extra);
+            let cli = TestCli::try_parse_from(argv).unwrap();
+            let CloudCommand::Deploy(args) = cli.command else {
+                panic!("expected deploy")
+            };
+            assert_eq!(args.unauthenticated_init, expected);
         }
     }
 

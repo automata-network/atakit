@@ -110,6 +110,11 @@ impl CloudProvider for QemuProvider {
             .metadata
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .chain(
+                opts.init_auth
+                    .iter()
+                    .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+            )
             .collect();
 
         let mut steps = vec![

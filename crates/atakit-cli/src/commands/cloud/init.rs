@@ -18,6 +18,9 @@ use crate::config::Config;
 use crate::progress::IndicatifReporter;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
+    if args.unsafe_skip_tls_attestation {
+        bail!("initialization requires verified portal TLS; remove --unsafe-skip-tls-attestation");
+    }
     // 1. Resolve instance.
     let (target_name, instance_name) =
         resolve_instance(&env.data_dir, &args.instance, args.target.as_deref())?;
@@ -27,6 +30,10 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     require_deployed_for_init(&state, &target_name, &instance_name)?;
+    if let Some(credential) = &state.init_auth_key_file {
+        atakit_cloud::init_auth::load(std::path::Path::new(credential))
+            .map_err(anyhow::Error::msg)?;
+    }
     let (portal_host, status_port, init_port) = portal_endpoints(&state)?;
 
     // 3. Resolve workload.
@@ -241,6 +248,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
 
     let mut init_config = InitConfig {
+        init_auth: None,
         platform: provider_config.platform.to_string(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
@@ -487,6 +495,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .save(&env.data_dir)
         .map_err(|e| anyhow::anyhow!("save deployment state before POST /init: {e}"))?;
 
+    if let Some(key_file) = &state.init_auth_key_file {
+        let verified = verified_tls.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("authenticated init requires verified or explicitly pinned portal TLS")
+        })?;
+        init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+            key_file: key_file.into(),
+            workload_id: format!(
+                "{:#x}",
+                crate::commands::workload::compute_workload_id(&workload_app_ref)
+            ),
+            tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+        });
+    }
+
     // 8. Initialize workload.
     eprintln!("  [{step}/{step_count}] Initialize workload...");
     let init_result = if let Some(source) = &remote_atawl_source {
@@ -534,7 +556,11 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     .await
     .map_err(|error| anyhow::anyhow!("{error}"))?
     {
-        PortalTerminalState::Running => eprintln!("{}", "done".green()),
+        PortalTerminalState::Running => {
+            atakit_cloud::init_auth::retire(&mut state, &env.data_dir)
+                .map_err(anyhow::Error::msg)?;
+            eprintln!("{}", "done".green());
+        }
         terminal @ PortalTerminalState::Failed { .. }
         | terminal @ PortalTerminalState::CleanHalt { .. } => {
             eprintln!("{}", "failed".red());

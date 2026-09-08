@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/atakit-init-auth",
     "crates/atakit-cvm-types",
     "crates/atakit-cvm-encoding",
     "crates/atakit-core",
