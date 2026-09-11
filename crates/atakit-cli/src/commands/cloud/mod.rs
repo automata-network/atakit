@@ -1,8 +1,10 @@
 pub mod deploy;
 pub mod destroy;
+pub mod disk;
 pub mod image;
 pub mod init;
 pub mod list;
+mod output;
 pub mod provider;
 pub mod reboot;
 pub mod serial;

@@ -36,6 +36,28 @@ pub enum CloudCommand {
     /// Create, rotate, renew, recover, or inspect portal sessions
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Unlock workload disks on first initialization or after reboot
+    #[command(subcommand)]
+    Disk(DiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum DiskCommand {
+    /// Privately prompt for one disk's passphrase
+    Unlock(DiskUnlockArgs),
+}
+
+#[derive(Args)]
+pub struct DiskUnlockArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub disk: String,
+    #[arg(long)]
+    pub owner_key: Option<String>,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
 }
 
 /// Portal session lifecycle subcommands.
@@ -78,6 +100,12 @@ pub enum CloudProviderCommand {
 /// Arguments for `cloud deploy`.
 #[derive(Args, Clone)]
 pub struct DeployArgs {
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with_all = ["disk_setup", "image_only"])]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (empty only) or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
 
@@ -181,11 +209,8 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// deploy time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
@@ -346,9 +371,13 @@ pub struct StatusArgs {
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Query live status from cloud provider
+    /// Query the provider IP and portal state (portal response is not attestation-verified)
     #[arg(long)]
     pub live: bool,
+
+    /// Write structured JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cloud reboot`.
@@ -372,6 +401,10 @@ pub struct ListArgs {
     /// Filter by target name
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Write structured JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cloud ssh`.
@@ -443,6 +476,12 @@ pub struct CloudImageGcArgs {
 /// Arguments for `cloud init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (empty only) or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 
@@ -504,11 +543,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Optional expected base-image assertion for portal TLS attestation.
@@ -1149,6 +1185,40 @@ mod tests {
             single_target_args.target = vec![target];
             assert_eq!(single_target_args.init_timeout, Some(1500));
         }
+    }
+
+    #[test]
+    fn overwrite_all_disks_is_explicit_and_conflicts_with_per_disk_setup() {
+        for argv in [
+            vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"],
+            vec!["test", "init", "gcp-vm", "workload:v1"],
+        ] {
+            let cli = TestCli::try_parse_from(argv.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(!args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(!args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            let mut all = argv;
+            all.push("--overwrite-all-disks");
+            let cli = TestCli::try_parse_from(all.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            all.extend(["--disk-setup", "data=create"]);
+            assert!(TestCli::try_parse_from(all).is_err());
+        }
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "--target",
+            "gcp-tdx",
+            "--image-only",
+            "--overwrite-all-disks"
+        ])
+        .is_err());
     }
 
     #[test]

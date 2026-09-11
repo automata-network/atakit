@@ -34,6 +34,35 @@ pub enum WorkloadCommand {
     /// Initialize a CVM portal directly (e.g. local QEMU)
     #[command(arg_required_else_help = true)]
     Init(Box<InitArgs>),
+    /// Unlock workload disks on an existing portal
+    #[command(subcommand)]
+    Disk(WorkloadDiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum WorkloadDiskCommand {
+    /// Supply a disk passphrase without resending initialization
+    Unlock(Box<WorkloadDiskUnlockArgs>),
+}
+
+#[derive(Args)]
+pub struct WorkloadDiskUnlockArgs {
+    /// Portal host or IP address (without a port)
+    pub host: String,
+    /// Persistent portal HTTPS port
+    #[arg(long, default_value_t = 2024)]
+    pub port: u16,
+    /// Disk name from the workload manifest
+    #[arg(long)]
+    pub disk: String,
+    /// Workload reference (<publisher>/<name>:<version>) or local .atawl archive
+    #[arg(long)]
+    pub workload: String,
+    /// Provisioned ES256K owner key from [keys]
+    #[arg(long)]
+    pub owner_key: String,
+    #[command(flatten)]
+    pub verification: atakit_cloud::cli::SessionVerificationArgs,
 }
 
 /// Arguments for `workload create`.
@@ -281,6 +310,12 @@ pub struct RmArgs {
 /// Arguments for `workload init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Private initialization credential for a VM created outside cloud deploy.
     #[arg(
         long,
@@ -358,11 +393,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Optional expected base-image assertion for portal TLS attestation.
@@ -457,6 +489,25 @@ pub struct InitArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overwrite_all_disks_conflicts_with_per_disk_setup() {
+        use clap::Parser;
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--overwrite-all-disks"])
+            .unwrap();
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected init");
+        };
+        assert!(args.overwrite_all_disks);
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--overwrite-all-disks",
+            "--disk-setup",
+            "data=create"
+        ])
+        .is_err());
+    }
     use clap::Parser;
 
     use super::WorkloadCommand;

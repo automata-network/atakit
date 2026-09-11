@@ -251,9 +251,14 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .iter()
         .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
         .collect();
-    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+    init::disk_init_without_passphrases(&args.disk_passphrase)?;
 
     let mut init_config = InitConfig {
+        disk_setup: init::resolve_disk_setup(
+            &args.disk_setup,
+            &declared,
+            args.overwrite_all_disks,
+        )?,
         init_auth: None,
         platform: provider_config.platform.to_string(),
         chain: init_chain,
@@ -262,7 +267,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         gas_wallet: gas_init,
         prover_credential: prover_init,
         pcr_policy: None,
-        disks: disk_passphrases,
     };
     if !registration_off && args.pcr_policy.is_some() {
         bail!("--pcr-policy requires effective chain registration = \"off\"");
@@ -552,11 +556,14 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     step += 1;
 
     eprint!("  [{step}/{step_count}] Wait for portal Running... ");
-    match init::wait_for_portal_terminal_until_with_client(
+    match super::disk::wait_for_running(
         &portal_client,
         &portal_host,
         status_port,
         init_deadline,
+        verified_tls.as_ref(),
+        &init_config,
+        &archive_path,
         |state| eprintln!("      state: {state}"),
     )
     .await

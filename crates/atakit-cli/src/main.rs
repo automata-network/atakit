@@ -133,12 +133,18 @@ async fn main() -> Result<()> {
             WorkloadCommand::Init(args) => {
                 commands::workload::init::run(*args, &env, &config).await
             }
+            WorkloadCommand::Disk(atakit_workload::cli::WorkloadDiskCommand::Unlock(args)) => {
+                commands::cloud::disk::run_host(*args, &env, &config).await
+            }
         },
         Command::Cloud(cmd) => match *cmd {
             CloudCommand::Deploy(args) => {
                 commands::cloud::deploy::run(args, &env, &config, cli.verbose).await
             }
             CloudCommand::Destroy(args) => commands::cloud::destroy::run(args, &env, &config).await,
+            CloudCommand::Disk(atakit_cloud::cli::DiskCommand::Unlock(args)) => {
+                commands::cloud::disk::run(args, &env, &config).await
+            }
             CloudCommand::Status(args) => commands::cloud::status::run(args, &env, &config).await,
             CloudCommand::Reboot(args) => commands::cloud::reboot::run(args, &env, &config).await,
             CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
@@ -213,6 +219,64 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn workload_disk_unlock_accepts_host_without_cloud_record() {
+        let args = [
+            "atakit",
+            "workload",
+            "disk",
+            "unlock",
+            "192.0.2.10",
+            "--disk",
+            "data",
+            "--workload",
+            "publisher/app:v1",
+            "--owner-key",
+            "owner",
+            "--chain",
+            "hoodi-fork",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Workload(WorkloadCommand::Disk(
+            atakit_workload::cli::WorkloadDiskCommand::Unlock(args),
+        )) = cli.command
+        else {
+            panic!("expected workload disk unlock");
+        };
+        assert_eq!(args.host, "192.0.2.10");
+        assert_eq!(args.port, 2024);
+        assert_eq!(args.workload, "publisher/app:v1");
+        assert_eq!(args.verification.chain.as_deref(), Some("hoodi-fork"));
+    }
+
+    #[test]
+    fn workload_disk_unlock_requires_identity_and_refuses_secret_arguments() {
+        let base = [
+            "atakit",
+            "workload",
+            "disk",
+            "unlock",
+            "::1",
+            "--disk",
+            "data",
+            "--workload",
+            "app.atawl",
+            "--owner-key",
+            "owner",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for flag in [
+            "--passphrase",
+            "--disk-passphrase",
+            "--unsafe-skip-tls-attestation",
+        ] {
+            let mut args = base.to_vec();
+            args.extend([flag, "secret"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(&base[..9]).is_err());
+    }
 
     #[test]
     fn workload_init_uses_the_shared_initialization_timeout_flag() {

@@ -18,6 +18,17 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
         all_states
     };
 
+    if args.json {
+        let deployments: Vec<_> = states.iter().map(super::output::saved_deployment).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "format": 1, "deployments": deployments,
+            }))?
+        );
+        return Ok(());
+    }
+
     if states.is_empty() {
         eprintln!("No deployments found.");
         return Ok(());
@@ -59,8 +70,8 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
     eprintln!(
         "{}",
         format!(
-            "{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {:<18}  {}",
-            "Instance", "Target", "Workload", "Image", "Status", "IP",
+            "{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {:<22}  {:<18}  {}",
+            "Instance", "Target", "Workload", "Image", "Init mode (saved)", "Status", "IP",
         )
         .dimmed()
     );
@@ -106,11 +117,12 @@ pub async fn run(args: ListArgs, env: &Env, _config: &Config) -> Result<()> {
         };
 
         eprintln!(
-            "{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {}  {}",
+            "{:<w_inst$}  {:<w_target$}  {:<w_workload$}  {:<w_image$}  {:<22}  {}  {}",
             s.instance_name.bold(),
             s.target_name,
             workload,
             s.image_ref,
+            s.init_auth_mode(),
             status_col,
             ip,
         );

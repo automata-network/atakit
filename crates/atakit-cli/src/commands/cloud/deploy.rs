@@ -238,7 +238,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         base_image_list,
         unmeasured_tar,
         unmeasured_data_paths,
-        disk_passphrases,
+        disk_setup,
     ): (
         _,
         _,
@@ -271,7 +271,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
         unmeasured_tar = None;
         unmeasured_data_paths = Vec::<String>::new();
         // No workload in image-only mode; reject any stray --disk-passphrase.
-        disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &BTreeMap::new())?;
+        init::disk_init_without_passphrases(&args.disk_passphrase)?;
+        disk_setup =
+            init::resolve_disk_setup(&args.disk_setup, &BTreeMap::new(), args.overwrite_all_disks)?;
     } else {
         let resolved = resolve_workload(
             &args.source,
@@ -303,7 +305,9 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             .iter()
             .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
             .collect();
-        disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+        init::disk_init_without_passphrases(&args.disk_passphrase)?;
+        disk_setup =
+            init::resolve_disk_setup(&args.disk_setup, &declared, args.overwrite_all_disks)?;
         workload_boot_min = resolved.boot_disk_size.clone();
         base_image_mode = resolved.base_image_mode;
         base_image_list = resolved.base_image;
@@ -1017,6 +1021,7 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                 };
 
                 let mut init_config = InitConfig {
+                    disk_setup: disk_setup.clone(),
                     init_auth: None,
                     platform: provider_config.platform.to_string(),
                     chain: init_chain,
@@ -1025,7 +1030,6 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                     gas_wallet: gas_init,
                     prover_credential: prover_init,
                     pcr_policy: None,
-                    disks: disk_passphrases.clone(),
                 };
                 if !registration_off && args.pcr_policy.is_some() {
                     bail!("--pcr-policy requires effective chain registration = \"off\"");
@@ -1184,11 +1188,14 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
                         eprintln!();
                         // Only Running means init and required registration
                         // both completed.
-                        let outcome = init::wait_for_portal_terminal_until_with_client(
+                        let outcome = super::disk::wait_for_running(
                             &portal_client,
                             &ip,
                             status_port,
                             init_deadline,
+                            verified_tls.as_ref(),
+                            &init_config,
+                            std::path::Path::new(ap),
                             |s| eprintln!("      state: {s}"),
                         )
                         .await;

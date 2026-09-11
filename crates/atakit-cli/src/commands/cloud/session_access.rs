@@ -86,11 +86,37 @@ pub(crate) async fn resolve_verified_portal_access(
     env: &Env,
     config: &Config,
 ) -> Result<VerifiedPortalAccess> {
+    resolve_portal_access(instance, target_filter, verification, env, config, false).await
+}
+
+pub(crate) async fn resolve_disk_unlock_access(
+    instance: &str,
+    target_filter: Option<&str>,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    config: &Config,
+) -> Result<VerifiedPortalAccess> {
+    resolve_portal_access(instance, target_filter, verification, env, config, true).await
+}
+
+fn permits_portal_access(status: &DeployStatus, allow_pending: bool) -> bool {
+    matches!(status, DeployStatus::Deployed { .. })
+        || (allow_pending && matches!(status, DeployStatus::Deploying { .. }))
+}
+
+async fn resolve_portal_access(
+    instance: &str,
+    target_filter: Option<&str>,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    config: &Config,
+    allow_pending: bool,
+) -> Result<VerifiedPortalAccess> {
     let (target_name, instance_name) = resolve_instance(&env.data_dir, instance, target_filter)?;
     let state = DeployState::load(&env.data_dir, &target_name, &instance_name)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    if !matches!(state.status, DeployStatus::Deployed { .. }) {
-        bail!("deployment {target_name}/{instance_name} is not deployed");
+    if !permits_portal_access(&state.status, allow_pending) {
+        bail!("deployment {target_name}/{instance_name} is not available for this operation");
     }
     if state.workload_name.is_empty() || state.workload_version.is_empty() {
         bail!("deployment {target_name}/{instance_name} has no initialized workload");
@@ -134,6 +160,35 @@ pub(crate) async fn resolve_verified_portal_access(
         None => bail!("no chain config is available for verifier trust lookup"),
     };
 
+    let verified_tls = verify_disk_portal_tls(
+        &host,
+        status_port,
+        verification,
+        env,
+        &init_chain,
+        &init::cloud_tls_attestation_report_path(&env.data_dir, &target_name, &instance_name),
+    )
+    .await?;
+    Ok(VerifiedPortalAccess {
+        target_name,
+        instance_name,
+        state,
+        host,
+        status_port,
+        chain_name,
+        verified_tls,
+        registration: target.registration.clone(),
+    })
+}
+
+pub(crate) async fn verify_disk_portal_tls(
+    host: &str,
+    status_port: u16,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    init_chain: &InitChainConfig,
+    report: &Path,
+) -> Result<VerifiedPortalTls> {
     let untrusted_portal_base_image_id = if verification.measurements.is_none() {
         Some(
             init::read_untrusted_portal_base_image_id(&host, status_port)
@@ -188,31 +243,12 @@ pub(crate) async fn resolve_verified_portal_access(
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let verified_tls = init::bootstrap_portal_tls(
-        &host,
-        status_port,
-        &tls_mode,
-        None,
-        None,
-        Some(&init::cloud_tls_attestation_report_path(
-            &env.data_dir,
-            &target_name,
-            &instance_name,
-        )),
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verified_tls =
+        init::bootstrap_portal_tls(&host, status_port, &tls_mode, None, None, Some(report))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    Ok(VerifiedPortalAccess {
-        target_name,
-        instance_name,
-        state,
-        host,
-        status_port,
-        chain_name,
-        verified_tls,
-        registration: target.registration.clone(),
-    })
+    Ok(verified_tls)
 }
 
 /// Why the workload policy inputs disagree with the authority portal TLS used,
@@ -327,7 +363,7 @@ async fn build_session_access(
     })
 }
 
-fn verification_chain_without_registry_derivation(
+pub(crate) fn verification_chain_without_registry_derivation(
     chain: &ChainConfig,
     registration: Option<&str>,
 ) -> InitChainConfig {
@@ -513,6 +549,28 @@ fn required_binding_for_registration(registration: Option<&str>) -> Option<Bindi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disk_unlock_allows_pending_deployments_without_relaxing_session_access() {
+        use super::*;
+        let pending = DeployStatus::Deploying { step: 4, total: 5 };
+        assert!(permits_portal_access(&pending, true));
+        assert!(!permits_portal_access(&pending, false));
+        let deployed = DeployStatus::Deployed {
+            ip: "127.0.0.1".into(),
+        };
+        assert!(permits_portal_access(&deployed, true));
+        assert!(permits_portal_access(&deployed, false));
+        for status in [
+            DeployStatus::Destroyed,
+            DeployStatus::Destroying,
+            DeployStatus::Failed {
+                step: "create".into(),
+                message: "failure".into(),
+            },
+        ] {
+            assert!(!permits_portal_access(&status, true));
+        }
+    }
     use std::io::Cursor;
 
     use atakit_cloud::{NewDeployParams, PersistedInitEnv, PlatformKind, PortalPorts};

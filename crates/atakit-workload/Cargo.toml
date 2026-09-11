@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cli = ["clap"]
+cli = ["clap", "dep:atakit-cloud"]
 
 [dependencies]
+atakit-cloud = { workspace = true, features = ["cli"], optional = true }
 atakit-core.workspace = true
 atakit-github.workspace = true
 thiserror.workspace = true
