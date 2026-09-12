@@ -11,6 +11,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const MAX_MEASUREMENT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MEASUREMENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn prompt_label(destination: &str, disk: &str) -> String {
     format!("Passphrase for disk '{disk}' on {destination}: ")
@@ -258,13 +259,10 @@ async fn check_workload_measurement(
             unmeasured_data_root: None,
         })
         .await?;
-    let measurements = read_json_limited(
-        client
-            .get(format!("{base}/platform-measurements"))
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?,
-        MAX_MEASUREMENT_RESPONSE_BYTES,
+    let measurements = read_measurements(
+        client,
+        &format!("{base}/platform-measurements"),
+        MEASUREMENT_READ_TIMEOUT,
     )
     .await?;
     validate_workload_measurement(
@@ -272,6 +270,36 @@ async fn check_workload_measurement(
         &expected.pcr23_sha256,
         &expected.pcr23_sha384,
     )
+}
+
+async fn read_measurements(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    // Hardware TPM reads can exceed the short status-poll deadline. Retry
+    // only this read-only GET, through the same attested TLS client. Never
+    // retry initialization or secret submission here, or bypass validation.
+    for attempt in 0..2 {
+        let result = async {
+            let response = client.get(url).timeout(timeout).send().await?;
+            read_json_limited(response, MAX_MEASUREMENT_RESPONSE_BYTES).await
+        }
+        .await;
+        match result {
+            Err(error)
+                if attempt == 0
+                    && error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout) =>
+            {
+                eprintln!("Attested measurement read timed out; retrying once before disk unlock.");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the second attempt always returns")
 }
 
 fn validate_workload_measurement(
@@ -458,6 +486,62 @@ fn request_digest(tls: &str, disk: &str, challenge: &str, body: &[u8]) -> [u8; 3
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn measurement_read_retries_one_timeout_but_stays_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for second_succeeds in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/platform-measurements",
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let n = socket.read(&mut request).await.unwrap();
+                    assert!(request[..n].starts_with(b"GET /platform-measurements "));
+                    if attempt == 0 || !second_succeeds {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                }
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_measurements(&client, &url, Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), second_succeeds);
+            if let Err(error) = result {
+                assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn measurement_read_does_not_retry_http_or_invalid_json() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for response in [(403, "denied".into()), (200, "invalid json".into())] {
+            let (url, server) = responses(vec![response]).await;
+            let error = read_measurements(&client, &url, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("HTTP 403")
+                    || error.to_string().contains("invalid disk API response")
+            );
+            server.await.unwrap();
+        }
+    }
+
     #[test]
     fn prompts_identify_the_destination_even_for_identical_disk_names() {
         let first = prompt_label("https://192.0.2.1:2024", "data");

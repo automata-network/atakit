@@ -331,6 +331,52 @@ mod tests {
     use crate::trust::files::TlsVerificationTrust;
     use crate::trust::source::{ExplicitTrustSource, TrustInputSource};
 
+    /// Read-only replay against a caller-selected registry and AMD collateral.
+    /// No live VM or transaction is needed. The time is fixed to capture time.
+    #[tokio::test]
+    #[ignore = "requires ATAKIT_AWS_ROTATION_RPC_URL and ATAKIT_AWS_ROTATION_SESSION_REGISTRY"]
+    async fn aws_rotation_saved_evidence_chain_replay() {
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../atakit-attestation/testdata/aws-rotation/evidence.json"
+        ))
+        .unwrap();
+        let expected_challenge: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(raw["request_binding"]["challenge"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let source = crate::trust::source::ChainTrustSource::connect(
+            std::env::var("ATAKIT_AWS_ROTATION_RPC_URL").unwrap(),
+            std::env::var("ATAKIT_AWS_ROTATION_SESSION_REGISTRY").unwrap(),
+            IntelTdxDcapCollateralConfig::default(),
+        )
+        .await
+        .unwrap();
+        let publisher = "0xaef8fc89416f01494ec6534de68d30aab26d7598db8a05967b0ba7d3ecb259d2";
+        let prepared = prepare_supplied_session_bundle(SuppliedSessionBundleVerificationRequest {
+            session_evidence: serde_json::from_value(raw).unwrap(),
+            expected_challenge,
+            mode: SessionVerificationMode::Chain {
+                source,
+                base_image: format!("{publisher}/automata-linux:v0.3.1-debug")
+                    .parse()
+                    .unwrap(),
+                workload: format!("{publisher}/fedora-oci:v0.0.17").parse().unwrap(),
+            },
+            required_binding: Some(BindingMode::Chain),
+        })
+        .await
+        .unwrap();
+        let verified = prepared
+            .verify_at(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1789198200))
+            .unwrap();
+        assert!(verified.session.checks.iter().all(|check| check.valid));
+        println!(
+            "Saved AWS rotation passed {} full-session checks",
+            verified.session.checks.len()
+        );
+    }
+
     fn fixture(encoded: &str) -> Vec<u8> {
         STANDARD
             .decode(encoded.lines().collect::<String>())

@@ -891,6 +891,28 @@ pub fn verify_session_bundle_at(
     }
 }
 
+/// Reconstruct the evidence authenticated by the retained provider attestation.
+/// The shared AK and TEE evidence stay unchanged; rotation's fresh evidence is
+/// still verified separately against the top-level session binding.
+fn provider_attestation_bundle(
+    bundle: &SessionEvidenceBundle,
+) -> std::borrow::Cow<'_, SessionEvidenceBundle> {
+    let Some(provider_binding) = &bundle.provider_binding else {
+        return std::borrow::Cow::Borrowed(bundle);
+    };
+    let mut projected = bundle.clone();
+    projected.binding = provider_binding.binding.clone();
+    projected.tpm_quote = provider_binding.tpm_quote.clone();
+    projected.tpm_certify = provider_binding.tpm_certify.clone();
+    projected.pcr_values = provider_binding.pcr_values.clone();
+    projected.event_log_hashes = provider_binding.event_log_hashes.clone();
+    projected.session_key_delegation.tpm_signing_key = provider_binding.tpm_signing_key.clone();
+    projected.session_id = provider_binding.session_id.clone();
+    projected.policy = provider_binding.policy.clone();
+    projected.provider_binding = None;
+    std::borrow::Cow::Owned(projected)
+}
+
 fn verify_provider_binding_evidence(
     bundle: &SessionEvidenceBundle,
     trust: &SessionTrust,
@@ -939,16 +961,7 @@ fn verify_provider_binding_evidence(
         );
     }
 
-    let mut projected = bundle.clone();
-    projected.binding = provider_binding.binding.clone();
-    projected.tpm_quote = provider_binding.tpm_quote.clone();
-    projected.tpm_certify = provider_binding.tpm_certify.clone();
-    projected.pcr_values = provider_binding.pcr_values.clone();
-    projected.event_log_hashes = provider_binding.event_log_hashes.clone();
-    projected.session_key_delegation.tpm_signing_key = provider_binding.tpm_signing_key.clone();
-    projected.session_id = provider_binding.session_id.clone();
-    projected.policy = provider_binding.policy.clone();
-    projected.provider_binding = None;
+    let projected = provider_attestation_bundle(bundle);
 
     let session_id = decode_hex_32(
         &projected.session_id,
@@ -1322,6 +1335,16 @@ fn verify_aws_platform(
     checks: &mut Vec<SessionVerificationCheck>,
     errors: &mut Vec<String>,
 ) {
+    // The NitroTPM document and SNP report belong to the original provider
+    // binding, not rotation's fresh nonce/PCR snapshot. Verify both original
+    // and current quotes under the same AK; never substitute the old quote for
+    // the new session's signature/challenge/policy checks.
+    verify_aws_quote_signature(bundle, checks, errors);
+    let provider_bundle = provider_attestation_bundle(bundle);
+    if bundle.provider_binding.is_some() {
+        verify_aws_quote_signature(&provider_bundle, checks, errors);
+    }
+    let bundle = provider_bundle.as_ref();
     if bundle.tee_evidence.kind != "configfs_tsm" {
         record(
             checks,
@@ -1427,6 +1450,43 @@ fn verify_aws_platform(
 struct AzureSnpTrust<'a> {
     amd_ark_roots: &'a CertificateTrust,
     amd_snp_collateral: &'a AmdSnpVerificationCollateral,
+}
+
+fn verify_aws_quote_signature(
+    bundle: &SessionEvidenceBundle,
+    checks: &mut Vec<SessionVerificationCheck>,
+    errors: &mut Vec<String>,
+) {
+    let ak = decode_b64(
+        &bundle.ak_evidence.ak_public,
+        "ak_evidence.ak_public",
+        errors,
+    );
+    let quote = decode_b64(
+        &bundle.tpm_quote.tpms_attest,
+        "tpm_quote.tpms_attest",
+        errors,
+    );
+    let signature = decode_b64(
+        &bundle.tpm_quote.tpm_signature,
+        "tpm_quote.tpm_signature",
+        errors,
+    );
+    if let (Some(ak), Some(quote), Some(signature)) = (ak, quote, signature) {
+        let mut report = super::VerificationReport {
+            checks: Vec::new(),
+            evidence: super::EvidenceSummary::default(),
+        };
+        let mut core_errors = Vec::new();
+        super::verification_core::verify_tpm_quote_signature(
+            &mut report,
+            &mut core_errors,
+            &ak,
+            &quote,
+            &signature,
+        );
+        import_core_checks(report, checks, errors);
+    }
 }
 
 fn verify_azure_platform(
@@ -3520,6 +3580,233 @@ fn keccak(bytes: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    fn aws_rotation_fixture() -> SessionEvidenceBundle {
+        let response: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/aws-rotation/evidence.json")).unwrap();
+        serde_json::from_value(response["evidence_bundle"].clone()).unwrap()
+    }
+
+    fn aws_rotation_checks(bundle: &SessionEvidenceBundle) -> Vec<SessionVerificationCheck> {
+        // Trust comes from the fixed original fixture, never the mutated input.
+        let binding = aws_nitro_binding_from_session_bundle(&aws_rotation_fixture()).unwrap();
+        let roots = CertificateTrust {
+            certificates: vec![super::super::aws_nitro_root_certificate(&binding).unwrap()],
+            hashes: vec![],
+        };
+        let mut checks = Vec::new();
+        let mut errors = Vec::new();
+        // These tests isolate the real NitroTPM document and TPM signatures.
+        // The independent SNP vendor certificate check intentionally has no
+        // collateral here; it is not claimed as a full-session acceptance test.
+        let snp = AmdSnpVerificationCollateral::from_vcek_chain(vec![], vec![], vec![], vec![]);
+        verify_aws_platform(
+            bundle,
+            &roots,
+            3600,
+            60,
+            &CertificateTrust::default(),
+            &snp,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1789198200),
+            &mut checks,
+            &mut errors,
+        );
+        checks
+    }
+
+    #[test]
+    fn aws_rotation_verifies_retained_document_and_both_quote_signatures() {
+        let bundle = aws_rotation_fixture();
+        assert_ne!(
+            bundle.binding.qualifying_data,
+            bundle
+                .provider_binding
+                .as_ref()
+                .unwrap()
+                .binding
+                .qualifying_data
+        );
+        let checks = aws_rotation_checks(&bundle);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "aws-nitrotpm-binding" && c.valid),
+            "{checks:?}"
+        );
+        let signatures: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name == "tpm-quote-signature")
+            .collect();
+        assert_eq!(signatures.len(), 2, "{checks:?}");
+        assert!(signatures.iter().all(|c| c.valid), "{checks:?}");
+    }
+
+    #[test]
+    fn aws_initial_binding_uses_current_quote_without_provider_projection() {
+        let bundle = provider_attestation_bundle(&aws_rotation_fixture()).into_owned();
+        assert!(bundle.provider_binding.is_none());
+        let checks = aws_rotation_checks(&bundle);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "aws-nitrotpm-binding" && c.valid),
+            "{checks:?}"
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|c| c.name == "tpm-quote-signature" && c.valid)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn aws_rotation_cannot_drop_original_provider_binding() {
+        let mut bundle = aws_rotation_fixture();
+        bundle.provider_binding = None;
+        let checks = aws_rotation_checks(&bundle);
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "aws-nitrotpm-binding" && !c.valid));
+    }
+
+    #[test]
+    fn aws_rotation_rejects_wrong_original_nonce_and_pcr_values() {
+        for tamper_nonce in [true, false] {
+            let mut bundle = aws_rotation_fixture();
+            let original = bundle.provider_binding.as_mut().unwrap();
+            if tamper_nonce {
+                original.binding.qualifying_data = format!("0x{}", "55".repeat(32));
+            } else {
+                original.pcr_values[0].sha384 = Some(format!("0x{}", "55".repeat(48)));
+            }
+            let checks = aws_rotation_checks(&bundle);
+            assert!(
+                checks
+                    .iter()
+                    .any(|c| c.name == "aws-nitrotpm-binding" && !c.valid),
+                "{checks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_rotation_rejects_tampered_original_or_current_quote_signature() {
+        for original in [false, true] {
+            let mut bundle = aws_rotation_fixture();
+            let quote = if original {
+                &mut bundle.provider_binding.as_mut().unwrap().tpm_quote
+            } else {
+                &mut bundle.tpm_quote
+            };
+            let mut signature = URL_SAFE_NO_PAD.decode(&quote.tpm_signature).unwrap();
+            *signature.last_mut().unwrap() ^= 1;
+            quote.tpm_signature = URL_SAFE_NO_PAD.encode(signature);
+            let checks = aws_rotation_checks(&bundle);
+            assert!(
+                checks
+                    .iter()
+                    .any(|c| c.name == "tpm-quote-signature" && !c.valid),
+                "{checks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_rotation_still_checks_new_quote_challenge_and_pcr_digest() {
+        for tamper_nonce in [true, false] {
+            let mut bundle = aws_rotation_fixture();
+            if tamper_nonce {
+                bundle.binding.qualifying_data = format!("0x{}", "55".repeat(32));
+            } else {
+                bundle.pcr_values[0].sha384 = Some(format!("0x{}", "55".repeat(48)));
+            }
+            // The original document remains valid, but the current quote must fail.
+            let checks = aws_rotation_checks(&bundle);
+            assert!(checks
+                .iter()
+                .any(|c| c.name == "aws-nitrotpm-binding" && c.valid));
+            let mut errors = Vec::new();
+            let mut checks = Vec::new();
+            verify_raw_quote(&bundle, &mut checks, &mut errors);
+            assert!(!errors.is_empty(), "{checks:?}");
+        }
+    }
+
+    #[test]
+    fn aws_rotation_rejects_changed_attestation_key() {
+        let mut bundle = aws_rotation_fixture();
+        let mut key = URL_SAFE_NO_PAD
+            .decode(&bundle.ak_evidence.ak_public)
+            .unwrap();
+        *key.last_mut().unwrap() ^= 1;
+        bundle.ak_evidence.ak_public = URL_SAFE_NO_PAD.encode(key);
+        let checks = aws_rotation_checks(&bundle);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "aws-nitrotpm-binding" && !c.valid),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn gcp_indexed_gpt_policy_rejects_changes_outside_gpt() {
+        use super::*;
+        use atakit_cvm_encoding::pcr_comparison::{IndexedEventSet256, IndexedEventSets256};
+
+        for (pcr_index, count) in [(2, 3usize), (5, 4usize)] {
+            let events: Vec<[u8; 32]> = (0..count).map(|i| [i as u8 + 1; 32]).collect();
+            let policy = PcrComparison256::DynamicIndexedEventSets(IndexedEventSets256 {
+                expected_event_count: count as u16,
+                checked_events: (0..count)
+                    .filter(|&i| i != 1)
+                    .map(|i| IndexedEventSet256 {
+                        event_index: i as u16,
+                        allowed_values: vec![events[i].into()],
+                    })
+                    .collect(),
+            });
+            let replay = |events: &[[u8; 32]]| {
+                events.iter().fold([0u8; 32], |previous, event| {
+                    let mut hash = Sha256::new();
+                    hash.update(previous);
+                    hash.update(event);
+                    hash.finalize().into()
+                })
+            };
+            let check = |events: &[[u8; 32]]| {
+                evaluate_comparison256(&policy, replay(events), events, pcr_index, 0xff)
+            };
+            assert!(check(&events).is_ok());
+            let mut changed_gpt = events.clone();
+            changed_gpt[1] = [99; 32];
+            assert!(check(&changed_gpt).is_ok());
+            for index in (0..count).filter(|&i| i != 1) {
+                let mut changed = events.clone();
+                changed[index] = [99; 32];
+                assert!(check(&changed)
+                    .unwrap_err()
+                    .contains("checked event mismatch"));
+            }
+            let mut extra = events.clone();
+            extra.push([99; 32]);
+            assert!(check(&extra).unwrap_err().contains("event count mismatch"));
+            assert!(check(&events[..count - 1])
+                .unwrap_err()
+                .contains("event count mismatch"));
+            assert!(evaluate_comparison256(
+                &policy,
+                replay(&events),
+                &changed_gpt,
+                pcr_index,
+                0xff
+            )
+            .unwrap_err()
+            .contains("replay"));
+        }
+    }
+
     use super::*;
     use atakit_cvm_encoding::pcr_comparison::{
         encode_dynamic256, encode_static256, encode_static384, DYNAMIC_SUBSEQUENCE, DYNAMIC_SUBSET,
