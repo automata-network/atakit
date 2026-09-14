@@ -74,6 +74,8 @@ impl StagingDir {
 /// Create a `.atawl` archive from the staging directory.
 ///
 /// The archive contains a single top-level directory named after the workload.
+/// All compression options produce zstd, the format accepted by the portal.
+/// The compression argument is retained for source compatibility.
 /// Returns the path to the created archive.
 pub fn create_archive(
     staging_root: &Path,
@@ -81,7 +83,7 @@ pub fn create_archive(
     workload_version: &str,
     output_dir: &Path,
     progress: &dyn ProgressHandle,
-    compression: ArchiveCompression,
+    _compression: ArchiveCompression,
 ) -> Result<PathBuf, WorkloadError> {
     let archive_path = output_dir.join(format!("{workload_name}-{workload_version}.atawl"));
     let file = std::fs::File::create(&archive_path).map_err(|e| WorkloadError::WriteFile {
@@ -89,38 +91,18 @@ pub fn create_archive(
         source: e,
     })?;
 
-    match compression {
-        ArchiveCompression::Zstd => {
-            let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
-            let counting = ProgressWriter {
-                inner: enc,
-                progress,
-            };
-            let mut tar = tar::Builder::new(counting);
-            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
-            tar.into_inner()
-                .map_err(WorkloadError::Io)?
-                .inner
-                .finish()
-                .map_err(WorkloadError::Io)?;
-        }
-        ArchiveCompression::Gz => {
-            let enc = flate2::GzBuilder::new()
-                .mtime(0)
-                .write(file, flate2::Compression::default());
-            let counting = ProgressWriter {
-                inner: enc,
-                progress,
-            };
-            let mut tar = tar::Builder::new(counting);
-            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
-            tar.into_inner()
-                .map_err(WorkloadError::Io)?
-                .inner
-                .finish()
-                .map_err(WorkloadError::Io)?;
-        }
-    }
+    let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
+    let counting = ProgressWriter {
+        inner: enc,
+        progress,
+    };
+    let mut tar = tar::Builder::new(counting);
+    append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
+    tar.into_inner()
+        .map_err(WorkloadError::Io)?
+        .inner
+        .finish()
+        .map_err(WorkloadError::Io)?;
 
     Ok(archive_path)
 }

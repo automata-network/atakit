@@ -34,6 +34,35 @@ pub enum WorkloadCommand {
     /// Initialize a CVM portal directly (e.g. local QEMU)
     #[command(arg_required_else_help = true)]
     Init(Box<InitArgs>),
+    /// Unlock workload disks on an existing portal
+    #[command(subcommand)]
+    Disk(WorkloadDiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum WorkloadDiskCommand {
+    /// Supply a disk passphrase without resending initialization
+    Unlock(Box<WorkloadDiskUnlockArgs>),
+}
+
+#[derive(Args)]
+pub struct WorkloadDiskUnlockArgs {
+    /// Portal host or IP address (without a port)
+    pub host: String,
+    /// Persistent portal HTTPS port
+    #[arg(long, default_value_t = 2024)]
+    pub port: u16,
+    /// Disk name from the workload manifest
+    #[arg(long)]
+    pub disk: String,
+    /// Workload reference (<publisher>/<name>:<version>) or local .atawl archive
+    #[arg(long)]
+    pub workload: String,
+    /// Provisioned ES256K owner key from [keys]
+    #[arg(long)]
+    pub owner_key: String,
+    #[command(flatten)]
+    pub verification: atakit_cloud::cli::SessionVerificationArgs,
 }
 
 /// Arguments for `workload create`.
@@ -69,7 +98,7 @@ pub struct BuildArgs {
     /// Skip importing the built archive into the local workload store
     #[arg(long)]
     pub no_store: bool,
-    /// Use gzip compression instead of zstd
+    /// Deprecated compatibility flag; workload archives always use zstd
     #[arg(long)]
     pub gz: bool,
 }
@@ -221,11 +250,6 @@ pub struct PullArgs {
 /// Arguments for `workload push`.
 #[derive(Args)]
 pub struct PushArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the source is
-    /// a file path rather than a publisher-qualified store reference. Defaults
-    /// to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Workload reference (name:version) or path to .atawl file
     pub source: Option<String>,
     /// Workload directory (for auto-detect)
@@ -242,11 +266,6 @@ pub struct PushArgs {
 /// Arguments for `workload import`.
 #[derive(Args)]
 pub struct ImportArgs {
-    /// Named ES256K key whose fingerprint is the publisher. An archive records
-    /// its name and version but not who published it, and the identifier is
-    /// derived from the publisher. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Path to .atawl file
     pub archive: PathBuf,
     /// Force overwrite if already in store
@@ -270,11 +289,6 @@ pub struct AddArgs {
     /// Workload reference (<publisher>/<name>:<version> or 0x<workload_id>), or
     /// path to a .atawl file
     pub reference: String,
-    /// Named ES256K key whose fingerprint is the publisher, when the reference
-    /// is a file path rather than a publisher-qualified reference. Defaults to
-    /// [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
@@ -296,18 +310,35 @@ pub struct RmArgs {
 /// Arguments for `workload init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
+    /// Private initialization credential for a VM created outside cloud deploy.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "unsafe_skip_tls_attestation"
+    )]
+    pub init_auth_key_file: Option<PathBuf>,
     /// Portal address: "host" or "host:port" (default port 1024;
     /// status port = init port + 1000).
     pub address: String,
 
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
-
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Workload directory (default: current directory)
     #[arg(short, long, conflicts_with = "source")]
@@ -337,12 +368,12 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
@@ -362,11 +393,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Optional expected base-image assertion for portal TLS attestation.
@@ -461,6 +489,25 @@ pub struct InitArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overwrite_all_disks_conflicts_with_per_disk_setup() {
+        use clap::Parser;
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--overwrite-all-disks"])
+            .unwrap();
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected init");
+        };
+        assert!(args.overwrite_all_disks);
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--overwrite-all-disks",
+            "--disk-setup",
+            "data=create"
+        ])
+        .is_err());
+    }
     use clap::Parser;
 
     use super::WorkloadCommand;
@@ -469,6 +516,15 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: WorkloadCommand,
+    }
+
+    #[test]
+    fn workload_build_still_accepts_legacy_gzip_flag() {
+        let cli = TestCli::try_parse_from(["test", "build", "--gz"]).unwrap();
+        let WorkloadCommand::Build(args) = cli.command else {
+            panic!("expected workload build command");
+        };
+        assert!(args.gz);
     }
 
     #[test]
@@ -500,5 +556,29 @@ mod tests {
             panic!("expected workload init command");
         };
         assert_eq!(args.platform, "aws");
+    }
+
+    #[test]
+    fn workload_init_remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--atawl-uri",
+            "http://repo.internal/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(
+            TestCli::try_parse_from(["test", "init", "127.0.0.1", "--atawl-sha256", &hash,])
+                .is_err()
+        );
     }
 }

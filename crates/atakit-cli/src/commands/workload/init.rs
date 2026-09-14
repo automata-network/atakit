@@ -8,8 +8,9 @@ use owo_colors::OwoColorize;
 
 use crate::commands::cloud::{
     effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
-    resolve_explicit_tls_measurement_policy, resolve_init_pcr_policy, resolve_unmeasured_tar,
-    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
+    resolve_explicit_tls_measurement_policy, resolve_init_pcr_policy, resolve_remote_atawl_source,
+    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    synthesize_self_generated_key,
 };
 use crate::config::Config;
 use crate::progress::IndicatifReporter;
@@ -27,15 +28,29 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         &args.dir,
         env,
         config,
-        args.signing_key.as_deref(),
         args.skip_freshness_check,
     )?;
     let archive_path = resolved.archive_path;
     let archive_sha256 = resolved.archive_sha256;
+    let archive_size_bytes = resolved.archive_size_bytes;
     let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
     let workload_attributes = resolved.attributes;
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
+    let remote_atawl_source = resolve_remote_atawl_source(
+        args.atawl_uri.as_deref(),
+        args.atawl_sha256.as_deref(),
+        archive_size_bytes,
+        &archive_sha256,
+        &workload_app_ref,
+    )?;
 
     // Collect unmeasured-data files. Explicit root flags take precedence over
     // the default <workload-dir>/unmeasured-data root.
@@ -127,9 +142,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .iter()
         .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
         .collect();
-    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+    init::disk_init_without_passphrases(&args.disk_passphrase)?;
 
     let mut init_config = InitConfig {
+        disk_setup: init::resolve_disk_setup(
+            &args.disk_setup,
+            &declared,
+            args.overwrite_all_disks,
+        )?,
+        init_auth: None,
         platform: args.platform.clone(),
         chain: init_chain,
         owner_operations: config.owner_operations.clone(),
@@ -137,7 +158,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         gas_wallet: gas_init,
         prover_credential: prover_init,
         pcr_policy: None,
-        disks: disk_passphrases,
     };
     if !registration_off && args.pcr_policy.is_some() {
         bail!("--pcr-policy requires effective chain registration = \"off\"");
@@ -174,6 +194,15 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!("  {:<18}{}", "Archive:".dimmed(), archive_path.display());
     eprintln!("  {:<18}{}", "SHA-256:".dimmed(), &archive_hash[..16]);
+    eprintln!(
+        "  {:<18}{}",
+        "ATAWL transfer:".dimmed(),
+        if remote_atawl_source.is_some() {
+            "portal download"
+        } else {
+            "client upload"
+        }
+    );
     eprintln!(
         "  {:<18}{}s",
         "Initialization timeout:".dimmed(),
@@ -287,13 +316,6 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         ))
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
-    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
-        workload_publisher
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
-        workload_name.clone(),
-        workload_version.clone(),
-    );
     init_config.pcr_policy = resolve_init_pcr_policy(
         args.pcr_policy.as_deref(),
         &init_config,
@@ -304,29 +326,62 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     .await?;
 
     // 7. Initialize workload.
+    if let Some(key_file) = &args.init_auth_key_file {
+        let verified = verified_tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("authenticated init requires verified portal TLS"))?;
+        init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+            key_file: key_file.clone(),
+            workload_id: format!(
+                "{:#x}",
+                crate::commands::workload::compute_workload_id(&workload_app_ref)
+            ),
+            tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+        });
+    }
     eprintln!("  [3/{step_count}] Initialize workload...");
-    init::post_portal_init_with_client(
-        &portal_client,
-        &host,
-        status_port,
-        init_port,
-        &archive_path.display().to_string(),
-        &archive_sha256,
-        unmeasured_tar.as_deref(),
-        &init_config,
-        std::time::Duration::from_secs(args.init_upload_timeout),
-        &IndicatifReporter,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let init_result = if let Some(source) = &remote_atawl_source {
+        init::post_portal_init_remote_with_client(
+            &portal_client,
+            &host,
+            status_port,
+            init_port,
+            source,
+            unmeasured_tar.as_deref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    } else {
+        init::post_portal_init_with_client(
+            &portal_client,
+            &host,
+            status_port,
+            init_port,
+            &archive_path.display().to_string(),
+            &archive_sha256,
+            unmeasured_tar.as_deref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    };
+    let init_deadline = init_result.map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("  {}", "done".green());
 
     eprint!("  [4/{step_count}] Wait for portal Running... ");
-    match init::wait_for_portal_terminal_with_client(
+    match crate::commands::cloud::disk::wait_for_running(
         &portal_client,
         &host,
         status_port,
-        initialization_timeout_secs,
+        init_deadline,
+        verified_tls.as_ref(),
+        &init_config,
+        &archive_path,
         |_| {},
     )
     .await

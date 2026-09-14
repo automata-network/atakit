@@ -1,8 +1,10 @@
 pub mod deploy;
 pub mod destroy;
+pub mod disk;
 pub mod image;
 pub mod init;
 pub mod list;
+mod output;
 pub mod provider;
 pub mod reboot;
 pub mod serial;
@@ -13,6 +15,7 @@ pub mod status;
 pub mod verify_session;
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,6 +30,7 @@ use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
 use atakit_cloud::init::{
     InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig, PortalTerminalState,
+    RemoteAtawlSource,
 };
 use atakit_cloud::pcr_policy::{
     resolve_init_pcr_policy as resolve_pcr_policy_for_init, PcrPolicyIdentifiers,
@@ -49,6 +53,121 @@ use sha2::{Digest, Sha256};
 use crate::config::{ChainConfig, Config, KeyMode, KeySpec, ProverSpec};
 
 pub(crate) const WAIT_FOR_PORTAL_RUNNING_STEP: &str = "Wait for portal Running";
+
+pub(crate) fn resolve_remote_atawl_source(
+    uri: Option<&str>,
+    supplied_sha256: Option<&str>,
+    archive_size_bytes: u64,
+    expected_archive_sha256: &[u8; 32],
+    workload_app_ref: &AppRef,
+) -> Result<Option<RemoteAtawlSource>> {
+    let (Some(uri), Some(supplied_sha256)) = (uri, supplied_sha256) else {
+        if uri.is_some() || supplied_sha256.is_some() {
+            bail!("--atawl-uri and --atawl-sha256 must be supplied together");
+        }
+        return Ok(None);
+    };
+
+    let supplied_sha256 = parse_remote_atawl_sha256(supplied_sha256)?;
+    if supplied_sha256 != *expected_archive_sha256 {
+        bail!(
+            "--atawl-sha256 does not match the locally resolved ATAWL; use the hash of the exact archive at the remote URI"
+        );
+    }
+
+    let workload_id = crate::commands::workload::compute_workload_id(workload_app_ref);
+
+    let source = RemoteAtawlSource {
+        format: 1,
+        uri: uri.to_string(),
+        archive_sha256: format!("0x{}", hex::encode(supplied_sha256)),
+        archive_size_bytes,
+        workload_id: format!("{workload_id:#x}"),
+    };
+    atakit_cloud::init::validate_remote_atawl_source(&source)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(Some(source))
+}
+
+fn parse_remote_atawl_sha256(value: &str) -> Result<[u8; 32]> {
+    let value = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("0x"))
+        .unwrap_or(value);
+    let bytes = hex::decode(value)
+        .map_err(|_| anyhow::anyhow!("--atawl-sha256 must contain exactly 32 bytes of hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("--atawl-sha256 must contain exactly 32 bytes of hex"))
+}
+
+#[cfg(test)]
+mod remote_atawl_source_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_uses_the_publisher_measured_in_the_manifest() {
+        let meta = atakit_workload::manifest::ManifestMeta {
+            format: atakit_workload::FORMAT_VERSION,
+            publisher: format!("0x{}", "33".repeat(32)),
+            name: "developer-workload".to_string(),
+            version: "v1".to_string(),
+        };
+
+        assert_eq!(
+            crate::commands::workload::measured_workload_ref(&meta)
+                .unwrap()
+                .publisher,
+            B256::repeat_byte(0x33)
+        );
+    }
+
+    #[test]
+    fn source_uses_the_inspected_archive_size_hash_and_workload_id() {
+        let expected = [0x11; 32];
+        let app_ref = AppRef::new(B256::repeat_byte(0x22), "example", "v1");
+
+        let source = resolve_remote_atawl_source(
+            Some("http://repo.internal/workload.atawl"),
+            Some(&format!("sha256:{}", "11".repeat(32))),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source.format, 1);
+        assert_eq!(source.archive_size_bytes, 5);
+        assert_eq!(source.archive_sha256, format!("0x{}", "11".repeat(32)));
+        assert_eq!(source.workload_id.len(), 66);
+    }
+
+    #[test]
+    fn source_rejects_a_different_hash_and_does_not_echo_uri_secrets() {
+        let expected = [0x11; 32];
+        let app_ref = AppRef::new(B256::repeat_byte(0x22), "example", "v1");
+        let mismatch = resolve_remote_atawl_source(
+            Some("https://repo.example/workload.atawl"),
+            Some(&"22".repeat(32)),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"));
+
+        let invalid_uri = resolve_remote_atawl_source(
+            Some("https://user:secret@repo.example/workload.atawl"),
+            Some(&"11".repeat(32)),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap_err();
+        assert!(!invalid_uri.to_string().contains("secret"));
+    }
+}
 
 pub(crate) fn terminal_initialization_error(
     target_name: &str,
@@ -135,6 +254,33 @@ impl<'a> InitEnvResolver<'a> {
     }
 }
 
+/// Check the selected prover before provisioning or sending /init.
+pub(crate) fn validate_init_prover(
+    config: &Config,
+    chain_name: &str,
+    cc_type: atakit_cloud::config::CcType,
+    registration_off: bool,
+) -> Result<()> {
+    if registration_off {
+        return Ok(());
+    }
+    let chain = config
+        .chains
+        .get(chain_name)
+        .with_context(|| format!("chain '{chain_name}' not found in [chains]"))?;
+    let uses_zk = chain.tee_backend == "zk"
+        || (chain.tee_backend == "auto" && cc_type == atakit_cloud::config::CcType::SevSnp);
+    if uses_zk && chain.prover.is_none() {
+        bail!("[chains.{chain_name}] requires a prover because the effective TEE backend is ZK; set prover = \"<profile-name>\" to select an existing [provers.<profile-name>] profile");
+    }
+    if let Some(name) = &chain.prover {
+        if !config.provers.contains_key(name) {
+            bail!("[chains.{chain_name}] selects undefined prover '{name}'; define [provers.{name}] or select an existing prover profile");
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the separately named credential used by a prover. A chain profile
 /// takes precedence over the persisted or target value. The gas wallet is not
 /// a prover credential.
@@ -166,6 +312,40 @@ pub(crate) fn effective_prover_credential(
 #[cfg(test)]
 mod prover_credential_tests {
     use super::*;
+
+    #[test]
+    fn init_prover_checks_effective_backend_and_profile() {
+        use atakit_cloud::config::CcType;
+        let mut config = config();
+        for (backend, cc, required) in [
+            ("auto", CcType::SevSnp, true),
+            ("auto", CcType::Tdx, false),
+            ("zk", CcType::SevSnp, true),
+            ("zk", CcType::Tdx, true),
+            ("solidity", CcType::Tdx, false),
+        ] {
+            let chain = config.chains.get_mut("primary").unwrap();
+            chain.tee_backend = backend.into();
+            chain.prover = None;
+            let result = validate_init_prover(&config, "primary", cc, false);
+            assert_eq!(result.is_err(), required, "{backend}/{cc}");
+            if let Err(error) = result {
+                assert!(error
+                    .to_string()
+                    .contains("[chains.primary] requires a prover"));
+            }
+            assert!(validate_init_prover(&config, "primary", cc, true).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("sp1".into());
+            assert!(validate_init_prover(&config, "primary", cc, false).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("missing".into());
+            assert!(validate_init_prover(&config, "primary", cc, false)
+                .unwrap_err()
+                .to_string()
+                .contains("undefined prover 'missing'"));
+        }
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, true).is_ok());
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, false).is_err());
+    }
 
     fn config() -> Config {
         Config::load_from_str(
@@ -746,6 +926,8 @@ pub(crate) struct ResolvedWorkload {
     pub archive_path: PathBuf,
     /// SHA-256 of the same immutable archive bytes used to parse the manifest.
     pub archive_sha256: [u8; 32],
+    /// Size of the same open archive file used for the hash and manifest.
+    pub archive_size_bytes: u64,
     pub name: String,
     pub version: String,
     pub ports: Vec<String>,
@@ -767,8 +949,7 @@ pub(crate) struct ResolvedWorkload {
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
-    /// Owner fingerprint of the workload's publisher. A store reference names
-    /// it; a path or directory takes it from the configured signing key.
+    /// Owner fingerprint recorded in the measured workload manifest.
     pub publisher: alloy_ext::core::primitives::B256,
 }
 
@@ -778,7 +959,6 @@ pub(crate) fn resolve_workload(
     dir: &Option<PathBuf>,
     env: &Env,
     config: &Config,
-    signing_key: Option<&str>,
     skip_freshness_check: bool,
 ) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
@@ -790,18 +970,28 @@ pub(crate) fn resolve_workload(
             let entry = store
                 .get(&workload_id)?
                 .ok_or_else(|| anyhow::anyhow!("workload not found in store: {src}"))?;
-            let (name, version) = (entry.meta.name.clone(), entry.meta.version.clone());
-            let publisher = entry
-                .meta
-                .publisher
-                .parse()
-                .context("store entry has an invalid publisher")?;
             let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
                 bail!("no archive blob for {src} in store");
             }
-            let (result, archive_sha256) = inspect_workload_archive_snapshot(&blob)
-                .context("failed to inspect store archive")?;
+            let (result, archive_sha256, archive_size_bytes) =
+                inspect_workload_archive_snapshot(&blob)
+                    .context("failed to inspect store archive")?;
+            let publisher =
+                crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
+            let entry_publisher: B256 = entry
+                .meta
+                .publisher
+                .parse()
+                .context("store entry has an invalid publisher")?;
+            if entry_publisher != publisher
+                || entry.meta.name != result.manifest.meta.name
+                || entry.meta.version != result.manifest.meta.version
+            {
+                bail!(
+                    "store entry identity does not match the measured workload manifest for {src}"
+                );
+            }
             let disks = result
                 .manifest
                 .disks
@@ -818,9 +1008,10 @@ pub(crate) fn resolve_workload(
             return Ok(ResolvedWorkload {
                 archive_path: blob,
                 archive_sha256,
+                archive_size_bytes,
                 publisher,
-                name,
-                version,
+                name: result.manifest.meta.name,
+                version: result.manifest.meta.version,
                 ports,
                 disks,
                 boot_disk_size: result.manifest.config.boot_disk_size,
@@ -837,7 +1028,7 @@ pub(crate) fn resolve_workload(
         if !path.exists() {
             bail!("archive not found: {src}");
         }
-        let (result, archive_sha256) =
+        let (result, archive_sha256, archive_size_bytes) =
             inspect_workload_archive_snapshot(&path).context("failed to inspect archive")?;
         let disks = result
             .manifest
@@ -852,11 +1043,12 @@ pub(crate) fn resolve_workload(
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
-        // A path records no publisher; the identity comes from the signing key.
-        let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
+        let publisher =
+            crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
         return Ok(ResolvedWorkload {
             archive_path: path,
             archive_sha256,
+            archive_size_bytes,
             publisher,
             name: result.manifest.meta.name,
             version: result.manifest.meta.version,
@@ -898,7 +1090,7 @@ pub(crate) fn resolve_workload(
         }
     }
 
-    let (result, archive_sha256) =
+    let (result, archive_sha256, archive_size_bytes) =
         inspect_workload_archive_snapshot(&archive_path).context("failed to inspect archive")?;
     let ports = collect_firewall_ports(&result.manifest);
     let disks = result
@@ -915,12 +1107,13 @@ pub(crate) fn resolve_workload(
     // The declared unmeasured-data set comes from the manifest (committed to
     // PCR23), not the source TOML, so every deploy mode resolves the same set.
     let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
-    // A workload directory records no publisher either.
-    let publisher = crate::commands::workload::configured_publisher(signing_key, config)?;
+    let publisher =
+        crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
     Ok(ResolvedWorkload {
         publisher,
         archive_path,
         archive_sha256,
+        archive_size_bytes,
         name: result.manifest.meta.name,
         version: result.manifest.meta.version,
         ports,
@@ -936,12 +1129,34 @@ pub(crate) fn resolve_workload(
 
 fn inspect_workload_archive_snapshot(
     archive_path: &Path,
-) -> Result<(atakit_workload::InspectResult, [u8; 32])> {
-    let bytes = std::fs::read(archive_path)
-        .with_context(|| format!("failed to read archive {}", archive_path.display()))?;
-    let archive_sha256 = Sha256::digest(&bytes).into();
-    let inspection = atakit_workload::inspect_workload_archive_bytes(&bytes)?;
-    Ok((inspection, archive_sha256))
+) -> Result<(atakit_workload::InspectResult, [u8; 32], u64)> {
+    let mut file = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
+    let archive_size_bytes = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "failed to read archive metadata for {}",
+                archive_path.display()
+            )
+        })?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash archive {}", archive_path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let archive_sha256 = hasher.finalize().into();
+    file.rewind()
+        .with_context(|| format!("failed to rewind archive {}", archive_path.display()))?;
+    let inspection = atakit_workload::inspect_workload_archive_reader(file)?;
+    Ok((inspection, archive_sha256, archive_size_bytes))
 }
 
 /// The declared unmeasured-data file paths from the manifest, as deploy-relative
@@ -1787,6 +2002,8 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
+            init_auth_required: None,
+            init_auth_key_file: None,
             format: 3,
             instance_name: "test-instance".to_string(),
             workload_publisher:

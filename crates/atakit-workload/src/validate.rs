@@ -238,6 +238,17 @@ pub fn validate_config_with_roots(
             crate::FORMAT_VERSION
         )));
     }
+    if config.format < 8
+        && (!w.depends_on.is_empty()
+            || config
+                .dependencies
+                .values()
+                .any(|dep| dep.depends_on.iter().any(|name| name == &w.name)))
+    {
+        return Err(WorkloadError::Validation(
+            "workload-wide depends_on references require format = 8".into(),
+        ));
+    }
 
     if config.format < 6 && !w.attributes.is_empty() {
         return Err(WorkloadError::Validation(
@@ -650,24 +661,10 @@ pub fn validate_config_with_roots(
     }
 
     // ── dependencies ───────────────────────────────────────
-    let dep_names: HashSet<&str> = config.dependencies.keys().map(|s| s.as_str()).collect();
+    validate_service_dependencies(config)?;
     for (dep_name, dep) in &config.dependencies {
         // Image source validation.
         validate_image_source(&dep.image, workload_dir)?;
-
-        // depends_on must reference other defined dependencies.
-        for ref_name in &dep.depends_on {
-            if !dep_names.contains(ref_name.as_str()) {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.depends_on references undefined dependency: {ref_name:?}"
-                )));
-            }
-            if ref_name == dep_name {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.depends_on cannot reference itself"
-                )));
-            }
-        }
 
         validate_env_files(
             &dep.env_file,
@@ -737,6 +734,122 @@ pub fn validate_config_with_roots(
     validate_log_grants(config)?;
 
     Ok(warnings)
+}
+
+fn validate_service_dependencies(config: &WorkloadConfig) -> Result<(), WorkloadError> {
+    let workload_name = config.workload.name.as_str();
+    if config.dependencies.contains_key(workload_name) {
+        return Err(WorkloadError::Validation(format!(
+            "dependency name {workload_name:?} conflicts with the workload name"
+        )));
+    }
+
+    let mut service_names: HashSet<&str> = config.dependencies.keys().map(String::as_str).collect();
+    service_names.insert(workload_name);
+
+    validate_depends_on_entries(
+        workload_name,
+        "workload.depends_on",
+        &config.workload.depends_on,
+        &service_names,
+    )?;
+    for (name, dep) in &config.dependencies {
+        validate_depends_on_entries(
+            name,
+            &format!("dependencies.{name}.depends_on"),
+            &dep.depends_on,
+            &service_names,
+        )?;
+    }
+
+    let mut graph = BTreeMap::new();
+    graph.insert(
+        config.workload.name.clone(),
+        config.workload.depends_on.clone(),
+    );
+    for (name, dep) in &config.dependencies {
+        graph.insert(name.clone(), dep.depends_on.clone());
+    }
+
+    validate_dependency_graph(&graph)
+}
+
+fn validate_depends_on_entries(
+    owner: &str,
+    context: &str,
+    entries: &[String],
+    service_names: &HashSet<&str>,
+) -> Result<(), WorkloadError> {
+    let mut seen = HashSet::new();
+    for name in entries {
+        if !service_names.contains(name.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context} references undefined service: {name:?}"
+            )));
+        }
+        if name == owner {
+            return Err(WorkloadError::Validation(format!(
+                "{context} cannot reference itself"
+            )));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context} contains duplicate service: {name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dependency_graph(graph: &BTreeMap<String, Vec<String>>) -> Result<(), WorkloadError> {
+    let mut states: BTreeMap<String, u8> = BTreeMap::new();
+
+    for root in graph.keys() {
+        if states.get(root).copied() == Some(2) {
+            continue;
+        }
+
+        states.insert(root.clone(), 1);
+        let mut path = vec![root.clone()];
+        let mut frames = vec![(root.clone(), 0usize)];
+
+        while let Some((name, next_dependency)) = frames.last().cloned() {
+            let dependencies = graph
+                .get(&name)
+                .expect("validated dependency graph contains every service");
+
+            if let Some(dependency) = dependencies.get(next_dependency) {
+                frames
+                    .last_mut()
+                    .expect("dependency traversal frame exists")
+                    .1 += 1;
+
+                match states.get(dependency).copied() {
+                    Some(2) => {}
+                    Some(1) => {
+                        let start = path.iter().position(|item| item == dependency).unwrap_or(0);
+                        let mut cycle = path[start..].to_vec();
+                        cycle.push(dependency.clone());
+                        return Err(WorkloadError::Validation(format!(
+                            "depends_on cycle detected: {}",
+                            cycle.join(" -> ")
+                        )));
+                    }
+                    _ => {
+                        states.insert(dependency.clone(), 1);
+                        path.push(dependency.clone());
+                        frames.push((dependency.clone(), 0));
+                    }
+                }
+            } else {
+                let (finished, _) = frames.pop().expect("dependency traversal frame exists");
+                path.pop();
+                states.insert(finished, 2);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_env_files(
@@ -1849,7 +1962,90 @@ depends_on = ["nonexistent"]
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("undefined dependency"));
+        assert!(err.to_string().contains("undefined service"));
+    }
+
+    #[test]
+    fn accepts_workload_and_dependency_startup_order() {
+        let toml = r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+
+[dependencies.log-shipper]
+image = "fluent-bit:latest"
+depends_on = ["api"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_depends_on_cycle_through_workload() {
+        let toml = r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["sidecar"]
+
+[dependencies.sidecar]
+image = "sidecar:latest"
+depends_on = ["api"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("depends_on cycle detected"), "{error}");
+    }
+
+    #[test]
+    fn validates_deep_dependency_chain_without_recursion() {
+        const SERVICE_COUNT: usize = 20_000;
+        let mut graph = BTreeMap::new();
+        for index in 0..SERVICE_COUNT {
+            let dependencies = if index + 1 < SERVICE_COUNT {
+                vec![format!("service-{:05}", index + 1)]
+            } else {
+                Vec::new()
+            };
+            graph.insert(format!("service-{index:05}"), dependencies);
+        }
+
+        assert!(validate_dependency_graph(&graph).is_ok());
+    }
+
+    #[test]
+    fn rejects_workload_depends_on_before_format_eight() {
+        let toml = r#"
+format = 7
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("require format = 8"), "{error}");
     }
 
     #[test]
@@ -3049,10 +3245,10 @@ options = { max-size = "50m", max-file = "0" }
 workload-logs = true
 [workload.logging]
 driver = "none"
-log-readers = ["app"]
+log-readers = ["shipper"]
 "#,
             r#"
-[dependencies.app]
+[dependencies.shipper]
 image = "x:latest"
 workload-logs = true
 "#,
@@ -3068,10 +3264,10 @@ workload-logs = true
         let toml = logging_toml(
             r#"
 [workload.logging]
-log-readers = ["app", "app"]
+log-readers = ["shipper", "shipper"]
 "#,
             r#"
-[dependencies.app]
+[dependencies.shipper]
 image = "x:latest"
 workload-logs = true
 "#,

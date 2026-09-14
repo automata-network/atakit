@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/atakit-init-auth",
     "crates/atakit-cvm-types",
     "crates/atakit-cvm-encoding",
     "crates/atakit-core",
@@ -42,6 +43,7 @@ futures-util = "0.3"
 urlencoding = "2"
 ipnet = "2"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 # Build / archive
 tempfile = "3"

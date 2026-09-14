@@ -36,6 +36,28 @@ pub enum CloudCommand {
     /// Create, rotate, renew, recover, or inspect portal sessions
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Unlock workload disks on first initialization or after reboot
+    #[command(subcommand)]
+    Disk(DiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum DiskCommand {
+    /// Privately prompt for one disk's passphrase
+    Unlock(DiskUnlockArgs),
+}
+
+#[derive(Args)]
+pub struct DiskUnlockArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub disk: String,
+    #[arg(long)]
+    pub owner_key: Option<String>,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
 }
 
 /// Portal session lifecycle subcommands.
@@ -78,13 +100,29 @@ pub enum CloudProviderCommand {
 /// Arguments for `cloud deploy`.
 #[derive(Args, Clone)]
 pub struct DeployArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with_all = ["disk_setup", "image_only"])]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (empty only) or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(
+        long,
+        value_name = "URI",
+        requires = "atawl_sha256",
+        conflicts_with_all = ["image_only", "skip_init"]
+    )]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for cloud planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name(s) from [cloud.targets.<name>]. Repeatable, or comma-separated.
     /// Passing multiple targets fans out into a concurrent multi-target deploy
@@ -142,11 +180,15 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_init: bool,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Provision without an initialization key; anyone who can reach /init can initialize the VM
+    #[arg(long)]
+    pub unauthenticated_init: bool,
+
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
@@ -167,11 +209,8 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// deploy time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
@@ -332,9 +371,13 @@ pub struct StatusArgs {
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Query live status from cloud provider
+    /// Query the provider IP and portal state (portal response is not attestation-verified)
     #[arg(long)]
     pub live: bool,
+
+    /// Write structured JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cloud reboot`.
@@ -358,6 +401,10 @@ pub struct ListArgs {
     /// Filter by target name
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Write structured JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cloud ssh`.
@@ -429,16 +476,27 @@ pub struct CloudImageGcArgs {
 /// Arguments for `cloud init`.
 #[derive(Args)]
 pub struct InitArgs {
-    /// Named ES256K key whose fingerprint is the publisher, when the workload
-    /// source is a path or directory rather than a publisher-qualified store
-    /// reference. Defaults to [publish] owner_key.
-    #[arg(long)]
-    pub signing_key: Option<String>,
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (empty only) or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name (for disambiguation)
     #[arg(long)]
@@ -460,12 +518,12 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Timeout in seconds after POST /init for proving, registration, and portal Running.
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
     /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
     #[arg(long, value_name = "SECONDS")]
     pub init_timeout: Option<u64>,
 
-    /// Timeout in seconds for the POST /init multipart upload.
+    /// Timeout in seconds for the ATAWL upload or portal download only.
     #[arg(long, default_value = "300", value_name = "SECONDS")]
     pub init_upload_timeout: u64,
 
@@ -485,11 +543,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Optional expected base-image assertion for portal TLS attestation.
@@ -1133,6 +1188,57 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_all_disks_is_explicit_and_conflicts_with_per_disk_setup() {
+        for argv in [
+            vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"],
+            vec!["test", "init", "gcp-vm", "workload:v1"],
+        ] {
+            let cli = TestCli::try_parse_from(argv.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(!args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(!args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            let mut all = argv;
+            all.push("--overwrite-all-disks");
+            let cli = TestCli::try_parse_from(all.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            all.extend(["--disk-setup", "data=create"]);
+            assert!(TestCli::try_parse_from(all).is_err());
+        }
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "--target",
+            "gcp-tdx",
+            "--image-only",
+            "--overwrite-all-disks"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn unauthenticated_init_is_an_explicit_deploy_choice() {
+        for (extra, expected) in [
+            (vec![], false),
+            (vec!["--unauthenticated-init"], true),
+            (vec!["--unauthenticated-init", "--skip-init"], true),
+        ] {
+            let mut argv = vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"];
+            argv.extend(extra);
+            let cli = TestCli::try_parse_from(argv).unwrap();
+            let CloudCommand::Deploy(args) = cli.command else {
+                panic!("expected deploy")
+            };
+            assert_eq!(args.unauthenticated_init, expected);
+        }
+    }
+
+    #[test]
     fn initialization_timeouts_use_calculated_defaults_until_overridden() {
         let cli = TestCli::try_parse_from(["test", "deploy", "workload:v1", "--target", "gcp-tdx"])
             .expect("deploy arguments");
@@ -1185,7 +1291,7 @@ mod tests {
             .expect("deploy help response")
             .to_string();
         assert!(deploy_help.contains("--init-timeout <SECONDS>"));
-        assert!(deploy_help.contains("proving, registration, and portal Running"));
+        assert!(deploy_help.contains("non-transfer /init work and waiting for portal Running"));
         assert!(deploy_help.contains("--init-upload-timeout <SECONDS>"));
 
         let init_help = TestCli::try_parse_from(["test", "init", "--help"])
@@ -1193,7 +1299,52 @@ mod tests {
             .expect("init help response")
             .to_string();
         assert!(init_help.contains("--init-timeout <SECONDS>"));
-        assert!(init_help.contains("proving, registration, and portal Running"));
+        assert!(init_help.contains("non-transfer /init work and waiting for portal Running"));
         assert!(init_help.contains("--init-upload-timeout <SECONDS>"));
+    }
+
+    #[test]
+    fn remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let deploy = TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL deploy arguments");
+        let CloudCommand::Deploy(args) = deploy.command else {
+            panic!("expected deploy command");
+        };
+        assert!(args.atawl_uri.is_some());
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+        ])
+        .is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+            "--skip-init",
+        ])
+        .is_err());
     }
 }

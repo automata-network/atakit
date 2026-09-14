@@ -5,9 +5,7 @@ use atakit_workload::{WorkloadMeta, WorkloadStore};
 use owo_colors::OwoColorize;
 
 use super::compute_workload_id;
-use crate::config::Config;
-
-pub async fn run(args: ImportArgs, env: &Env, config: &Config) -> Result<()> {
+pub async fn run(args: ImportArgs, env: &Env) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
     // Inspect archive to get name, version, SHA256
@@ -24,17 +22,10 @@ pub async fn run(args: ImportArgs, env: &Env, config: &Config) -> Result<()> {
         .await
         .with_context(|| format!("failed to inspect {}", args.archive.display()))?;
 
-    let name = &result.manifest.meta.name;
-    let version = &result.manifest.meta.version;
-
-    // The identifier is publisher-qualified and an archive records no
-    // publisher, so the identity comes from the configured signing key.
-    let publisher = super::configured_publisher(args.signing_key.as_deref(), config)?;
-    let app_ref = automata_tee_workload_measurement::types::AppRef::new(
-        publisher,
-        name.clone(),
-        version.clone(),
-    );
+    let app_ref = super::measured_workload_ref(&result.manifest.meta)?;
+    let publisher = app_ref.publisher;
+    let name = &app_ref.name;
+    let version = &app_ref.version;
     let workload_id = compute_workload_id(&app_ref);
     let workload_id_hex = format!("{workload_id:#x}");
     let publisher_hex = format!("{publisher:#x}");

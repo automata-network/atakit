@@ -64,6 +64,21 @@ pub fn compute_workload_id(app_ref: &AppRef) -> B256 {
     B256::from(atakit_cvm_encoding::workload_id(&shared_app_ref(app_ref)))
 }
 
+/// Publisher-qualified identity recorded in the measured workload manifest.
+pub fn measured_workload_ref(
+    meta: &atakit_workload::manifest::ManifestMeta,
+) -> anyhow::Result<AppRef> {
+    let publisher = meta
+        .publisher
+        .parse()
+        .context("workload manifest has an invalid publisher")?;
+    Ok(AppRef::new(
+        publisher,
+        meta.name.clone(),
+        meta.version.clone(),
+    ))
+}
+
 /// The specification-defined base-image identifier for a publisher-qualified reference.
 pub fn compute_base_image_id(app_ref: &AppRef) -> B256 {
     B256::from(atakit_cvm_encoding::base_image_id(&shared_app_ref(app_ref)))
@@ -369,19 +384,6 @@ pub fn compute_final_pcr23(event_hash_hex: &str) -> Option<String> {
     hasher.update([0u8; 32]);
     hasher.update(event_bytes);
     Some(format!("0x{}", hex::encode(hasher.finalize())))
-}
-
-/// The publisher a command is acting as, from its configured identity.
-///
-/// A file path records a name and version but never who published it, and the
-/// identifier is derived from the publisher — so a path form takes its identity
-/// from the signing key, defaulting to `[publish] owner_key`. A reference names
-/// its publisher and never reaches here.
-pub fn configured_publisher(
-    signing_key: Option<&str>,
-    config: &crate::config::Config,
-) -> anyhow::Result<B256> {
-    owner_fingerprint(&resolve_owner_key(signing_key, config)?)
 }
 
 /// The owner fingerprint of a resolved ES256K key.

@@ -30,7 +30,7 @@ pub struct BuildOptions {
     pub engine: Option<ContainerEngine>,
     /// Show verbose output from container commands.
     pub verbose: bool,
-    /// Archive compression format (default: zstd).
+    /// Legacy compression option. All values produce a zstd archive.
     pub compression: ArchiveCompression,
     /// Root for logical measured-data paths. Defaults to
     /// `<workload_dir>/measured-data`.

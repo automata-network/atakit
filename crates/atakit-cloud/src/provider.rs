@@ -8,6 +8,8 @@ use crate::state::{DeployState, PersistedInitEnv, PortalPorts};
 
 /// Options for a deploy operation.
 pub struct DeployOptions {
+    /// Public bootstrap only; private credentials never enter a deployment plan.
+    pub init_auth: Option<String>,
     pub instance_name: String,
     pub target_name: String,
     pub target: CloudTarget,

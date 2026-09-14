@@ -67,7 +67,7 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(wl_dir.join("measured-data/config/cert.pem"), b"fake-cert").unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [package]
 measured-data = ["/config/cert.pem"]
@@ -97,7 +97,7 @@ fn setup_baby_container_workload_dir(tmp: &std::path::Path) -> std::path::PathBu
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "baby-workload"
@@ -172,6 +172,34 @@ fn read_manifest_json(archive_path: &std::path::Path) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn legacy_gzip_option_builds_zstd_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = build_workload(
+        &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
+            workload_dir: setup_workload_dir(tmp.path()),
+            output_dir: None,
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::Gz,
+            measured_data_root: None,
+            unmeasured_data_root: None,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let bytes = std::fs::read(&result.archive_path).unwrap();
+    assert_eq!(&bytes[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    assert_eq!(
+        read_manifest_json(&result.archive_path)["meta"]["name"],
+        "my-workload"
+    );
+    assert!(inspect_workload_archive_bytes(&bytes).is_ok());
+}
+
+#[tokio::test]
 async fn build_produces_valid_archive() {
     let tmp = tempfile::tempdir().unwrap();
     let wl_dir = setup_workload_dir(tmp.path());
@@ -205,7 +233,8 @@ async fn build_produces_valid_archive() {
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
     let manifest = read_manifest_json(&result.archive_path);
-    assert_eq!(manifest["meta"]["format"], 7);
+    assert_eq!(manifest["meta"]["format"], atakit_workload::FORMAT_VERSION);
+    assert_eq!(manifest["config"]["depends_on"], serde_json::json!([]));
     assert_eq!(manifest["meta"]["publisher"], TEST_PUBLISHER);
     assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
@@ -517,7 +546,7 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "multi-app"
@@ -525,6 +554,7 @@ version = "v0.2.0"
 base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 ports = ["3000:3000"]
+depends_on = ["redis"]
 
 [dependencies.redis]
 image = { file = "./sidecar.tar" }
@@ -606,6 +636,7 @@ async fn build_with_dependency() {
         .dependencies
         .as_ref()
         .expect("manifest should have dependencies");
+    assert_eq!(inspect_result.manifest.config.depends_on, vec!["redis"]);
     assert!(deps.contains_key("redis"));
     let redis = &deps["redis"];
     assert_eq!(redis.image, "redis:v0.2.0"); // auto-tagged from file source

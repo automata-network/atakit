@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use atakit_core::{NullReporter, ProgressHandle, ProgressReporter};
 use futures_util::TryStreamExt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::CloudError;
 use crate::pcr_policy::ResolvedPcrPolicyConfig;
@@ -32,6 +34,28 @@ pub use atakit_attestation_client::{
     TlsVerificationTrustFiles, TrustAnchorsBuilder, TrustInputSource, TrustProvenance, TrustSource,
     VerifiedPortalTls,
 };
+
+pub const ATAWL_SOURCE_CONTENT_TYPE: &str = "application/vnd.atakit.atawl-source+json";
+const ATAWL_UPLOAD_SIZE_HEADER: &str = "atakit-archive-size";
+const ATAWL_UPLOAD_SHA256_HEADER: &str = "atakit-archive-sha256";
+const ATAWL_TRANSFER_TIMEOUT_HEADER: &str = "atakit-atawl-transfer-timeout-seconds";
+const INIT_TIMEOUT_HEADER: &str = "atakit-init-timeout-seconds";
+const INIT_TIMEOUT_MODE: &str = "portal-enforced-non-transfer-v1";
+const MAX_ATAWL_SOURCE_SIZE: usize = 16 * 1024;
+
+/// The portal may need the full five-minute container teardown budget after
+/// the initialization deadline. Keep the HTTP request alive long enough for
+/// that cleanup and the final state update to finish.
+const PORTAL_INIT_CLEANUP_GRACE: Duration = Duration::from_secs(6 * 60);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteAtawlSource {
+    pub format: u32,
+    pub uri: String,
+    pub archive_sha256: String,
+    pub archive_size_bytes: u64,
+    pub workload_id: String,
+}
 
 /// Choose one authority for portal TLS verification.
 ///
@@ -128,6 +152,8 @@ const MAX_PORTAL_STATUS_RESPONSE_BYTES: usize = 64 * 1024;
 /// Init-time configuration sent to the portal via POST /init.
 #[derive(Debug, Clone)]
 pub struct InitConfig {
+    pub disk_setup: BTreeMap<String, String>,
+    pub init_auth: Option<crate::init_auth::ClientAuth>,
     /// Sent verbatim as `platform.declared` in the init JSON (e.g. "gcp", "azure", "qemu").
     pub platform: String,
     pub chain: InitChainConfig,
@@ -138,106 +164,61 @@ pub struct InitConfig {
     /// The internal field name is retained during the compatibility cycle.
     pub prover_credential: Option<InitKeyConfig>,
     pub pcr_policy: Option<ResolvedPcrPolicyConfig>,
-    /// Operator-supplied per-disk passphrases, keyed by manifest disk name.
-    /// Forwarded as `disks.<name>.passphrase` in the init JSON for disks
-    /// whose manifest `unlock_method` includes `"passphrase"`. Empty for
-    /// the common no-encryption / TPM-only case (then the `disks` field is
-    /// omitted from the JSON entirely). Passphrases are per-VM secrets, so
-    /// they come from the `--disk-passphrase NAME=VALUE` CLI flag rather
-    /// than persisted config. Validate names against the declared disks
-    /// with [`parse_disk_passphrases`] before populating this.
-    pub disks: BTreeMap<String, String>,
 }
 
-/// Parse `--disk-passphrase NAME=VALUE` entries into a name→passphrase map,
-/// validating each NAME against the disks the workload manifest declares.
-///
-/// `declared` maps each declared disk name to its `unlock_method` list (from
-/// the manifest). The checks — which the portal would otherwise apply later
-/// (at `/init`, or worse at disk-create time mid-boot) — are done here so the
-/// operator gets a fast, clear error before anything is uploaded:
-///
-/// - **Unknown disk** — a `NAME` not in `declared` (operator typo).
-/// - **Orphan passphrase** — `NAME` is declared but its `unlock_method` does
-///   not include `"passphrase"`, so the passphrase would be ignored.
-/// - **Missing passphrase** — a declared disk lists `"passphrase"` in its
-///   `unlock_method` but no `--disk-passphrase` was supplied for it (the
-///   common "I forgot the passphrase" mistake).
-/// - Malformed entries, empty names, empty values, and duplicate names.
-///
-/// The passphrase value is taken verbatim after the first `=` (so it may
-/// contain `=`); only the name is trimmed.
-pub fn parse_disk_passphrases(
+/// Reject the removed /init passphrase input. Disk unlock uses the persistent API.
+pub fn disk_init_without_passphrases(raw: &[String]) -> Result<(), CloudError> {
+    if !raw.is_empty() {
+        return Err(CloudError::InvalidDiskPassphrase { message: "--disk-passphrase is no longer accepted by initialization; use atakit cloud disk unlock after /init".into() });
+    }
+    Ok(())
+}
+
+pub fn parse_disk_setup(
     raw: &[String],
     declared: &BTreeMap<String, Vec<String>>,
 ) -> Result<BTreeMap<String, String>, CloudError> {
-    let uses_passphrase = |methods: &[String]| methods.iter().any(|m| m == "passphrase");
-
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut result = BTreeMap::new();
     for entry in raw {
-        let (name, value) =
-            entry
-                .split_once('=')
-                .ok_or_else(|| CloudError::InvalidDiskPassphrase {
-                    message: format!("expected NAME=VALUE, got {entry:?}"),
-                })?;
-        let name = name.trim();
-        if name.is_empty() {
+        let Some((name, action)) = entry.split_once('=') else {
             return Err(CloudError::InvalidDiskPassphrase {
-                message: format!("empty disk name in {entry:?}"),
-            });
-        }
-        if value.is_empty() {
-            return Err(CloudError::InvalidDiskPassphrase {
-                message: format!("empty passphrase for disk '{name}'"),
-            });
-        }
-        let Some(methods) = declared.get(name) else {
-            let mut names: Vec<&str> = declared.keys().map(String::as_str).collect();
-            names.sort_unstable();
-            let names = if names.is_empty() {
-                "(none)".to_string()
-            } else {
-                names.join(", ")
-            };
-            return Err(CloudError::InvalidDiskPassphrase {
-                message: format!(
-                    "disk '{name}' is not declared in the workload manifest; \
-                     declared disks: {names}"
-                ),
+                message: "--disk-setup expects NAME=create or NAME=overwrite".into(),
             });
         };
-        if !uses_passphrase(methods) {
-            return Err(CloudError::InvalidDiskPassphrase {
-                message: format!(
-                    "disk '{name}' does not use passphrase unlock \
-                     (unlock_method = {methods:?}); --disk-passphrase only \
-                     applies to disks with \"passphrase\" in their unlock_method"
-                ),
-            });
+        if !declared.contains_key(name)
+            || !matches!(action, "create" | "overwrite")
+            || result.insert(name.into(), action.into()).is_some()
+        {
+            return Err(CloudError::InvalidDiskPassphrase { message: "--disk-setup must select each declared disk at most once with create or overwrite".into() });
         }
-        if out.insert(name.to_string(), value.to_string()).is_some() {
-            return Err(CloudError::InvalidDiskPassphrase {
-                message: format!("duplicate --disk-passphrase for disk '{name}'"),
-            });
+        if action == "overwrite" {
+            eprintln!(
+                "warning: disk '{name}' is authorized for overwrite; existing data will be erased"
+            );
         }
     }
+    Ok(result)
+}
 
-    // Reverse check: every disk that declares passphrase unlock must have
-    // been given one — the common "operator forgot --disk-passphrase" case.
-    for (name, methods) in declared {
-        if uses_passphrase(methods) && !out.contains_key(name) {
-            return Err(CloudError::InvalidDiskPassphrase {
-                message: format!(
-                    "disk '{name}' requires a passphrase (its unlock_method \
-                     includes \"passphrase\") but none was supplied; \
-                     pass --disk-passphrase {name}=<value>"
-                ),
-            });
-        }
+/// Expand blanket operator permission into exact manifest disk names.
+pub fn resolve_disk_setup(
+    raw: &[String],
+    declared: &BTreeMap<String, Vec<String>>,
+    overwrite_all: bool,
+) -> Result<BTreeMap<String, String>, CloudError> {
+    if !overwrite_all {
+        return parse_disk_setup(raw, declared);
     }
-
-    Ok(out)
+    if !raw.is_empty() || declared.is_empty() {
+        return Err(CloudError::InvalidDiskPassphrase {
+            message: "--overwrite-all-disks requires workload disks and cannot be combined with --disk-setup".into(),
+        });
+    }
+    let entries: Vec<_> = declared
+        .keys()
+        .map(|name| format!("{name}=overwrite"))
+        .collect();
+    parse_disk_setup(&entries, declared)
 }
 
 /// Chain config section of the init payload.
@@ -329,6 +310,7 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
     });
 
     let mut portal_config = serde_json::json!({
+        "disk_setup": config.disk_setup,
         "format": INIT_SCHEMA_VERSION,
         "platform": {
             "declared": &config.platform,
@@ -352,26 +334,10 @@ fn build_portal_config_json(config: &InitConfig) -> serde_json::Value {
             .expect("ResolvedPcrPolicyConfig serialization cannot fail");
     }
 
-    // Only emit `disks` when there is at least one passphrase. The portal
-    // treats an absent `disks` field as an empty map.
-    if !config.disks.is_empty() {
-        let disks: serde_json::Map<String, serde_json::Value> = config
-            .disks
-            .iter()
-            .map(|(name, passphrase)| {
-                (
-                    name.clone(),
-                    serde_json::json!({ "passphrase": passphrase }),
-                )
-            })
-            .collect();
-        portal_config["disks"] = serde_json::Value::Object(disks);
-    }
-
     portal_config
 }
 
-async fn read_response_bytes_limited(
+pub(crate) async fn read_response_bytes_limited(
     response: reqwest::Response,
     maximum_bytes: usize,
     label: &str,
@@ -488,6 +454,50 @@ pub enum PortalTerminalState {
     CleanHalt { detail: String },
 }
 
+/// One initialization deadline for every non-ATAWL-transfer part of `/init`.
+///
+/// The portal reports the measured transfer duration. Adding only that duration
+/// to the request-start deadline prevents pre-transfer work, later `/init` work,
+/// or the wait for `Running` from borrowing unused ATAWL transfer time.
+#[derive(Debug, Clone, Copy)]
+pub struct PortalInitDeadline {
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+}
+
+impl PortalInitDeadline {
+    fn starting_at(
+        started_at: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Self, CloudError> {
+        let deadline = started_at
+            .checked_add(timeout)
+            .ok_or_else(|| CloudError::Config {
+                message: "initialization timeout is too large".to_string(),
+            })?;
+        Ok(Self { deadline, timeout })
+    }
+
+    fn starting_now(timeout: Duration) -> Result<Self, CloudError> {
+        Self::starting_at(tokio::time::Instant::now(), timeout)
+    }
+
+    fn from_request_timing(
+        request_started_at: tokio::time::Instant,
+        transfer_duration: Duration,
+        timeout: Duration,
+    ) -> Result<Self, CloudError> {
+        let deadline = request_started_at
+            .checked_add(timeout)
+            .and_then(|deadline| deadline.checked_add(transfer_duration))
+            .ok_or_else(|| CloudError::Config {
+                message: "initialization timeout plus ATAWL transfer duration is too large"
+                    .to_string(),
+            })?;
+        Ok(Self { deadline, timeout })
+    }
+}
+
 /// Poll the portal `/status` endpoint until it reaches a terminal state
 /// (Running, Failed, or CleanHalt) or `timeout_secs` elapses.
 ///
@@ -517,23 +527,56 @@ pub async fn wait_for_portal_terminal_with_client(
     host: &str,
     status_port: u16,
     timeout_secs: u64,
+    on_transition: impl FnMut(&str),
+) -> Result<PortalTerminalState, CloudError> {
+    wait_for_portal_terminal_until_with_client(
+        client,
+        host,
+        status_port,
+        PortalInitDeadline::starting_now(Duration::from_secs(timeout_secs))?,
+        on_transition,
+    )
+    .await
+}
+
+/// Poll until the portal reaches a terminal state, without restarting the
+/// initialization timeout consumed by `POST /init`.
+pub async fn wait_for_portal_terminal_until_with_client(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+    init_deadline: PortalInitDeadline,
     mut on_transition: impl FnMut(&str),
 ) -> Result<PortalTerminalState, CloudError> {
     let url = format!("https://{host}:{status_port}/status");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let interval = Duration::from_secs(2);
     let mut last_state: Option<String> = None;
 
     loop {
-        match client.get(&url).send().await {
+        let timeout_error = || CloudError::PortalTimeout {
+            address: format!("{host}:{status_port}"),
+            timeout_secs: init_deadline.timeout.as_secs(),
+        };
+        if tokio::time::Instant::now() >= init_deadline.deadline {
+            return Err(timeout_error());
+        }
+
+        let response = tokio::time::timeout_at(init_deadline.deadline, client.get(&url).send())
+            .await
+            .map_err(|_| timeout_error())?;
+        match response {
             Ok(resp) if resp.status().is_success() => {
-                match read_response_bytes_limited(
-                    resp,
-                    MAX_PORTAL_STATUS_RESPONSE_BYTES,
-                    "portal status response",
+                let body = tokio::time::timeout_at(
+                    init_deadline.deadline,
+                    read_response_bytes_limited(
+                        resp,
+                        MAX_PORTAL_STATUS_RESPONSE_BYTES,
+                        "portal status response",
+                    ),
                 )
                 .await
-                .and_then(|body| {
+                .map_err(|_| timeout_error())?;
+                match body.and_then(|body| {
                     serde_json::from_slice::<serde_json::Value>(&body)
                         .map_err(|error| format!("parse portal status response: {error}"))
                 }) {
@@ -572,13 +615,10 @@ pub async fn wait_for_portal_terminal_with_client(
             }
         }
 
-        if tokio::time::Instant::now() + interval > deadline {
-            return Err(CloudError::PortalTimeout {
-                address: format!("{host}:{status_port}"),
-                timeout_secs,
-            });
-        }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + interval).min(init_deadline.deadline),
+        )
+        .await;
     }
 }
 
@@ -594,11 +634,10 @@ pub async fn post_portal_init(
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
 ) -> Result<(), CloudError> {
-    let archive_bytes = std::fs::read(archive_path).map_err(|source| CloudError::IoPath {
-        path: archive_path.into(),
-        source,
-    })?;
-    let archive_sha256: [u8; 32] = Sha256::digest(&archive_bytes).into();
+    if init_config.init_auth.is_some() {
+        return Err(CloudError::Config { message: "authenticated initialization requires post_portal_init_with_client with a verified, certificate-pinned client".into() });
+    }
+    let archive_sha256 = hash_workload_archive(archive_path).await?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(300))
@@ -617,9 +656,11 @@ pub async fn post_portal_init(
         unmeasured_tar,
         init_config,
         Duration::from_secs(300),
+        Duration::from_secs(300),
         &progress,
     )
     .await
+    .map(|_| ())
 }
 
 // Keep transport, payload, timeout, and progress controls explicit for callers.
@@ -633,32 +674,160 @@ pub async fn post_portal_init_with_client(
     expected_archive_sha256: &[u8; 32],
     unmeasured_tar: Option<&[u8]>,
     init_config: &InitConfig,
-    upload_timeout: Duration,
+    atawl_transfer_timeout: Duration,
+    init_timeout: Duration,
     progress: &dyn ProgressReporter,
-) -> Result<(), CloudError> {
-    let archive_bytes =
-        read_validated_workload_archive(archive_path, expected_archive_sha256).await?;
+) -> Result<PortalInitDeadline, CloudError> {
+    let (archive_file, archive_size) =
+        open_validated_workload_archive(archive_path, expected_archive_sha256).await?;
     verify_portal_init_schema(client, host, status_port).await?;
+    let mut archive_headers = reqwest::header::HeaderMap::new();
+    archive_headers.insert(
+        reqwest::header::HeaderName::from_static(ATAWL_UPLOAD_SIZE_HEADER),
+        reqwest::header::HeaderValue::from_str(&archive_size.to_string()).map_err(|error| {
+            CloudError::Http {
+                message: error.to_string(),
+            }
+        })?,
+    );
+    archive_headers.insert(
+        reqwest::header::HeaderName::from_static(ATAWL_UPLOAD_SHA256_HEADER),
+        reqwest::header::HeaderValue::from_str(&format!(
+            "0x{}",
+            hex::encode(expected_archive_sha256)
+        ))
+        .map_err(|error| CloudError::Http {
+            message: error.to_string(),
+        })?,
+    );
+    let atawl_part = reqwest::multipart::Part::stream_with_length(archive_file, archive_size)
+        .file_name("archive.atawl")
+        .mime_str("application/octet-stream")
+        .map_err(|e| CloudError::Http {
+            message: e.to_string(),
+        })?
+        .headers(archive_headers);
+    submit_portal_init(
+        client,
+        host,
+        status_port,
+        init_port,
+        atawl_part,
+        archive_size,
+        "Uploading ATAWL",
+        unmeasured_tar,
+        init_config,
+        atawl_transfer_timeout,
+        init_timeout,
+        progress,
+        "upload",
+        hex::encode(expected_archive_sha256),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn post_portal_init_remote_with_client(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+    init_port: u16,
+    source: &RemoteAtawlSource,
+    unmeasured_tar: Option<&[u8]>,
+    init_config: &InitConfig,
+    atawl_transfer_timeout: Duration,
+    init_timeout: Duration,
+    progress: &dyn ProgressReporter,
+) -> Result<PortalInitDeadline, CloudError> {
+    validate_remote_atawl_source(source)?;
+    let descriptor = serde_json::to_vec(source).map_err(|error| CloudError::Http {
+        message: format!("serialize remote ATAWL source: {error}"),
+    })?;
+    validate_remote_atawl_descriptor_size(&descriptor)?;
+    verify_portal_remote_atawl_support(client, host, status_port).await?;
+    if reqwest::Url::parse(&source.uri).is_ok_and(|uri| uri.scheme() == "http") {
+        tracing::warn!("remote ATAWL uses HTTP; archive confidentiality is not protected");
+    }
+    let source_sha256 = atakit_init_auth::hash(&descriptor);
+    let atawl_part = reqwest::multipart::Part::bytes(descriptor)
+        .file_name("atawl-source.json")
+        .mime_str(ATAWL_SOURCE_CONTENT_TYPE)
+        .map_err(|error| CloudError::Http {
+            message: error.to_string(),
+        })?;
+    submit_portal_init(
+        client,
+        host,
+        status_port,
+        init_port,
+        atawl_part,
+        source.archive_size_bytes,
+        "Portal downloading ATAWL",
+        unmeasured_tar,
+        init_config,
+        atawl_transfer_timeout,
+        init_timeout,
+        progress,
+        "download",
+        source.archive_sha256.trim_start_matches("0x").to_string(),
+        Some(source_sha256),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_portal_init(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+    init_port: u16,
+    atawl_part: reqwest::multipart::Part,
+    atawl_size: u64,
+    progress_message: &str,
+    unmeasured_tar: Option<&[u8]>,
+    init_config: &InitConfig,
+    atawl_transfer_timeout: Duration,
+    init_timeout: Duration,
+    progress: &dyn ProgressReporter,
+    method: &'static str,
+    archive_sha256: String,
+    source_sha256: Option<String>,
+) -> Result<PortalInitDeadline, CloudError> {
     let url = format!("https://{host}:{init_port}/init");
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let transfer_timeout_header = atawl_transfer_timeout_header_value(atawl_transfer_timeout)?;
+    let init_timeout_header = init_timeout_header_value(init_timeout)?;
+    tracing::info!(%transfer_id, method, "starting portal ATAWL transfer");
 
-    // Build config JSON.
-    let config_json = build_portal_config_json(init_config);
-    let config_bytes = config_json.to_string().into_bytes();
-    let payload_bytes = archive_bytes.len() as u64
-        + config_bytes.len() as u64
-        + unmeasured_tar.map_or(0, |u| u.len() as u64);
-
-    // Build multipart form.
-    let mut form = reqwest::multipart::Form::new()
-        .part(
-            "atawl",
-            reqwest::multipart::Part::bytes(archive_bytes)
-                .file_name("archive.atawl")
-                .mime_str("application/octet-stream")
-                .map_err(|e| CloudError::Http {
-                    message: e.to_string(),
-                })?,
+    let config_bytes = build_portal_config_json(init_config)
+        .to_string()
+        .into_bytes();
+    let authorization = if let Some(auth) = &init_config.init_auth {
+        let intent = crate::init_auth::Intent {
+            deployment_id: String::new(),
+            tls_fingerprint: String::new(),
+            challenge: String::new(),
+            transfer_id: transfer_id.clone(),
+            archive_sha256,
+            archive_size: atawl_size,
+            workload_id: String::new(),
+            config_sha256: atakit_init_auth::hash(&config_bytes),
+            unmeasured_sha256: unmeasured_tar.map(atakit_init_auth::hash),
+            source_sha256,
+            transfer_timeout: atawl_transfer_timeout.as_secs(),
+            init_timeout: init_timeout.as_secs(),
+        };
+        Some(
+            crate::init_auth::authorize(client, host, status_port, auth, intent)
+                .await
+                .map_err(|message| CloudError::PortalInitFailed { message })?,
         )
+    } else {
+        None
+    };
+    let mut form = reqwest::multipart::Form::new()
+        .part("atawl", atawl_part)
         .part(
             "config",
             reqwest::multipart::Part::bytes(config_bytes)
@@ -682,67 +851,300 @@ pub async fn post_portal_init_with_client(
     }
 
     let boundary = form.boundary().to_string();
-    let progress_handle: Arc<dyn ProgressHandle> = progress
-        .create(
-            &format!(
-                "Uploading /init multipart payload ({} payload bytes)",
-                payload_bytes
-            ),
-            0,
-        )
-        .into();
-    let stream_progress = Arc::clone(&progress_handle);
-    let body_stream = form.into_stream().inspect_ok(move |chunk| {
-        stream_progress.inc(chunk.len() as u64);
-    });
-
-    let send_result = client
-        .post(&url)
-        .timeout(upload_timeout)
+    // This is only a safety cap while the response is unavailable. The portal
+    // enforces the non-transfer budget, and its response supplies the measured
+    // transfer duration used to construct the exact client-side deadline.
+    let request_timeout =
+        maximum_portal_init_request_timeout(atawl_transfer_timeout, init_timeout)?;
+    let request_started_at = tokio::time::Instant::now();
+    let maximum_request_deadline =
+        request_started_at
+            .checked_add(request_timeout)
+            .ok_or_else(|| CloudError::Config {
+                message: "portal initialization request timeout is too large".to_string(),
+            })?;
+    let progress_label = format!("{progress_message} [{transfer_id}]");
+    let progress_handle: Arc<dyn ProgressHandle> =
+        progress.create(&progress_label, atawl_size).into();
+    let poll_task = tokio::spawn(poll_atawl_transfer_progress(
+        client.clone(),
+        host.to_string(),
+        status_port,
+        transfer_id.clone(),
+        Arc::clone(&progress_handle),
+    ));
+    let mut request = client.post(&url);
+    if let Some(authorization) = authorization {
+        request = request.header(atakit_init_auth::HEADER, authorization);
+    }
+    let send_result = request
+        .timeout(request_timeout)
         .header(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
         )
-        .body(reqwest::Body::wrap_stream(body_stream))
+        .header("Atakit-Transfer-Id", &transfer_id)
+        .header(ATAWL_TRANSFER_TIMEOUT_HEADER, transfer_timeout_header)
+        .header(INIT_TIMEOUT_HEADER, init_timeout_header)
+        .body(reqwest::Body::wrap_stream(form.into_stream()))
         .send()
         .await;
+    poll_task.abort();
     progress_handle.finish();
 
-    let resp = send_result.map_err(|e| CloudError::PortalInitFailed {
-        message: format!("request failed: {e}"),
-    })?;
+    let resp = match send_result {
+        Ok(resp) => resp,
+        Err(error) => {
+            if let Some(auth) = &init_config.init_auth {
+                return reconcile_init_response(
+                    client,
+                    host,
+                    status_port,
+                    auth,
+                    &transfer_id,
+                    maximum_request_deadline,
+                    request_timeout,
+                )
+                .await;
+            }
+            return Err(CloudError::PortalInitFailed {
+                message: format!("request failed: {error}"),
+            });
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = read_response_bytes_limited(
-            resp,
-            MAX_PORTAL_ERROR_RESPONSE_BYTES,
-            "portal init error response",
+        let body_result = tokio::time::timeout_at(
+            maximum_request_deadline,
+            read_response_bytes_limited(
+                resp,
+                MAX_PORTAL_ERROR_RESPONSE_BYTES,
+                "portal init error response",
+            ),
         )
         .await
-        .map(|body| String::from_utf8_lossy(&body).into_owned())
-        .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
+        .map_err(|_| CloudError::PortalTimeout {
+            address: format!("{host}:{init_port}"),
+            timeout_secs: request_timeout.as_secs(),
+        })?;
+        if body_result
+            .as_ref()
+            .is_ok_and(|body| is_initialization_timeout_response(body))
+        {
+            return Err(CloudError::PortalTimeout {
+                address: format!("{host}:{init_port}"),
+                timeout_secs: init_timeout.as_secs(),
+            });
+        }
+        let body = body_result
+            .map(|body| String::from_utf8_lossy(&body).into_owned())
+            .unwrap_or_else(|error| format!("<could not read response body: {error}>"));
         return Err(CloudError::PortalInitFailed {
             message: format!("portal returned {status}: {body}"),
         });
     }
 
+    let response_body_result = tokio::time::timeout_at(
+        maximum_request_deadline,
+        read_response_bytes_limited(
+            resp,
+            MAX_PORTAL_STATUS_RESPONSE_BYTES,
+            "portal init response",
+        ),
+    )
+    .await;
+    let response_body = match response_body_result {
+        Ok(Ok(body)) => body,
+        _ if init_config.init_auth.is_some() => {
+            return reconcile_init_response(
+                client,
+                host,
+                status_port,
+                init_config.init_auth.as_ref().unwrap(),
+                &transfer_id,
+                maximum_request_deadline,
+                request_timeout,
+            )
+            .await;
+        }
+        Ok(Err(message)) => return Err(CloudError::PortalInitFailed { message }),
+        Err(_) => {
+            return Err(CloudError::PortalTimeout {
+                address: format!("{host}:{init_port}"),
+                timeout_secs: request_timeout.as_secs(),
+            })
+        }
+    };
+    let response: serde_json::Value =
+        serde_json::from_slice(&response_body).map_err(|error| CloudError::PortalInitFailed {
+            message: format!("parse portal init response: {error}"),
+        })?;
+    let transfer_duration_ms = response
+        .get("atawl_transfer_duration_ms")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| CloudError::PortalInitFailed {
+            message: "portal init response omitted atawl_transfer_duration_ms".to_string(),
+        })?;
+    let init_deadline = PortalInitDeadline::from_request_timing(
+        request_started_at,
+        Duration::from_millis(transfer_duration_ms),
+        init_timeout,
+    )?;
+    if tokio::time::Instant::now() >= init_deadline.deadline {
+        return Err(CloudError::PortalTimeout {
+            address: format!("{host}:{init_port}"),
+            timeout_secs: init_timeout.as_secs(),
+        });
+    }
+    match response.get("transfer_id").and_then(|value| value.as_str()) {
+        Some(returned) if returned != transfer_id => {
+            return Err(CloudError::PortalInitFailed {
+                message: "portal init response returned a different transfer_id".to_string(),
+            })
+        }
+        None if method == "download" => {
+            return Err(CloudError::PortalInitFailed {
+                message: "portal init response omitted transfer_id".to_string(),
+            })
+        }
+        Some(_) | None => {}
+    }
+
     tracing::info!("workload initialized on CVM at {host}:{init_port}");
-    Ok(())
+    Ok(init_deadline)
 }
 
-async fn read_validated_workload_archive(
+/// A lost response never causes a second POST. Ask the same pinned portal
+/// whether it accepted this exact transfer before continuing status polling.
+async fn reconcile_init_response(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+    auth: &crate::init_auth::ClientAuth,
+    transfer_id: &str,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<PortalInitDeadline, CloudError> {
+    let (_, bootstrap) = crate::init_auth::load(&auth.key_file)
+        .map_err(|message| CloudError::PortalInitFailed { message })?;
+    if let Ok(Ok(status)) = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_portal_status(client, host, status_port),
+    )
+    .await
+    {
+        if status_accepts_init_transfer(&status, &bootstrap, transfer_id) {
+            if status["state"] == "Running" {
+                return PortalInitDeadline::starting_now(Duration::from_secs(5));
+            }
+            if tokio::time::Instant::now() < deadline {
+                return Ok(PortalInitDeadline { deadline, timeout });
+            }
+        }
+    }
+    Err(CloudError::PortalInitFailed {
+        message: "initialization response was lost; the request was not sent again. Check `atakit cloud status` before retrying. The saved initialization credential remains available.".into(),
+    })
+}
+
+fn status_accepts_init_transfer(
+    status: &serde_json::Value,
+    bootstrap: &atakit_init_auth::Bootstrap,
+    transfer_id: &str,
+) -> bool {
+    let Ok(fingerprint) = bootstrap.fingerprint() else {
+        return false;
+    };
+    let accepted = &status["init_auth"];
+    accepted["deployment_id"].as_str() == Some(&bootstrap.deployment_id)
+        && accepted["accepted_transfer_id"].as_str() == Some(transfer_id)
+        && accepted["key_fingerprint"].as_str() == Some(&fingerprint)
+}
+
+fn maximum_portal_init_request_timeout(
+    atawl_transfer_timeout: Duration,
+    init_timeout: Duration,
+) -> Result<Duration, CloudError> {
+    atawl_transfer_timeout
+        .checked_add(init_timeout)
+        .and_then(|timeout| timeout.checked_add(PORTAL_INIT_CLEANUP_GRACE))
+        .ok_or_else(|| CloudError::Config {
+            message:
+                "ATAWL transfer timeout plus initialization timeout and cleanup grace is too large"
+                    .to_string(),
+        })
+}
+
+fn atawl_transfer_timeout_header_value(
+    timeout: Duration,
+) -> Result<reqwest::header::HeaderValue, CloudError> {
+    if timeout.is_zero() || timeout.subsec_nanos() != 0 {
+        return Err(CloudError::Config {
+            message: "ATAWL transfer timeout must be a positive whole number of seconds"
+                .to_string(),
+        });
+    }
+    reqwest::header::HeaderValue::from_str(&timeout.as_secs().to_string()).map_err(|error| {
+        CloudError::Config {
+            message: format!("invalid ATAWL transfer timeout: {error}"),
+        }
+    })
+}
+
+fn init_timeout_header_value(
+    timeout: Duration,
+) -> Result<reqwest::header::HeaderValue, CloudError> {
+    if timeout.is_zero() || timeout.subsec_nanos() != 0 {
+        return Err(CloudError::Config {
+            message: "initialization timeout must be a positive whole number of seconds"
+                .to_string(),
+        });
+    }
+    reqwest::header::HeaderValue::from_str(&timeout.as_secs().to_string()).map_err(|error| {
+        CloudError::Config {
+            message: format!("invalid initialization timeout: {error}"),
+        }
+    })
+}
+
+fn is_initialization_timeout_response(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| {
+        value.get("code").and_then(|code| code.as_str()) == Some("initialization_timeout")
+    })
+}
+
+fn validate_remote_atawl_descriptor_size(descriptor: &[u8]) -> Result<(), CloudError> {
+    if descriptor.len() <= MAX_ATAWL_SOURCE_SIZE {
+        return Ok(());
+    }
+    Err(CloudError::Config {
+        message: format!(
+            "remote ATAWL source descriptor is {} bytes; the protocol limit is {MAX_ATAWL_SOURCE_SIZE} bytes",
+            descriptor.len()
+        ),
+    })
+}
+
+async fn open_validated_workload_archive(
     archive_path: &str,
     expected_archive_sha256: &[u8; 32],
-) -> Result<Vec<u8>, CloudError> {
-    let archive_bytes =
-        tokio::fs::read(archive_path)
-            .await
-            .map_err(|source| CloudError::IoPath {
-                path: archive_path.into(),
-                source,
-            })?;
-    let actual_archive_sha256: [u8; 32] = Sha256::digest(&archive_bytes).into();
+) -> Result<(tokio::fs::File, u64), CloudError> {
+    let mut archive_file = tokio::fs::File::open(archive_path)
+        .await
+        .map_err(|source| CloudError::IoPath {
+            path: archive_path.into(),
+            source,
+        })?;
+    let archive_size = archive_file
+        .metadata()
+        .await
+        .map_err(|source| CloudError::IoPath {
+            path: archive_path.into(),
+            source,
+        })?
+        .len();
+    let actual_archive_sha256 = hash_open_file(&mut archive_file, archive_path).await?;
     if actual_archive_sha256 != *expected_archive_sha256 {
         return Err(CloudError::WorkloadArchiveChanged {
             path: archive_path.into(),
@@ -750,7 +1152,162 @@ async fn read_validated_workload_archive(
             actual: hex::encode(actual_archive_sha256),
         });
     }
-    Ok(archive_bytes)
+    archive_file
+        .rewind()
+        .await
+        .map_err(|source| CloudError::IoPath {
+            path: archive_path.into(),
+            source,
+        })?;
+    Ok((archive_file, archive_size))
+}
+
+async fn hash_workload_archive(archive_path: &str) -> Result<[u8; 32], CloudError> {
+    let mut archive_file = tokio::fs::File::open(archive_path)
+        .await
+        .map_err(|source| CloudError::IoPath {
+            path: archive_path.into(),
+            source,
+        })?;
+    hash_open_file(&mut archive_file, archive_path).await
+}
+
+async fn hash_open_file(
+    archive_file: &mut tokio::fs::File,
+    archive_path: &str,
+) -> Result<[u8; 32], CloudError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = archive_file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| CloudError::IoPath {
+                path: archive_path.into(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub fn validate_remote_atawl_source(source: &RemoteAtawlSource) -> Result<(), CloudError> {
+    if source.format != 1 {
+        return Err(CloudError::Config {
+            message: "remote ATAWL source format must be 1".to_string(),
+        });
+    }
+    if source.archive_size_bytes == 0 {
+        return Err(CloudError::Config {
+            message: "remote ATAWL archive_size_bytes must be greater than zero".to_string(),
+        });
+    }
+    validate_remote_bytes32("archive_sha256", &source.archive_sha256)?;
+    validate_remote_bytes32("workload_id", &source.workload_id)?;
+    let uri = reqwest::Url::parse(&source.uri).map_err(|_| CloudError::Config {
+        message: "remote ATAWL URI is invalid".to_string(),
+    })?;
+    if !matches!(uri.scheme(), "http" | "https")
+        || uri.host().is_none()
+        || !uri.username().is_empty()
+        || uri.password().is_some()
+        || uri.fragment().is_some()
+    {
+        return Err(CloudError::Config {
+            message: "remote ATAWL URI must be HTTP or HTTPS, contain a host, and omit credentials and fragments".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_remote_bytes32(name: &str, value: &str) -> Result<(), CloudError> {
+    let valid = value
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())
+        .is_some_and(|bytes| bytes.len() == 32);
+    if valid {
+        Ok(())
+    } else {
+        Err(CloudError::Config {
+            message: format!("remote ATAWL {name} must be a 0x-prefixed bytes32 value"),
+        })
+    }
+}
+
+async fn poll_atawl_transfer_progress(
+    client: reqwest::Client,
+    host: String,
+    status_port: u16,
+    transfer_id: String,
+    progress: Arc<dyn ProgressHandle>,
+) -> tokio::time::Instant {
+    let url = format!("https://{host}:{status_port}/status");
+    let mut last_received = 0_u64;
+    let mut observed = false;
+    loop {
+        if let Ok(response) = client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                if let Ok(body) = read_response_bytes_limited(
+                    response,
+                    MAX_PORTAL_STATUS_RESPONSE_BYTES,
+                    "portal transfer status response",
+                )
+                .await
+                {
+                    if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        let transfer = status.get("atawl_transfer");
+                        let matches = transfer
+                            .and_then(|transfer| transfer.get("transfer_id"))
+                            .and_then(|value| value.as_str())
+                            == Some(transfer_id.as_str());
+                        if matches {
+                            observed = true;
+                            let received = transfer
+                                .and_then(|transfer| transfer.get("bytes_received"))
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(last_received);
+                            if received > last_received {
+                                progress.inc(received - last_received);
+                                last_received = received;
+                            }
+                        } else if atawl_transfer_has_finished(&status, observed) {
+                            progress.finish();
+                            return tokio::time::Instant::now();
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn atawl_transfer_has_finished(status: &serde_json::Value, observed: bool) -> bool {
+    if observed {
+        return true;
+    }
+
+    let state = status.get("state").and_then(|value| value.as_str());
+    if matches!(state, Some("Failed" | "Running" | "CleanHalt")) {
+        return true;
+    }
+
+    // A local archive can finish between two 500 ms status polls. The portal
+    // publishes `atawl_received` immediately after it renames the completed
+    // archive. Later phases also prove that either transfer method has ended.
+    let step = status.get("step").and_then(|value| value.as_str());
+    matches!(step, Some("atawl_received"))
+        || (state == Some("Initializing")
+            && !matches!(step, None | Some("receive" | "atawl_transfer")))
+        || matches!(state, Some("InitializingWorkload" | "Registering"))
 }
 
 async fn verify_portal_init_schema(
@@ -758,6 +1315,39 @@ async fn verify_portal_init_schema(
     host: &str,
     status_port: u16,
 ) -> Result<(), CloudError> {
+    let status = read_portal_status(client, host, status_port).await?;
+    validate_portal_init_schema(&status)
+}
+
+async fn verify_portal_remote_atawl_support(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+) -> Result<(), CloudError> {
+    let status = read_portal_status(client, host, status_port).await?;
+    validate_portal_init_schema(&status)?;
+    let supported = status
+        .get("atawl_part_content_types")
+        .and_then(|value| value.as_array())
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(ATAWL_SOURCE_CONTENT_TYPE))
+        });
+    if supported {
+        Ok(())
+    } else {
+        Err(CloudError::PortalInitFailed {
+            message: "portal does not advertise remote ATAWL source support".to_string(),
+        })
+    }
+}
+
+async fn read_portal_status(
+    client: &reqwest::Client,
+    host: &str,
+    status_port: u16,
+) -> Result<serde_json::Value, CloudError> {
     let url = format!("https://{host}:{status_port}/status");
     let response = client
         .get(&url)
@@ -780,37 +1370,93 @@ async fn verify_portal_init_schema(
     .map_err(|message| CloudError::PortalInitFailed {
         message: format!("read portal init schema from {url}: {message}"),
     })?;
-    let status = serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
+    serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
         CloudError::PortalInitFailed {
             message: format!("parse portal status from {url}: {error}"),
         }
-    })?;
-    validate_portal_init_schema(&status)
+    })
 }
 
 fn validate_portal_init_schema(status: &serde_json::Value) -> Result<(), CloudError> {
     let observed = status
         .get("init_schema_version")
         .and_then(|value| value.as_u64());
-    if observed == Some(u64::from(INIT_SCHEMA_VERSION)) {
-        return Ok(());
+    if observed != Some(u64::from(INIT_SCHEMA_VERSION)) {
+        return Err(CloudError::PortalInitFailed {
+            message: format!(
+                "portal does not support required init schema version {INIT_SCHEMA_VERSION}; observed {}",
+                observed
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "no init_schema_version".to_string())
+            ),
+        });
     }
-    Err(CloudError::PortalInitFailed {
-        message: format!(
-            "portal does not support required init schema version {INIT_SCHEMA_VERSION}; observed {}",
-            observed
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "no init_schema_version".to_string())
-        ),
-    })
+    let timeout_mode = status
+        .get("init_timeout_mode")
+        .and_then(|value| value.as_str());
+    if timeout_mode != Some(INIT_TIMEOUT_MODE) {
+        return Err(CloudError::PortalInitFailed {
+            message: format!(
+                "portal does not support required initialization timeout mode {INIT_TIMEOUT_MODE}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn lost_response_recovery_requires_the_exact_deployment_key_and_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, bootstrap) = crate::init_auth::create(dir.path()).unwrap();
+        let status = serde_json::json!({"state":"Running","init_auth":{
+            "deployment_id":bootstrap.deployment_id,"key_fingerprint":bootstrap.fingerprint().unwrap(),
+            "accepted_transfer_id":"accepted-transfer"}});
+        assert!(status_accepts_init_transfer(
+            &status,
+            &bootstrap,
+            "accepted-transfer"
+        ));
+        assert!(!status_accepts_init_transfer(
+            &status,
+            &bootstrap,
+            "different-transfer"
+        ));
+        assert!(!status_accepts_init_transfer(
+            &serde_json::json!({"state":"Running"}),
+            &bootstrap,
+            "accepted-transfer"
+        ));
+        for name in ["deployment_id", "key_fingerprint", "accepted_transfer_id"] {
+            let mut changed = status.clone();
+            changed["init_auth"][name] = serde_json::json!("different");
+            assert!(
+                !status_accepts_init_transfer(&changed, &bootstrap, "accepted-transfer"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn initialization_credential_never_enters_portal_config() {
+        let mut config = sample_config();
+        config.init_auth = Some(crate::init_auth::ClientAuth {
+            key_file: "/private/operator-init-key.json".into(),
+            workload_id: "11".repeat(32),
+            tls_fingerprint: "22".repeat(32),
+        });
+        let encoded = build_portal_config_json(&config).to_string();
+        assert!(!encoded.contains("init_auth"));
+        assert!(!encoded.contains("operator-init-key"));
+    }
+
     fn sample_config() -> InitConfig {
         InitConfig {
+            disk_setup: Default::default(),
+            init_auth: None,
             platform: "gcp".to_string(),
             chain: InitChainConfig {
                 rpc_url: "https://rpc.example.com".to_string(),
@@ -845,7 +1491,6 @@ mod tests {
                 private_key: Some("0xSP1".to_string()),
             }),
             pcr_policy: None,
-            disks: BTreeMap::new(),
         }
     }
 
@@ -947,105 +1592,60 @@ mod tests {
     }
 
     #[test]
-    fn portal_config_json_emits_disk_passphrases_when_present() {
-        let mut cfg = sample_config();
-        cfg.disks
-            .insert("secrets".to_string(), "hunter2".to_string());
-        cfg.disks
-            .insert("appdata".to_string(), "correct horse".to_string());
-
-        let json = build_portal_config_json(&cfg);
-        assert_eq!(json["disks"]["secrets"]["passphrase"], "hunter2");
-        assert_eq!(json["disks"]["appdata"]["passphrase"], "correct horse");
-        // Exactly the per-disk passphrase object, nothing else.
-        assert_eq!(json["disks"]["secrets"].as_object().unwrap().len(), 1);
+    fn init_rejects_passphrases_without_echoing_them() {
+        assert!(disk_init_without_passphrases(&[]).is_ok());
+        let error = disk_init_without_passphrases(&["data=DO_NOT_LOG".into()]).unwrap_err();
+        assert!(!error.to_string().contains("DO_NOT_LOG"));
+        let mut config = sample_config();
+        config.disk_setup.insert("data".into(), "create".into());
+        let json = build_portal_config_json(&config);
+        assert_eq!(json["disk_setup"]["data"], "create");
+        assert!(json.get("disks").is_none());
     }
 
     #[test]
-    fn parse_disk_passphrases_accepts_declared_names() {
-        let declared = declared(&[("secrets", &["passphrase"]), ("appdata", &["passphrase"])]);
-        let raw = vec![
-            "secrets=hunter2".to_string(),
-            "appdata=correct horse".to_string(),
-        ];
-        let parsed = parse_disk_passphrases(&raw, &declared).unwrap();
-        assert_eq!(parsed.get("secrets").map(String::as_str), Some("hunter2"));
+    fn overwrite_all_expands_only_declared_disks_and_rejects_mixed_permissions() {
+        let disks = declared(&[("database", &["passphrase"]), ("scratch", &[])]);
         assert_eq!(
-            parsed.get("appdata").map(String::as_str),
-            Some("correct horse")
+            resolve_disk_setup(&[], &disks, true).unwrap(),
+            BTreeMap::from([
+                ("database".into(), "overwrite".into()),
+                ("scratch".into(), "overwrite".into()),
+            ])
         );
+        assert!(resolve_disk_setup(&[], &disks, false).unwrap().is_empty());
+        assert!(resolve_disk_setup(&["database=create".into()], &disks, true).is_err());
+        assert!(resolve_disk_setup(&[], &BTreeMap::new(), true).is_err());
     }
 
     #[test]
-    fn parse_disk_passphrases_rejects_undeclared_disk() {
-        let declared = declared(&[("data", &["tpm"])]);
-        let err = parse_disk_passphrases(&["typo=x".to_string()], &declared).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("typo"), "got: {msg}");
-        assert!(msg.contains("not declared"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_disk_passphrases_rejects_orphan_passphrase() {
-        // A passphrase for a disk that doesn't use passphrase unlock.
-        let declared = declared(&[("data", &["tpm"])]);
-        let err = parse_disk_passphrases(&["data=x".to_string()], &declared).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("data"), "got: {msg}");
-        assert!(msg.contains("does not use passphrase"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_disk_passphrases_rejects_missing_passphrase() {
-        // A disk declares passphrase unlock but the operator supplied none.
-        let declared = declared(&[("secrets", &["passphrase"])]);
-        let err = parse_disk_passphrases(&[], &declared).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("secrets"), "got: {msg}");
-        assert!(msg.contains("requires a passphrase"), "got: {msg}");
-        assert!(
-            msg.contains("--disk-passphrase secrets="),
-            "expected the fix hint: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_disk_passphrases_accepts_tpm_passphrase_combo() {
-        // tpm+passphrase disk: the passphrase keyslot must still be supplied.
-        let declared = declared(&[("appdata", &["tpm", "passphrase"])]);
-        let parsed = parse_disk_passphrases(&["appdata=x".to_string()], &declared).unwrap();
-        assert_eq!(parsed.get("appdata").map(String::as_str), Some("x"));
-    }
-
-    #[test]
-    fn parse_disk_passphrases_value_may_contain_equals() {
-        let declared = declared(&[("secrets", &["passphrase"])]);
-        let parsed = parse_disk_passphrases(&["secrets=a=b=c".to_string()], &declared).unwrap();
-        assert_eq!(parsed.get("secrets").map(String::as_str), Some("a=b=c"));
-    }
-
-    #[test]
-    fn parse_disk_passphrases_rejects_malformed_empty_and_duplicate() {
-        let declared = declared(&[("secrets", &["passphrase"])]);
-        // No '='.
-        assert!(parse_disk_passphrases(&["secrets".to_string()], &declared).is_err());
-        // Empty value.
-        assert!(parse_disk_passphrases(&["secrets=".to_string()], &declared).is_err());
-        // Empty name.
-        assert!(parse_disk_passphrases(&["=x".to_string()], &declared).is_err());
-        // Duplicate name.
-        assert!(parse_disk_passphrases(
-            &["secrets=a".to_string(), "secrets=b".to_string()],
-            &declared
+    fn disk_setup_requires_exact_names_actions_and_no_duplicates() {
+        let disks = declared(&[("database", &["passphrase"]), ("uploads", &["tpm"])]);
+        assert!(parse_disk_setup(&[], &disks).unwrap().is_empty());
+        let setup = parse_disk_setup(
+            &["database=create".into(), "uploads=overwrite".into()],
+            &disks,
         )
-        .is_err());
-    }
-
-    #[test]
-    fn parse_disk_passphrases_empty_input_is_empty_map() {
-        // No passphrase-requiring disks → empty input is valid.
-        let declared = declared(&[("scratch", &["tpm"])]);
-        assert!(parse_disk_passphrases(&[], &declared).unwrap().is_empty());
+        .unwrap();
+        assert_eq!(setup["database"], "create");
+        assert_eq!(setup["uploads"], "overwrite");
+        for values in [
+            vec!["missing=create"],
+            vec!["database=erase"],
+            vec!["database"],
+            vec!["database=create", "database=overwrite"],
+        ] {
+            assert!(parse_disk_setup(
+                &values.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                &disks
+            )
+            .is_err());
+        }
+        let error = disk_init_without_passphrases(&["database=DO_NOT_LOG".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cloud disk unlock"));
+        assert!(!error.contains("DO_NOT_LOG"));
     }
 
     /// When the operator sets `registration` and/or `chain_id` in
@@ -1076,7 +1676,8 @@ mod tests {
     #[test]
     fn latest_portal_schema_capability_is_required() {
         validate_portal_init_schema(&serde_json::json!({
-            "init_schema_version": INIT_SCHEMA_VERSION
+            "init_schema_version": INIT_SCHEMA_VERSION,
+            "init_timeout_mode": INIT_TIMEOUT_MODE
         }))
         .unwrap();
 
@@ -1088,11 +1689,168 @@ mod tests {
             let error = validate_portal_init_schema(&status).unwrap_err();
             assert!(error.to_string().contains("required init schema version"));
         }
+
+        let error = validate_portal_init_schema(&serde_json::json!({
+            "init_schema_version": INIT_SCHEMA_VERSION
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("initialization timeout mode"));
     }
 
     #[test]
     fn initialization_timeout_covers_proof_owner_operation_and_buffer() {
         assert_eq!(initialization_timeout_seconds(None, 300), 1_260);
+    }
+
+    #[test]
+    fn one_initialization_deadline_excludes_only_measured_transfer_time() {
+        let request_started = tokio::time::Instant::now();
+        let deadline = PortalInitDeadline::from_request_timing(
+            request_started,
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deadline
+                .deadline
+                .saturating_duration_since(request_started + Duration::from_secs(35)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(deadline.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn portal_init_request_timeout_includes_cleanup_grace() {
+        assert_eq!(
+            maximum_portal_init_request_timeout(Duration::from_secs(20), Duration::from_secs(60),)
+                .unwrap(),
+            Duration::from_secs(20 + 60 + 6 * 60),
+        );
+    }
+
+    #[test]
+    fn transfer_completion_survives_a_missed_progress_sample() {
+        assert!(!atawl_transfer_has_finished(
+            &serde_json::json!({"state": "Initializing", "step": "receive"}),
+            false,
+        ));
+        assert!(atawl_transfer_has_finished(
+            &serde_json::json!({"state": "Initializing", "step": "atawl_received"}),
+            false,
+        ));
+        assert!(atawl_transfer_has_finished(
+            &serde_json::json!({"state": "Initializing", "step": "extract"}),
+            false,
+        ));
+        assert!(atawl_transfer_has_finished(
+            &serde_json::json!({"state": "Initializing", "step": "receive"}),
+            true,
+        ));
+    }
+
+    #[test]
+    fn remote_atawl_source_validation_accepts_http_and_rejects_credentials() {
+        let source = RemoteAtawlSource {
+            format: 1,
+            uri: "http://10.0.0.5/workload.atawl".into(),
+            archive_sha256: format!("0x{}", "11".repeat(32)),
+            archive_size_bytes: 123,
+            workload_id: format!("0x{}", "22".repeat(32)),
+        };
+        assert!(validate_remote_atawl_source(&source).is_ok());
+
+        let mut invalid = source;
+        invalid.uri = "https://user:pass@repo/workload.atawl".into();
+        assert!(validate_remote_atawl_source(&invalid).is_err());
+    }
+
+    fn remote_source_with_descriptor_size(size: usize) -> RemoteAtawlSource {
+        let mut source = RemoteAtawlSource {
+            format: 1,
+            uri: "https://repo.example/".into(),
+            archive_sha256: format!("0x{}", "11".repeat(32)),
+            archive_size_bytes: 123,
+            workload_id: format!("0x{}", "22".repeat(32)),
+        };
+        let base_size = serde_json::to_vec(&source).unwrap().len();
+        assert!(base_size <= size);
+        source.uri.push_str(&"a".repeat(size - base_size));
+        assert_eq!(serde_json::to_vec(&source).unwrap().len(), size);
+        source
+    }
+
+    #[test]
+    fn remote_descriptor_exactly_at_the_protocol_limit_is_accepted() {
+        let source = remote_source_with_descriptor_size(MAX_ATAWL_SOURCE_SIZE);
+        let descriptor = serde_json::to_vec(&source).unwrap();
+        validate_remote_atawl_descriptor_size(&descriptor).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_remote_descriptor_is_rejected_before_http_submission() {
+        let source = remote_source_with_descriptor_size(MAX_ATAWL_SOURCE_SIZE + 1);
+        let descriptor = serde_json::to_vec(&source).unwrap();
+        let error = validate_remote_atawl_descriptor_size(&descriptor).unwrap_err();
+        assert!(matches!(error, CloudError::Config { .. }));
+        assert!(error.to_string().contains("16384 bytes"));
+
+        let error = post_portal_init_remote_with_client(
+            &reqwest::Client::new(),
+            "127.0.0.1",
+            9,
+            9,
+            &source,
+            None,
+            &sample_config(),
+            Duration::from_secs(47),
+            Duration::from_secs(47),
+            &NullReporter,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CloudError::Config { .. }));
+        assert!(error.to_string().contains("16384 bytes"));
+    }
+
+    #[test]
+    fn local_and_remote_init_share_the_same_transfer_timeout_header() {
+        let value = atawl_transfer_timeout_header_value(Duration::from_secs(47)).unwrap();
+        assert_eq!(value, "47");
+        let init_value = init_timeout_header_value(Duration::from_secs(91)).unwrap();
+        assert_eq!(init_value, "91");
+    }
+
+    #[test]
+    fn portal_initialization_timeout_keeps_the_client_timeout_error() {
+        assert!(is_initialization_timeout_response(
+            br#"{"code":"initialization_timeout"}"#
+        ));
+        assert!(!is_initialization_timeout_response(
+            br#"{"code":"atawl_transfer_timeout"}"#
+        ));
+    }
+
+    #[test]
+    fn remote_capability_requires_the_descriptor_media_type() {
+        let supported = serde_json::json!({
+            "init_schema_version": INIT_SCHEMA_VERSION,
+            "init_timeout_mode": INIT_TIMEOUT_MODE,
+            "atawl_part_content_types": [
+                "application/octet-stream",
+                ATAWL_SOURCE_CONTENT_TYPE
+            ]
+        });
+        assert_eq!(
+            supported["atawl_part_content_types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|value| value.as_str() == Some(ATAWL_SOURCE_CONTENT_TYPE))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1104,15 +1862,19 @@ mod tests {
             .unwrap();
         let expected: [u8; 32] = Sha256::digest(b"validated archive").into();
 
-        let bytes = read_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
-            .await
-            .unwrap();
+        let (mut file, size) =
+            open_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
+                .await
+                .unwrap();
+        assert_eq!(size, b"validated archive".len() as u64);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"validated archive");
 
         tokio::fs::write(&archive_path, b"replacement archive")
             .await
             .unwrap();
-        let error = read_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
+        let error = open_validated_workload_archive(archive_path.to_str().unwrap(), &expected)
             .await
             .unwrap_err();
         assert!(matches!(error, CloudError::WorkloadArchiveChanged { .. }));

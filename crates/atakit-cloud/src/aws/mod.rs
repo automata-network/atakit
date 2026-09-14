@@ -91,6 +91,11 @@ impl CloudProvider for AwsProvider {
                 .metadata
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(
+                    opts.init_auth
+                        .iter()
+                        .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+                )
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
@@ -440,6 +445,7 @@ mod tests {
 
     fn test_deploy_opts() -> DeployOptions {
         DeployOptions {
+            init_auth: None,
             instance_name: "test-instance".to_string(),
             target_name: "test-target".to_string(),
             target: test_target(),

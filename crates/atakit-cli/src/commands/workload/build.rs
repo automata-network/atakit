@@ -23,11 +23,9 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         None => None,
     };
 
-    let compression = if args.gz {
-        ArchiveCompression::Gz
-    } else {
-        ArchiveCompression::Zstd
-    };
+    if args.gz {
+        eprintln!("Warning: --gz is deprecated for workload builds; writing zstd instead.");
+    }
 
     // The publisher is written into the measured manifest, so it has to be
     // known before the build rather than at store-import time: it is part of
@@ -43,7 +41,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
         output_dir: args.output,
         engine,
         verbose,
-        compression,
+        compression: ArchiveCompression::Zstd,
         measured_data_root: args.measured_data_root,
         unmeasured_data_root: args.unmeasured_data_root,
     };

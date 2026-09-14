@@ -50,16 +50,10 @@ pub async fn run(args: AddArgs, env: &Env, config: &Config) -> Result<()> {
             .await
             .with_context(|| format!("failed to inspect {}", path.display()))?;
         let size = std::fs::metadata(path)?.len();
-        let name = result.manifest.meta.name.clone();
-        let version = result.manifest.meta.version.clone();
-        // A path records no publisher, so the identity comes from the
-        // configured signing key.
-        let publisher = super::configured_publisher(args.signing_key.as_deref(), config)?;
-        let app_ref = automata_tee_workload_measurement::types::AppRef::new(
-            publisher,
-            name.clone(),
-            version.clone(),
-        );
+        let app_ref = super::measured_workload_ref(&result.manifest.meta)?;
+        let publisher = app_ref.publisher;
+        let name = app_ref.name.clone();
+        let version = app_ref.version.clone();
         (
             compute_workload_id(&app_ref),
             name,

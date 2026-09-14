@@ -5,8 +5,8 @@
 # `atakit workload build` compiles it into a deterministic .atawl archive
 # containing manifest.json + images + measured-data.
 
-# Schema version. Current: 6.
-format = 6
+# Schema version. Current: 8.
+format = 8
 
 # ── package data ────────────────────────────────────────────────
 #
@@ -39,6 +39,11 @@ format = 6
 # version: must start with "v", followed by alphanumeric/.-_ chars.
 name = "{{name}}"
 version = "v0.0.1"
+
+# Services that must be started before the main workload. Entries may name
+# dependency keys declared below. Dependencies may refer back to this workload
+# with its exact `name`. Cycles are rejected.
+# depends_on = ["redis"]
 
 # ── on-chain parameters ──────────────────────────────────────────
 #

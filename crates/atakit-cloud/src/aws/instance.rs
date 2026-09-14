@@ -90,6 +90,9 @@ pub async fn create_instance(
     // Instance tags: the Name tag plus metadata (AWS equivalent of GCP labels).
     let mut tags = vec![serde_json::json!({ "Key": "Name", "Value": name })];
     for (k, v) in metadata {
+        if k == "atakit-init-auth" {
+            continue;
+        }
         tags.push(serde_json::json!({ "Key": k, "Value": v }));
     }
     let tag_spec =
@@ -116,6 +119,14 @@ pub async fn create_instance(
         "--output".into(),
         "json".into(),
     ];
+    if let Some((_, bootstrap)) = metadata.iter().find(|(key, _)| key == "atakit-init-auth") {
+        args.extend([
+            "--user-data".into(),
+            atakit_init_auth::encode_user_data(&serde_json::from_str(bootstrap)?)?,
+            "--metadata-options".into(),
+            "HttpEndpoint=enabled,HttpTokens=required".into(),
+        ]);
+    }
     if !mappings.is_empty() {
         args.push("--block-device-mappings".into());
         args.push(serde_json::to_string(&mappings)?);
@@ -342,6 +353,45 @@ mod tests {
 
     use super::*;
     use crate::exec::CommandOutput;
+
+    #[tokio::test]
+    async fn init_bootstrap_uses_user_data_and_requires_imdsv2() {
+        let runner = RecordingRunner::with_outputs(&[
+            r#"{"Instances":[{"InstanceId":"i-123"}]}"#,
+            "",
+            "203.0.113.30",
+        ]);
+        let public = r#"{"format":1,"scheme":"atakit-init-es256k-v1","public_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","deployment_id":"1111111111111111111111111111111111111111111111111111111111111111"}"#;
+        create_instance(
+            "region",
+            "vm",
+            "m6a.large",
+            "ami",
+            "sg",
+            "subnet",
+            &[("atakit-init-auth".into(), public.into())],
+            &[],
+            None,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let args = &calls[0].1;
+        let index = args.iter().position(|arg| arg == "--user-data").unwrap();
+        let decoded = atakit_init_auth::decode_user_data(&args[index + 1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, serde_json::from_str(public).unwrap());
+        assert!(args
+            .iter()
+            .any(|arg| arg == "HttpEndpoint=enabled,HttpTokens=required"));
+        let tags = args
+            .iter()
+            .position(|arg| arg == "--tag-specifications")
+            .unwrap();
+        assert!(!args[tags + 1].contains("atakit-init-auth"));
+    }
 
     #[derive(Default)]
     struct RecordingRunner {

@@ -145,6 +145,11 @@ impl CloudProvider for AzureProvider {
                 .metadata
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(
+                    opts.init_auth
+                        .iter()
+                        .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+                )
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
@@ -799,6 +804,7 @@ mod tests {
 
     fn test_deploy_opts(image_ref: &str) -> DeployOptions {
         DeployOptions {
+            init_auth: None,
             instance_name: "test-instance".into(),
             target_name: "test-target".into(),
             target: test_target(),

@@ -40,6 +40,9 @@ automata-tee-workload-measurement.workspace = true
 hex.workspace = true
 sha2.workspace = true
 k256.workspace = true
+nix = { version = "0.29", features = ["term"] }
+zeroize = "1"
+bytes = "1.11"
 serde_json_canonicalizer.workspace = true
 tar.workspace = true
 flate2.workspace = true

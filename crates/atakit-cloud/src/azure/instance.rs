@@ -63,7 +63,11 @@ pub async fn create_instance(
     }
 
     // Tags (Azure equivalent of GCP labels/metadata).
-    let tags_str: Vec<String> = metadata.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let tags_str: Vec<String> = metadata
+        .iter()
+        .filter(|(k, _)| k != "atakit-init-auth")
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     let tags_flag;
     if !tags_str.is_empty() {
         tags_flag = tags_str.join(" ");
@@ -71,6 +75,12 @@ pub async fn create_instance(
         args.push(&tags_flag);
     }
 
+    let user_data;
+    if let Some((_, bootstrap)) = metadata.iter().find(|(key, _)| key == "atakit-init-auth") {
+        user_data = atakit_init_auth::encode_user_data(&serde_json::from_str(bootstrap)?)?;
+        args.push("--user-data");
+        args.push(&user_data);
+    }
     args.push("--output");
     args.push("json");
 
@@ -341,6 +351,35 @@ mod tests {
     use crate::exec::CommandOutput;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn init_bootstrap_uses_user_data_not_tags() {
+        let runner = MockRunner::new(vec![output(r#"{"publicIpAddress":"203.0.113.30"}"#)]);
+        let public = r#"{"format":1,"scheme":"atakit-init-es256k-v1","public_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","deployment_id":"1111111111111111111111111111111111111111111111111111111111111111"}"#;
+        create_instance(
+            "sub",
+            "rg",
+            "vm",
+            "Standard_DC4as_v5",
+            "image",
+            CcType::SevSnp,
+            "nsg",
+            &[("atakit-init-auth".into(), public.into())],
+            None,
+            None,
+            &runner,
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls();
+        let args = &calls[0].1;
+        let index = args.iter().position(|arg| arg == "--user-data").unwrap();
+        let decoded = atakit_init_auth::decode_user_data(&args[index + 1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, serde_json::from_str(public).unwrap());
+        assert!(!args.iter().any(|arg| arg == "--tags"));
+    }
 
     struct MockRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,

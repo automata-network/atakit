@@ -6,6 +6,7 @@ pub mod error;
 pub mod exec;
 pub mod gcp;
 pub mod init;
+pub mod init_auth;
 pub mod naming;
 pub mod pcr_policy;
 pub mod plan;

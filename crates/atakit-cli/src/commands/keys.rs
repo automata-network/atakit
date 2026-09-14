@@ -17,10 +17,20 @@ use crate::config::{Config, KeyMode, KeySpec, KeyType};
 
 #[derive(Subcommand)]
 pub enum KeysCommand {
+    /// Create a dedicated initialization key; print only its public bootstrap JSON
+    CreateInit,
     /// List the keys declared in `[keys]`
     Ls(LsArgs),
     /// Show one key's type, fingerprint, and public key
     Show(ShowArgs),
+}
+
+pub fn create_init(env: &atakit_core::Env) -> Result<()> {
+    let (path, bootstrap) =
+        atakit_cloud::init_auth::create(&env.data_dir).map_err(anyhow::Error::msg)?;
+    eprintln!("Private initialization credential: {}", path.display());
+    println!("{}", serde_json::to_string(&bootstrap)?);
+    Ok(())
 }
 
 #[derive(Args)]

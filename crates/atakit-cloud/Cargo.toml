@@ -8,6 +8,8 @@ license.workspace = true
 cli = ["clap"]
 
 [dependencies]
+libc = "0.2"
+atakit-init-auth = { path = "../atakit-init-auth" }
 atakit-core.workspace = true
 atakit-config.workspace = true
 atakit-attestation.workspace = true
@@ -28,6 +30,7 @@ hex.workspace = true
 k256.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
+uuid.workspace = true
 
 async-trait.workspace = true
 

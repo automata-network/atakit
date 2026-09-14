@@ -19,7 +19,8 @@ pub use build::{build_workload, BuildOptions, BuildResult};
 pub use error::WorkloadError;
 pub use image::ContainerEngine;
 pub use inspect::{
-    inspect_workload, inspect_workload_archive_bytes, InspectOptions, InspectResult,
+    inspect_workload, inspect_workload_archive_bytes, inspect_workload_archive_reader,
+    InspectOptions, InspectResult,
 };
 pub use repository::{
     hex_equal, GithubWorkloadRepository, HttpWorkloadRepository, RepositoryArchiveMeta,
@@ -30,8 +31,7 @@ pub use store::{CachedChainSpec, WorkloadEntry, WorkloadMeta, WorkloadStore};
 
 /// Current format version for `atakit-workload.toml` and `manifest.json`.
 ///
-/// Format 7 added `meta.publisher`. It is the only supported format: a
-/// workload's identifier is publisher-qualified, and no earlier manifest
-/// records a publisher or allows one to be derived, so an older manifest cannot
-/// yield the identifier its workload is registered under.
-pub const FORMAT_VERSION: u32 = 7;
+/// Format 8 added the main workload's materialized `config.depends_on` field.
+/// It is the only supported compiled manifest format, so an older workload
+/// archive must be rebuilt.
+pub const FORMAT_VERSION: u32 = 8;
