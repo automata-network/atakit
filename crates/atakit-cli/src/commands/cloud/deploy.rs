@@ -758,7 +758,20 @@ async fn run_one(args: DeployArgs, env: &Env, config: &Config, verbose: bool) ->
             } else {
                 format!("{:<15}", "")
             };
-            eprintln!("  {label}- {name} ({gb}GB, {disk_type}, LUN {index})");
+            let setup = if args.skip_init {
+                String::new()
+            } else {
+                let description = match disk_setup.get(name).map(String::as_str) {
+                    Some("create") => "create (initialize only if empty)"
+                        .yellow()
+                        .bold()
+                        .to_string(),
+                    Some("overwrite") => "overwrite (ERASE EXISTING DATA)".red().bold().to_string(),
+                    _ => "no formatting authorized".yellow().to_string(),
+                };
+                format!("; {description}")
+            };
+            eprintln!("  {label}- {name} ({gb}GB, {disk_type}, LUN {index}){setup}");
         }
     }
     if let Some(ref src) = resolved_image.source_path {
