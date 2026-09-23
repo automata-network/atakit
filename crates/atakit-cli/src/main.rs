@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Image(cmd) => match cmd {
+            ImageCommand::Inspect(args) => commands::image::inspect::run(args, &env),
             ImageCommand::Ls(args) => commands::image::ls::run(args, &env, &config).await,
             ImageCommand::Pull(args) => commands::image::pull::run(args, &env, &config).await,
             ImageCommand::Rm(args) => commands::image::rm::run(args, &env).await,

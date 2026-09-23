@@ -7,6 +7,8 @@ use crate::types::ImageRef;
 /// Image subcommand.
 #[derive(Subcommand)]
 pub enum ImageCommand {
+    /// Inspect a local image’s publisher-qualified identity and downloaded platforms
+    Inspect(InspectArgs),
     /// List available CVM base image releases
     #[command(name = "ls")]
     Ls(LsArgs),
@@ -91,4 +93,14 @@ pub struct ImportArgs {
     /// Overwrite existing files in the store
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `image inspect`.
+#[derive(Args)]
+pub struct InspectArgs {
+    /// Local image reference (e.g. "automata-linux:v0.3.0-debug")
+    pub image: ImageRef,
+    /// Print machine-readable JSON
+    #[arg(long)]
+    pub json: bool,
 }

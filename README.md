@@ -160,6 +160,10 @@ atakit image ls
 # Include remote (GitHub Releases) images
 atakit image ls --remote
 
+# Inspect local publisher identity (no network / chain verification)
+atakit image inspect automata-linux:v0.3.0-debug
+atakit image inspect automata-linux:v0.3.0-debug --json
+
 # Query a specific GitHub repository
 atakit image ls --remote --repo automata-network/debug-linux
 

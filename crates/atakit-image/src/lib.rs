@@ -19,4 +19,4 @@ pub use store::{ImageStore, ReleaseStatus};
 pub use types::{Asset, AssetKind, ImageRef, Platform, Release, VersionSelector};
 
 #[cfg(feature = "cli")]
-pub use cli::{ExportArgs, ImageCommand, ImportArgs, LsArgs, PullArgs, RmArgs};
+pub use cli::{ExportArgs, ImageCommand, ImportArgs, InspectArgs, LsArgs, PullArgs, RmArgs};
