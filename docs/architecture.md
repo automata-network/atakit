@@ -18,6 +18,7 @@ crates/
   atakit-attestation/   network-free TLS, TEE, and session verification
   atakit-attestation-client/ read-only RPC and portal verification client
   atakit-cloud/         provider plans, execution, state, and portal client
+  atakit-emulator/      native Portal emulation, private Anvil fork, and Compose projection
   atakit-cli/           clap surface, top-level config composition, and presentation
 ```
 
@@ -26,7 +27,7 @@ owns prompts, progress bars, output formatting, and top-level error context.
 
 ## Command routing
 
-The built-in command families are `image`, `workload`, and `cloud`. Clap's
+The built-in command families are `image`, `workload`, `cloud`, and `emulator`. Clap's
 external-subcommand handler also delegates unknown first-level commands to an
 `atakit-<name>` executable on `PATH`; for example, `atakit imgbuild ...`
 executes `atakit-imgbuild ...` when that binary is installed.
@@ -150,3 +151,12 @@ contract types supplied by `automata-tee-workload-measurement`. Operator
 configuration keeps the owner identity, gas payer, and prover credential as
 separate named keys. The workload manifest does not select a prover backend or
 chain submission policy; those remain deployment policy.
+
+## Local workload emulation
+
+`atakit-emulator` owns a native daemon and a secondary Anvil fork of the user's
+development chain. Workload processes remain separately managed by an IDE, native
+exec, or Compose. Registry addresses and policy contracts are retained; hardware
+attestation backends are patched only on the secondary fork. See the
+[Emulator README](../crates/atakit-emulator/README.md) for commands, identity,
+persistence, and mock boundaries.

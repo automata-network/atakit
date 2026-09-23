@@ -11,7 +11,46 @@ All-in-one CLI for creation, provisioning, and management of Confidential Virtua
 - **Cloud deployment** -- deploy workloads to CVM instances on GCP and Azure, with full orchestration of images, firewall rules, disks, and instances
 - **Deployment management** -- status, SSH, serial console, destroy with selective resource preservation
 
+## Local application development
+
+Use `atakit emulator` to test Portal signing and business-contract verification
+against a private fork of your development Anvil, with native processes or Compose.
+It does not require a cloud VM. The emulator and your application have separate
+lifecycles; `up` prepares sessions and sockets, then `exec` or `workload-compose`
+starts your app. Native execution needs no container engine; container execution
+supports Docker or Podman with a compatible Compose provider.
+
+Currently, use a local workload TOML with `image.build`. Workloads without a
+build source, including `.atawl` packages downloaded by `workload pull`, are
+not yet supported for this workflow.
+
+- [Emulator usage and troubleshooting](crates/atakit-emulator/README.md)
+
+```sh
+# First start your upstream Anvil and configure atakit chains/keys.
+atakit emulator up --workload ./atakit-workload.toml
+atakit emulator status
+atakit emulator exec -- cargo run
+# Or use containers:
+atakit emulator workload-compose up --build
+```
+
+To build and run containers for a specific architecture with Docker or a
+compatible Podman Compose provider, put `--platform` before `up`:
+
+```sh
+atakit emulator workload-compose --platform linux/amd64 up --build
+```
+
+For multiple workloads, add `--workload NAME` before `up`. The option sets the
+Compose `platform` field for all generated services. Without it, the container
+engine chooses the platform. Repeat the option on each `up`, which regenerates
+the Compose file; `logs` and `down` reuse that file. The engine must support the
+selected architecture. See [Compose usage](crates/atakit-emulator/README.md#run-workload-containers)
+for details.
+
 ## Install
+
 
 Requires Rust 1.70+.
 
@@ -188,9 +227,10 @@ atakit workload create my-workload
 atakit workload build -d ./my-workload
 
 # Share one source tree across multiple workload configs.
-# --file is absolute or relative to --dir; image and data paths still use --dir.
-# The selected config can use image = { build = ".", ... }.
-atakit workload build -d . --file workloads/validator/atakit-workload.toml
+# --dir defaults to the current directory, so -d . is unnecessary.
+# --file selects the TOML; build contexts and data paths still use the working
+# directory, not the TOML's directory. Use --dir to select another working directory.
+atakit workload build --file workloads/validator/atakit-workload.toml
 
 # Package paths are logical absolute paths. By default, measured files are read
 # from ./my-workload/measured-data. The unmeasured root is used to expand or
