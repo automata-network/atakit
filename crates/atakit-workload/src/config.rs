@@ -86,7 +86,12 @@ impl LoggingSection {
 impl WorkloadConfig {
     /// Read and parse `atakit-workload.toml` from a workload directory.
     pub fn from_dir(workload_dir: &std::path::Path) -> Result<Self, WorkloadError> {
-        let path = workload_dir.join(CONFIG_FILENAME);
+        Self::from_file(&workload_dir.join(CONFIG_FILENAME))
+    }
+
+    /// Read and parse an explicitly selected workload config.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, WorkloadError> {
+        let path = path.to_path_buf();
         let content = std::fs::read_to_string(&path).map_err(|e| WorkloadError::ReadFile {
             path: path.clone(),
             source: e,

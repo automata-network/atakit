@@ -78,6 +78,10 @@ pub struct BuildArgs {
     /// Workload directory (default: current directory)
     #[arg(short, long)]
     pub dir: Option<PathBuf>,
+    /// Config file, absolute or relative to --dir (default: atakit-workload.toml).
+    /// Image and package data paths remain relative to --dir.
+    #[arg(short, long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
     /// Named ES256K key whose owner fingerprint is the publisher. The workload
     /// identifier is derived from it, so it cannot be computed without one.
     /// Defaults to [publish] owner_key.

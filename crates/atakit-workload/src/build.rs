@@ -14,8 +14,11 @@ use crate::WorkloadError;
 
 /// Options for `build_workload`.
 pub struct BuildOptions {
-    /// Directory containing `atakit-workload.toml`.
+    /// Root directory for image build contexts and package data.
     pub workload_dir: PathBuf,
+    /// Config file, absolute or relative to `workload_dir`.
+    /// Defaults to `atakit-workload.toml` within that directory.
+    pub config_file: Option<PathBuf>,
     /// Fingerprint of the publishing key: `0x` followed by 64 lowercase
     /// hexadecimal characters.
     ///
@@ -65,8 +68,11 @@ pub async fn build_workload(
     let output_dir = opts.output_dir.as_deref().unwrap_or(workload_dir);
 
     // 1. Parse config
-    let handle = progress.create("Reading atakit-workload.toml...", 0);
-    let config = WorkloadConfig::from_dir(workload_dir)?;
+    let handle = progress.create("Reading workload config...", 0);
+    let config = match &opts.config_file {
+        Some(file) => WorkloadConfig::from_file(&workload_dir.join(file))?,
+        None => WorkloadConfig::from_dir(workload_dir)?,
+    };
     handle.finish();
 
     let name = config.workload.name.clone();

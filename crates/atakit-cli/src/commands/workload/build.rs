@@ -37,6 +37,7 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
 
     let opts = atakit_workload::BuildOptions {
         workload_dir,
+        config_file: args.file,
         publisher: publisher_hex.clone(),
         output_dir: args.output,
         engine,

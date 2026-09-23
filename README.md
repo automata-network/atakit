@@ -183,6 +183,11 @@ atakit workload create my-workload
 # Build a workload into a .atawl archive
 atakit workload build -d ./my-workload
 
+# Share one source tree across multiple workload configs.
+# --file is absolute or relative to --dir; image and data paths still use --dir.
+# The selected config can use image = { build = ".", ... }.
+atakit workload build -d . --file workloads/validator/atakit-workload.toml
+
 # Package paths are logical absolute paths. By default, measured files are read
 # from ./my-workload/measured-data. The unmeasured root is used to expand or
 # validate unmeasured declarations; contents are not embedded in the archive.

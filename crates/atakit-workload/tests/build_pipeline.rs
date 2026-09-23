@@ -178,6 +178,7 @@ async fn legacy_gzip_option_builds_zstd_archive() {
         &BuildOptions {
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: setup_workload_dir(tmp.path()),
+            config_file: None,
             output_dir: None,
             engine: None,
             verbose: false,
@@ -208,6 +209,7 @@ async fn build_produces_valid_archive() {
 
     let result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir.clone()),
@@ -302,6 +304,7 @@ async fn build_materializes_baby_container_slots_in_manifest() {
 
     let result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
@@ -358,6 +361,7 @@ async fn build_defaults_output_to_workload_dir() {
 
     let result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: None,
@@ -387,6 +391,7 @@ async fn build_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
@@ -403,6 +408,7 @@ async fn build_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
@@ -436,6 +442,7 @@ async fn inspect_archive_matches_build() {
 
     let build_result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
@@ -489,6 +496,7 @@ async fn inspect_dir_matches_archive() {
 
     let build_result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out_dir),
@@ -578,6 +586,7 @@ async fn build_with_dependency() {
 
     let result = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
@@ -672,6 +681,7 @@ async fn build_with_dependency_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
@@ -688,6 +698,7 @@ async fn build_with_dependency_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            config_file: None,
             publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
@@ -706,4 +717,74 @@ async fn build_with_dependency_is_deterministic() {
         r1.archive_hash, r2.archive_hash,
         "dependency builds must be deterministic"
     );
+}
+
+// Selecting a nested config must not relocate image or measured-data paths.
+#[tokio::test]
+async fn selected_config_keeps_resources_at_workload_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = setup_workload_dir(tmp.path());
+    let selected = root.join("workloads/validator/config.toml");
+    std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    std::fs::rename(root.join("atakit-workload.toml"), &selected).unwrap();
+    // A root config must not silently override the explicitly selected file.
+    std::fs::write(root.join("atakit-workload.toml"), "invalid TOML [").unwrap();
+    for file in [
+        std::path::PathBuf::from("workloads/validator/config.toml"),
+        selected,
+    ] {
+        let result = build_workload(
+            &BuildOptions {
+                workload_dir: root.clone(),
+                config_file: Some(file),
+                publisher: TEST_PUBLISHER.to_string(),
+                output_dir: None,
+                engine: None,
+                verbose: false,
+                compression: ArchiveCompression::default(),
+                measured_data_root: None,
+                unmeasured_data_root: None,
+            },
+            &NullReporter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.name, "my-workload");
+        assert_eq!(result.image_count, 1);
+        assert_eq!(result.measured_file_count, 1);
+        assert_eq!(result.archive_path.parent(), Some(root.as_path()));
+        let manifest = read_manifest_json(&result.archive_path);
+        assert_eq!(manifest["meta"]["format"], atakit_workload::FORMAT_VERSION);
+        assert_eq!(manifest["meta"]["publisher"], TEST_PUBLISHER);
+    }
+}
+
+#[tokio::test]
+async fn missing_selected_config_does_not_fall_back_to_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = setup_workload_dir(tmp.path());
+    let error = build_workload(
+        &BuildOptions {
+            workload_dir: root.clone(),
+            config_file: Some("missing.toml".into()),
+            publisher: TEST_PUBLISHER.to_string(),
+            output_dir: None,
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
+        },
+        &NullReporter,
+    )
+    .await
+    .err()
+    .expect("missing selected config must fail");
+    match error {
+        atakit_workload::WorkloadError::ReadFile { path, source } => {
+            assert_eq!(path, root.join("missing.toml"));
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        error => panic!("unexpected error: {error}"),
+    }
 }
