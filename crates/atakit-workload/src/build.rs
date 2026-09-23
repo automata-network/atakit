@@ -64,6 +64,15 @@ pub async fn build_workload(
     opts: &BuildOptions,
     progress: &dyn ProgressReporter,
 ) -> Result<BuildResult, WorkloadError> {
+    build_workload_with_builder(opts, progress, None).await
+}
+
+/// Builds a workload with an explicitly selected Docker builder.
+pub async fn build_workload_with_builder(
+    opts: &BuildOptions,
+    progress: &dyn ProgressReporter,
+    builder: Option<&str>,
+) -> Result<BuildResult, WorkloadError> {
     let workload_dir = &opts.workload_dir;
     let output_dir = opts.output_dir.as_deref().unwrap_or(workload_dir);
 
@@ -120,12 +129,13 @@ pub async fn build_workload(
             let handle = progress.create(&format!("Building {resolved_image}..."), 0);
             let context = workload_dir.join(build);
             engine
-                .build_image(
+                .build_image_with_builder(
                     &context,
                     containerfile.as_deref(),
                     &resolved_image,
                     args,
                     opts.verbose,
+                    builder,
                 )
                 .await?;
             engine
@@ -172,12 +182,13 @@ pub async fn build_workload(
                     progress.create(&format!("Building {dep_resolved} ({dep_name})..."), 0);
                 let context = workload_dir.join(build);
                 engine
-                    .build_image(
+                    .build_image_with_builder(
                         &context,
                         containerfile.as_deref(),
                         &dep_resolved,
                         args,
                         opts.verbose,
+                        builder,
                     )
                     .await?;
                 engine

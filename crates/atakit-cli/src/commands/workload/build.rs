@@ -48,7 +48,50 @@ pub async fn run(args: BuildArgs, env: &Env, config: &Config, verbose: bool) -> 
     };
 
     let progress = IndicatifReporter;
-    let result = atakit_workload::build_workload(&opts, &progress).await?;
+    let workload_config = match &opts.config_file {
+        Some(file) => {
+            atakit_workload::config::WorkloadConfig::from_file(&opts.workload_dir.join(file))?
+        }
+        None => atakit_workload::config::WorkloadConfig::from_dir(&opts.workload_dir)?,
+    };
+    let data_roots = atakit_workload::data::DataRoots::resolve(
+        &opts.workload_dir,
+        opts.measured_data_root.as_ref(),
+        opts.unmeasured_data_root.as_ref(),
+    );
+    // Validate inputs before prompting to create any builder resources.
+    atakit_workload::validate::validate_config_with_roots(
+        &workload_config,
+        &opts.workload_dir,
+        &data_roots,
+    )?;
+    let needs_build = matches!(
+        workload_config.workload.image,
+        atakit_workload::config::ImageSource::Build { .. }
+    ) || workload_config.dependencies.values().any(|dependency| {
+        matches!(
+            dependency.image,
+            atakit_workload::config::ImageSource::Build { .. }
+        )
+    });
+    let mut opts = opts;
+    let builder = if needs_build {
+        let engine = match opts.engine {
+            Some(engine) => engine,
+            None => atakit_workload::ContainerEngine::detect().await?,
+        };
+        opts.engine = Some(engine);
+        if engine == atakit_workload::ContainerEngine::Docker {
+            Some(super::docker_builder::select(verbose).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let result =
+        atakit_workload::build::build_workload_with_builder(&opts, &progress, builder.as_deref())
+            .await?;
 
     // Inspect the built archive once: we need it to surface the manifest
     // event hash alongside the file hash, and (below) to populate store

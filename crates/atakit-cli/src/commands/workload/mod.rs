@@ -2,6 +2,7 @@ pub mod add;
 pub mod build;
 pub mod create;
 pub mod deactivate;
+mod docker_builder;
 pub mod export;
 pub mod import;
 pub mod info;

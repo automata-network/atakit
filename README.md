@@ -213,6 +213,9 @@ atakit workload publish my-service:v0.0.1
 atakit workload spec <workload-id>
 ```
 
+For Docker builds, atakit selects a compatible builder automatically and asks
+before creating one if needed.
+
 ### Cloud deployment
 
 Requires a configured target in `config.toml` (see [Configuration](#configuration)).

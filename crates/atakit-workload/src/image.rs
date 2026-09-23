@@ -60,6 +60,20 @@ impl ContainerEngine {
         args: &BTreeMap<String, String>,
         verbose: bool,
     ) -> Result<(), WorkloadError> {
+        self.build_image_with_builder(context, containerfile, tag, args, verbose, None)
+            .await
+    }
+
+    /// Builds an image using a selected Docker builder; Podman ignores this option.
+    pub async fn build_image_with_builder(
+        &self,
+        context: &Path,
+        containerfile: Option<&str>,
+        tag: &str,
+        args: &BTreeMap<String, String>,
+        verbose: bool,
+        builder: Option<&str>,
+    ) -> Result<(), WorkloadError> {
         match self {
             ContainerEngine::Docker => {
                 let tar = tempfile::Builder::new()
@@ -80,6 +94,10 @@ impl ContainerEngine {
                     .arg("--build-arg")
                     .arg("SOURCE_DATE_EPOCH=0")
                     .env("SOURCE_DATE_EPOCH", "0");
+
+                if let Some(builder) = builder {
+                    cmd.arg("--builder").arg(builder);
+                }
 
                 if let Some(cf) = containerfile {
                     cmd.arg("-f").arg(context.join(cf));
