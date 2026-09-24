@@ -191,7 +191,7 @@ pub(crate) async fn verify_disk_portal_tls(
 ) -> Result<VerifiedPortalTls> {
     let untrusted_portal_base_image_id = if verification.measurements.is_none() {
         Some(
-            init::read_untrusted_portal_base_image_id(&host, status_port)
+            init::read_untrusted_portal_base_image_id(host, status_port)
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
         )
@@ -204,7 +204,7 @@ pub(crate) async fn verify_disk_portal_tls(
         untrusted_portal_base_image_id,
         &verification.measurement_publisher_key,
         &env.data_dir,
-        &init_chain,
+        init_chain,
     )
     .await?;
     let tls_verification_trust =
@@ -235,7 +235,7 @@ pub(crate) async fn verify_disk_portal_tls(
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let tls_mode = init::portal_tls_mode_for_init_chain(
-        &init_chain,
+        init_chain,
         tls_verification_trust,
         tdx_dcap,
         measurement_policy,
@@ -244,7 +244,7 @@ pub(crate) async fn verify_disk_portal_tls(
     .await
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let verified_tls =
-        init::bootstrap_portal_tls(&host, status_port, &tls_mode, None, None, Some(report))
+        init::bootstrap_portal_tls(host, status_port, &tls_mode, None, None, Some(report))
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
 

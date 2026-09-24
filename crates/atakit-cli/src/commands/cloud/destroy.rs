@@ -35,7 +35,7 @@ pub async fn run(mut args: DestroyArgs, env: &Env, config: &Config) -> Result<()
                 "Destroying".dimmed(),
                 instances.len().to_string().bold(),
             );
-            let futures = instances.iter().cloned().map(|i| {
+            let futures = instances.iter().map(|i| {
                 let mut single = args.clone();
                 single.instance = vec![i.clone()];
                 async move {

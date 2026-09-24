@@ -253,7 +253,9 @@ pub fn parse_bytes32_hex(value: &str) -> Option<[u8; 32]> {
 
 pub fn valid_amd_sev_snp_tcb(value: &[u8; 32]) -> bool {
     value
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .all(|lane| lane[..4].iter().all(|byte| *byte == 0))
 }
 
@@ -261,8 +263,10 @@ pub fn amd_sev_snp_tcb_meets_minimum(actual: &[u8; 32], minimum: &[u8; 32]) -> b
     valid_amd_sev_snp_tcb(actual)
         && valid_amd_sev_snp_tcb(minimum)
         && actual
-            .chunks_exact(8)
-            .zip(minimum.chunks_exact(8))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(minimum.as_chunks::<8>().0)
             .all(|(actual_lane, minimum_lane)| {
                 actual_lane[4..].iter().zip(&minimum_lane[4..]).all(
                     |(actual_component, minimum_component)| actual_component >= minimum_component,

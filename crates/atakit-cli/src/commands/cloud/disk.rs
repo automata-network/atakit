@@ -314,7 +314,7 @@ fn validate_workload_measurement(
     for (bank, value) in [("sha256", sha256), ("sha384", sha384)] {
         if !pcr[bank]
             .as_str()
-            .is_some_and(|actual| atakit_workload::hex_equal(actual, &value))
+            .is_some_and(|actual| atakit_workload::hex_equal(actual, value))
         {
             bail!("portal workload measurement does not match the selected archive ({bank})");
         }
@@ -382,6 +382,8 @@ async fn unlock_one(
     Ok(())
 }
 
+// Keep the portal polling and disk-unlock inputs explicit at this orchestration boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn wait_for_running(
     client: &reqwest::Client,
     host: &str,
@@ -482,217 +484,6 @@ fn request_digest(tls: &str, disk: &str, challenge: &str, body: &[u8]) -> [u8; 3
         hash.update(part);
     }
     hash.finalize().into()
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn measurement_read_retries_one_timeout_but_stays_bounded() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for second_succeeds in [true, false] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!(
-                "http://{}/platform-measurements",
-                listener.local_addr().unwrap()
-            );
-            let server = tokio::spawn(async move {
-                for attempt in 0..2 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut request = [0; 4096];
-                    let n = socket.read(&mut request).await.unwrap();
-                    assert!(request[..n].starts_with(b"GET /platform-measurements "));
-                    if attempt == 0 || !second_succeeds {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                        )
-                        .await;
-                }
-            });
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                read_measurements(&client, &url, Duration::from_millis(50)),
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.is_ok(), second_succeeds);
-            if let Err(error) = result {
-                assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
-            }
-            server.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn measurement_read_does_not_retry_http_or_invalid_json() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        for response in [(403, "denied".into()), (200, "invalid json".into())] {
-            let (url, server) = responses(vec![response]).await;
-            let error = read_measurements(&client, &url, Duration::from_secs(1))
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("HTTP 403")
-                    || error.to_string().contains("invalid disk API response")
-            );
-            server.await.unwrap();
-        }
-    }
-
-    #[test]
-    fn prompts_identify_the_destination_even_for_identical_disk_names() {
-        let first = prompt_label("https://192.0.2.1:2024", "data");
-        let second = prompt_label("https://192.0.2.2:2024", "data");
-        assert_ne!(first, second);
-        assert!(first.contains("192.0.2.1:2024"));
-        assert!(first.contains("'data'"));
-    }
-
-    #[test]
-    fn secret_http_body_transfers_the_original_allocation() {
-        let source = Zeroizing::new(b"{\"passphrase\":\"secret\"}".to_vec());
-        let pointer = source.as_ptr();
-        let body = secret_http_body(source);
-        assert_eq!(body.as_ptr(), pointer);
-        let copy = body.clone();
-        drop(body);
-        assert_eq!(copy.as_ptr(), pointer);
-        assert_eq!(copy.as_ref(), b"{\"passphrase\":\"secret\"}");
-    }
-
-    #[test]
-    fn backspace_erases_a_whole_utf8_character() {
-        let mut input = Zeroizing::new("aé🔑".as_bytes().to_vec());
-        erase_last_character(&mut input);
-        assert_eq!(&**input, "aé".as_bytes());
-        erase_last_character(&mut input);
-        assert_eq!(&**input, b"a");
-        erase_last_character(&mut input);
-        erase_last_character(&mut input);
-        assert!(input.is_empty());
-    }
-    #[test]
-    fn workload_identity_uses_the_encoded_reference_id() {
-        let reference = crate::commands::workload::parse_workload_ref(
-            "0xaef8fc89416f01494ec6534de68d30aab26d7598db8a05967b0ba7d3ecb259d2/disk-unlock-test:v0.0.1",
-            &Default::default(),
-        ).unwrap();
-        let expected = reference.workload_id();
-        let status = serde_json::json!({"workload_id":
-            "0x621243d364889972213ec48c4fc6d6c9f8bad7a3447474ac4a21bc8106a7e2e7"});
-        assert!(super::validate_workload_identity(&status, &expected).is_ok());
-        assert!(super::validate_workload_identity(&status, &hex::encode(expected)).is_err());
-        assert!(super::validate_workload_identity(&serde_json::json!({}), "0x1234").is_err());
-    }
-    use super::*;
-
-    async fn responses(values: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/status", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            for (status, body) in values {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
-                if status == 0 {
-                    continue;
-                } // Simulate a dropped connection.
-                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                let _ = socket.write_all(response.as_bytes()).await;
-            }
-        });
-        (url, server)
-    }
-
-    #[tokio::test]
-    async fn status_poll_retries_transport_http_and_json_failures() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let (url, server) = responses(vec![
-            (0, String::new()),
-            (503, "unavailable".into()),
-            (200, "not json".into()),
-            (200, r#"{"state":"AwaitingDiskUnlock"}"#.into()),
-        ])
-        .await;
-        let status = tokio::time::timeout(Duration::from_secs(5), poll_status(&client, &url))
-            .await
-            .unwrap();
-        assert_eq!(status["state"], "AwaitingDiskUnlock");
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn measurement_limit_accepts_large_logs_but_remains_bounded() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let body = serde_json::json!({"pcrs":[], "event_log": "x".repeat(100_000)}).to_string();
-        let (url, server) =
-            responses(vec![(200, body.clone()), (200, body.clone()), (200, body)]).await;
-        assert!(read_json_limited(
-            client.get(&url).send().await.unwrap(),
-            MAX_MEASUREMENT_RESPONSE_BYTES
-        )
-        .await
-        .is_ok());
-        assert!(read_json(client.get(&url).send().await.unwrap())
-            .await
-            .is_err());
-        assert!(
-            read_json_limited(client.get(&url).send().await.unwrap(), 1024)
-                .await
-                .is_err()
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn terminal_wait_is_cancellable_and_restores_settings() {
-        use nix::sys::termios::tcgetattr;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let pty = nix::pty::openpty(None, None).unwrap();
-        let mut master = std::fs::File::from(pty.master);
-        let tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
-            .unwrap();
-        let original = tcgetattr(&tty).unwrap();
-        assert!(tokio::time::timeout(
-            Duration::from_millis(30),
-            prompt_on_terminal("data", tty.try_clone().unwrap())
-        )
-        .await
-        .is_err());
-        assert_eq!(tcgetattr(&tty).unwrap().local_flags, original.local_flags);
-        let input = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            master.write_all("é\u{7f}secret\n".as_bytes()).unwrap();
-        };
-        let (result, ()) =
-            tokio::join!(prompt_on_terminal("data", tty.try_clone().unwrap()), input);
-        assert_eq!(result.unwrap().as_str(), "secret");
-        assert_eq!(tcgetattr(&tty).unwrap().local_flags, original.local_flags);
-    }
-    #[test]
-    fn workload_measurement_requires_both_banks_of_pcr23() {
-        let valid = serde_json::json!({"pcrs":[{"index":23,"sha256":"0x1234","sha384":"0x5678"}]});
-        assert!(validate_workload_measurement(&valid, "0x1234", "0x5678").is_ok());
-        assert!(validate_workload_measurement(&valid, "0xabcd", "0x5678").is_err());
-        assert!(validate_workload_measurement(&valid, "0x1234", "0xabcd").is_err());
-        assert!(validate_workload_measurement(&serde_json::json!({}), "0x1234", "0x5678").is_err());
-    }
-    #[test]
-    fn disk_signature_matches_portal_protocol_vector() {
-        assert_eq!(
-            hex::encode(request_digest("tls", "database", "nonce", b"secret")),
-            "c4b475ddcd87caabad702569a9b323abdb6f901724c74aade026ad10726419e5"
-        );
-    }
 }
 
 async fn poll_status(client: &reqwest::Client, url: &str) -> serde_json::Value {
@@ -814,4 +605,215 @@ async fn prompt_on_terminal(name: &str, mut tty: std::fs::File) -> Result<Zeroiz
             .context("passphrase must be UTF-8")?
             .to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn measurement_read_retries_one_timeout_but_stays_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for second_succeeds in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/platform-measurements",
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let n = socket.read(&mut request).await.unwrap();
+                    assert!(request[..n].starts_with(b"GET /platform-measurements "));
+                    if attempt == 0 || !second_succeeds {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                }
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_measurements(&client, &url, Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), second_succeeds);
+            if let Err(error) = result {
+                assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn measurement_read_does_not_retry_http_or_invalid_json() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for response in [(403, "denied".into()), (200, "invalid json".into())] {
+            let (url, server) = responses(vec![response]).await;
+            let error = read_measurements(&client, &url, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("HTTP 403")
+                    || error.to_string().contains("invalid disk API response")
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn prompts_identify_the_destination_even_for_identical_disk_names() {
+        let first = prompt_label("https://192.0.2.1:2024", "data");
+        let second = prompt_label("https://192.0.2.2:2024", "data");
+        assert_ne!(first, second);
+        assert!(first.contains("192.0.2.1:2024"));
+        assert!(first.contains("'data'"));
+    }
+
+    #[test]
+    fn secret_http_body_transfers_the_original_allocation() {
+        let source = Zeroizing::new(b"{\"passphrase\":\"secret\"}".to_vec());
+        let pointer = source.as_ptr();
+        let body = secret_http_body(source);
+        assert_eq!(body.as_ptr(), pointer);
+        let copy = body.clone();
+        drop(body);
+        assert_eq!(copy.as_ptr(), pointer);
+        assert_eq!(copy.as_ref(), b"{\"passphrase\":\"secret\"}");
+    }
+
+    #[test]
+    fn backspace_erases_a_whole_utf8_character() {
+        let mut input = Zeroizing::new("aé🔑".as_bytes().to_vec());
+        erase_last_character(&mut input);
+        assert_eq!(&**input, "aé".as_bytes());
+        erase_last_character(&mut input);
+        assert_eq!(&**input, b"a");
+        erase_last_character(&mut input);
+        erase_last_character(&mut input);
+        assert!(input.is_empty());
+    }
+    #[test]
+    fn workload_identity_uses_the_encoded_reference_id() {
+        let reference = crate::commands::workload::parse_workload_ref(
+            "0xaef8fc89416f01494ec6534de68d30aab26d7598db8a05967b0ba7d3ecb259d2/disk-unlock-test:v0.0.1",
+            &Default::default(),
+        ).unwrap();
+        let expected = reference.workload_id();
+        let status = serde_json::json!({"workload_id":
+            "0x621243d364889972213ec48c4fc6d6c9f8bad7a3447474ac4a21bc8106a7e2e7"});
+        assert!(super::validate_workload_identity(&status, &expected).is_ok());
+        assert!(super::validate_workload_identity(&status, &hex::encode(expected)).is_err());
+        assert!(super::validate_workload_identity(&serde_json::json!({}), "0x1234").is_err());
+    }
+    use super::*;
+
+    async fn responses(values: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/status", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in values {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                if status == 0 {
+                    continue;
+                } // Simulate a dropped connection.
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn status_poll_retries_transport_http_and_json_failures() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (url, server) = responses(vec![
+            (0, String::new()),
+            (503, "unavailable".into()),
+            (200, "not json".into()),
+            (200, r#"{"state":"AwaitingDiskUnlock"}"#.into()),
+        ])
+        .await;
+        let status = tokio::time::timeout(Duration::from_secs(5), poll_status(&client, &url))
+            .await
+            .unwrap();
+        assert_eq!(status["state"], "AwaitingDiskUnlock");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn measurement_limit_accepts_large_logs_but_remains_bounded() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let body = serde_json::json!({"pcrs":[], "event_log": "x".repeat(100_000)}).to_string();
+        let (url, server) =
+            responses(vec![(200, body.clone()), (200, body.clone()), (200, body)]).await;
+        assert!(read_json_limited(
+            client.get(&url).send().await.unwrap(),
+            MAX_MEASUREMENT_RESPONSE_BYTES
+        )
+        .await
+        .is_ok());
+        assert!(read_json(client.get(&url).send().await.unwrap())
+            .await
+            .is_err());
+        assert!(
+            read_json_limited(client.get(&url).send().await.unwrap(), 1024)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_is_cancellable_and_restores_settings() {
+        use nix::sys::termios::tcgetattr;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let mut master = std::fs::File::from(pty.master);
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap();
+        let original = tcgetattr(&tty).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            prompt_on_terminal("data", tty.try_clone().unwrap())
+        )
+        .await
+        .is_err());
+        assert_eq!(tcgetattr(&tty).unwrap().local_flags, original.local_flags);
+        let input = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            master.write_all("é\u{7f}secret\n".as_bytes()).unwrap();
+        };
+        let (result, ()) =
+            tokio::join!(prompt_on_terminal("data", tty.try_clone().unwrap()), input);
+        assert_eq!(result.unwrap().as_str(), "secret");
+        assert_eq!(tcgetattr(&tty).unwrap().local_flags, original.local_flags);
+    }
+    #[test]
+    fn workload_measurement_requires_both_banks_of_pcr23() {
+        let valid = serde_json::json!({"pcrs":[{"index":23,"sha256":"0x1234","sha384":"0x5678"}]});
+        assert!(validate_workload_measurement(&valid, "0x1234", "0x5678").is_ok());
+        assert!(validate_workload_measurement(&valid, "0xabcd", "0x5678").is_err());
+        assert!(validate_workload_measurement(&valid, "0x1234", "0xabcd").is_err());
+        assert!(validate_workload_measurement(&serde_json::json!({}), "0x1234", "0x5678").is_err());
+    }
+    #[test]
+    fn disk_signature_matches_portal_protocol_vector() {
+        assert_eq!(
+            hex::encode(request_digest("tls", "database", "nonce", b"secret")),
+            "c4b475ddcd87caabad702569a9b323abdb6f901724c74aade026ad10726419e5"
+        );
+    }
 }

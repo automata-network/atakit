@@ -170,7 +170,7 @@ pub async fn run(mut args: DeployArgs, env: &Env, config: &Config, verbose: bool
             // it for per-target deploys so they don't delete what we just
             // uploaded.
             args.force_image = false;
-            let futures = targets.iter().cloned().map(|t| {
+            let futures = targets.iter().map(|t| {
                 let mut single = args.clone();
                 single.target = vec![t.clone()];
                 // Image-only requires --name in single-target mode (no

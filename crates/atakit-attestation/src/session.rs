@@ -3764,7 +3764,7 @@ mod tests {
                     .filter(|&i| i != 1)
                     .map(|i| IndexedEventSet256 {
                         event_index: i as u16,
-                        allowed_values: vec![events[i].into()],
+                        allowed_values: vec![events[i]],
                     })
                     .collect(),
             });

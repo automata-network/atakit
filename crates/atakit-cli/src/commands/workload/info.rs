@@ -361,7 +361,7 @@ fn print_info(
 fn print_multi(label: &str, items: &[String]) {
     for (i, item) in items.iter().enumerate() {
         if i == 0 {
-            println!("  {:<18}{}", format!("{label}"), item);
+            println!("  {label:<18}{item}");
         } else {
             println!("  {:<18}{}", "", item);
         }
