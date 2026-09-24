@@ -76,6 +76,8 @@ impl TrustSource {
 /// verifications from it.
 #[derive(Debug, Clone)]
 pub struct PackTrustSource {
+    #[cfg(test)]
+    verification_time: Option<u64>,
     inner: std::sync::Arc<PackTrustSourceInner>,
     tdx_dcap_collateral: IntelTdxDcapCollateralConfig,
 }
@@ -157,6 +159,8 @@ impl PackTrustSource {
         }
 
         Ok(Self {
+            #[cfg(test)]
+            verification_time: None,
             inner: std::sync::Arc::new(PackTrustSourceInner {
                 collateral,
                 collateral_packs,
@@ -200,7 +204,18 @@ impl PackTrustSource {
     /// remembered to ask would leave `bootstrap_portal_tls` — which is public
     /// and takes a `TrustSource` directly — using expired packs.
     pub(crate) fn ensure_valid_now(&self) -> Result<(), PortalVerificationError> {
+        #[cfg(test)]
+        if let Some(now) = self.verification_time {
+            return self.ensure_valid_at(now);
+        }
         self.ensure_valid_at(now_unix())
+    }
+
+    /// Set this test source's clock without affecting concurrent tests or production callers.
+    #[cfg(test)]
+    pub(crate) fn with_verification_time(mut self, now: u64) -> Self {
+        self.verification_time = Some(now);
+        self
     }
 
     /// Select the packed Intel TDX DCAP collateral covering this quote.

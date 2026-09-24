@@ -336,7 +336,8 @@ mod tests {
                 Vec::new(),
                 IntelTdxDcapCollateralConfig::default(),
             )
-            .expect("pack source"),
+            .expect("pack source")
+            .with_verification_time(crate::pack::fixture::NOW),
         ))
     }
 
@@ -392,7 +393,8 @@ mod tests {
             Vec::new(),
             IntelTdxDcapCollateralConfig::default(),
         )
-        .expect("pack source");
+        .expect("pack source")
+        .with_verification_time(crate::pack::fixture::NOW);
         let builder = TrustAnchorsBuilder::new(TrustSource::Packs(source));
 
         let error = builder

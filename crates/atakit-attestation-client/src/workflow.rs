@@ -415,8 +415,9 @@ mod tests {
         let pack = crate::pack::read::read_trust_pack(&archive, &options)
             .expect("the pack verifies inside its own window");
 
-        let source =
-            PackTrustSource::new(Vec::new(), vec![pack], tdx_dcap_collateral).expect("pack source");
+        let source = PackTrustSource::new(Vec::new(), vec![pack], tdx_dcap_collateral)
+            .expect("pack source")
+            .with_verification_time(crate::pack::fixture::NOW);
         SessionVerificationMode::Packs {
             source,
             base_image_id,
@@ -656,10 +657,25 @@ mod tests {
         let SessionVerificationMode::Packs { source, .. } = packs_mode(false) else {
             unreachable!()
         };
-        assert!(source.ensure_valid_at(crate::pack::fixture::NOW).is_ok());
-        let error = source
-            .ensure_valid_at(crate::pack::fixture::NOT_AFTER)
-            .expect_err("the same held source must refuse once the window closes");
-        assert!(error.to_string().contains("validity"), "got {error}");
+        for now in [
+            crate::pack::fixture::NOT_BEFORE,
+            crate::pack::fixture::NOT_AFTER - 1,
+        ] {
+            assert!(source
+                .clone()
+                .with_verification_time(now)
+                .workload_pack()
+                .is_ok());
+        }
+        for now in [
+            crate::pack::fixture::NOT_BEFORE - 1,
+            crate::pack::fixture::NOT_AFTER,
+        ] {
+            let held = source.clone().with_verification_time(now);
+            let error = held
+                .workload_pack()
+                .expect_err("a held source must refuse outside its validity window");
+            assert!(error.to_string().contains("validity"), "got {error}");
+        }
     }
 }
