@@ -47,6 +47,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry for Emulator tests
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+      - run: anvil --version
       - run: cargo test --workspace --locked
 
   build:
