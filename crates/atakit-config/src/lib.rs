@@ -831,6 +831,47 @@ fn drain_command_pipe(
 }
 
 #[cfg(unix)]
+fn wait_for_command_pipe_activity(
+    stdout: &impl std::os::fd::AsRawFd,
+    stderr: &impl std::os::fd::AsRawFd,
+    stdout_eof: bool,
+    stderr_eof: bool,
+) -> std::io::Result<()> {
+    let mut pipes = [
+        libc::pollfd {
+            fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // Wake as soon as output is available. A fixed sleep after each bounded
+    // read batch throttles helpers whose writes produce short pipe reads.
+    // The timeout still lets the caller check process state and its deadline
+    // when a helper is silent or has closed both output streams.
+    // SAFETY: pipes is a valid pollfd array; nonnegative descriptors are owned
+    // by the live stdout/stderr handles. poll ignores negative descriptors.
+    let result = unsafe {
+        libc::poll(
+            pipes.as_mut_ptr(),
+            pipes.len() as libc::nfds_t,
+            COMMAND_POLL_INTERVAL.as_millis() as libc::c_int,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn drain_command_pipe_after_exit(
     pipe: &mut impl Read,
     output: &mut CapturedCommandOutput,
@@ -1232,7 +1273,20 @@ fn resolve_command(
                     program: program.clone(),
                 });
             }
-            Ok(CommandChildState::Running) => std::thread::sleep(COMMAND_POLL_INTERVAL),
+            Ok(CommandChildState::Running) => {
+                if let Err(source) =
+                    wait_for_command_pipe_activity(&stdout, &stderr, stdout_eof, stderr_eof)
+                {
+                    terminate_command_tree(&mut child);
+                    restore_command_terminal(&mut foreground, source_kind, name, program)?;
+                    return Err(ConfigError::WaitCommand {
+                        source_kind,
+                        name: name.to_string(),
+                        program: program.clone(),
+                        source,
+                    });
+                }
+            }
             Err(source) => {
                 terminate_command_tree(&mut child);
                 restore_command_terminal(&mut foreground, source_kind, name, program)?;
