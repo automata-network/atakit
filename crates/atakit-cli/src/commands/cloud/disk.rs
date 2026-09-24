@@ -771,6 +771,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn terminal_wait_is_cancellable_and_restores_settings() {
         use nix::sys::termios::tcgetattr;
