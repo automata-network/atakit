@@ -28,7 +28,10 @@ use x509_parser::time::ASN1Time;
 
 mod amd_snp_policy;
 mod aws_nitrotpm;
+pub mod evidence_abi;
 mod session;
+pub mod session_protocol;
+pub mod signing;
 mod tdx_dcap;
 mod verification_core;
 pub use amd_snp_policy::*;
@@ -865,10 +868,11 @@ pub struct MeasurementVariant {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[repr(u8)]
 pub enum PcrBankSelection {
-    Sha256,
-    Sha384,
-    Sha256AndSha384,
+    Sha256 = 0,
+    Sha384 = 1,
+    Sha256AndSha384 = 2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

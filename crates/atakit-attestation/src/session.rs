@@ -2273,7 +2273,8 @@ fn verify_delegation(
     }
 }
 
-fn delegation_digest(
+/// Compute the digest authorizing a session key to sign for a workload.
+pub fn delegation_digest(
     chain_id: u64,
     registry: [u8; 20],
     base_image: [u8; 32],
