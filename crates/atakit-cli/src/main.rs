@@ -25,6 +25,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run native Portal emulation on an owned secondary Anvil fork
+    #[command(subcommand)]
+    Emulator(atakit_emulator::cli::EmulatorCommand),
     /// Manage CVM base images
     #[command(subcommand)]
     Image(ImageCommand),
@@ -99,6 +102,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Command::Emulator(cmd) => commands::emulator::run(cmd, &config).await,
         Command::Image(cmd) => match cmd {
             ImageCommand::Inspect(args) => commands::image::inspect::run(args, &env),
             ImageCommand::Ls(args) => commands::image::ls::run(args, &env, &config).await,

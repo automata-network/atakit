@@ -9,6 +9,8 @@ name = "atakit"
 path = "src/main.rs"
 
 [dependencies]
+atakit-emulator.workspace = true
+fs2.workspace = true
 atakit-core.workspace = true
 atakit-cvm-encoding.workspace = true
 atakit-cvm-types.workspace = true
