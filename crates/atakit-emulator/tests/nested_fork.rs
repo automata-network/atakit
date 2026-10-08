@@ -293,3 +293,76 @@ async fn owned_fork_supports_real_p256_precompile_without_patching_signature_ver
     assert_ne!(invalid, word(1));
     Ok(())
 }
+
+#[tokio::test]
+async fn embedded_dcap_mock_supports_v1_and_v2_quote_commitments() -> Result<()> {
+    use alloy_sol_types::{sol, SolCall};
+    sol! {
+        function verifyAndAttestOnChainV2(bytes quote, uint32 tcb, bool minCheck)
+            external returns (bool success, bytes output, bytes body);
+        function verifyAndAttestOnChain(bytes quote) external returns (bool success, bytes output);
+    }
+    let (_upstream, url) = upstream().await?;
+    raw(
+        &url,
+        "anvil_setCode",
+        json!([
+            ACCOUNT,
+            format!(
+                "0x{}",
+                include_str!("../assets/EmulatorDcapAttestation.runtime.hex").trim()
+            )
+        ]),
+    )
+    .await?;
+    let reader = rpc::ReadRpc::new(&url)?;
+    let mut quote = vec![0u8; 636];
+    quote[0] = 4;
+    quote[4] = 0x81;
+    for min_check in [false, true] {
+        let call = verifyAndAttestOnChainV2Call {
+            quote: quote.clone().into(),
+            tcb: 0,
+            minCheck: min_check,
+        };
+        let output = reader
+            .call(ACCOUNT, &format!("0x{}", hex::encode(call.abi_encode())))
+            .await?;
+        let result = verifyAndAttestOnChainV2Call::abi_decode_returns(&hex::decode(&output[2..])?)?;
+        assert!(result.success);
+        assert_eq!(result.output.len(), 317);
+        assert_eq!(&result.output[..5], &[0, 2, 0, 1, 6]);
+        assert_eq!(&result.body[..], &quote[48..632]);
+        assert_eq!(
+            &result.output[253..285],
+            alloy_primitives::keccak256(&quote).as_slice()
+        );
+        assert_eq!(
+            &result.output[285..317],
+            alloy_primitives::keccak256(&result.body).as_slice()
+        );
+    }
+    let legacy = verifyAndAttestOnChainCall {
+        quote: quote.clone().into(),
+    };
+    let output = reader
+        .call(ACCOUNT, &format!("0x{}", hex::encode(legacy.abi_encode())))
+        .await?;
+    let result = verifyAndAttestOnChainCall::abi_decode_returns(&hex::decode(&output[2..])?)?;
+    assert!(result.success);
+    assert_eq!(&result.output[11..], &quote[48..632]);
+    quote.push(0);
+    let malformed = verifyAndAttestOnChainV2Call {
+        quote: quote.into(),
+        tcb: 0,
+        minCheck: true,
+    };
+    assert!(reader
+        .call(
+            ACCOUNT,
+            &format!("0x{}", hex::encode(malformed.abi_encode()))
+        )
+        .await
+        .is_err());
+    Ok(())
+}

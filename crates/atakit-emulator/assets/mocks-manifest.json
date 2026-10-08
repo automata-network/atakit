@@ -1,10 +1,10 @@
 {
   "EmulatorDcapAttestation": {
-    "source_sha256": "4ab1ad0d654bd3942ed64b695aa8a5f35cf8a54f764a87bcccfc69d620b8ad82",
-    "runtime_sha256": "46c2d4dd288bf02442e11d57694d413e85feec62d8455db690b1d1422c3b9edc"
+    "source_sha256": "7bc744eb2c2cb2a2a25abb881094cf27eb4c0f2f04779b2f3368f2139a5bd563",
+    "runtime_sha256": "ac728092ef688163c8297f6f14afd1889fc2f0a9dec5db48ec66d31080b9e6a4"
   },
   "EmulatorTpmAttestation": {
     "source_sha256": "13d72a0ed2e4a77a367ceb5d0b5aa95489b46cbd04cfabe3378219a5c48b3101",
-    "runtime_sha256": "4fbfe5ceca7fe103089872a54ef18c8a434a48c4fb2e6c6c8a330ede27e81b02"
+    "runtime_sha256": "1790a13a222c54159f0a71216721fc2149e9cf4294f71e1d5906e2c2e441b430"
   }
 }
