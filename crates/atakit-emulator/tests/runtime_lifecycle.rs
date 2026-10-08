@@ -34,6 +34,7 @@ async fn setup(root: &Path) -> Result<(AnvilFork, PreparedLaunch)> {
     let fixture: Value =
         serde_json::from_slice(&std::fs::read(std::env::var("EMULATOR_FIXTURE_JSON")?)?)?;
     let a = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: std::env::var("EMULATOR_FIXTURE_RPC")?,
         block_number: None,
         port: port(),
@@ -70,6 +71,7 @@ async fn setup(root: &Path) -> Result<(AnvilFork, PreparedLaunch)> {
         a,
         PreparedLaunch {
             launch: LaunchConfig {
+                hardfork: "osaka".into(),
                 target: None,
                 chain: Some("fixture".into()),
                 fork_url: upstream_url,

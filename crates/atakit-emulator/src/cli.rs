@@ -53,6 +53,9 @@ pub struct UpArgs {
     pub fork_block: Option<u64>,
     #[arg(long)]
     pub anvil_port: Option<u16>,
+    /// Anvil hardfork (default: osaka); overrides the emulator configuration.
+    #[arg(long)]
+    pub hardfork: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub foreground: Option<bool>,
     #[arg(long = "workload")]

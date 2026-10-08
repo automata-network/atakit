@@ -24,6 +24,7 @@ async fn real_registries_validate_session_and_message_signatures() {
         .unwrap()
         .port();
     let mut fork = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: std::env::var("EMULATOR_FIXTURE_RPC").unwrap(),
         block_number: None,
         port,

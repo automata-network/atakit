@@ -80,6 +80,7 @@ async fn nested_fork_executes_inherited_code_and_keeps_upstream_unchanged() -> R
     raw(&url, "evm_mine", json!([])).await?;
     let temp = tempfile::tempdir()?;
     let mut b = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url.clone(),
         block_number: None,
         port: port(),
@@ -125,6 +126,7 @@ async fn fork_keeps_its_anchor_after_upstream_transactions_and_restores_local_st
     raw(&url, "evm_mine", json!([])).await?;
     let temp = tempfile::tempdir()?;
     let mut b = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url.clone(),
         block_number: None,
         port: port(),
@@ -165,6 +167,7 @@ async fn fork_keeps_its_anchor_after_upstream_transactions_and_restores_local_st
     let anchor = b.snapshot.block_number;
     b.stop().await?;
     let mut restored = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url.clone(),
         block_number: Some(anchor),
         port: port(),
@@ -192,6 +195,7 @@ async fn occupied_port_is_not_adopted_or_modified() -> Result<()> {
     let occupied = TcpListener::bind("127.0.0.1:0")?;
     let temp = tempfile::tempdir()?;
     let result = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url,
         block_number: None,
         port: occupied.local_addr()?.port(),
@@ -213,6 +217,7 @@ async fn upstream_reset_invalidates_the_recorded_snapshot() -> Result<()> {
     raw(&url, "evm_mine", json!([])).await?;
     let temp = tempfile::tempdir()?;
     let mut b = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url.clone(),
         block_number: None,
         port: port(),
@@ -242,6 +247,7 @@ async fn reset_at_the_same_block_hash_is_detected_by_instance_id() -> Result<()>
     .await?;
     let temp = tempfile::tempdir()?;
     let mut b = AnvilFork::spawn(ForkOptions {
+        hardfork: "osaka".into(),
         upstream_url: url.clone(),
         block_number: None,
         port: port(),
@@ -266,7 +272,8 @@ async fn owned_fork_supports_real_p256_precompile_without_patching_signature_ver
     let (_a, url) = upstream().await?;
     let temp = tempfile::tempdir()?;
     let mut b = AnvilFork::spawn(ForkOptions {
-        upstream_url: url,
+        hardfork: "osaka".into(),
+        upstream_url: url.clone(),
         block_number: None,
         port: port(),
         log_path: temp.path().join("p256.log"),
@@ -291,6 +298,18 @@ async fn owned_fork_supports_real_p256_precompile_without_patching_signature_ver
     b.stop().await?;
     assert_eq!(valid, word(1));
     assert_ne!(invalid, word(1));
+    let mut older = AnvilFork::spawn(ForkOptions {
+        hardfork: "prague".into(),
+        upstream_url: url,
+        block_number: None,
+        port: port(),
+        log_path: temp.path().join("prague.log"),
+        load_state: None,
+    })
+    .await?;
+    assert_eq!(older.rpc.call(address, &data).await?, "0x");
+    older.stop().await?;
+
     Ok(())
 }
 

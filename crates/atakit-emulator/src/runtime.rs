@@ -221,6 +221,7 @@ fn compatible(old: &PreparedLaunch, new: &PreparedLaunch) -> bool {
         && old.base_image_registry == new.base_image_registry
         && old.launch.chain == new.launch.chain
         && old.launch.fork_url == new.launch.fork_url
+        && old.launch.hardfork == new.launch.hardfork
         && old.publisher_secret == new.publisher_secret
 }
 fn validate_checkpoint(
@@ -255,6 +256,11 @@ fn validate_checkpoint(
                 "fork-url",
                 redact_url(&previous.launch.fork_url),
                 redact_url(&new.launch.fork_url),
+            ),
+            (
+                "hardfork",
+                previous.launch.hardfork.clone(),
+                new.launch.hardfork.clone(),
             ),
             (
                 "SessionRegistry",
@@ -510,6 +516,7 @@ pub async fn run_foreground_with_startup_lock(
             .map(|s| s.snapshot.block_number)
             .or(p.launch.fork_block),
         port: p.launch.anvil_port,
+        hardfork: p.launch.hardfork.clone(),
         log_path: dir.join("anvil.log"),
         load_state: None,
     })
@@ -768,7 +775,7 @@ pub async fn run_foreground_with_startup_lock(
                             sessions.clear();disabled.clear();
                             for w in endpoints.workloads.values_mut(){w.session_id=None;w.workload_id=None;}
                             b.stop().await?;
-                            b=AnvilFork::spawn(ForkOptions{upstream_url:p.launch.fork_url.clone(),block_number:None,port:p.launch.anvil_port,log_path:dir.join("anvil.log"),load_state:None}).await?;
+                            b=AnvilFork::spawn(ForkOptions{hardfork:p.launch.hardfork.clone(),upstream_url:p.launch.fork_url.clone(),block_number:None,port:p.launch.anvil_port,log_path:dir.join("anvil.log"),load_state:None}).await?;
                             engine=self::engine(&b,&p).await?;
                             checkpoint_valid=true;
                             for w in &p.launch.workloads {
@@ -1006,6 +1013,16 @@ mod checkpoint_tests {
                 "block_hash":"0xabc","upstream_instance_id":"instance"},
             "dump":"0x00","sessions":{},"disabled":[],"config_hashes":{"signer":"old"}
         })).unwrap()
+    }
+    #[test]
+    fn changing_hardfork_rejects_saved_checkpoint() {
+        let old = saved();
+        let mut new = old.prepared.clone();
+        new.launch.hardfork = "prague".into();
+        let message = validate_checkpoint(&old, &new, &old.config_hashes)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("hardfork: saved osaka, requested prague"));
     }
     #[test]
     fn omitted_platform_flags_show_saved_and_requested_values() {

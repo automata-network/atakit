@@ -22,6 +22,7 @@ pub struct ForkOptions {
     pub upstream_url: String,
     pub block_number: Option<u64>,
     pub port: u16,
+    pub hardfork: String,
     pub log_path: PathBuf,
     /// Opaque anvil_dumpState output from a matching emulator checkpoint.
     pub load_state: Option<String>,
@@ -83,10 +84,8 @@ impl AnvilFork {
             &snapshot.block_number.to_string(),
             "--chain-id",
             &chain_id.to_string(),
-            // Hoodi registries use the real EIP-7951 P-256 precompile at 0x100.
-            // Anvil's implicit fork default can remain Prague even on a newer upstream.
             "--hardfork",
-            "osaka",
+            &options.hardfork,
             "--preserve-historical-states",
             "--no-rate-limit",
             "--quiet",

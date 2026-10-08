@@ -155,6 +155,14 @@ atakit emulator stop  # save chain/session state for restart
 
 `up` starts a managed background process. Use `--foreground` for terminal logs and
 Ctrl-C shutdown. Its Anvil B defaults to `127.0.0.1:8546`; `--anvil-port` changes it.
+Anvil B defaults to `osaka`. Override it with `atakit emulator up --hardfork <name>`
+or the top-level `hardfork = "<name>"` in `atakit-emulator.toml`.
+CLI takes precedence over the file; names are validated by the installed Anvil.
+Startup and refresh use the same selection. Changing it requires a fresh runtime
+(`emulator down`, then `up`); older checkpoints without this field use Osaka.
+Earlier hardforks may lack the P-256 precompile required by your Registry.
+Transaction gas remains conservatively capped at 2^24 (and the block gas limit).
+
 The default Portal socket is created directly at `<runtime>/<instance>/root/run/atakit-portal.sock`.
 Use `--output-socket /absolute/path/portal.sock` to override it. No socket alias is created; clients using an override must connect to that explicit path.
 Add generated `portal.sock` and the private runtime directory to your project
@@ -183,6 +191,7 @@ Save the configuration as `atakit-emulator.toml` in your project directory:
 ```toml
 fork-url = "http://127.0.0.1:8545"
 anvil-port = 8546
+hardfork = "osaka"
 runtime-dir = ".atakit-emulator"
 
 [[workloads]]

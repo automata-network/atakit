@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{NamedValue, UpArgs, WorkloadInput};
 
+fn default_hardfork() -> String {
+    "osaka".into()
+}
+
 const WORKLOAD_CONFIG: &str = "atakit-workload.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +22,8 @@ pub struct LaunchConfig {
     pub fork_url: String,
     pub fork_block: Option<u64>,
     pub anvil_port: u16,
+    #[serde(default = "default_hardfork")]
+    pub hardfork: String,
     pub runtime_dir: PathBuf,
     pub foreground: bool,
     pub owner_key: Option<String>,
@@ -45,6 +51,7 @@ pub struct EmulatorFileConfig {
     pub fork_url: Option<String>,
     pub fork_block: Option<u64>,
     pub anvil_port: Option<u16>,
+    pub hardfork: Option<String>,
     pub runtime_dir: Option<PathBuf>,
     pub foreground: Option<bool>,
     pub owner_key: Option<String>,
@@ -233,6 +240,11 @@ pub fn resolve_up(args: &UpArgs, cwd: &Path) -> Result<LaunchConfig> {
             .unwrap_or_else(|| "http://127.0.0.1:8545".into()),
         fork_block: args.fork_block.or(file.fork_block),
         anvil_port: args.anvil_port.or(file.anvil_port).unwrap_or(8546),
+        hardfork: args
+            .hardfork
+            .clone()
+            .or(file.hardfork)
+            .unwrap_or_else(default_hardfork),
         runtime_dir,
         foreground: args.foreground.or(file.foreground).unwrap_or(false),
         owner_key: effective_shared_owner,
@@ -287,6 +299,7 @@ fn empty_file() -> EmulatorFileConfig {
         fork_url: None,
         fork_block: None,
         anvil_port: None,
+        hardfork: None,
         runtime_dir: None,
         foreground: None,
         owner_key: None,

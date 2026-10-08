@@ -542,3 +542,28 @@ fn up_rejects_pulled_packages_before_parsing_toml() {
         "{error:#}"
     );
 }
+
+#[test]
+fn hardfork_defaults_to_osaka_and_cli_overrides_file() {
+    let temp = temp_dir();
+    workload(temp.path(), "atakit-workload.toml", "app");
+    let resolve =
+        |args: &[&str]| serde_json::to_value(resolve_up(&up(args), temp.path()).unwrap()).unwrap();
+    assert_eq!(resolve(&["up", "--workload", "."])["hardfork"], "osaka");
+    fs::write(
+        temp.path().join("atakit-emulator.toml"),
+        "hardfork = 'prague'\n[[workloads]]\nfile = '.'\n",
+    )
+    .unwrap();
+    assert_eq!(resolve(&["up"])["hardfork"], "prague");
+    assert_eq!(resolve(&["up", "--hardfork", "osaka"])["hardfork"], "osaka");
+    // Forward future names to Anvil instead of maintaining a second hardfork enum.
+    assert_eq!(
+        resolve(&["up", "--hardfork", "future-fork"])["hardfork"],
+        "future-fork"
+    );
+    let mut saved = resolve(&["up"]);
+    saved.as_object_mut().unwrap().remove("hardfork");
+    let restored: atakit_emulator::config::LaunchConfig = serde_json::from_value(saved).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap()["hardfork"], "osaka");
+}
