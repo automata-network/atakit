@@ -229,6 +229,7 @@ async fn infer_cloud_target(
         upstream_url: launch.fork_url.clone(),
         block_number: launch.fork_block,
         port,
+        hardfork: launch.hardfork.clone(),
         log_path: temporary.path().join("anvil.log"),
         load_state: None,
     })
