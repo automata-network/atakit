@@ -1,4 +1,5 @@
 pub mod deps;
+pub mod disk;
 pub mod firewall;
 pub mod image;
 pub mod instance;
@@ -42,6 +43,9 @@ impl CloudProvider for AwsProvider {
     }
 
     async fn plan_deploy(&self, opts: &DeployOptions) -> Result<DeployPlan, CloudError> {
+        if let Some(allocation_id) = &opts.static_ip {
+            instance::validate_static_ip_allocation_id(allocation_id)?;
+        }
         let names = ResourceNames::for_aws(&opts.instance_name, &opts.image_ref);
         let mut steps = vec![DeployStep::CheckDeps];
 
@@ -63,12 +67,12 @@ impl CloudProvider for AwsProvider {
             ports,
         });
 
-        // Disks from the workload manifest. AWS creates EBS data volumes
-        // inline with run-instances (DeleteOnTermination=true), so there is
-        // no separate CreateDisks step.
+        // CreateInstanceAws creates each workload volume separately, records
+        // its returned ID, and attaches it with DeleteOnTermination=true.
         let mut disks = Vec::new();
         for (disk_name, index, size_gb) in &opts.workload_disks {
             disks.push(DiskSpec {
+                performance: None,
                 name: format!("{}-{disk_name}", names.instance),
                 device_name: disk_name.clone(),
                 index: *index,
@@ -77,7 +81,11 @@ impl CloudProvider for AwsProvider {
             });
         }
 
+        for disk in &mut disks {
+            opts.disk_configuration.apply(disk);
+        }
         steps.push(DeployStep::CreateInstanceAws {
+            boot_disk_performance: opts.disk_configuration.boot.clone(),
             instance_name: names.instance.clone(),
             instance_type: opts.target.vmtype.clone(),
             image_name: names.image.clone(),
@@ -86,13 +94,21 @@ impl CloudProvider for AwsProvider {
                 .metadata
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(
+                    opts.init_auth
+                        .iter()
+                        .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+                )
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
+            static_ip: opts.static_ip.clone(),
         });
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal {
+                timeout_secs: crate::init::PORTAL_READINESS_TIMEOUT_SECONDS,
+            });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });
@@ -192,6 +208,7 @@ impl CloudProvider for AwsProvider {
             }
 
             DeployStep::CreateInstanceAws {
+                boot_disk_performance,
                 instance_name,
                 instance_type,
                 image_name,
@@ -199,18 +216,42 @@ impl CloudProvider for AwsProvider {
                 metadata,
                 disks,
                 boot_disk_size_gb,
+                static_ip,
             } => {
-                let ami_id = image::find_ami(&self.region, image_name, runner)
-                    .await?
-                    .ok_or_else(|| CloudError::InstanceError {
-                        message: format!("AMI '{image_name}' not found"),
-                    })?;
-                let sg_id = firewall::find_security_group(&self.region, security_group, runner)
-                    .await?
-                    .ok_or_else(|| CloudError::InstanceError {
-                        message: format!("security group '{security_group}' not found"),
-                    })?;
-                let subnet = instance::find_subnet(&self.region, runner).await?;
+                let (ami_id, sg_id, subnet) = if let Some(saved) =
+                    runner.recorded_creation("instance").await?
+                {
+                    let crate::provisioning::CreateRequest::Aws { args } = saved.request else {
+                        return Err(crate::provisioning::error("wrong AWS creation record"));
+                    };
+                    let get = |key: &str| {
+                        args.windows(2)
+                            .find(|a| a[0] == key)
+                            .map(|a| a[1].clone())
+                            .ok_or_else(|| {
+                                crate::provisioning::error(format!("saved AWS request lacks {key}"))
+                            })
+                    };
+                    (
+                        get("--image-id")?,
+                        get("--security-group-ids")?,
+                        get("--subnet-id")?,
+                    )
+                } else {
+                    let ami = image::find_ami(&self.region, image_name, runner)
+                        .await?
+                        .ok_or_else(|| crate::provisioning::error("AWS image not found"))?;
+                    let group = firewall::find_security_group(&self.region, security_group, runner)
+                        .await?
+                        .ok_or_else(|| {
+                            crate::provisioning::error("AWS security group not found")
+                        })?;
+                    (
+                        ami,
+                        group,
+                        instance::find_subnet(&self.region, runner).await?,
+                    )
+                };
 
                 let (instance_id, ip) = instance::create_instance(
                     &self.region,
@@ -220,12 +261,21 @@ impl CloudProvider for AwsProvider {
                     &sg_id,
                     &subnet,
                     metadata,
-                    disks,
+                    &[],
                     *boot_disk_size_gb,
+                    boot_disk_performance.as_ref(),
+                    static_ip.as_deref(),
                     runner,
                 )
                 .await?;
 
+                if !disks.is_empty() {
+                    let zone = disk::subnet_zone(&self.region, &subnet, runner).await?;
+                    for spec in disks {
+                        let disk = disk::create(&self.region, &zone, spec, runner).await?;
+                        disk::attach(&self.region, &instance_id, &disk, runner).await?;
+                    }
+                }
                 updates.instance = Some(instance_id);
                 updates.external_ip = Some(ip);
             }
@@ -269,8 +319,15 @@ impl CloudProvider for AwsProvider {
         let mut steps = Vec::new();
 
         // Terminate the instance first; EBS data volumes auto-delete with it.
+        // AWS detaches its Elastic IP but keeps the operator-owned allocation.
         if let Some(ref id) = aws.instance {
             steps.push(DestroyStep::DeleteInstance { name: id.clone() });
+        }
+        if !opts.preserve.contains(&"disks".into()) && !aws.disks.is_empty() {
+            steps.push(DestroyStep::DeleteDisks {
+                names: aws.disks.clone(),
+                resource_group: None,
+            });
         }
 
         // Delete the security group (unless preserved).
@@ -302,6 +359,12 @@ impl CloudProvider for AwsProvider {
         _verbose: bool,
     ) -> Result<(), CloudError> {
         match step {
+            DestroyStep::DeleteDisks { names, .. } => {
+                for id in names {
+                    disk::delete(&self.region, id, runner).await?;
+                }
+                Ok(())
+            }
             DestroyStep::DeleteInstance { name } => {
                 instance::terminate_instance(&self.region, name, runner).await
             }
@@ -314,10 +377,10 @@ impl CloudProvider for AwsProvider {
             DestroyStep::DeleteS3Bucket { name } => image::delete_bucket(name, runner).await,
 
             // GCP / Azure / QEMU steps.
-            DestroyStep::DeleteDisks { .. }
-            | DestroyStep::DeleteFirewall { .. }
+            DestroyStep::DeleteFirewall { .. }
             | DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
+            | DestroyStep::DeleteAzureResource { .. }
             | DestroyStep::DeleteResourceGroup { .. }
             | DestroyStep::DeleteImageVersion { .. }
             | DestroyStep::DeleteImageDefinition { .. }
@@ -411,6 +474,10 @@ mod tests {
 
     fn test_target() -> CloudTarget {
         CloudTarget {
+            availability_zone: None,
+            boot_disk: Default::default(),
+            disks: Default::default(),
+            runtime: Default::default(),
             provider: "test-aws".to_string(),
             vmtype: "m6a.large".to_string(),
             uefi: None,
@@ -419,16 +486,20 @@ mod tests {
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
             chain: Some("testnet".to_string()),
             registration: None,
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
-            sp1_payer: None,
+            prover_credential: None,
         }
     }
 
     fn test_deploy_opts() -> DeployOptions {
         DeployOptions {
+            disk_configuration: Default::default(),
+            init_auth: None,
             instance_name: "test-instance".to_string(),
             target_name: "test-target".to_string(),
             target: test_target(),
@@ -448,6 +519,8 @@ mod tests {
             portal_ports: Default::default(),
             workload_disks: Vec::new(),
             boot_disk_size_gb: None,
+            static_ip: None,
+            static_ip_resource_group: None,
         }
     }
 
@@ -499,5 +572,30 @@ mod tests {
         assert!(ports.contains(&"3000/tcp".to_string()));
         assert!(!ports.contains(&"2024/tcp".to_string()));
         assert!(!ports.contains(&"1024/tcp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_passes_static_ip_allocation_to_instance_creation() {
+        let provider = AwsProvider::new("us-east-1".to_string());
+        let mut opts = test_deploy_opts();
+        opts.static_ip = Some("eipalloc-0123456789abcdef0".to_string());
+
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+        let allocation = plan.steps.iter().find_map(|step| match step {
+            DeployStep::CreateInstanceAws { static_ip, .. } => static_ip.as_deref(),
+            _ => None,
+        });
+        assert_eq!(allocation, opts.static_ip.as_deref());
+    }
+
+    #[tokio::test]
+    async fn plan_deploy_rejects_static_ip_values_that_are_not_allocation_ids() {
+        let provider = AwsProvider::new("us-east-1".into());
+        for invalid in ["", "203.0.113.10", "my-ip", "eipalloc-", "eipalloc-xyz"] {
+            let mut opts = test_deploy_opts();
+            opts.static_ip = Some(invalid.into());
+            let err = provider.plan_deploy(&opts).await.err().expect(invalid);
+            assert!(err.to_string().contains("Elastic IP allocation ID"));
+        }
     }
 }

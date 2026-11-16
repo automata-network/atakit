@@ -6,24 +6,30 @@ use atakit_workload::cli::PushArgs;
 use atakit_workload::{UploadContext, WorkloadCoords, WorkloadStore};
 use owo_colors::OwoColorize;
 
-use super::{compute_workload_id, find_versioned_archive, looks_like_store_ref};
+use super::{
+    compute_workload_id, find_versioned_archive, looks_like_store_ref, measured_workload_ref,
+    parse_workload_ref, WorkloadRef,
+};
 use crate::config::Config;
 
 pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
-    // Resolve source archive path.
+    // A publisher-qualified store reference is an assertion about the measured
+    // archive identity. File paths and directory archives need no external
+    // publisher input because the current format records it in the manifest.
+    let mut expected_ref = None;
     let archive_path = if let Some(ref source) = args.source {
         if looks_like_store_ref(source) {
-            // name:version store reference
-            let (name, version) = source
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let path = store.blob_path(&name, &version)?;
+            let workload_ref = parse_workload_ref(source, &config.alias)?;
+            let workload_id_hex = workload_ref.workload_id();
+            if let WorkloadRef::Ref(ref app_ref) = workload_ref {
+                expected_ref = Some(app_ref.clone());
+            }
+            let path = store.blob_path(&workload_id_hex)?;
             if !path.exists() {
                 anyhow::bail!(
-                    "no archive blob for {name}:{version} in store. Run `atakit workload pull` first."
+                    "no archive blob for {source} in store. Run `atakit workload pull` first."
                 );
             }
             path
@@ -46,21 +52,31 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
 
     // Inspect archive.
     let inspect_opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive_path.clone()),
         workload_dir: None,
         engine: None,
         verbose,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
     let result = atakit_workload::inspect_workload(&inspect_opts).await?;
     let manifest = &result.manifest;
-    let name = manifest.meta.name.clone();
-    let version = manifest.meta.version.clone();
+    let app_ref = measured_workload_ref(&manifest.meta)?;
+    if expected_ref
+        .as_ref()
+        .is_some_and(|expected| expected != &app_ref)
+    {
+        anyhow::bail!("store reference identity does not match the measured workload manifest");
+    }
+    let name = app_ref.name.clone();
+    let version = app_ref.version.clone();
     let archive_size = std::fs::metadata(&archive_path)
         .with_context(|| format!("failed to stat {}", archive_path.display()))?
         .len();
 
-    let workload_id = compute_workload_id(&name, &version);
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    let workload_id = compute_workload_id(&app_ref);
+    let workload_id_hex = format!("{workload_id:#x}");
 
     // Resolve repository and its credential (if any). A github repo
     // without a configured credential will fail the upload() gate
@@ -104,7 +120,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
     );
     println!("  {:<18}{}", "Size:", format_size(archive_size));
     println!("  {:<18}{}", "Manifest SHA256:", result.sha256.dimmed());
-    println!("  {:<18}{}", "PCR23:", result.pcr23.dimmed());
+    println!("  {:<18}{}", "PCR23:", result.pcr23_sha256.dimmed());
     println!("  {:<18}{}", "Workload ID:", workload_id_hex.dimmed());
     println!("  {:<18}{}", "Repository:", repo_uri.cyan());
     println!();
@@ -140,7 +156,7 @@ pub async fn run(args: PushArgs, env: &Env, config: &Config, verbose: bool) -> R
         coords,
         archive_path: archive_path.as_path(),
         manifest_sha256: result.sha256.clone(),
-        pcr23: result.pcr23.clone(),
+        pcr23: result.pcr23_sha256.clone(),
     };
 
     println!("Uploading to {}...", repo_uri.dimmed());

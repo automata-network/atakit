@@ -1,17 +1,19 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
-use atakit_cloud::init::{self, InitConfig};
+use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_core::Env;
 use atakit_workload::cli::InitArgs;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use crate::commands::cloud::{
-    init_chain_from_config, init_key_from_config, registration_is_off, resolve_unmeasured_tar,
-    resolve_workload, synthesize_off_init_chain, synthesize_self_generated_key,
+    effective_prover_credential, init_chain_from_config, init_key_from_config, registration_is_off,
+    resolve_explicit_tls_measurement_policy, resolve_init_pcr_policy, resolve_remote_atawl_source,
+    resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
+    synthesize_self_generated_key,
 };
 use crate::config::Config;
+use crate::progress::IndicatifReporter;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // 1. Parse address into (host, init_port). Default port 1024; status = init + 1000.
@@ -21,23 +23,52 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("init port {init_port} + 1000 overflows u16"))?;
 
     // 2. Resolve workload.
-    let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+    let resolved = resolve_workload(
+        &args.source,
+        &args.dir,
+        env,
+        config,
+        args.skip_freshness_check,
+        args.unmeasured_data_root
+            .as_deref()
+            .or(args.unmeasured_data_dir.as_deref()),
+    )?;
     let archive_path = resolved.archive_path;
+    let archive_sha256 = resolved.archive_sha256;
+    let archive_size_bytes = resolved.archive_size_bytes;
+    let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
-
-    // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over
-    // workload dir. Errors if the manifest declares paths but none are available.
-    let unmeasured_tar = resolve_unmeasured_tar(
-        &resolved.unmeasured_data_paths,
-        args.unmeasured_data_dir.as_ref(),
-        resolved.workload_dir.as_ref(),
+    let workload_attributes = resolved.attributes;
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
+    let remote_atawl_source = resolve_remote_atawl_source(
+        args.atawl_uri.as_deref(),
+        args.atawl_sha256.as_deref(),
+        archive_size_bytes,
+        &archive_sha256,
+        &workload_app_ref,
     )?;
 
-    // 3. Compute archive hash (display-only).
-    let bytes = std::fs::read(&archive_path)
-        .map_err(|e| anyhow::anyhow!("failed to read archive {}: {e}", archive_path.display()))?;
-    let archive_hash = format!("{:x}", Sha256::digest(&bytes));
+    // Collect unmeasured-data files. Explicit root flags take precedence over
+    // the default <workload-dir>/unmeasured-data root.
+    let unmeasured_tar = resolve_unmeasured_tar(
+        &env.cache_dir,
+        &resolved.unmeasured_data_paths,
+        &resolved.manifest.unmeasured_env_files,
+        args.unmeasured_data_root.as_ref(),
+        args.unmeasured_data_dir.as_ref(),
+        resolved.workload_dir.as_ref(),
+        args.no_unmeasured_data,
+    )?;
+
+    // 3. Display the hash of the exact archive snapshot inspected above.
+    let archive_hash = hex::encode(archive_sha256);
 
     // 4. Resolve init env. No target available, so fall back to [cloud.defaults] only.
     let defaults = &config.cloud.defaults;
@@ -54,7 +85,13 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     let registration = defaults.registration.as_deref();
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => init_chain_from_config(name, chain, registration).await?,
+            Some(chain) => {
+                let prover = chain
+                    .prover
+                    .as_ref()
+                    .and_then(|name| config.provers.get(name));
+                init_chain_from_config(name, chain, registration, prover).await?
+            }
             None if registration_is_off(registration) => synthesize_off_init_chain(),
             None => bail!("chain '{name}' not found in [chains]"),
         },
@@ -84,22 +121,23 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         },
         None => synthesize_self_generated_key(),
     };
-    let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
-    // SP1 prover-network key: `[cloud.defaults] sp1_payer` if set, else default
-    // to the gas-wallet key. Missing gas/sp1 synthesizes an ephemeral
-    // self-generated key; configured provisioned keys are also valid.
-    let sp1_payer_name = defaults
-        .sp1_payer
-        .clone()
-        .or_else(|| gas_wallet_name.clone());
-    let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
-    let sp1_init = match sp1_payer_name.as_deref() {
-        Some(name) => match config.keys.get(name) {
-            Some(spec) => init_key_from_config(name, spec, false)?,
-            None if registration_off => synthesize_self_generated_key(),
-            None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
-        },
-        None => synthesize_self_generated_key(),
+    // The prover credential must be separate from the gas wallet.
+    let prover_credential_name = effective_prover_credential(
+        config,
+        chain_name.as_deref(),
+        defaults.prover_credential.clone(),
+        registration_off,
+    )?;
+    let prover_init = if registration_off {
+        None
+    } else {
+        match prover_credential_name.as_deref() {
+            Some(name) => match config.keys.get(name) {
+                Some(spec) => Some(init_key_from_config(name, spec, false)?),
+                None => bail!("key '{name}' not found in [keys]"),
+            },
+            None => None,
+        }
     };
 
     // Validate operator-supplied disk passphrases against what the workload
@@ -109,21 +147,45 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .iter()
         .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
         .collect();
-    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+    init::disk_init_without_passphrases(&args.disk_passphrase)?;
 
-    let init_config = InitConfig {
+    let mut init_config = InitConfig {
+        runtime_cpu: Default::default(),
+        runtime_disks: Default::default(),
+        thp: None,
+        local_ssd: None,
+        disk_setup: init::resolve_disk_setup(
+            &args.disk_setup,
+            &declared,
+            args.overwrite_all_disks,
+        )?,
+        init_auth: None,
+        submission: None,
         platform: args.platform.clone(),
         chain: init_chain,
+        owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
-        sp1_payer: sp1_init,
-        disks: disk_passphrases,
+        prover_credential: prover_init,
+        pcr_policy: None,
     };
+    if !registration_off && args.pcr_policy.is_some() {
+        bail!("--pcr-policy requires effective chain registration = \"off\"");
+    }
+    let initialization_timeout_secs = init::initialization_timeout_seconds(
+        args.init_timeout,
+        init_config.owner_operations.op_expiry_seconds,
+    );
 
     // 5. Show plan and confirm.
     eprintln!("{}", "Plan:".dimmed());
     eprintln!("  1. Wait for CVM portal");
     eprintln!("  2. Initialize workload");
+    if !registration_off {
+        eprintln!("  3. Wait for session registration by atakit-portal");
+    } else {
+        eprintln!("  3. Wait for portal Running");
+    }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
     eprintln!("  {:<18}{}", "Host:".dimmed(), host.bold());
@@ -142,7 +204,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!("  {:<18}{}", "Archive:".dimmed(), archive_path.display());
     eprintln!("  {:<18}{}", "SHA-256:".dimmed(), &archive_hash[..16]);
-    eprintln!("  {:<18}{}s", "Timeout:".dimmed(), args.timeout);
+    eprintln!(
+        "  {:<18}{}",
+        "ATAWL transfer:".dimmed(),
+        if remote_atawl_source.is_some() {
+            "portal download"
+        } else {
+            "client upload"
+        }
+    );
+    eprintln!(
+        "  {:<18}{}s",
+        "Initialization timeout:".dimmed(),
+        initialization_timeout_secs
+    );
     eprintln!();
 
     if !args.yes {
@@ -156,24 +231,179 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     }
 
     // 6. Wait for portal.
-    eprint!("  [1/2] Wait for CVM portal... ");
-    init::wait_for_portal(&host, status_port, args.timeout)
+    let step_count = 4;
+    eprint!("  [1/{step_count}] Wait for CVM portal... ");
+    init::wait_for_portal(&host, status_port, init::PORTAL_READINESS_TIMEOUT_SECONDS)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
 
-    // 7. Initialize workload.
-    eprint!("  [2/2] Initialize workload... ");
-    init::post_portal_init(
-        &host,
-        init_port,
-        &archive_path.display().to_string(),
-        unmeasured_tar.as_deref(),
+    eprint!("  [2/{step_count}] Verify portal TLS... ");
+    let verified_tls = if args.unsafe_skip_tls_attestation {
+        eprintln!("{}", "unsafe bypass".yellow());
+        crate::commands::cloud::warn_unsafe_skip_tls_attestation();
+        None
+    } else {
+        let untrusted_portal_base_image_id = if args.measurements.is_none() {
+            Some(
+                init::read_untrusted_portal_base_image_id(&host, status_port)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+            )
+        } else {
+            None
+        };
+        let measurement_policy = resolve_explicit_tls_measurement_policy(
+            args.measurements.as_deref(),
+            args.base_image.as_deref(),
+            untrusted_portal_base_image_id,
+            &args.measurement_publisher_key,
+            &env.data_dir,
+            &init_config.chain,
+        )
+        .await?;
+        let tls_verification_trust =
+            init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+                gcp_ak_root_certs: &args.gcp_ak_root_cert,
+                azure_maa_certs: &args.azure_maa_cert,
+                aws_nitro_root_certs: &args.aws_nitro_root_cert,
+                amd_ark_root_certs: &args.amd_ark_root_cert,
+                amd_snp_crls: &args.amd_snp_crl,
+                amd_snp_security_policy: args.amd_snp_security_policy.as_deref(),
+                aws_document_maximum_age_seconds: args.aws_document_maximum_age_seconds,
+                aws_document_allowed_future_clock_difference_seconds: args
+                    .aws_document_allowed_future_clock_difference_seconds,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+            &args.tdx_dcap_automata_read_strategy,
+            args.tdx_dcap_automata_multicall3_address.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tdx_dcap_collateral = init::tdx_dcap_collateral_config_with_read_strategy(
+            args.tdx_dcap_collateral.clone(),
+            args.tdx_dcap_pccs_url.clone(),
+            args.tdx_dcap_automata_collateral_rpc_url.clone(),
+            args.tdx_dcap_automata_pcs_dao.clone(),
+            automata_read_strategy,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tls_mode = init::portal_tls_mode_for_init_chain(
+            &init_config.chain,
+            tls_verification_trust,
+            tdx_dcap_collateral,
+            measurement_policy,
+            untrusted_portal_base_image_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let verified_tls = init::bootstrap_portal_tls(
+            &host,
+            status_port,
+            &tls_mode,
+            Some(workload_attributes),
+            args.trust_tls_cert_sha256.as_deref(),
+            Some(&init::workload_tls_attestation_report_path(
+                &env.cache_dir,
+                &host,
+                status_port,
+            )),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+            eprintln!("{}", "overridden".yellow());
+            eprintln!("{message}");
+        } else {
+            eprintln!("{}", "done".green());
+        }
+        Some(verified_tls)
+    };
+    let portal_client = match &verified_tls {
+        Some(verified) => verified.client().clone(),
+        None => init::unsafe_portal_client(std::time::Duration::from_secs(
+            init::PORTAL_READINESS_TIMEOUT_SECONDS,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+    init_config.pcr_policy = resolve_init_pcr_policy(
+        args.pcr_policy.as_deref(),
         &init_config,
+        registration_off,
+        verified_tls.as_ref(),
+        &workload_app_ref,
+    )
+    .await?;
+
+    // 7. Initialize workload.
+    if let Some(key_file) = &args.init_auth_key_file {
+        let verified = verified_tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("authenticated init requires verified portal TLS"))?;
+        init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+            key_file: key_file.clone(),
+            workload_id: format!(
+                "{:#x}",
+                crate::commands::workload::compute_workload_id(&workload_app_ref)
+            ),
+            tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+        });
+    }
+    eprintln!("  [3/{step_count}] Initialize workload...");
+    let _disk_progress =
+        crate::commands::cloud::disk_progress::start(&portal_client, &host, status_port);
+    let init_result = if let Some(source) = &remote_atawl_source {
+        init::post_portal_init_remote_with_client(
+            &portal_client,
+            &host,
+            status_port,
+            init_port,
+            source,
+            unmeasured_tar.as_ref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    } else {
+        init::post_portal_init_with_client(
+            &portal_client,
+            &host,
+            status_port,
+            init_port,
+            &archive_path.display().to_string(),
+            &archive_sha256,
+            unmeasured_tar.as_ref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    };
+    let init_deadline = init_result.map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!("  {}", "done".green());
+
+    eprint!("  [4/{step_count}] Wait for portal Running... ");
+    match crate::commands::cloud::disk::wait_for_running(
+        &portal_client,
+        &host,
+        status_port,
+        init_deadline,
+        verified_tls.as_ref(),
+        &init_config,
+        &archive_path,
+        |_| {},
     )
     .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    eprintln!("{}", "done".green());
+    .map_err(|error| anyhow::anyhow!("{error}"))?
+    {
+        PortalTerminalState::Running => eprintln!("{}", "done".green()),
+        PortalTerminalState::Failed { detail } | PortalTerminalState::CleanHalt { detail } => {
+            bail!("portal did not reach Running: {detail}")
+        }
+    }
 
     // 8. Summary.
     eprintln!();

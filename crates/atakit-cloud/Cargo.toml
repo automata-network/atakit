@@ -2,27 +2,41 @@
 name = "atakit-cloud"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 cli = ["clap"]
 
 [dependencies]
+libc = "0.2"
+atakit-init-auth = { path = "../atakit-init-auth" }
 atakit-core.workspace = true
+atakit-config.workspace = true
+atakit-attestation.workspace = true
+atakit-attestation-client.workspace = true
+alloy.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-base64 = "0.22"
+base64.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+futures-util.workspace = true
 sha2.workspace = true
+sha3.workspace = true
+hex.workspace = true
+k256.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
+uuid.workspace = true
 
 async-trait.workspace = true
 
 clap = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen.workspace = true
 toml.workspace = true

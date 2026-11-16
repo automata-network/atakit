@@ -98,6 +98,7 @@ impl CloudProvider for QemuProvider {
             .workload_disks
             .iter()
             .map(|(disk_name, index, size_gb)| DiskSpec {
+                performance: None,
                 name: format!("{}-{disk_name}", opts.instance_name),
                 device_name: disk_name.clone(),
                 index: *index,
@@ -110,6 +111,11 @@ impl CloudProvider for QemuProvider {
             .metadata
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .chain(
+                opts.init_auth
+                    .iter()
+                    .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+            )
             .collect();
 
         let mut steps = vec![
@@ -128,7 +134,9 @@ impl CloudProvider for QemuProvider {
         ];
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal {
+                timeout_secs: crate::init::PORTAL_READINESS_TIMEOUT_SECONDS,
+            });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });

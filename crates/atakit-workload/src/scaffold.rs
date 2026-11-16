@@ -59,7 +59,23 @@ mod tests {
         assert!(dir.join(CONFIG_FILENAME).is_file());
 
         let content = std::fs::read_to_string(dir.join(CONFIG_FILENAME)).unwrap();
-        assert!(content.contains("format = 2"));
+        assert!(content.contains("format = 16"));
+        let config = crate::config::WorkloadConfig::load_from_str(&content).unwrap();
+        assert_eq!(config.format, atakit_core::cpu::CPU_POLICY_FORMAT);
+        let manifest = crate::manifest::build_manifest(
+            &config,
+            &format!("0x{}", "11".repeat(32)),
+            "my-app:latest",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(manifest.meta.format, atakit_core::cpu::CPU_POLICY_FORMAT);
+        assert!(content.contains("[workload.attributes]"));
         assert!(content.contains("name = \"my-app\""));
         assert!(content.contains("version = \"v0.0.1\""));
         assert!(content.contains("base-image-mode = \"blacklist\""));

@@ -22,9 +22,9 @@ pub struct CloudImages {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudImage {
     pub platform: PlatformKind,
-    /// GCE image name (GCP) or image definition name (Azure).
+    /// GCE image name, Azure image definition name, or AWS AMI name.
     pub cloud_name: String,
-    /// GCS bucket (GCP only).
+    /// GCS or S3 upload bucket. Image removal preserves upload storage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
     /// Gallery resource group (Azure only).
@@ -40,6 +40,9 @@ pub struct CloudImage {
     pub cc_types: Vec<CcType>,
     /// When the image was uploaded.
     pub uploaded_at: DateTime<Utc>,
+    /// Exact resources saved before removal, so interrupted cleanup can resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<crate::image_removal::ImageRemoval>,
 }
 
 impl Default for CloudImages {
@@ -52,6 +55,32 @@ impl Default for CloudImages {
 }
 
 impl CloudImages {
+    /// Serialize upload/removal of the same tracked image and provider.
+    pub fn lock(
+        data_dir: &Path,
+        image_ref: &str,
+        provider: &str,
+    ) -> Result<crate::resume::DeploymentLock, CloudError> {
+        crate::resume::DeploymentLock::acquire(
+            data_dir,
+            &format!("cloud-image/{provider}"),
+            image_ref,
+        )
+        .map_err(|e| CloudError::State {
+            message: format!("cannot lock cloud image '{image_ref}' for '{provider}': {e}"),
+        })
+    }
+
+    pub fn ensure_not_removing(&self, image_ref: &str, provider: &str) -> Result<(), CloudError> {
+        if self
+            .get(image_ref, provider)
+            .is_some_and(|r| r.removal.is_some())
+        {
+            return Err(CloudError::State { message: format!("image removal is incomplete; run `atakit cloud image rm {image_ref} --provider {provider}` before uploading") });
+        }
+        Ok(())
+    }
+
     /// Path to the cloud images state file.
     fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("cloud").join("images.json")
@@ -82,17 +111,7 @@ impl CloudImages {
         let json = serde_json::to_string_pretty(self).map_err(|e| CloudError::State {
             message: format!("failed to serialize cloud images: {e}"),
         })?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).map_err(|e| CloudError::State {
-            message: format!("failed to write {}: {e}", tmp.display()),
-        })?;
-        std::fs::rename(&tmp, &path).map_err(|e| CloudError::State {
-            message: format!(
-                "failed to rename {} -> {}: {e}",
-                tmp.display(),
-                path.display()
-            ),
-        })?;
+        crate::resume::write_private_file(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -152,13 +171,14 @@ mod tests {
     fn sample_record() -> CloudImage {
         CloudImage {
             platform: PlatformKind::Gcp,
-            cloud_name: "dev-baseimage-v0-0-1-debug".to_string(),
-            bucket: Some("atakit-upload-dev-baseimage-v0-0-1-debug".to_string()),
+            cloud_name: "example-image-v0-0-1-debug".to_string(),
+            bucket: Some("atakit-upload-example-image-v0-0-1-debug".to_string()),
             gallery_rg: None,
             gallery: None,
             image_version: None,
             cc_types: vec![CcType::SevSnp, CcType::Tdx],
             uploaded_at: Utc::now(),
+            removal: None,
         }
     }
 

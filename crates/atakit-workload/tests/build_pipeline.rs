@@ -1,8 +1,13 @@
 use std::io::Read;
 
 use atakit_core::{ArchiveCompression, NullReporter};
-use atakit_workload::{build_workload, inspect_workload, BuildOptions, InspectOptions};
+use atakit_workload::{
+    build_workload, inspect_workload, inspect_workload_archive_bytes, BuildOptions, InspectOptions,
+};
 use sha2::{Digest, Sha256};
+
+/// Fixed publisher for pipeline tests, which are not about publisher handling.
+const TEST_PUBLISHER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// Build a minimal but valid docker-archive tar containing a single image
 /// with a config blob made unique by `marker`. Returns the tar bytes.
@@ -48,7 +53,7 @@ fn make_docker_archive_tar(marker: &str) -> Vec<u8> {
 /// build pipeline can run without Docker/Podman.
 fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     let wl_dir = tmp.join("my-workload");
-    std::fs::create_dir_all(wl_dir.join("config")).unwrap();
+    std::fs::create_dir_all(wl_dir.join("measured-data/config")).unwrap();
 
     // Real (minimal) docker-archive tar so the build pipeline can extract
     // the image config digest. Content is otherwise unused.
@@ -59,13 +64,13 @@ fn setup_workload_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
 
     // Measured-data file
-    std::fs::write(wl_dir.join("config/cert.pem"), b"fake-cert").unwrap();
+    std::fs::write(wl_dir.join("measured-data/config/cert.pem"), b"fake-cert").unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [package]
-measured-data = ["./config/cert.pem"]
+measured-data = ["/config/cert.pem"]
 
 [workload]
 name = "my-workload"
@@ -92,7 +97,7 @@ fn setup_baby_container_workload_dir(tmp: &std::path::Path) -> std::path::PathBu
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "baby-workload"
@@ -101,9 +106,12 @@ base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 atakit-portal = true
 gid-group = "app"
+ip-env = true
 
-[workload.disks]
-data = "/data"
+[workload.storage.data]
+disk = "data"
+base-path = "/"
+mount-path = "/data"
 
 [baby-container]
 enabled = true
@@ -113,7 +121,7 @@ max-instances = 2
 parent-service = "baby-workload"
 image-selection = "single"
 max-instances = 1
-trust-policy = "user-helper-image"
+ip-env = true
 
 [baby-container.slots.analysis-job.lifecycle]
 image-retention = "disk"
@@ -131,7 +139,7 @@ read-only = false
 
 [baby-container.slots.analysis-job.storage.workspace.permissions]
 baby = "rw"
-parent = "ro"
+parent = "rw"
 
 [disks.data]
 index = 10
@@ -163,6 +171,34 @@ fn read_manifest_json(archive_path: &std::path::Path) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn legacy_gzip_option_builds_zstd_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = build_workload(
+        &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
+            workload_dir: setup_workload_dir(tmp.path()),
+            output_dir: None,
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::Gz,
+            measured_data_root: None,
+            unmeasured_data_root: None,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    let bytes = std::fs::read(&result.archive_path).unwrap();
+    assert_eq!(&bytes[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    assert_eq!(
+        read_manifest_json(&result.archive_path)["meta"]["name"],
+        "my-workload"
+    );
+    assert!(inspect_workload_archive_bytes(&bytes).is_ok());
+}
+
+#[tokio::test]
 async fn build_produces_valid_archive() {
     let tmp = tempfile::tempdir().unwrap();
     let wl_dir = setup_workload_dir(tmp.path());
@@ -171,11 +207,14 @@ async fn build_produces_valid_archive() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir.clone()),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -192,6 +231,11 @@ async fn build_produces_valid_archive() {
         .to_string_lossy()
         .ends_with("my-workload-v0.1.0.atawl"));
     assert!(!result.archive_hash.is_empty());
+    let manifest = read_manifest_json(&result.archive_path);
+    assert_eq!(manifest["meta"]["format"], atakit_workload::FORMAT_VERSION);
+    assert_eq!(manifest["config"]["depends_on"], serde_json::json!([]));
+    assert_eq!(manifest["meta"]["publisher"], TEST_PUBLISHER);
+    assert_eq!(manifest["config"]["attributes"], serde_json::json!({}));
 
     // Verify archive contents
     let file = std::fs::File::open(&result.archive_path).unwrap();
@@ -257,11 +301,14 @@ async fn build_materializes_baby_container_slots_in_manifest() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -269,6 +316,8 @@ async fn build_materializes_baby_container_slots_in_manifest() {
     .unwrap();
 
     let manifest = read_manifest_json(&result.archive_path);
+    assert_eq!(manifest["config"]["ip_env"], true);
+    assert_eq!(manifest["config"]["storage"]["data"]["mount_path"], "/data");
     let baby = &manifest["config"]["baby-container"];
     assert_eq!(baby["enabled"], true);
     assert_eq!(baby["max_instances"], 2);
@@ -278,6 +327,7 @@ async fn build_materializes_baby_container_slots_in_manifest() {
     );
     assert_eq!(baby["slots"]["analysis-job"]["gid_group"], "app");
     assert_eq!(baby["slots"]["analysis-job"]["image_selection"], "single");
+    assert_eq!(baby["slots"]["analysis-job"]["ip_env"], true);
     assert_eq!(
         baby["slots"]["analysis-job"]["lifecycle"]["image_retention"],
         "disk"
@@ -292,11 +342,11 @@ async fn build_materializes_baby_container_slots_in_manifest() {
     );
     assert_eq!(
         baby["slots"]["analysis-job"]["storage"]["workspace"]["permissions"]["parent"],
-        "ro"
+        "rw"
     );
     assert_eq!(
         baby["slots"]["analysis-job"]["trust_policy"],
-        "user-helper-image"
+        serde_json::Value::Null
     );
 }
 
@@ -307,11 +357,14 @@ async fn build_defaults_output_to_workload_dir() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: None,
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -333,11 +386,14 @@ async fn build_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -346,11 +402,14 @@ async fn build_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -376,11 +435,14 @@ async fn inspect_archive_matches_build() {
 
     let build_result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -388,13 +450,18 @@ async fn inspect_archive_matches_build() {
     .unwrap();
 
     let inspect_result = inspect_workload(&InspectOptions {
-        archive: Some(build_result.archive_path),
+        publisher: None,
+        archive: Some(build_result.archive_path.clone()),
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
+    let archive_bytes = std::fs::read(build_result.archive_path).unwrap();
+    let byte_snapshot_result = inspect_workload_archive_bytes(&archive_bytes).unwrap();
 
     assert_eq!(inspect_result.manifest.meta.name, "my-workload");
     assert_eq!(inspect_result.manifest.meta.version, "v0.1.0");
@@ -405,6 +472,11 @@ async fn inspect_archive_matches_build() {
     assert!(inspect_result
         .manifest_raw
         .contains("\"name\":\"my-workload\""));
+    assert_eq!(byte_snapshot_result.sha256, inspect_result.sha256);
+    assert_eq!(
+        byte_snapshot_result.manifest.config.attributes,
+        inspect_result.manifest.config.attributes
+    );
 }
 
 #[tokio::test]
@@ -416,11 +488,14 @@ async fn inspect_dir_matches_archive() {
 
     let build_result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -428,19 +503,25 @@ async fn inspect_dir_matches_archive() {
     .unwrap();
 
     let archive_result = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(build_result.archive_path),
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
 
     let dir_result = inspect_workload(&InspectOptions {
+        publisher: Some(TEST_PUBLISHER.to_string()),
         archive: None,
         workload_dir: Some(wl_dir),
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -464,7 +545,7 @@ fn setup_workload_with_dependency(tmp: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
 
     let config = r#"
-format = 2
+format = 8
 
 [workload]
 name = "multi-app"
@@ -472,11 +553,13 @@ version = "v0.2.0"
 base-image-mode = "blacklist"
 image = { file = "./app.tar" }
 ports = ["3000:3000"]
+depends_on = ["redis"]
 
 [dependencies.redis]
 image = { file = "./sidecar.tar" }
 ports = ["6379:6379"]
 restart = "unless-stopped"
+ip-env = true
 
 [dependencies.redis.environment]
 REDIS_MAX_MEMORY = "256mb"
@@ -494,11 +577,14 @@ async fn build_with_dependency() {
 
     let result = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out_dir),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -532,10 +618,13 @@ async fn build_with_dependency() {
 
     // Verify manifest has dependency populated
     let inspect_result = inspect_workload(&InspectOptions {
+        publisher: None,
         archive: Some(result.archive_path),
         workload_dir: None,
         engine: None,
         verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     })
     .await
     .unwrap();
@@ -546,11 +635,13 @@ async fn build_with_dependency() {
         .dependencies
         .as_ref()
         .expect("manifest should have dependencies");
+    assert_eq!(inspect_result.manifest.config.depends_on, vec!["redis"]);
     assert!(deps.contains_key("redis"));
     let redis = &deps["redis"];
     assert_eq!(redis.image, "redis:v0.2.0"); // auto-tagged from file source
     assert_eq!(redis.ports, vec!["6379:6379"]);
     assert_eq!(redis.restart, "unless-stopped");
+    assert!(redis.ip_env);
     assert_eq!(redis.environment.get("REDIS_MAX_MEMORY").unwrap(), "256mb");
 
     // The `images` section must hold one entry per service, each with the
@@ -580,11 +671,14 @@ async fn build_with_dependency_is_deterministic() {
 
     let r1 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir.clone(),
             output_dir: Some(out1),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -593,11 +687,14 @@ async fn build_with_dependency_is_deterministic() {
 
     let r2 = build_workload(
         &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
             workload_dir: wl_dir,
             output_dir: Some(out2),
             engine: None,
             verbose: false,
             compression: ArchiveCompression::default(),
+            measured_data_root: None,
+            unmeasured_data_root: None,
         },
         &NullReporter,
     )
@@ -608,4 +705,45 @@ async fn build_with_dependency_is_deterministic() {
         r1.archive_hash, r2.archive_hash,
         "dependency builds must be deterministic"
     );
+}
+
+#[tokio::test]
+async fn integrity_option_survives_build_and_archive_inspection() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = setup_workload_dir(tmp.path());
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("atakit-workload.toml"))
+        .unwrap();
+    writeln!(config, r#"
+[disks.data]
+size = "10GB"
+encryption = {{ unlock_method = ["tpm"], bind = ["baseimage", "workload"], integrity = "hmac-sha256" }}
+"#).unwrap();
+    drop(config);
+    let result = build_workload(
+        &BuildOptions {
+            publisher: TEST_PUBLISHER.to_string(),
+            workload_dir: dir,
+            output_dir: None,
+            engine: None,
+            verbose: false,
+            compression: ArchiveCompression::Zstd,
+            measured_data_root: None,
+            unmeasured_data_root: None,
+        },
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+    let manifest = read_manifest_json(&result.archive_path);
+    assert_eq!(manifest["meta"]["format"], 12);
+    assert_eq!(
+        manifest["disks"]["data"]["encryption"]["integrity"],
+        "hmac-sha256"
+    );
+    let inspected =
+        inspect_workload_archive_bytes(&std::fs::read(result.archive_path).unwrap()).unwrap();
+    assert_eq!(inspected.manifest.meta.format, 12);
 }

@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::PlatformKind;
 use crate::error::CloudError;
 
-const FORMAT_VERSION: u32 = 1;
+/// Format 3 records the workload publisher. Format 2 cannot be migrated: the
+/// publisher is not derivable from a name and version, and it is now an input
+/// to the workload identifier, so a format 2 deployment cannot be resolved to a
+/// registered workload at all.
+const FORMAT_VERSION: u32 = 3;
 pub const DEFAULT_PORTAL_INIT_PORT: u16 = 1024;
 pub const DEFAULT_PORTAL_STATUS_PORT: u16 = 2024;
 
@@ -41,8 +45,39 @@ impl Default for PortalPorts {
 /// Persistent deployment state stored as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployState {
+    #[serde(default)]
+    pub cleanup: crate::provisioning_cleanup::Cleanup,
+    #[serde(default)]
+    pub provisioning: crate::provisioning::Provisioning,
+    #[serde(default)]
+    pub created_boot_disk: Option<crate::disk_inventory::ObservedDisk>,
+    /// Names whose one-time create permission requires fresh provider identities.
+    #[serde(default)]
+    pub automatic_disk_setup: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub disk_configuration: crate::disk_profiles::ResolvedDiskConfiguration,
+    #[serde(default)]
+    pub created_disks: BTreeMap<String, crate::disk_inventory::CreatedDisk>,
+    #[serde(default)]
+    pub initialization: Option<crate::resume::Initialization>,
+    /// True only after VM creation and required resource attachments completed.
+    #[serde(default)]
+    pub provisioning_complete: bool,
+    /// AWS instance ID, GCP numeric instance ID, or Azure vmId UUID.
+    #[serde(default)]
+    pub cloud_instance_id: Option<String>,
+    /// Launch-time choice, retained after the private credential is removed.
+    #[serde(default)]
+    pub init_auth_required: Option<bool>,
+    #[serde(default)]
+    pub init_auth_key_file: Option<String>,
     pub format: u32,
     pub instance_name: String,
+    /// Owner fingerprint of the workload's publisher. Stored rather than the
+    /// derived identifier so the state still shows a readable reference and can
+    /// recompute the identifier, instead of holding an opaque hash whose
+    /// provenance cannot be checked.
+    pub workload_publisher: String,
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
@@ -53,7 +88,11 @@ pub struct DeployState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: DeployStatus,
+    /// Provider image selector used to create and manage cloud resources.
     pub image_ref: String,
+    /// Canonical base-image identity used only as an optional verifier subject
+    /// default. It is never a collateral or policy trust source.
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -76,14 +115,14 @@ pub enum DeployStatus {
 /// Init environment config persisted for re-deploys.
 /// Stores reference names into `[chains.*]` and `[keys.*]` config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedInitEnv {
     pub chain: String,
     pub owner_key: String,
     pub gas_wallet: String,
-    /// Optional SP1 prover-network key name. `#[serde(default)]` so deploy
-    /// states written before this field existed still load (as `None`).
+    /// Optional prover credential key name.
     #[serde(default)]
-    pub sp1_payer: Option<String>,
+    pub prover_credential: Option<String>,
 }
 
 /// Cloud provider resources tracked in state.
@@ -162,6 +201,8 @@ pub struct GcpResources {
 /// Azure-specific resource tracking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AzureResources {
+    #[serde(default)]
+    pub owned_resources: BTreeMap<String, crate::provisioning_cleanup::AzureResource>,
     pub subscription: String,
     pub region: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +230,8 @@ pub struct AzureResources {
 /// AWS-specific resource tracking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AwsResources {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<String>,
     pub region: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
@@ -230,12 +273,18 @@ fn state_path(data_dir: &Path, target: &str, instance: &str) -> PathBuf {
 /// Parameters for creating a new deployment state.
 pub struct NewDeployParams {
     pub instance_name: String,
+    /// Owner fingerprint of the workload's publisher. Stored rather than the
+    /// derived identifier so the state still shows a readable reference and can
+    /// recompute the identifier, instead of holding an opaque hash whose
+    /// provenance cannot be checked.
+    pub workload_publisher: String,
     pub workload_name: String,
     pub workload_version: String,
     pub target_name: String,
     pub provider_name: String,
     pub platform: PlatformKind,
     pub image_ref: String,
+    pub base_image_ref: Option<String>,
     pub archive_path: String,
     pub archive_hash: String,
     pub init_env: PersistedInitEnv,
@@ -245,12 +294,34 @@ pub struct NewDeployParams {
 }
 
 impl DeployState {
+    /// Saved launch mode, not a live query of the portal.
+    pub fn init_auth_mode(&self) -> &'static str {
+        match self.init_auth_required {
+            Some(true) => "authenticated",
+            Some(false) => "unsigned",
+            None if self.init_auth_key_file.is_some() => "authenticated",
+            None => "unknown (not recorded)",
+        }
+    }
+
     /// Create a new deploy state in "deploying" status.
     pub fn new(params: NewDeployParams) -> Self {
         let now = Utc::now();
         Self {
+            cleanup: Default::default(),
+            provisioning: Default::default(),
+            created_boot_disk: None,
+            automatic_disk_setup: Default::default(),
+            disk_configuration: Default::default(),
+            created_disks: Default::default(),
+            initialization: None,
+            provisioning_complete: false,
+            cloud_instance_id: None,
+            init_auth_required: None,
+            init_auth_key_file: None,
             format: FORMAT_VERSION,
             instance_name: params.instance_name,
+            workload_publisher: params.workload_publisher,
             workload_name: params.workload_name,
             workload_version: params.workload_version,
             target_name: params.target_name,
@@ -263,12 +334,83 @@ impl DeployState {
                 total: params.total_steps,
             },
             image_ref: params.image_ref,
+            base_image_ref: params.base_image_ref,
             archive_path: params.archive_path,
             archive_hash: params.archive_hash,
             init_env: params.init_env,
             portal_ports: params.portal_ports,
             resources: ResourceSet::default(),
         }
+    }
+
+    /// Load state from disk.
+    /// Diagnostics resolve the current state directory without creating or moving files.
+    pub fn load_for_diagnose(
+        data_dir: &Path,
+        reference: &str,
+        target: Option<&str>,
+    ) -> Result<Self, CloudError> {
+        let (embedded, instance) = reference
+            .split_once('/')
+            .map_or((None, reference), |(t, i)| (Some(t), i));
+        if embedded.zip(target).is_some_and(|(a, b)| a != b) {
+            return Err(CloudError::State {
+                message: "instance target conflicts with --target".into(),
+            });
+        }
+        let target = target.or(embedded);
+        let valid = |value: &str| {
+            !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\'])
+        };
+        if !valid(instance) || target.is_some_and(|value| !valid(value)) {
+            return Err(CloudError::State {
+                message: "invalid deployment reference".into(),
+            });
+        }
+        let base = data_dir.join("cloud/deployments");
+        let mut candidates = Vec::new();
+        if let Some(target) = target {
+            candidates.push((
+                target.to_string(),
+                base.join(target).join(format!("{instance}.state.json")),
+            ));
+        } else if base.exists() {
+            for entry in fs::read_dir(&base)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let path = entry.path().join(format!("{instance}.state.json"));
+                    if path.is_file() {
+                        candidates.push((entry.file_name().to_string_lossy().into_owned(), path));
+                    }
+                }
+            }
+        }
+        if candidates.len() > 1 {
+            return Err(CloudError::State {
+                message: "instance exists in multiple targets; specify --target".into(),
+            });
+        }
+        let Some((target, path)) = candidates.pop() else {
+            return Err(CloudError::StateNotFound {
+                instance: reference.into(),
+            });
+        };
+        let content = fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CloudError::StateNotFound {
+                    instance: reference.into(),
+                }
+            } else {
+                CloudError::Io(e)
+            }
+        })?;
+        let state = decode_deploy_state(&content, &path)?;
+        if state.target_name != target || state.instance_name != instance {
+            return Err(CloudError::State {
+                message: "saved deployment identity differs from its file location".into(),
+            });
+        }
+        Ok(state)
     }
 
     /// Load state from disk.
@@ -286,10 +428,7 @@ impl DeployState {
                 }
             }
         })?;
-        let state: DeployState = serde_json::from_str(&content).map_err(|e| CloudError::State {
-            message: format!("failed to parse {}: {e}", path.display()),
-        })?;
-        Ok(state)
+        decode_deploy_state(&content, &path)
     }
 
     /// Save state to disk (atomic via temp file + rename).
@@ -302,17 +441,7 @@ impl DeployState {
                 source: e,
             })?;
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &json).map_err(|e| CloudError::IoPath {
-            path: tmp.clone(),
-            source: e,
-        })?;
-        fs::rename(&tmp, &path).map_err(|e| CloudError::IoPath {
-            path: path.clone(),
-            source: e,
-        })?;
-        Ok(())
+        write_state_file(&path, self)
     }
 
     /// Delete state file from disk.
@@ -437,7 +566,11 @@ impl DeployState {
             gcp.firewall_rule = Some(f.clone());
         }
         if !updates.disks.is_empty() {
-            gcp.disks.extend(updates.disks.iter().cloned());
+            for disk in &updates.disks {
+                if !gcp.disks.contains(disk) {
+                    gcp.disks.push(disk.clone());
+                }
+            }
         }
         if let Some(ref i) = updates.instance {
             gcp.instance = Some(i.clone());
@@ -477,7 +610,11 @@ impl DeployState {
             az.nsg = Some(f.clone());
         }
         if !updates.disks.is_empty() {
-            az.disks.extend(updates.disks.iter().cloned());
+            for disk in &updates.disks {
+                if !az.disks.contains(disk) {
+                    az.disks.push(disk.clone());
+                }
+            }
         }
         if let Some(ref i) = updates.instance {
             az.instance = Some(i.clone());
@@ -486,6 +623,53 @@ impl DeployState {
             az.external_ip = Some(ip.clone());
         }
     }
+}
+
+fn decode_deploy_state(content: &str, path: &Path) -> Result<DeployState, CloudError> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| CloudError::State {
+            message: format!("failed to parse {}: {e}", path.display()),
+        })?;
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CloudError::State {
+            message: format!(
+                "failed to parse {}: missing or invalid format",
+                path.display()
+            ),
+        })?;
+    let format = u32::try_from(format).map_err(|_| CloudError::State {
+        message: format!(
+            "failed to parse {}: unsupported format {format}",
+            path.display()
+        ),
+    })?;
+
+    // No format below the current one can be migrated. The publisher is an
+    // input to the workload identifier and is not derivable from a name and
+    // version, so an older deployment cannot be resolved to a registered
+    // workload at all. Migration would have to invent the value it is missing.
+    if format != FORMAT_VERSION {
+        return Err(CloudError::State {
+            message: format!(
+                "failed to parse {}: format {format} predates publisher-qualified workload \
+                 identifiers and cannot be migrated, because the publisher is not derivable from \
+                 a name and version. Redeploy the instance.",
+                path.display()
+            ),
+        });
+    }
+
+    let state: DeployState = serde_json::from_value(value).map_err(|e| CloudError::State {
+        message: format!("failed to parse {}: {e}", path.display()),
+    })?;
+    Ok(state)
+}
+
+fn write_state_file(path: &Path, state: &DeployState) -> Result<(), CloudError> {
+    let json = serde_json::to_string_pretty(state)?;
+    crate::resume::write_private_file(path, json.as_bytes())
 }
 
 /// List all deployment states across all targets.
@@ -586,17 +770,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn state_round_trip() {
-        let dir = TempDir::new().unwrap();
+    fn test_state() -> DeployState {
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "test-instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "my-workload".into(),
             workload_version: "v0.0.1".into(),
             target_name: "prod-gcp".into(),
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "automata-linux:v0.1.6".into(),
+            base_image_ref: Some("automata-linux:v0.1.6".into()),
             archive_path: "/tmp/my-workload-v0.0.1.atawl".into(),
             archive_hash: "abc123".into(),
             init_env: PersistedInitEnv::default(),
@@ -606,18 +791,117 @@ mod tests {
         state.resources.gcp = Some(GcpResources {
             project: "my-project".into(),
             zone: "us-central1-a".into(),
+            firewall_rule: Some("test-instance-ingress".into()),
+            disks: vec!["test-instance-data".into()],
+            instance: Some("test-instance".into()),
+            external_ip: Some("192.0.2.10".into()),
             ..Default::default()
         });
+        state
+    }
+
+    fn format_1_value(sp1_payer: serde_json::Value) -> serde_json::Value {
+        let mut value = serde_json::to_value(test_state()).unwrap();
+        value["format"] = serde_json::json!(1);
+        let init_env = value["init_env"].as_object_mut().unwrap();
+        init_env.remove("prover_credential");
+        init_env.insert("sp1_payer".into(), sp1_payer);
+        value
+    }
+
+    fn write_state_value(dir: &Path, value: &serde_json::Value) -> PathBuf {
+        let path = state_path(dir, "prod-gcp", "test-instance");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn init_auth_mode_survives_credential_removal_and_serialization() {
+        let mut state = test_state();
+        assert_eq!(state.init_auth_mode(), "unknown (not recorded)");
+        state.init_auth_key_file = Some("credential.json".into());
+        assert_eq!(state.init_auth_mode(), "authenticated");
+        state.init_auth_required = Some(true);
+        state.init_auth_key_file = None;
+        let encoded = serde_json::to_string(&state).unwrap();
+        let mut decoded: DeployState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.init_auth_mode(), "authenticated");
+        decoded.init_auth_required = Some(false);
+        assert_eq!(decoded.init_auth_mode(), "unsigned");
+        let mut legacy = serde_json::to_value(&decoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("init_auth_required");
+        let decoded: DeployState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.init_auth_mode(), "unknown (not recorded)");
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut state = test_state();
+        state.image_ref = "automata-linux:v0.1.6-provider-alias".into();
+        state.base_image_ref = Some("automata-linux:v0.1.6".into());
         state.save(dir.path()).unwrap();
 
         let loaded = DeployState::load(dir.path(), "prod-gcp", "test-instance").unwrap();
         assert_eq!(loaded.instance_name, "test-instance");
         assert_eq!(loaded.workload_name, "my-workload");
-        assert_eq!(loaded.format, 1);
+        assert_eq!(loaded.format, FORMAT_VERSION);
         assert!(matches!(
             loaded.status,
             DeployStatus::Deploying { step: 0, total: 7 }
         ));
+        assert_eq!(loaded.image_ref, "automata-linux:v0.1.6-provider-alias");
+        assert_eq!(
+            loaded.base_image_ref.as_deref(),
+            Some("automata-linux:v0.1.6")
+        );
+    }
+
+    #[test]
+    fn persisted_init_environment_rejects_sp1_payer() {
+        let error = serde_json::from_value::<PersistedInitEnv>(serde_json::json!({
+            "chain": "hoodi",
+            "owner_key": "owner",
+            "gas_wallet": "gas",
+            "sp1_payer": "prover"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("sp1_payer"));
+    }
+
+    /// Formats below the current one are refused, not migrated.
+    ///
+    /// The publisher is an input to the workload identifier and is not
+    /// derivable from a name and version, so an older deployment cannot be
+    /// resolved to a registered workload. Migration would have to invent the
+    /// value it lacks, and a deployment silently pointing at the wrong
+    /// workload is worse than one that refuses to load.
+    #[test]
+    fn older_formats_are_refused_with_a_reason_and_a_remedy() {
+        for older in [1, 2] {
+            let dir = TempDir::new().unwrap();
+            let mut value = format_1_value(serde_json::Value::Null);
+            value["format"] = serde_json::json!(older);
+            let path = write_state_value(dir.path(), &value);
+
+            let error = DeployState::load(dir.path(), "prod-gcp", "test-instance")
+                .expect_err("an older format must not load");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("format {older}")),
+                "the failure must name the format; got {message}"
+            );
+            assert!(
+                message.contains("publisher"),
+                "the failure must say why it cannot be migrated; got {message}"
+            );
+            assert!(
+                message.contains("Redeploy"),
+                "the failure must say what to do; got {message}"
+            );
+            assert!(path.exists(), "a refused load must not remove the file");
+        }
     }
 
     #[test]
@@ -632,12 +916,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "web".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "my-app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),
@@ -657,12 +944,15 @@ mod tests {
         for target in &["staging", "prod"] {
             let mut state = DeployState::new(NewDeployParams {
                 instance_name: "web".into(),
+                workload_publisher:
+                    "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -682,12 +972,15 @@ mod tests {
         for target in &["staging", "prod"] {
             let mut state = DeployState::new(NewDeployParams {
                 instance_name: "web".into(),
+                workload_publisher:
+                    "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
                 workload_name: "app".into(),
                 workload_version: "v1".into(),
                 target_name: target.to_string(),
                 provider_name: "gcp-test".into(),
                 platform: PlatformKind::Gcp,
                 image_ref: "img:v1".into(),
+                base_image_ref: Some("img:v1".into()),
                 archive_path: "/tmp/a.atawl".into(),
                 archive_hash: "hash".into(),
                 init_env: PersistedInitEnv::default(),
@@ -706,12 +999,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut state = DeployState::new(NewDeployParams {
             instance_name: "del-me".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "app".into(),
             workload_version: "v1".into(),
             target_name: "staging".into(),
             provider_name: "gcp-test".into(),
             platform: PlatformKind::Gcp,
             image_ref: "img:v1".into(),
+            base_image_ref: Some("img:v1".into()),
             archive_path: "/tmp/a.atawl".into(),
             archive_hash: "hash".into(),
             init_env: PersistedInitEnv::default(),

@@ -5,6 +5,11 @@ use clap::{Args, Subcommand};
 /// Cloud deployment subcommand.
 #[derive(Subcommand)]
 pub enum CloudCommand {
+    /// Replace owner-provided files on the next VM reboot
+    #[command(subcommand)]
+    UnmeasuredData(UnmeasuredDataCommand),
+    /// Stage CPU choices and disk queue modes; disk modes apply on the next VM reboot
+    Configure(ConfigureArgs),
     /// Deploy a workload to a cloud CVM
     #[command(arg_required_else_help = true)]
     Deploy(DeployArgs),
@@ -12,6 +17,10 @@ pub enum CloudCommand {
     Destroy(DestroyArgs),
     /// Show deployment status
     Status(StatusArgs),
+    /// Diagnose a saved deployment without changing it
+    Diagnose(DiagnoseArgs),
+    /// Reboot a saved AWS deployment
+    Reboot(RebootArgs),
     /// List all deployments
     #[command(alias = "list")]
     Ls(ListArgs),
@@ -28,6 +37,84 @@ pub enum CloudCommand {
     /// Initialize a deployed instance with a workload
     #[command(arg_required_else_help = true)]
     Init(InitArgs),
+    /// Continue an interrupted deployment command without repeating accepted initialization
+    Resume(ResumeArgs),
+    /// Verify current session evidence without deployment policy or a transaction
+    #[command(arg_required_else_help = true)]
+    VerifySession(VerifySessionArgs),
+    /// Create, rotate, renew, recover, or inspect portal sessions
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Unlock workload disks on first initialization or after reboot
+    #[command(subcommand)]
+    Disk(DiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum DiskCommand {
+    /// Privately prompt for one disk's passphrase
+    Unlock(DiskUnlockArgs),
+}
+
+#[derive(Subcommand)]
+pub enum UnmeasuredDataCommand {
+    /// Preview and save a complete local folder for the next VM reboot
+    Update(UnmeasuredDataUpdateArgs),
+    /// Show update progress without stored contents or content IDs
+    Status(UnmeasuredDataInstanceArgs),
+    /// Cancel the pending replacement; keep active data
+    Discard(UnmeasuredDataInstanceArgs),
+}
+#[derive(Args)]
+pub struct UnmeasuredDataInstanceArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub owner_key: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+#[derive(Args)]
+pub struct UnmeasuredDataUpdateArgs {
+    #[command(flatten)]
+    pub instance: UnmeasuredDataInstanceArgs,
+    /// Complete replacement folder; undeclared local files are skipped
+    #[arg(long, default_value = "./unmeasured-data")]
+    pub unmeasured_data_root: PathBuf,
+    /// Fetch the manifest and preview locally; do not load the owner key or upload
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args)]
+pub struct DiskUnlockArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub disk: String,
+    #[arg(long)]
+    pub owner_key: Option<String>,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Portal session lifecycle subcommands.
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Create a new session
+    New(SessionMutationArgs),
+    /// Rotate the current session key
+    RotateKey(SessionMutationArgs),
+    /// Renew the current session
+    Renew(SessionMutationArgs),
+    /// Recover an older session into a new current session
+    Recover(SessionRecoverArgs),
+    /// Show one lifecycle request or the portal's selected request
+    Status(SessionStatusArgs),
 }
 
 /// Cloud image subcommands.
@@ -53,10 +140,37 @@ pub enum CloudProviderCommand {
 }
 
 /// Arguments for `cloud deploy`.
-#[derive(Args, Clone)]
+#[derive(Args, Clone, serde::Serialize)]
 pub struct DeployArgs {
+    #[command(flatten)]
+    pub runtime: RuntimeCpuArgs,
+    /// Check deployment inputs, cloud access, registry records and supported CPU quotas, then exit
+    #[arg(long)]
+    pub check_only: bool,
+
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with_all = ["disk_setup", "image_only"])]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (rejects detected disk metadata; may erase raw data) or NAME=overwrite (erases detected formats too)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Workload source: name:version (store ref), path to .atawl file, or omit for dir mode
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(
+        long,
+        value_name = "URI",
+        requires = "atawl_sha256",
+        conflicts_with_all = ["image_only", "skip_init"]
+    )]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for cloud planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name(s) from [cloud.targets.<name>]. Repeatable, or comma-separated.
     /// Passing multiple targets fans out into a concurrent multi-target deploy
@@ -114,6 +228,19 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_init: bool,
 
+    /// Provision without an initialization key; anyone who can reach /init can initialize the VM
+    #[arg(long)]
+    pub unauthenticated_init: bool,
+
+    /// Timeout in seconds for the ATAWL upload or portal download only.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub init_upload_timeout: u64,
+
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
+
     /// Deploy only the base image VM without a workload (for measurements)
     #[arg(long)]
     pub image_only: bool,
@@ -122,15 +249,20 @@ pub struct DeployArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Source directory for unmeasured data; uses <workload-dir>/unmeasured-data when present, otherwise prompts
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// deploy time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Continue without uploading unmeasured data (never prompt for a source)
+    #[arg(long, conflicts_with_all = ["unmeasured_data_root", "unmeasured_data_dir"])]
+    pub no_unmeasured_data: bool,
+
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
 
     /// Override OS boot disk size (e.g. "100GB", "1TB"). Default is 4GB.
@@ -139,6 +271,16 @@ pub struct DeployArgs {
     #[arg(long, value_name = "SIZE")]
     pub boot_disk_size: Option<String>,
 
+    /// Existing operator-managed static public IP resource to attach.
+    /// GCP: reserved address name. Azure: Public IP name. AWS: Elastic IP
+    /// allocation ID (eipalloc-...). The address must be unassociated.
+    #[arg(long, value_name = "REF")]
+    pub static_ip: Option<String>,
+
+    /// Azure resource group containing --static-ip.
+    #[arg(long, value_name = "RG")]
+    pub static_ip_resource_group: Option<String>,
+
     /// CVM portal /init port. Default: 1024.
     #[arg(long, value_name = "PORT")]
     pub init_port: Option<u16>,
@@ -146,6 +288,100 @@ pub struct DeployArgs {
     /// CVM portal /status port. Default: 2024.
     #[arg(long, value_name = "PORT")]
     pub status_port: Option<u16>,
+
+    /// Optional expected base-image assertion for portal TLS attestation.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Explicit signed measurement pack for offline portal TLS verification.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
+
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for verifier-side Intel TDX DCAP collateral fetch.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for verifier-side Intel TDX DCAP lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for verifier-side Intel TDX DCAP collateral lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// Automata PCCS read strategy. Direct concurrent calls are the default.
+    #[arg(
+        long = "tdx-dcap-automata-read-strategy",
+        value_parser = ["direct-concurrent", "multicall3"],
+        default_value = "direct-concurrent"
+    )]
+    pub tdx_dcap_automata_read_strategy: String,
+
+    /// Multicall3 address override for Automata PCCS reads.
+    #[arg(long = "tdx-dcap-automata-multicall3-address", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_multicall3_address: Option<String>,
+
+    /// One-shot override: trust only this live TLS certificate SHA-256.
+    #[arg(long, value_name = "0xSHA256")]
+    pub trust_tls_cert_sha256: Option<String>,
+
+    /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
+    #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
+    pub unsafe_skip_tls_attestation: bool,
 }
 
 /// Arguments for `cloud destroy`.
@@ -172,7 +408,8 @@ pub struct DestroyArgs {
     #[arg(long)]
     pub clean_image: bool,
 
-    /// Skip confirmation prompt
+    /// Skip the normal confirmation prompt. Disks without creation records
+    /// still require interactive approval.
     #[arg(short, long)]
     pub yes: bool,
 }
@@ -187,9 +424,47 @@ pub struct StatusArgs {
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Query live status from cloud provider
+    /// Query current cloud and portal status (unverified unless --verify is supplied)
     #[arg(long)]
     pub live: bool,
+
+    /// Verify portal attestation and the current session on every refresh.
+    #[arg(long, requires = "live")]
+    pub verify: bool,
+
+    /// Refresh until Ctrl+C. Each refresh replaces the previous check results.
+    #[arg(long, requires = "live")]
+    pub watch: bool,
+
+    /// Delay between completed refreshes.
+    #[arg(long, requires = "watch", default_value = "5", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: u64,
+
+    /// Maximum duration of each network or verification check.
+    #[arg(long, requires = "live", default_value = "60", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub check_timeout: u64,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+
+    /// Write JSON to stdout; --watch emits one JSON object per line.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cloud reboot`.
+#[derive(Args)]
+pub struct RebootArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 /// Arguments for `cloud list`.
@@ -198,6 +473,10 @@ pub struct ListArgs {
     /// Filter by target name
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Write structured JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cloud ssh`.
@@ -246,7 +525,7 @@ pub struct CloudImageUploadArgs {
 /// Arguments for `cloud image rm`.
 #[derive(Args)]
 pub struct CloudImageRmArgs {
-    /// Image reference to remove (e.g. dev-baseimage:v0.0.1-debug)
+    /// Image reference to remove (e.g. example-image:v0.0.1-debug)
     pub image: String,
 
     /// Provider to remove from
@@ -267,13 +546,31 @@ pub struct CloudImageGcArgs {
 }
 
 /// Arguments for `cloud init`.
-#[derive(Args)]
+#[derive(Args, serde::Serialize)]
 pub struct InitArgs {
+    #[command(flatten)]
+    pub runtime: RuntimeCpuArgs,
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create (rejects detected disk metadata; may erase raw data) or NAME=overwrite (erases detected formats too)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
     /// Instance name (or target/instance)
     pub instance: String,
 
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
+
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
 
     /// Target name (for disambiguation)
     #[arg(long)]
@@ -295,9 +592,14 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Agent wait timeout in seconds
-    #[arg(long, default_value = "300")]
-    pub timeout: u64,
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
+
+    /// Timeout in seconds for the ATAWL upload or portal download only.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub init_upload_timeout: u64,
 
     /// Skip confirmation prompt
     #[arg(short, long)]
@@ -307,16 +609,353 @@ pub struct InitArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Source directory for unmeasured data; uses <workload-dir>/unmeasured-data when present, otherwise prompts
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Continue without uploading unmeasured data (never prompt for a source)
+    #[arg(long, conflicts_with_all = ["unmeasured_data_root", "unmeasured_data_dir"])]
+    pub no_unmeasured_data: bool,
+
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
+
+    /// Optional expected base-image assertion for portal TLS attestation.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Explicit signed measurement pack for offline portal TLS verification.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
+
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for verifier-side Intel TDX DCAP collateral fetch.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for verifier-side Intel TDX DCAP lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for verifier-side Intel TDX DCAP collateral lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// Automata PCCS read strategy. Direct concurrent calls are the default.
+    #[arg(
+        long = "tdx-dcap-automata-read-strategy",
+        value_parser = ["direct-concurrent", "multicall3"],
+        default_value = "direct-concurrent"
+    )]
+    pub tdx_dcap_automata_read_strategy: String,
+
+    /// Multicall3 address override for Automata PCCS reads.
+    #[arg(long = "tdx-dcap-automata-multicall3-address", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_multicall3_address: Option<String>,
+
+    /// One-shot override: trust only this live TLS certificate SHA-256.
+    #[arg(long, value_name = "0xSHA256")]
+    pub trust_tls_cert_sha256: Option<String>,
+
+    /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
+    #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
+    pub unsafe_skip_tls_attestation: bool,
+}
+
+/// Arguments for `cloud verify-session`.
+#[derive(Args)]
+pub struct VerifySessionArgs {
+    /// Optional local deployment name (or target/instance) used only to fill
+    /// missing subject identity fields.
+    pub instance: Option<String>,
+
+    /// Target name for disambiguating a local deployment shortcut.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Portal host or IP supplied by the verifier.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// Portal HTTPS status port. Defaults to 2024 with --host.
+    #[arg(long, value_name = "PORT")]
+    pub status_port: Option<u16>,
+
+    /// Expected canonical workload reference.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub workload_ref: Option<String>,
+
+    /// Verification report output path.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Observe an existing request or submit a recorded, never-sent initialization.
+#[derive(Args)]
+pub struct ResumeArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Maximum time this command runs. Does not change any portal timer.
+    #[arg(long, default_value = "900", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub wait_timeout: u64,
+}
+
+#[derive(Args)]
+pub struct DiagnoseArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Maximum duration of each diagnostic check. Does not change portal timers.
+    #[arg(long, default_value = "60", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub check_timeout: u64,
+    /// Write a public JSON diagnostic report, including when checks fail.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
+    /// Include an already-collected local workload log in the separate log export.
+    #[arg(long, value_name = "PATH", requires = "log_report")]
+    pub workload_log: Vec<PathBuf>,
+    /// Write selected logs to a separate private JSON file. Logs are not redacted.
+    #[arg(long, value_name = "PATH", requires_all = ["workload_log", "report"])]
+    pub log_report: Option<PathBuf>,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Trust inputs shared by session verification and lifecycle commands.
+#[derive(Args, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SessionVerificationArgs {
+    /// Chain config used only for read-only trust, collateral, and session-state checks.
+    #[arg(long)]
+    pub chain: Option<String>,
+
+    /// Manually trusted SHA-256 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha384.
+    #[arg(
+        long,
+        value_name = "0xBYTES32",
+        requires = "trusted_workload_pcr23_sha384"
+    )]
+    pub trusted_workload_pcr23_sha256: Option<String>,
+
+    /// Manually trusted SHA-384 PCR23 value for the workload manifest.
+    /// This must be supplied with --trusted-workload-pcr23-sha256.
+    #[arg(
+        long,
+        value_name = "0xBYTES48",
+        requires = "trusted_workload_pcr23_sha256"
+    )]
+    pub trusted_workload_pcr23_sha384: Option<String>,
+
+    /// Expected base image for the signed measurement policy.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Signed measurement pack JSON file or directory.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
+
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted AMD SEV-SNP policy file. Selects explicit trust mode, which
+    /// cannot be combined with a configured chain.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// TDX DCAP collateral JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for GCP TDX collateral.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for read-only GCP TDX lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for read-only GCP TDX lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// Automata PCCS read strategy. Direct concurrent calls are the default.
+    #[arg(
+        long = "tdx-dcap-automata-read-strategy",
+        value_parser = ["direct-concurrent", "multicall3"],
+        default_value = "direct-concurrent"
+    )]
+    pub tdx_dcap_automata_read_strategy: String,
+
+    /// Multicall3 address override for Automata PCCS reads.
+    #[arg(long = "tdx-dcap-automata-multicall3-address", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_multicall3_address: Option<String>,
+}
+
+/// Common arguments for a session-changing operation.
+#[derive(Args, Clone)]
+pub struct SessionMutationArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Owner key name override (references [keys.<name>])
+    #[arg(long)]
+    pub owner_key: Option<String>,
+
+    /// Complete owner-authorization window in seconds.
+    /// Defaults to 900 seconds plus [owner_operations] op_expiry_seconds.
+    /// An explicit value replaces that calculated default.
+    #[arg(long, value_name = "SECONDS")]
+    pub op_expiry_seconds: Option<u64>,
+
+    /// Maximum time to wait for completion. Defaults to the complete owner-
+    /// authorization window plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
+}
+
+/// Arguments for `cloud session recover`.
+#[derive(Args, Clone)]
+pub struct SessionRecoverArgs {
+    #[command(flatten)]
+    pub mutation: SessionMutationArgs,
+
+    /// Older chain session to recover.
+    #[arg(long, value_name = "0xBYTES32")]
+    pub old_session_id: String,
+}
+
+/// Arguments for `cloud session status`.
+#[derive(Args, Clone)]
+pub struct SessionStatusArgs {
+    /// Instance name (or target/instance)
+    pub instance: String,
+
+    /// Target name (for disambiguation)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Exact lifecycle request hash. Omit to read `/session/status`.
+    #[arg(long, value_name = "0xBYTES32")]
+    pub request_hash: Option<String>,
+
+    /// Wait until the selected request completes or fails.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Maximum wait time in seconds.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub timeout: u64,
+
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
 }
 
 /// Arguments for `cloud serial`.
@@ -328,4 +967,747 @@ pub struct SerialArgs {
     /// Target name (for disambiguation)
     #[arg(long)]
     pub target: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn unmeasured_data_commands_use_a_folder_and_never_offer_remote_values() {
+        #[derive(Parser)]
+        struct DataCli {
+            #[command(subcommand)]
+            command: CloudCommand,
+        }
+        let parsed = DataCli::try_parse_from([
+            "atakit cloud",
+            "unmeasured-data",
+            "update",
+            "my-aws/tool-node",
+            "--check",
+        ])
+        .unwrap();
+        let CloudCommand::UnmeasuredData(UnmeasuredDataCommand::Update(args)) = parsed.command
+        else {
+            panic!("expected update");
+        };
+        assert!(args.check);
+        assert_eq!(
+            args.unmeasured_data_root,
+            PathBuf::from("./unmeasured-data")
+        );
+        for command in ["status", "discard"] {
+            assert!(DataCli::try_parse_from([
+                "atakit cloud",
+                "unmeasured-data",
+                command,
+                "tool-node",
+                "--target",
+                "my-aws",
+                "--json"
+            ])
+            .is_ok());
+        }
+        for forbidden in ["--show-values", "--delete", "--only"] {
+            assert!(DataCli::try_parse_from([
+                "atakit cloud",
+                "unmeasured-data",
+                "update",
+                "my-aws/tool-node",
+                forbidden
+            ])
+            .is_err());
+        }
+        for forbidden in ["show", "diff", "apply"] {
+            assert!(DataCli::try_parse_from([
+                "atakit cloud",
+                "unmeasured-data",
+                forbidden,
+                "my-aws/tool-node"
+            ])
+            .is_err());
+        }
+    }
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: CloudCommand,
+    }
+
+    #[test]
+    fn operator_cpu_cli_exposes_configuration_and_reset_conflicts() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "configure",
+            "my-vm",
+            "--runtime-config",
+            "runtime.toml",
+            "--cpu-idle-governor",
+            "teo",
+            "--cpu-idle-disabled-states",
+            "",
+            "--cpuset",
+            "0-3",
+            "--check",
+        ])
+        .unwrap();
+        let CloudCommand::Configure(args) = cli.command else {
+            panic!("expected configure");
+        };
+        assert!(args.check);
+        assert_eq!(args.runtime.cpu_idle_disabled_states.as_deref(), Some(""));
+        assert_eq!(args.runtime.cpuset.as_deref(), Some("0-3"));
+        assert!(TestCli::try_parse_from(["test", "configure", "my-vm", "--reset"]).is_ok());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "configure",
+            "my-vm",
+            "--reset",
+            "--cpuset",
+            "0"
+        ])
+        .is_err());
+        for argv in [
+            vec![
+                "test",
+                "deploy",
+                "app:v1",
+                "--target",
+                "c4",
+                "--runtime-config",
+                "runtime.toml",
+            ],
+            vec![
+                "test",
+                "init",
+                "my-vm",
+                "app:v1",
+                "--runtime-config",
+                "runtime.toml",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(argv).is_ok());
+        }
+    }
+
+    #[test]
+    fn resume_has_an_independent_positive_wait_timeout() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "resume",
+            "vm",
+            "--target",
+            "azure",
+            "--wait-timeout",
+            "45",
+        ])
+        .unwrap();
+        let CloudCommand::Resume(args) = cli.command else {
+            panic!("expected resume");
+        };
+        assert_eq!(args.instance, "vm");
+        assert_eq!(args.target.as_deref(), Some("azure"));
+        assert_eq!(args.wait_timeout, 45);
+        assert!(TestCli::try_parse_from(["test", "resume", "vm", "--wait-timeout", "0"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "resume", "vm", "--init-timeout", "60"]).is_err());
+    }
+
+    #[test]
+    fn status_verification_and_watch_require_live_and_positive_timers() {
+        for args in [
+            vec!["test", "status", "vm"],
+            vec!["test", "status", "vm", "--live"],
+            vec![
+                "test",
+                "status",
+                "vm",
+                "--live",
+                "--verify",
+                "--watch",
+                "--json",
+                "--interval",
+                "2",
+                "--check-timeout",
+                "3",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["test", "status", "vm", "--verify"],
+            vec!["test", "status", "vm", "--watch"],
+            vec!["test", "status", "vm", "--live", "--interval", "2"],
+            vec![
+                "test",
+                "status",
+                "vm",
+                "--live",
+                "--watch",
+                "--interval",
+                "0",
+            ],
+            vec!["test", "status", "vm", "--live", "--check-timeout", "0"],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnose_report_and_optional_local_logs_require_separate_explicit_outputs() {
+        for args in [
+            vec!["test", "diagnose", "vm"],
+            vec!["test", "diagnose", "vm", "--report", "report.json"],
+            vec![
+                "test",
+                "diagnose",
+                "vm",
+                "--report",
+                "report.json",
+                "--workload-log",
+                "web.log",
+                "--workload-log",
+                "worker.log",
+                "--log-report",
+                "logs.json",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["test", "diagnose", "vm", "--workload-log", "web.log"],
+            vec!["test", "diagnose", "vm", "--log-report", "logs.json"],
+            vec![
+                "test",
+                "diagnose",
+                "vm",
+                "--workload-log",
+                "web.log",
+                "--log-report",
+                "logs.json",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn reboot_accepts_exact_instance_target_and_confirmation_arguments() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "reboot",
+            "aws-vm",
+            "--target",
+            "aws-m6a-large",
+            "--yes",
+        ])
+        .expect("reboot arguments");
+
+        let CloudCommand::Reboot(args) = cli.command else {
+            panic!("expected reboot command");
+        };
+        assert_eq!(args.instance, "aws-vm");
+        assert_eq!(args.target.as_deref(), Some("aws-m6a-large"));
+        assert!(args.yes);
+    }
+
+    #[test]
+    fn cloud_init_accepts_complete_aws_explicit_trust_inputs() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-nitro-root-cert",
+            "root.pem",
+            "--aws-document-maximum-age-seconds",
+            "300",
+            "--aws-document-allowed-future-clock-difference-seconds",
+            "60",
+        ])
+        .expect("AWS explicit trust arguments");
+
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected cloud init command");
+        };
+        assert_eq!(args.aws_nitro_root_cert, [PathBuf::from("root.pem")]);
+        assert_eq!(args.aws_document_maximum_age_seconds, Some(300));
+        assert_eq!(
+            args.aws_document_allowed_future_clock_difference_seconds,
+            Some(60)
+        );
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "aws-vm",
+            "--aws-document-maximum-age-seconds",
+            "300",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn verify_session_accepts_repeatable_manual_azure_maa_keys() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "azure-vm",
+            "--azure-maa-cert",
+            "aa",
+            "--azure-maa-cert",
+            "bb",
+        ])
+        .expect("verify-session arguments");
+
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(
+            args.verification.azure_maa_cert,
+            [PathBuf::from("aa"), PathBuf::from("bb")]
+        );
+    }
+
+    #[test]
+    fn verify_session_accepts_explicit_remote_subject() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "--host",
+            "203.0.113.10",
+            "--status-port",
+            "2024",
+            "--base-image",
+            "automata-linux:v1",
+            "--workload-ref",
+            "example:v1",
+            "--chain",
+            "hoodi",
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(args.instance, None);
+        assert_eq!(args.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(args.status_port, Some(2024));
+        assert_eq!(args.workload_ref.as_deref(), Some("example:v1"));
+        assert_eq!(
+            args.verification.base_image.as_deref(),
+            Some("automata-linux:v1")
+        );
+        assert_eq!(args.verification.chain.as_deref(), Some("hoodi"));
+    }
+
+    #[test]
+    fn verify_session_accepts_automata_multicall3_options() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "gcp-vm",
+            "--tdx-dcap-automata-read-strategy",
+            "multicall3",
+            "--tdx-dcap-automata-multicall3-address",
+            "0x1111111111111111111111111111111111111111",
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(
+            args.verification.tdx_dcap_automata_read_strategy,
+            "multicall3"
+        );
+        assert_eq!(
+            args.verification
+                .tdx_dcap_automata_multicall3_address
+                .as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn trusted_workload_pcr23_banks_are_shared_by_verification_and_lifecycle_commands() {
+        let sha256 = format!("0x{}", "55".repeat(32));
+        let sha384 = format!("0x{}", "66".repeat(48));
+        let cli = TestCli::try_parse_from([
+            "test",
+            "verify-session",
+            "gcp-vm",
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
+        ])
+        .expect("verify-session arguments");
+        let CloudCommand::VerifySession(args) = cli.command else {
+            panic!("expected verify-session command");
+        };
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
+        );
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "renew",
+            "gcp-vm",
+            "--trusted-workload-pcr23-sha256",
+            &sha256,
+            "--trusted-workload-pcr23-sha384",
+            &sha384,
+        ])
+        .expect("session renew arguments");
+        let CloudCommand::Session(SessionCommand::Renew(args)) = cli.command else {
+            panic!("expected session renew command");
+        };
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            args.verification.trusted_workload_pcr23_sha384.as_deref(),
+            Some(sha384.as_str())
+        );
+
+        let help = TestCli::try_parse_from(["test", "verify-session", "--help"])
+            .err()
+            .expect("verify-session help response")
+            .to_string();
+        assert!(help.contains("--trusted-workload-pcr23-sha256 <0xBYTES32>"));
+        assert!(help.contains("--trusted-workload-pcr23-sha384 <0xBYTES48>"));
+    }
+
+    #[test]
+    fn session_lifecycle_commands_parse_exact_arguments() {
+        let cli =
+            TestCli::try_parse_from(["test", "session", "new", "gcp-vm"]).expect("new arguments");
+        assert!(matches!(
+            cli.command,
+            CloudCommand::Session(SessionCommand::New(_))
+        ));
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "rotate-key",
+            "gcp-vm",
+            "--owner-key",
+            "owner",
+            "--chain",
+            "test-chain",
+        ])
+        .expect("rotate-key arguments");
+        let CloudCommand::Session(SessionCommand::RotateKey(args)) = cli.command else {
+            panic!("expected session rotate-key command");
+        };
+        assert_eq!(args.instance, "gcp-vm");
+        assert_eq!(args.owner_key.as_deref(), Some("owner"));
+        assert_eq!(args.verification.chain.as_deref(), Some("test-chain"));
+
+        let cli = TestCli::try_parse_from(["test", "session", "renew", "gcp-vm"])
+            .expect("renew arguments");
+        assert!(matches!(
+            cli.command,
+            CloudCommand::Session(SessionCommand::Renew(_))
+        ));
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "recover",
+            "gcp-vm",
+            "--old-session-id",
+            "0x11",
+        ])
+        .expect("recover arguments");
+        let CloudCommand::Session(SessionCommand::Recover(args)) = cli.command else {
+            panic!("expected session recover command");
+        };
+        assert_eq!(args.old_session_id, "0x11");
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "session",
+            "status",
+            "gcp-vm",
+            "--request-hash",
+            "0x22",
+            "--wait",
+        ])
+        .expect("status arguments");
+        let CloudCommand::Session(SessionCommand::Status(args)) = cli.command else {
+            panic!("expected session status command");
+        };
+        assert!(args.wait);
+        assert_eq!(args.request_hash.as_deref(), Some("0x22"));
+    }
+
+    #[test]
+    fn lifecycle_help_explains_proof_aware_deadline_and_wait() {
+        let help = TestCli::try_parse_from(["test", "session", "new", "--help"])
+            .err()
+            .expect("session new help response")
+            .to_string();
+        assert!(help.contains("--op-expiry-seconds <SECONDS>"));
+        assert!(help.contains("900 seconds plus [owner_operations] op_expiry_seconds"));
+        assert!(help.contains("explicit value replaces that calculated default"));
+        assert!(help.contains("authorization window plus 60 seconds"));
+    }
+
+    #[test]
+    fn session_relay_commands_are_not_available() {
+        assert!(TestCli::try_parse_from(["test", "relay-session", "example-vm"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "register", "example-vm"]).is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "session",
+            "new",
+            "example-vm",
+            "--gas-wallet",
+            "gas"
+        ])
+        .is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "session",
+            "new",
+            "example-vm",
+            "--unsafe-skip-tls-attestation"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn deploy_initialization_timeout_is_separate_and_reaches_every_target() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx,azure-sev-snp",
+            "--init-timeout",
+            "1500",
+        ])
+        .expect("deploy arguments");
+        let CloudCommand::Deploy(args) = cli.command else {
+            panic!("expected deploy command");
+        };
+
+        assert_eq!(args.init_timeout, Some(1500));
+        assert_eq!(args.target, ["gcp-tdx", "azure-sev-snp"]);
+        for target in args.target.iter().cloned() {
+            let mut single_target_args = args.clone();
+            single_target_args.target = vec![target];
+            assert_eq!(single_target_args.init_timeout, Some(1500));
+        }
+    }
+
+    #[test]
+    fn overwrite_all_disks_is_explicit_and_conflicts_with_per_disk_setup() {
+        for argv in [
+            vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"],
+            vec!["test", "init", "gcp-vm", "workload:v1"],
+        ] {
+            let cli = TestCli::try_parse_from(argv.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(!args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(!args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            let mut all = argv;
+            all.push("--overwrite-all-disks");
+            let cli = TestCli::try_parse_from(all.clone()).unwrap();
+            match cli.command {
+                CloudCommand::Deploy(args) => assert!(args.overwrite_all_disks),
+                CloudCommand::Init(args) => assert!(args.overwrite_all_disks),
+                _ => panic!(),
+            }
+            all.extend(["--disk-setup", "data=create"]);
+            assert!(TestCli::try_parse_from(all).is_err());
+        }
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "--target",
+            "gcp-tdx",
+            "--image-only",
+            "--overwrite-all-disks"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn unauthenticated_init_is_an_explicit_deploy_choice() {
+        for (extra, expected) in [
+            (vec![], false),
+            (vec!["--unauthenticated-init"], true),
+            (vec!["--unauthenticated-init", "--skip-init"], true),
+        ] {
+            let mut argv = vec!["test", "deploy", "workload:v1", "--target", "gcp-tdx"];
+            argv.extend(extra);
+            let cli = TestCli::try_parse_from(argv).unwrap();
+            let CloudCommand::Deploy(args) = cli.command else {
+                panic!("expected deploy")
+            };
+            assert_eq!(args.unauthenticated_init, expected);
+        }
+    }
+
+    #[test]
+    fn initialization_timeouts_use_calculated_defaults_until_overridden() {
+        let cli = TestCli::try_parse_from(["test", "deploy", "workload:v1", "--target", "gcp-tdx"])
+            .expect("deploy arguments");
+        let CloudCommand::Deploy(args) = cli.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from(["test", "init", "gcp-vm", "workload:v1"])
+            .expect("init arguments");
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--init-timeout",
+            "1400",
+        ])
+        .expect("init arguments");
+        let CloudCommand::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--timeout",
+            "1400",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn portal_readiness_timeout_remains_300_seconds() {
+        assert_eq!(crate::init::PORTAL_READINESS_TIMEOUT_SECONDS, 300);
+    }
+
+    #[test]
+    fn command_help_distinguishes_initialization_and_upload_timeouts() {
+        let deploy_help = TestCli::try_parse_from(["test", "deploy", "--help"])
+            .err()
+            .expect("deploy help response")
+            .to_string();
+        assert!(deploy_help.contains("--init-timeout <SECONDS>"));
+        assert!(deploy_help.contains("non-transfer /init work and waiting for portal Running"));
+        assert!(deploy_help.contains("--init-upload-timeout <SECONDS>"));
+
+        let init_help = TestCli::try_parse_from(["test", "init", "--help"])
+            .err()
+            .expect("init help response")
+            .to_string();
+        assert!(init_help.contains("--init-timeout <SECONDS>"));
+        assert!(init_help.contains("non-transfer /init work and waiting for portal Running"));
+        assert!(init_help.contains("--init-upload-timeout <SECONDS>"));
+    }
+
+    #[test]
+    fn remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let deploy = TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL deploy arguments");
+        let CloudCommand::Deploy(args) = deploy.command else {
+            panic!("expected deploy command");
+        };
+        assert!(args.atawl_uri.is_some());
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "gcp-vm",
+            "workload:v1",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+        ])
+        .is_err());
+        assert!(TestCli::try_parse_from([
+            "test",
+            "deploy",
+            "workload:v1",
+            "--target",
+            "gcp-tdx",
+            "--atawl-uri",
+            "https://repo.example/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+            "--skip-init",
+        ])
+        .is_err());
+    }
+}
+
+#[derive(Args, Clone, Default, serde::Serialize)]
+pub struct RuntimeCpuArgs {
+    /// CPU and THP choices in TOML; overrides target and shared configuration
+    #[arg(long)]
+    pub runtime_config: Option<PathBuf>,
+    #[arg(long)]
+    pub cpu_idle_governor: Option<String>,
+    /// Comma-separated state names; an empty string clears the lower-priority list
+    #[arg(long)]
+    pub cpu_idle_disabled_states: Option<String>,
+    #[arg(long)]
+    pub cpu_frequency_governor: Option<String>,
+    /// Guest CPUs for the main workload, for example 0-3
+    #[arg(long)]
+    pub cpuset: Option<String>,
+    #[arg(long, value_name = "NAME=CPUS")]
+    pub dependency_cpuset: Vec<String>,
+    #[arg(long, value_name = "SLOT=CPUS")]
+    pub baby_cpuset: Vec<String>,
+}
+#[derive(Args)]
+pub struct ConfigureArgs {
+    pub instance: String,
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub owner_key: Option<String>,
+    /// Check CPU permissions, disk queues and THP support without saving or applying
+    #[arg(long)]
+    pub check: bool,
+    /// Reset CPU choices, disk queues and THP; publisher-fixed CPU settings still apply
+    #[arg(long, conflicts_with_all = ["runtime_config", "cpu_idle_governor", "cpu_idle_disabled_states", "cpu_frequency_governor", "cpuset", "dependency_cpuset", "baby_cpuset"])]
+    pub reset: bool,
+    #[command(flatten)]
+    pub runtime: RuntimeCpuArgs,
+    #[command(flatten)]
+    pub verification: SessionVerificationArgs,
 }

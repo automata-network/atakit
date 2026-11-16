@@ -2,68 +2,93 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use atakit_cloud::cli::InitArgs;
-use atakit_cloud::init::{self, InitConfig};
+use atakit_cloud::init::{self, InitConfig, PortalTerminalState};
 use atakit_cloud::state::{DeployState, DeployStatus};
+use atakit_cloud::{PlatformKind, ProcessRunner};
 use atakit_core::Env;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
 
 use super::{
-    init_chain_from_config, init_key_from_config, portal_endpoints, registration_is_off,
-    resolve_instance, resolve_unmeasured_tar, resolve_workload, synthesize_off_init_chain,
-    synthesize_self_generated_key, InitEnvResolver,
+    effective_prover_credential, init_chain_from_config, init_key_from_config, portal_endpoints,
+    registration_is_off, resolve_explicit_tls_measurement_policy, resolve_instance,
+    resolve_remote_atawl_source, resolve_unmeasured_tar, resolve_workload,
+    synthesize_off_init_chain, synthesize_self_generated_key, InitEnvResolver,
 };
 use crate::config::Config;
+use crate::progress::IndicatifReporter;
 
 pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
+    if args.unsafe_skip_tls_attestation {
+        bail!("initialization requires verified portal TLS; remove --unsafe-skip-tls-attestation");
+    }
     // 1. Resolve instance.
     let (target_name, instance_name) =
         resolve_instance(&env.data_dir, &args.instance, args.target.as_deref())?;
+    let _deployment_lock =
+        atakit_cloud::resume::DeploymentLock::acquire(&env.data_dir, &target_name, &instance_name)?;
 
     // 2. Load state and verify status.
     let mut state = DeployState::load(&env.data_dir, &target_name, &instance_name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    match &state.status {
-        DeployStatus::Deployed { ip } => {
-            if ip.is_empty() {
-                bail!("deployment {target_name}/{instance_name} has no external IP");
-            }
-        }
-        other => {
-            let status_desc = match other {
-                DeployStatus::Deploying { .. } => "still deploying",
-                DeployStatus::Failed { .. } => "in failed state",
-                DeployStatus::Destroying => "being destroyed",
-                DeployStatus::Destroyed => "already destroyed",
-                DeployStatus::Deployed { .. } => unreachable!(),
-            };
-            bail!(
-                "cannot init {target_name}/{instance_name}: instance is {status_desc}. \
-				 Only deployed instances can be initialized."
-            );
-        }
+    require_deployed_for_init(&state, &target_name, &instance_name)?;
+    if state.initialization.is_some() {
+        bail!("initialization is already recorded; use atakit cloud resume");
+    }
+    if let Some(credential) = &state.init_auth_key_file {
+        atakit_cloud::init_auth::load(std::path::Path::new(credential))
+            .map_err(anyhow::Error::msg)?;
     }
     let (portal_host, status_port, init_port) = portal_endpoints(&state)?;
 
     // 3. Resolve workload.
-    let resolved = resolve_workload(&args.source, &args.dir, env, args.skip_freshness_check)?;
+    let resolved = resolve_workload(
+        &args.source,
+        &args.dir,
+        env,
+        config,
+        args.skip_freshness_check,
+        args.unmeasured_data_root
+            .as_deref()
+            .or(args.unmeasured_data_dir.as_deref()),
+    )?;
     let archive_path = resolved.archive_path;
+    let archive_sha256 = resolved.archive_sha256;
+    let archive_size_bytes = resolved.archive_size_bytes;
+    let workload_publisher = format!("{:#x}", resolved.publisher);
     let workload_name = resolved.name;
     let workload_version = resolved.version;
-
-    // Collect unmeasured-data files: --unmeasured-data-dir takes precedence over
-    // workload dir. Errors if the manifest declares paths but none are available.
-    let unmeasured_tar = resolve_unmeasured_tar(
-        &resolved.unmeasured_data_paths,
-        args.unmeasured_data_dir.as_ref(),
-        resolved.workload_dir.as_ref(),
+    let workload_ports = resolved.ports;
+    let workload_attributes = resolved.attributes;
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid workload publisher: {error}"))?,
+        workload_name.clone(),
+        workload_version.clone(),
+    );
+    let remote_atawl_source = resolve_remote_atawl_source(
+        args.atawl_uri.as_deref(),
+        args.atawl_sha256.as_deref(),
+        archive_size_bytes,
+        &archive_sha256,
+        &workload_app_ref,
     )?;
 
-    // 4. Compute archive hash.
-    let bytes = std::fs::read(&archive_path)
-        .map_err(|e| anyhow::anyhow!("failed to read archive {}: {e}", archive_path.display()))?;
-    let archive_hash = format!("{:x}", Sha256::digest(&bytes));
+    // Collect unmeasured-data files. Explicit root flags take precedence over
+    // the default <workload-dir>/unmeasured-data root.
+    let unmeasured_tar = resolve_unmeasured_tar(
+        &env.cache_dir,
+        &resolved.unmeasured_data_paths,
+        &resolved.manifest.unmeasured_env_files,
+        args.unmeasured_data_root.as_ref(),
+        args.unmeasured_data_dir.as_ref(),
+        resolved.workload_dir.as_ref(),
+        args.no_unmeasured_data,
+    )?;
+
+    // 4. Display and persist the hash of the exact archive snapshot inspected above.
+    let archive_hash = hex::encode(archive_sha256);
 
     // 5. Resolve init env: CLI > persisted state > target config.
     // Look up the target to use its defaults for missing CLI args.
@@ -134,9 +159,21 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     // Resolve chain config. Registration is target-owned. When it is off,
     // /init has no chain interaction and can omit chain entirely.
     let registration = target.registration.as_deref();
+    super::validate_init_prover(
+        config,
+        chain_name.as_deref().unwrap_or_default(),
+        target.resolved_cc_type(state.platform)?,
+        registration_is_off(registration),
+    )?;
     let init_chain = match chain_name.as_deref() {
         Some(name) => match config.chains.get(name) {
-            Some(chain) => init_chain_from_config(name, chain, registration).await?,
+            Some(chain) => {
+                let prover = chain
+                    .prover
+                    .as_ref()
+                    .and_then(|name| config.provers.get(name));
+                init_chain_from_config(name, chain, registration, prover).await?
+            }
             None if registration_is_off(registration) => synthesize_off_init_chain(),
             None => bail!("chain '{name}' not found in [chains]"),
         },
@@ -150,8 +187,7 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     };
 
     // Resolve init keys. Active registration requires an owner-key reference.
-    // Owner/gas/sp1 can be provisioned keys supplied by a relay/prover
-    // operator or self-generated ephemeral keys.
+    // Owner, gas-wallet, and prover keys can be provisioned or self-generated.
     let registration_off = registration_is_off(registration);
     let owner_init = match owner_key_name.as_deref() {
         Some(name) if config.keys.contains_key(name) => {
@@ -170,25 +206,30 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         },
         None => synthesize_self_generated_key(),
     };
-    let gas_wallet_name_ref = gas_wallet_name.as_deref().unwrap_or_default();
-    // SP1 prover-network key: state override > target config > default to the
-    // gas-wallet key. Missing gas/sp1 synthesizes an ephemeral self-generated
-    // key; configured provisioned keys are also valid.
-    let sp1_payer_name = state
+    // Resolve with the same precedence as deploy. A selected chain profile
+    // wins over persisted/target fallback, including under --chain recovery.
+    let fallback_credential = state
         .init_env
-        .sp1_payer
+        .prover_credential
         .clone()
         .filter(|s| !s.is_empty())
-        .or_else(|| resolver.sp1_payer())
-        .or_else(|| gas_wallet_name.clone());
-    let sp1_payer_name_ref = sp1_payer_name.as_deref().unwrap_or(gas_wallet_name_ref);
-    let sp1_init = match sp1_payer_name.as_deref() {
-        Some(name) => match config.keys.get(name) {
-            Some(spec) => init_key_from_config(name, spec, false)?,
-            None if registration_off => synthesize_self_generated_key(),
-            None => bail!("key '{sp1_payer_name_ref}' not found in [keys]"),
-        },
-        None => synthesize_self_generated_key(),
+        .or_else(|| resolver.prover_credential());
+    let prover_credential_name = effective_prover_credential(
+        config,
+        chain_name.as_deref(),
+        fallback_credential,
+        registration_off,
+    )?;
+    let prover_init = if registration_off {
+        None
+    } else {
+        match prover_credential_name.as_deref() {
+            Some(name) => match config.keys.get(name) {
+                Some(spec) => Some(init_key_from_config(name, spec, false)?),
+                None => bail!("key '{name}' not found in [keys]"),
+            },
+            None => None,
+        }
     };
 
     // Resolve provider platform for the InitConfig.
@@ -202,6 +243,21 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
                 target.provider
             )
         })?;
+    if provider_config.platform != state.platform {
+        bail!("configured provider platform differs from the saved deployment platform");
+    }
+    let reconcile_firewall = matches!(
+        state.platform,
+        PlatformKind::Gcp | PlatformKind::Aws | PlatformKind::Azure
+    );
+    if registration_off
+        && args.unsafe_skip_tls_attestation
+        && !matches!(provider_config.platform, atakit_cloud::PlatformKind::Qemu)
+    {
+        bail!(
+            "registration-off initialization requires full TLS attestation; remove --unsafe-skip-tls-attestation"
+        );
+    }
 
     // Validate operator-supplied disk passphrases against what the workload
     // manifest declares (unknown / orphan / missing disks) before touching
@@ -211,21 +267,80 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         .iter()
         .map(|(name, (_, _, methods))| (name.clone(), methods.clone()))
         .collect();
-    let disk_passphrases = init::parse_disk_passphrases(&args.disk_passphrase, &declared)?;
+    init::disk_init_without_passphrases(&args.disk_passphrase)?;
 
-    let init_config = InitConfig {
+    let runtime_file = super::configure::RuntimeFile::read(&args.runtime)?;
+    let mut init_config = InitConfig {
+        thp: runtime_file.thp(&config.cloud.defaults.runtime, &target.runtime),
+        runtime_disks: super::configure::resolve_disks(target, &resolved.manifest)?,
+        runtime_cpu: super::configure::resolve_for_manifest(
+            &args.runtime,
+            &config.cloud.defaults.runtime,
+            &target.runtime,
+            &resolved.manifest,
+            &runtime_file,
+        )?,
+        local_ssd: state.disk_configuration.local_ssd()?,
+        disk_setup: init::resolve_disk_setup(
+            &args.disk_setup,
+            &declared,
+            args.overwrite_all_disks,
+        )?,
+        init_auth: None,
+        submission: None,
         platform: provider_config.platform.to_string(),
         chain: init_chain,
+        owner_operations: config.owner_operations.clone(),
         owner_key: owner_init,
         gas_wallet: gas_init,
-        sp1_payer: sp1_init,
-        disks: disk_passphrases,
+        prover_credential: prover_init,
+        pcr_policy: None,
     };
+    // A delayed /init may use the fresh-disk records only for the exact workload
+    // whose data disks this deploy created. Explicit setup choices remain explicit.
+    if state.archive_hash == archive_hash {
+        state
+            .automatic_disk_setup
+            .retain(|name| !init_config.disk_setup.contains_key(name));
+        for name in &state.automatic_disk_setup {
+            anyhow::ensure!(
+                declared.contains_key(name),
+                "saved fresh disk is not declared by this workload"
+            );
+            init_config.disk_setup.insert(name.clone(), "create".into());
+        }
+    } else {
+        state.automatic_disk_setup.clear();
+    }
+    if !registration_off && args.pcr_policy.is_some() {
+        bail!("--pcr-policy requires effective chain registration = \"off\"");
+    }
+    let initialization_timeout_secs = init::initialization_timeout_seconds(
+        args.init_timeout,
+        init_config.owner_operations.op_expiry_seconds,
+    );
 
     // 6. Show plan and confirm.
     eprintln!("{}", "Plan:".dimmed());
-    eprintln!("  1. Wait for CVM portal");
-    eprintln!("  2. Initialize workload");
+    if reconcile_firewall {
+        eprintln!("  1. Open the workload ports on the existing firewall");
+        eprintln!("  2. Wait for CVM portal");
+        eprintln!("  3. Initialize workload");
+    } else {
+        eprintln!("  1. Wait for CVM portal");
+        eprintln!("  2. Initialize workload");
+    }
+    if !registration_off {
+        eprintln!(
+            "  {}. Wait for session registration by atakit-portal",
+            if reconcile_firewall { 4 } else { 3 }
+        );
+    } else {
+        eprintln!(
+            "  {}. Wait for the local-bound session and workload",
+            if reconcile_firewall { 4 } else { 3 }
+        );
+    }
     eprintln!();
     eprintln!("{}", "Configuration:".dimmed());
     eprintln!(
@@ -242,7 +357,20 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     );
     eprintln!("  {:<18}{}", "Archive:".dimmed(), archive_path.display());
     eprintln!("  {:<18}{}", "SHA-256:".dimmed(), &archive_hash[..16]);
-    eprintln!("  {:<18}{}s", "Timeout:".dimmed(), args.timeout);
+    eprintln!(
+        "  {:<18}{}",
+        "ATAWL transfer:".dimmed(),
+        if remote_atawl_source.is_some() {
+            "portal download"
+        } else {
+            "client upload"
+        }
+    );
+    eprintln!(
+        "  {:<18}{}s",
+        "Initialization timeout:".dimmed(),
+        initialization_timeout_secs
+    );
     eprintln!();
 
     if !args.yes {
@@ -255,42 +383,280 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
         }
     }
 
-    // 7. Wait for portal.
-    eprint!("  [1/2] Wait for CVM portal... ");
-    init::wait_for_portal(&portal_host, status_port, args.timeout)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    eprintln!("{}", "done".green());
+    // Save the workload identity and configuration references before the
+    // one-shot POST /init. A process exit after the portal accepts /init must
+    // not leave the deployment record describing the previous workload.
+    replace_workload_identity(
+        &mut state,
+        &workload_publisher,
+        &workload_name,
+        &workload_version,
+    );
+    state.archive_path = archive_path.display().to_string();
+    state.archive_hash = archive_hash.clone();
+    if let Some(base_image_ref) = &args.base_image {
+        state.base_image_ref = Some(base_image_ref.clone());
+    }
+    state.init_env = atakit_cloud::PersistedInitEnv {
+        chain: chain_name.clone().unwrap_or_default(),
+        owner_key: owner_key_name.unwrap_or_default(),
+        gas_wallet: gas_wallet_name.unwrap_or_default(),
+        prover_credential: prover_credential_name,
+    };
+    state
+        .save(&env.data_dir)
+        .map_err(|e| anyhow::anyhow!("save deployment state before POST /init: {e}"))?;
 
-    // 8. Initialize workload.
-    eprint!("  [2/2] Initialize workload... ");
-    init::post_portal_init(
-        &portal_host,
-        init_port,
-        &archive_path.display().to_string(),
-        unmeasured_tar.as_deref(),
+    // 7. Wait for portal.
+    let mut step_count = 4;
+    if reconcile_firewall {
+        step_count += 1;
+    }
+    let mut step = 1;
+    if reconcile_firewall {
+        eprint!("  [{step}/{step_count}] Update firewall... ");
+        atakit_cloud::firewall::update_for_init(&state, &workload_ports, &ProcessRunner::default())
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        eprintln!("{}", "done".green());
+        step += 1;
+    }
+    let verification = super::resume::saved_verification(&args, &state)?;
+    super::resume::prepare_inputs(
+        &mut state,
+        env,
         &init_config,
+        remote_atawl_source.as_ref(),
+        unmeasured_tar.as_ref(),
+        args.init_upload_timeout,
+        initialization_timeout_secs,
+        args.pcr_policy.as_deref(),
+        verification,
+    )?;
+
+    eprint!("  [{step}/{step_count}] Wait for CVM portal... ");
+    init::wait_for_portal(
+        &portal_host,
+        status_port,
+        init::PORTAL_READINESS_TIMEOUT_SECONDS,
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("{}", "done".green());
+    step += 1;
 
-    // 9. Update state.
-    state.workload_name = workload_name.clone();
-    state.workload_version = workload_version.clone();
-    state.archive_path = archive_path.display().to_string();
-    state.archive_hash = archive_hash;
-    state.init_env = atakit_cloud::PersistedInitEnv {
-        chain: chain_name.unwrap_or_default(),
-        owner_key: owner_key_name.unwrap_or_default(),
-        gas_wallet: gas_wallet_name.unwrap_or_default(),
-        sp1_payer: sp1_payer_name,
-    };
-    state
-        .save(&env.data_dir)
+    eprint!("  [{step}/{step_count}] Verify portal TLS... ");
+    let verified_tls = if args.unsafe_skip_tls_attestation {
+        eprintln!("{}", "unsafe bypass".yellow());
+        super::warn_unsafe_skip_tls_attestation();
+        None
+    } else {
+        let untrusted_portal_base_image_id = if args.measurements.is_none() {
+            Some(
+                init::read_untrusted_portal_base_image_id(&portal_host, status_port)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+            )
+        } else {
+            None
+        };
+        let measurement_policy = resolve_explicit_tls_measurement_policy(
+            args.measurements.as_deref(),
+            args.base_image.as_deref(),
+            untrusted_portal_base_image_id,
+            &args.measurement_publisher_key,
+            &env.data_dir,
+            &init_config.chain,
+        )
+        .await?;
+        let tls_verification_trust =
+            init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+                gcp_ak_root_certs: &args.gcp_ak_root_cert,
+                azure_maa_certs: &args.azure_maa_cert,
+                aws_nitro_root_certs: &args.aws_nitro_root_cert,
+                amd_ark_root_certs: &args.amd_ark_root_cert,
+                amd_snp_crls: &args.amd_snp_crl,
+                amd_snp_security_policy: args.amd_snp_security_policy.as_deref(),
+                aws_document_maximum_age_seconds: args.aws_document_maximum_age_seconds,
+                aws_document_allowed_future_clock_difference_seconds: args
+                    .aws_document_allowed_future_clock_difference_seconds,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+            &args.tdx_dcap_automata_read_strategy,
+            args.tdx_dcap_automata_multicall3_address.clone(),
+        )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tdx_dcap_collateral = init::tdx_dcap_collateral_config_with_read_strategy(
+            args.tdx_dcap_collateral.clone(),
+            args.tdx_dcap_pccs_url.clone(),
+            args.tdx_dcap_automata_collateral_rpc_url.clone(),
+            args.tdx_dcap_automata_pcs_dao.clone(),
+            automata_read_strategy,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tls_mode = init::portal_tls_mode_for_init_chain(
+            &init_config.chain,
+            tls_verification_trust,
+            tdx_dcap_collateral,
+            measurement_policy,
+            untrusted_portal_base_image_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let verified_tls = init::bootstrap_portal_tls(
+            &portal_host,
+            status_port,
+            &tls_mode,
+            Some(workload_attributes),
+            args.trust_tls_cert_sha256.as_deref(),
+            Some(&init::cloud_tls_attestation_report_path(
+                &env.data_dir,
+                &target_name,
+                &instance_name,
+            )),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(message) = init::tls_manual_override_message(&verified_tls) {
+            eprintln!("{}", "overridden".yellow());
+            eprintln!("{message}");
+        } else {
+            eprintln!("{}", "done".green());
+        }
+        Some(verified_tls)
+    };
+    step += 1;
+    let portal_client = match &verified_tls {
+        Some(verified) => verified.client().clone(),
+        None => init::unsafe_portal_client(std::time::Duration::from_secs(
+            init::PORTAL_READINESS_TIMEOUT_SECONDS,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+    init_config.pcr_policy = super::resolve_init_pcr_policy(
+        args.pcr_policy.as_deref(),
+        &init_config,
+        registration_off,
+        verified_tls.as_ref(),
+        &workload_app_ref,
+    )
+    .await?;
 
-    // 10. Summary.
+    if let Some(key_file) = &state.init_auth_key_file {
+        let verified = verified_tls.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("authenticated init requires verified or explicitly pinned portal TLS")
+        })?;
+        init_config.init_auth = Some(atakit_cloud::init_auth::ClientAuth {
+            key_file: key_file.into(),
+            workload_id: format!(
+                "{:#x}",
+                crate::commands::workload::compute_workload_id(&workload_app_ref)
+            ),
+            tls_fingerprint: hex::encode(verified.identity().cert_sha256),
+        });
+    }
+
+    init_config.submission = Some(atakit_cloud::resume::Submission::for_state(
+        &state,
+        &env.data_dir,
+    )?);
+
+    // 8. Initialize workload.
+    eprintln!("  [{step}/{step_count}] Initialize workload...");
+    let _disk_progress = super::disk_progress::start(&portal_client, &portal_host, status_port);
+    let init_result = if let Some(source) = &remote_atawl_source {
+        init::post_portal_init_remote_with_client(
+            &portal_client,
+            &portal_host,
+            status_port,
+            init_port,
+            source,
+            unmeasured_tar.as_ref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    } else {
+        init::post_portal_init_with_client(
+            &portal_client,
+            &portal_host,
+            status_port,
+            init_port,
+            &archive_path.display().to_string(),
+            &archive_sha256,
+            unmeasured_tar.as_ref(),
+            &init_config,
+            std::time::Duration::from_secs(args.init_upload_timeout),
+            std::time::Duration::from_secs(initialization_timeout_secs),
+            &IndicatifReporter,
+        )
+        .await
+    };
+    state = DeployState::load(&env.data_dir, &target_name, &instance_name)?;
+    let init_deadline = init_result.map_err(|e| anyhow::anyhow!("{e}; initialization record retained. Run `atakit cloud resume {instance_name} --target {target_name}`"))?;
+    eprintln!("  {}", "done".green());
+    step += 1;
+
+    eprint!("  [{step}/{step_count}] Wait for portal Running... ");
+    match super::disk::wait_for_running(
+        &portal_client,
+        &portal_host,
+        status_port,
+        init_deadline,
+        verified_tls.as_ref(),
+        &init_config,
+        &archive_path,
+        |state| eprintln!("      state: {state}"),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?
+    {
+        PortalTerminalState::Running => {
+            if let Some(verified) = verified_tls {
+                if state
+                    .initialization
+                    .as_ref()
+                    .is_some_and(|r| r.bootstrap.is_some())
+                    && verified.manual_override().is_none()
+                {
+                    let inputs = atakit_cloud::resume::load_inputs(
+                        &env.data_dir,
+                        state.initialization.as_ref().unwrap(),
+                    )?;
+                    let verification = serde_json::from_value(inputs.verification.clone())?;
+                    super::resume::complete(
+                        &mut state,
+                        env,
+                        config,
+                        verified,
+                        &portal_host,
+                        status_port,
+                        &inputs,
+                        &verification,
+                    )
+                    .await?;
+                }
+            }
+            eprintln!("{}", "done".green());
+        }
+        terminal @ PortalTerminalState::Failed { .. }
+        | terminal @ PortalTerminalState::CleanHalt { .. } => {
+            eprintln!("{}", "failed".red());
+            let error = super::persist_portal_terminal_failure(
+                &mut state,
+                &env.data_dir,
+                &target_name,
+                &instance_name,
+                terminal,
+            )?;
+            return Err(error);
+        }
+    }
+
+    // 11. Summary.
     eprintln!();
     eprintln!("{}", "==> Workload initialized!".green().bold());
     eprintln!();
@@ -309,4 +675,169 @@ pub async fn run(args: InitArgs, env: &Env, config: &Config) -> Result<()> {
     eprintln!();
 
     Ok(())
+}
+
+fn replace_workload_identity(state: &mut DeployState, publisher: &str, name: &str, version: &str) {
+    state.workload_publisher = publisher.to_owned();
+    state.workload_name = name.to_owned();
+    state.workload_version = version.to_owned();
+}
+
+fn require_deployed_for_init(
+    state: &DeployState,
+    target_name: &str,
+    instance_name: &str,
+) -> Result<()> {
+    match &state.status {
+        DeployStatus::Deployed { ip } if !ip.is_empty() => Ok(()),
+        DeployStatus::Deployed { .. } => {
+            bail!("deployment {target_name}/{instance_name} has no external IP")
+        }
+        other => {
+            let status_desc = match other {
+                DeployStatus::Deploying { .. } => "still deploying",
+                DeployStatus::Failed { .. } => "in failed state",
+                DeployStatus::Destroying => "being destroyed",
+                DeployStatus::Destroyed => "already destroyed",
+                DeployStatus::Deployed { .. } => unreachable!(),
+            };
+            bail!(
+                "cannot init {target_name}/{instance_name}: instance is {status_desc}. \
+				 Only deployed instances can be initialized."
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use atakit_cloud::{GcpResources, NewDeployParams, PersistedInitEnv, PortalPorts};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn deployed_state() -> DeployState {
+        let mut state = DeployState::new(NewDeployParams {
+            instance_name: "test-instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".into(),
+            workload_name: "updated-workload".into(),
+            workload_version: "v2".into(),
+            target_name: "gcp-tdx".into(),
+            provider_name: "gcp-provider".into(),
+            platform: PlatformKind::Gcp,
+            image_ref: "automata-linux:v2".into(),
+            base_image_ref: Some("automata-linux:v2".into()),
+            archive_path: "/tmp/updated-workload-v2.atawl".into(),
+            archive_hash: "updated-hash".into(),
+            init_env: PersistedInitEnv {
+                chain: "test-chain".into(),
+                owner_key: "owner".into(),
+                gas_wallet: "gas-wallet".into(),
+                prover_credential: Some("prover".into()),
+            },
+            portal_ports: PortalPorts::default(),
+            total_steps: 7,
+        });
+        state.status = DeployStatus::Deployed {
+            ip: "192.0.2.10".into(),
+        };
+        state.resources.gcp = Some(GcpResources {
+            project: "project".into(),
+            zone: "asia-southeast1-b".into(),
+            firewall_rule: Some("test-firewall".into()),
+            instance: Some("test-instance".into()),
+            external_ip: Some("192.0.2.10".into()),
+            ..Default::default()
+        });
+        state
+    }
+
+    #[test]
+    fn portal_failed_state_is_saved_without_losing_recovery_data() {
+        let data_dir = TempDir::new().unwrap();
+        let mut state = deployed_state();
+        state.save(data_dir.path()).unwrap();
+
+        let error = super::super::persist_portal_terminal_failure(
+            &mut state,
+            data_dir.path(),
+            "gcp-tdx",
+            "test-instance",
+            PortalTerminalState::Failed {
+                detail: "registration transaction reverted".into(),
+            },
+        )
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("registration transaction reverted"));
+        assert!(error.to_string().contains("atakit cloud destroy"));
+        assert!(error.to_string().contains("atakit cloud deploy"));
+
+        let loaded = DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
+        match &loaded.status {
+            DeployStatus::Failed { step, message } => {
+                assert_eq!(step, super::super::WAIT_FOR_PORTAL_RUNNING_STEP);
+                assert!(message.contains("terminal Failed state"));
+            }
+            status => panic!("expected Failed deployment status, got {status:?}"),
+        }
+        assert_eq!(loaded.workload_name, "updated-workload");
+        assert_eq!(loaded.workload_version, "v2");
+        assert_eq!(loaded.archive_path, "/tmp/updated-workload-v2.atawl");
+        assert_eq!(loaded.init_env.gas_wallet, "gas-wallet");
+        let gcp = loaded.resources.gcp.as_ref().unwrap();
+        assert_eq!(gcp.project, "project");
+        assert_eq!(gcp.instance.as_deref(), Some("test-instance"));
+
+        let retry_error = require_deployed_for_init(&loaded, "gcp-tdx", "test-instance")
+            .unwrap_err()
+            .to_string();
+        assert!(retry_error.contains("instance is in failed state"));
+
+        DeployState::delete(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
+        assert!(DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").is_err());
+    }
+
+    #[test]
+    fn replacing_workload_identity_updates_the_publisher() {
+        let data_dir = TempDir::new().unwrap();
+        let mut state = deployed_state();
+        let publisher = format!("0x{}", "42".repeat(32));
+
+        replace_workload_identity(&mut state, &publisher, "replacement-workload", "v3");
+        state.save(data_dir.path()).unwrap();
+
+        let loaded = DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
+        assert_eq!(loaded.workload_publisher, publisher);
+        assert_eq!(loaded.workload_name, "replacement-workload");
+        assert_eq!(loaded.workload_version, "v3");
+    }
+
+    #[test]
+    fn empty_clean_halt_detail_is_saved_with_a_clean_halt_message() {
+        let data_dir = TempDir::new().unwrap();
+        let mut state = deployed_state();
+        state.save(data_dir.path()).unwrap();
+
+        super::super::persist_portal_terminal_failure(
+            &mut state,
+            data_dir.path(),
+            "gcp-tdx",
+            "test-instance",
+            PortalTerminalState::CleanHalt {
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+
+        let loaded = DeployState::load(data_dir.path(), "gcp-tdx", "test-instance").unwrap();
+        let DeployStatus::Failed { step, message } = loaded.status else {
+            panic!("expected Failed deployment status");
+        };
+        assert_eq!(step, super::super::WAIT_FOR_PORTAL_RUNNING_STEP);
+        assert!(message.contains("terminal CleanHalt state"));
+        assert!(!message.contains("terminal Failed state"));
+    }
 }

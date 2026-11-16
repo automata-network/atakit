@@ -1,3 +1,4 @@
+use atakit_core::storage_access::{self, StorageAccess};
 use std::collections::BTreeMap;
 
 use serde::de;
@@ -6,6 +7,8 @@ use serde::Deserialize;
 use crate::WorkloadError;
 
 const CONFIG_FILENAME: &str = "atakit-workload.toml";
+
+pub use atakit_core::tee_attributes::{AttributeRequirements, AttributeValue};
 
 /// Top-level structure of `atakit-workload.toml`.
 #[derive(Debug, Deserialize)]
@@ -45,6 +48,7 @@ pub struct PackageSection {
 /// portal-emitted bind-mount; access also requires the reader to be in the
 /// same `gid-group` and to opt in with `workload-logs = true`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingSection {
     #[serde(default = "default_log_driver")]
     pub driver: String,
@@ -52,6 +56,9 @@ pub struct LoggingSection {
     pub options: BTreeMap<String, String>,
     #[serde(default, rename = "log-readers")]
     pub log_readers: Vec<String>,
+    /// Baby slots only: whether their parent can use the logs API.
+    #[serde(default)]
+    pub access: Option<String>,
 }
 
 fn default_log_driver() -> String {
@@ -64,6 +71,7 @@ impl Default for LoggingSection {
             driver: default_log_driver(),
             options: BTreeMap::new(),
             log_readers: Vec::new(),
+            access: None,
         }
     }
 }
@@ -90,8 +98,9 @@ impl WorkloadConfig {
             source: e,
         })?;
         check_legacy_fields(&content)?;
-        let mut config: Self =
-            toml::from_str(&content).map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
+        let mut config: Self = expand_cpu_defaults(&content)
+            .and_then(toml::Value::try_into)
+            .map_err(|e| WorkloadError::ParseConfig { path, source: e })?;
         config.inject_defaults();
         Ok(config)
     }
@@ -99,10 +108,12 @@ impl WorkloadConfig {
     /// Parse from a TOML string. Runs legacy field checks.
     pub fn load_from_str(content: &str) -> Result<Self, WorkloadError> {
         check_legacy_fields(content)?;
-        let mut config: Self = toml::from_str(content).map_err(|e| WorkloadError::ParseConfig {
-            path: CONFIG_FILENAME.into(),
-            source: e,
-        })?;
+        let mut config: Self = expand_cpu_defaults(content)
+            .and_then(toml::Value::try_into)
+            .map_err(|e| WorkloadError::ParseConfig {
+                path: CONFIG_FILENAME.into(),
+                source: e,
+            })?;
         config.inject_defaults();
         Ok(config)
     }
@@ -113,6 +124,13 @@ impl WorkloadConfig {
         self.workload.logging.inject_defaults();
         for dep in self.dependencies.values_mut() {
             dep.logging.inject_defaults();
+        }
+        if self.format >= crate::BABY_LOG_POLICY_FORMAT_VERSION {
+            if let Some(baby) = self.baby_container.as_mut() {
+                for slot in baby.slots.values_mut() {
+                    slot.logging.inject_defaults();
+                }
+            }
         }
     }
 
@@ -157,16 +175,42 @@ impl WorkloadConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+    #[serde(default, rename = "cpu-idle", skip_serializing_if = "Option::is_none")]
+    pub cpu_idle: Option<atakit_core::cpu_config::CpuIdleRules>,
+    #[serde(
+        default,
+        rename = "cpu-frequency",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpu_frequency: Option<atakit_core::cpu_config::CpuFrequencyRules>,
+
+    #[serde(default)]
+    pub readiness: Option<atakit_core::readiness::Readiness>,
     pub name: String,
     pub version: String,
     #[serde(rename = "base-image-mode")]
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
+    #[serde(default)]
+    pub attributes: AttributeRequirements,
     pub image: ImageSource,
     #[serde(default)]
     pub ports: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
     #[serde(default)]
@@ -175,8 +219,10 @@ pub struct WorkloadSection {
     pub entrypoint: Option<StringOrArray>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "env-file", alias = "env_file")]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "unmeasured-env-file")]
+    pub unmeasured_env_file: Option<StringOrArray>,
     #[serde(default = "default_session_ttl", rename = "session-ttl")]
     pub session_ttl: u64,
     #[serde(default, rename = "atakit-portal")]
@@ -185,11 +231,17 @@ pub struct WorkloadSection {
     #[serde(default, rename = "gid-group")]
     pub gid_group: Option<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: DataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: DataMount,
+    /// Legacy format-2 service disk mounts. Kept as source compatibility and
+    /// compiled into manifest v3 `storage`.
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage: BTreeMap<String, ServiceStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     /// Minimum boot/OS disk size (e.g. "50GB"). Cloud default if omitted.
     #[serde(default, rename = "boot-disk-size")]
     pub boot_disk_size: Option<String>,
@@ -319,9 +371,74 @@ impl<'de> Deserialize<'de> for StringOrArray {
     }
 }
 
+/// Per-service data mount selector.
+///
+/// `true` preserves the format-3 whole-directory opt-in. A path array is the
+/// format-4 selective form and expands against the package-declared data set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataMount {
+    Bool(bool),
+    Paths(Vec<String>),
+}
+
+impl Default for DataMount {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
+}
+
+impl DataMount {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::Bool(enabled) => *enabled,
+            Self::Paths(paths) => !paths.is_empty(),
+        }
+    }
+
+    pub fn paths(&self) -> &[String] {
+        match self {
+            Self::Bool(_) => &[],
+            Self::Paths(paths) => paths,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataMount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Paths(Vec<String>),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(v) => Ok(DataMount::Bool(v)),
+            Raw::Paths(v) => Ok(DataMount::Paths(v)),
+        }
+    }
+}
+
 /// Dependency container configuration (same container fields as workload).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DependencySection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+
+    #[serde(default)]
+    pub readiness: Option<atakit_core::readiness::Readiness>,
     pub image: ImageSource,
     #[serde(default)]
     pub ports: Vec<String>,
@@ -333,8 +450,10 @@ pub struct DependencySection {
     pub entrypoint: Option<StringOrArray>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "env-file", alias = "env_file")]
     pub env_file: Option<StringOrArray>,
+    #[serde(default, rename = "unmeasured-env-file")]
+    pub unmeasured_env_file: Option<StringOrArray>,
     #[serde(default, rename = "atakit-portal")]
     pub atakit_portal: bool,
     /// GID sharing group. Default: workload name.
@@ -343,11 +462,17 @@ pub struct DependencySection {
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: DataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: DataMount,
+    /// Legacy format-2 service disk mounts. Kept as source compatibility and
+    /// compiled into manifest v3 `storage`.
     #[serde(default)]
     pub disks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage: BTreeMap<String, ServiceStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
@@ -490,6 +615,19 @@ pub struct BabyContainerSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BabyContainerSlotSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+
+    #[serde(default, rename = "allowed-capabilities")]
+    pub allowed_capabilities: Vec<String>,
     #[serde(rename = "parent-service")]
     pub parent_service: String,
     #[serde(default, rename = "gid-group")]
@@ -504,6 +642,8 @@ pub struct BabyContainerSlotSection {
     pub lifecycle: BabyContainerLifecycleSection,
     #[serde(default)]
     pub storage: BTreeMap<String, BabyContainerStorageSection>,
+    #[serde(default, rename = "ip-env")]
+    pub ip_env: bool,
     #[serde(default)]
     pub logging: LoggingSection,
 }
@@ -516,9 +656,46 @@ fn default_baby_slot_max_instances() -> u32 {
     1
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceStorageSection {
+    #[serde(default)]
+    pub access: Option<Vec<StorageAccess>>,
+    pub disk: String,
+    #[serde(rename = "base-path")]
+    pub base_path: String,
+    #[serde(rename = "mount-path")]
+    pub mount_path: String,
+    #[serde(default, rename = "read-only")]
+    pub read_only: Option<bool>,
+    #[serde(default)]
+    pub executable: Option<bool>,
+}
+impl ServiceStorageSection {
+    pub fn read_only(&self) -> bool {
+        storage_access::read_only(&self.access, self.read_only)
+    }
+    pub fn executable(&self) -> bool {
+        storage_access::executable(&self.access, self.executable)
+    }
+    pub fn validate_access(&self, format: u32) -> Result<(), String> {
+        storage_access::validate_mount_access(
+            format,
+            &self.access,
+            self.read_only,
+            self.executable,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BabyContainerLifecycleSection {
+    #[serde(default, rename = "rootfs-size-mib")]
+    pub rootfs_size_mib: Option<u64>,
+    #[serde(default, rename = "rootfs-disk")]
+    pub rootfs_disk: Option<String>,
     #[serde(default = "default_baby_image_retention", rename = "image-retention")]
     pub image_retention: String,
     #[serde(
@@ -539,6 +716,8 @@ impl Default for BabyContainerLifecycleSection {
             instance_retention: default_baby_instance_retention(),
             restart: default_baby_restart(),
             rootfs: default_baby_rootfs(),
+            rootfs_size_mib: None,
+            rootfs_disk: None,
         }
     }
 }
@@ -562,6 +741,8 @@ fn default_baby_rootfs() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BabyContainerStorageSection {
+    #[serde(default)]
+    pub access: Option<Vec<StorageAccess>>,
     pub disk: String,
     #[serde(rename = "base-path")]
     pub base_path: String,
@@ -569,12 +750,63 @@ pub struct BabyContainerStorageSection {
     pub mount_path: String,
     #[serde(default = "default_baby_storage_retention")]
     pub retention: String,
+    #[serde(default, rename = "parent-access")]
+    pub parent_access: Option<Vec<StorageAccess>>,
     #[serde(default = "default_baby_storage_scope")]
     pub scope: String,
     #[serde(default, rename = "read-only")]
-    pub read_only: bool,
+    pub read_only: Option<bool>,
     #[serde(default)]
-    pub permissions: BabyContainerStoragePermissionsSection,
+    pub executable: Option<bool>,
+    #[serde(default)]
+    pub permissions: Option<BabyContainerStoragePermissionsSection>,
+}
+impl BabyContainerStorageSection {
+    pub fn read_only(&self) -> bool {
+        storage_access::read_only(&self.access, self.read_only)
+    }
+    pub fn executable(&self) -> bool {
+        storage_access::executable(&self.access, self.executable)
+    }
+    pub fn validate_access(&self, format: u32) -> Result<(), String> {
+        storage_access::validate_mount_access(
+            format,
+            &self.access,
+            self.read_only,
+            self.executable,
+        )?;
+        if format >= 14 {
+            if self.permissions.is_some() {
+                return Err(
+                    "format 14 storage requires access and parent-access instead of permissions"
+                        .into(),
+                );
+            }
+            storage_access::validate_access(self.parent_access.as_deref().unwrap_or(&[]), true)?;
+        } else if self.parent_access.is_some() {
+            return Err("parent-access requires format 14".into());
+        }
+        Ok(())
+    }
+    pub fn baby_permission(&self) -> &str {
+        self.permissions.as_ref().map_or("rw", |p| p.baby.as_str())
+    }
+    pub fn parent_permission(&self) -> &str {
+        self.permissions
+            .as_ref()
+            .map_or("none", |p| p.parent.as_str())
+    }
+    pub fn parent_allows(&self, read_only: bool, executable: bool) -> bool {
+        if self.access.is_some() {
+            storage_access::parent_allows(
+                self.parent_access.as_deref().unwrap_or(&[]),
+                read_only,
+                executable,
+            )
+        } else {
+            self.parent_permission() != "none" && (self.parent_permission() != "ro" || read_only)
+        }
+    }
 }
 
 fn default_baby_storage_retention() -> String {
@@ -630,6 +862,8 @@ pub struct DiskSection {
 #[serde(deny_unknown_fields)]
 pub struct EncryptionSection {
     #[serde(default)]
+    pub integrity: Option<String>,
+    #[serde(default)]
     pub unlock_method: Vec<String>,
     #[serde(default)]
     pub bind: Vec<String>,
@@ -642,7 +876,8 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
         Err(_) => return Ok(()), // defer to real parser for syntax errors
     };
 
-    if let Some(fmt) = value.get("format").and_then(|v| v.as_integer()) {
+    let format = value.get("format").and_then(|v| v.as_integer());
+    if let Some(fmt) = format {
         if fmt == 1 {
             return Err(WorkloadError::Validation(
                 "format = 1 is no longer supported. Update to format = 2 \
@@ -654,6 +889,12 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     }
 
     if let Some(workload) = value.get("workload").and_then(|v| v.as_table()) {
+        if workload.contains_key("env-file") && workload.contains_key("env_file") {
+            return Err(WorkloadError::Validation(
+                "[workload] cannot use both `env-file` and legacy `env_file`; use `env-file`"
+                    .into(),
+            ));
+        }
         if workload.contains_key("cvm_agent") {
             return Err(WorkloadError::Validation(
                 "`cvm_agent` is no longer supported in format 2. \
@@ -666,20 +907,11 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
                 "`ttl` has been renamed to `session-ttl` in format 2.".into(),
             ));
         }
-        if workload.get("measured-data").is_some_and(|v| v.is_array()) {
+        if workload.contains_key("disks") && format != Some(2) {
             return Err(WorkloadError::Validation(
-                "`measured-data` on [workload] must be a boolean in format 2. \
-                 Move file lists to `[package] measured-data`."
-                    .into(),
-            ));
-        }
-        if workload
-            .get("unmeasured-data")
-            .is_some_and(|v| v.is_array())
-        {
-            return Err(WorkloadError::Validation(
-                "`unmeasured-data` on [workload] must be a boolean in format 2. \
-                 Move file lists to `[package] unmeasured-data`."
+                "`[workload.disks]` is only supported for format = 2 compatibility. \
+                 Use `[workload.storage.<label>]` with `disk`, `base-path`, \
+                 `mount-path`, and optional `read-only`."
                     .into(),
             ));
         }
@@ -688,22 +920,22 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     if let Some(deps) = value.get("dependencies").and_then(|v| v.as_table()) {
         for (name, dep) in deps {
             if let Some(t) = dep.as_table() {
+                if t.contains_key("env-file") && t.contains_key("env_file") {
+                    return Err(WorkloadError::Validation(format!(
+                        "dependencies.{name} cannot use both `env-file` and legacy `env_file`; use `env-file`"
+                    )));
+                }
                 if t.contains_key("cvm_agent") {
                     return Err(WorkloadError::Validation(format!(
                         "dependencies.{name}: `cvm_agent` is no longer supported. \
                          Rename to `atakit-portal`."
                     )));
                 }
-                if t.get("measured-data").is_some_and(|v| v.is_array()) {
+                if t.contains_key("disks") && format != Some(2) {
                     return Err(WorkloadError::Validation(format!(
-                        "dependencies.{name}: `measured-data` must be a boolean in format 2. \
-                         Move file lists to `[package] measured-data`."
-                    )));
-                }
-                if t.get("unmeasured-data").is_some_and(|v| v.is_array()) {
-                    return Err(WorkloadError::Validation(format!(
-                        "dependencies.{name}: `unmeasured-data` must be a boolean in format 2. \
-                         Move file lists to `[package] unmeasured-data`."
+                        "`[dependencies.{name}.disks]` is only supported for format = 2 compatibility. \
+                         Use `[dependencies.{name}.storage.<label>]` with `disk`, `base-path`, \
+                         `mount-path`, and optional `read-only`."
                     )));
                 }
             }
@@ -744,6 +976,80 @@ fn check_legacy_fields(content: &str) -> Result<(), WorkloadError> {
     Ok(())
 }
 
+/// Expand the source-only shorthand before typed parsing, so explicit fields
+/// (including false and empty lists) always override the preset.
+fn expand_cpu_defaults(content: &str) -> Result<toml::Value, toml::de::Error> {
+    use serde::de::Error;
+    let mut root: toml::Value = toml::from_str(content)?;
+    let Some(workload) = root.get_mut("workload").and_then(toml::Value::as_table_mut) else {
+        return Ok(root);
+    };
+    let enabled = match workload.remove("allow-operator-cpu-tuning") {
+        None => false,
+        Some(toml::Value::Boolean(v)) => v,
+        Some(_) => {
+            return Err(toml::de::Error::custom(
+                "allow-operator-cpu-tuning must be a boolean",
+            ))
+        }
+    };
+    if !enabled {
+        return Ok(root);
+    }
+    fn defaults(table: &mut toml::map::Map<String, toml::Value>, key: &str, text: &str) {
+        let value: toml::Value = toml::from_str(text).expect("constant CPU preset");
+        let entry = table
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        if let Some(entry) = entry.as_table_mut() {
+            for (key, value) in value.as_table().unwrap() {
+                entry.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    // A fixed publisher choice keeps its existing required=true default.
+    for key in ["cpu-idle", "cpu-frequency"] {
+        if let Some(policy) = workload.get_mut(key).and_then(toml::Value::as_table_mut) {
+            let fixed = policy.contains_key("governor")
+                || policy
+                    .get("disabled-states")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|v| !v.is_empty());
+            if fixed {
+                policy
+                    .entry("required".to_string())
+                    .or_insert(toml::Value::Boolean(true));
+            }
+        }
+    }
+    const SET: &str = "allow-operator = true\nallowed-cpus = 'online'\nrequired = false";
+    defaults(workload, "cpu-idle", "driver = 'auto'\nallow-operator = true\nrequired = false\nallowed-governors = ['haltpoll', 'menu', 'teo']\nallowed-disabled-states = ['*']");
+    defaults(
+        workload,
+        "cpu-frequency",
+        "allow-operator = false\nrequired = false\nallowed-governors = []",
+    );
+    defaults(workload, "cpuset-policy", SET);
+    if let Some(deps) = root
+        .get_mut("dependencies")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for dep in deps.iter_mut().filter_map(|(_, v)| v.as_table_mut()) {
+            defaults(dep, "cpuset-policy", SET);
+        }
+    }
+    if let Some(slots) = root
+        .get_mut("baby-container")
+        .and_then(|b| b.get_mut("slots"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        for slot in slots.iter_mut().filter_map(|(_, v)| v.as_table_mut()) {
+            defaults(slot, "cpuset-policy", SET);
+        }
+    }
+    Ok(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +1069,30 @@ image = "my-app:latest"
         assert_eq!(cfg.workload.name, "my-app");
         assert_eq!(cfg.workload.version, "v0.0.1");
         assert!(matches!(cfg.workload.image, ImageSource::Registry(ref s) if s == "my-app:latest"));
+    }
+
+    #[test]
+    fn parses_attributes() {
+        let toml = r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false, true]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workload.attributes["atakit.attestation.v1.tee.amd-sev-snp.debug.enabled"],
+            vec![
+                AttributeValue::Boolean(false),
+                AttributeValue::Boolean(true)
+            ]
+        );
     }
 
     #[test]
@@ -813,8 +1143,8 @@ image = { file = "./images/app.tar" }
 format = 2
 
 [package]
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/signer_key"]
+measured-data = ["/config/hello", "/config/cert.pem"]
+unmeasured-data = ["/additional-data/signer_key"]
 
 [workload]
 name = "secure-signer"
@@ -832,8 +1162,10 @@ unmeasured-data = true
 [workload.environment]
 RUST_LOG = "info"
 
-[workload.disks]
-data = "/data"
+[workload.storage.data]
+disk = "data"
+base-path = "/"
+mount-path = "/data"
 
 [dependencies.redis]
 image = "redis:7"
@@ -864,14 +1196,19 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         assert_eq!(cfg.workload.ports, vec!["3000:3000"]);
         assert!(cfg.workload.atakit_portal);
         assert_eq!(cfg.workload.gid_group.as_deref(), Some("shared"));
-        assert!(cfg.workload.measured_data);
-        assert!(cfg.workload.unmeasured_data);
+        assert!(cfg.workload.measured_data.is_enabled());
+        assert!(cfg.workload.unmeasured_data.is_enabled());
+        assert_eq!(cfg.workload.storage["data"].disk, "data");
+        assert_eq!(cfg.workload.storage["data"].base_path, "/");
+        assert_eq!(cfg.workload.storage["data"].mount_path, "/data");
         let pkg = cfg.package.as_ref().unwrap();
         assert_eq!(pkg.measured_data.len(), 2);
         assert_eq!(pkg.unmeasured_data.len(), 1);
         assert!(cfg.dependencies.contains_key("redis"));
-        assert!(cfg.dependencies["model-server"].measured_data);
-        assert!(!cfg.dependencies["model-server"].unmeasured_data);
+        assert!(cfg.dependencies["model-server"].measured_data.is_enabled());
+        assert!(!cfg.dependencies["model-server"]
+            .unmeasured_data
+            .is_enabled());
         assert!(cfg.firewall.is_some());
         assert!(cfg.baby_container.is_some());
         assert!(cfg.disks.contains_key("data"));
@@ -879,6 +1216,86 @@ encryption = { unlock_method = ["tpm"], bind = ["workload"] }
         let enc = &cfg.disks["data"].encryption;
         assert_eq!(enc.unlock_method, vec!["tpm"]);
         assert_eq!(enc.bind, vec!["workload"]);
+    }
+
+    #[test]
+    fn accepts_format_2_legacy_workload_disks_mounts() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.workload.disks["data"], "/data");
+    }
+
+    #[test]
+    fn rejects_format_3_legacy_workload_disks_mounts() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("[workload.storage.<label>]"));
+    }
+
+    #[test]
+    fn accepts_format_2_legacy_dependency_disks_mounts() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+data = "/data"
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.dependencies["sidecar"].disks["data"], "/data");
+    }
+
+    #[test]
+    fn rejects_format_3_legacy_dependency_disks_mounts() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+data = "/data"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("[dependencies.sidecar.storage.<label>]"));
     }
 
     #[test]
@@ -1048,7 +1465,7 @@ ttl = 3600
     }
 
     #[test]
-    fn rejects_array_measured_data_on_workload() {
+    fn accepts_array_measured_data_on_workload() {
         let toml = r#"
 format = 2
 
@@ -1057,14 +1474,14 @@ name = "test"
 version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "test:latest"
-measured-data = ["./config/hello"]
+measured-data = ["/config/hello"]
 "#;
-        let err = check_legacy_fields(toml).unwrap_err();
-        assert!(err.to_string().contains("boolean"));
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(cfg.workload.measured_data.paths(), &["/config/hello"]);
     }
 
     #[test]
-    fn rejects_array_measured_data_on_dependency() {
+    fn accepts_array_measured_data_on_dependency() {
         let toml = r#"
 format = 2
 
@@ -1076,10 +1493,13 @@ image = "test:latest"
 
 [dependencies.redis]
 image = "redis:7"
-measured-data = ["./config/hello"]
+measured-data = ["/config/hello"]
 "#;
-        let err = check_legacy_fields(toml).unwrap_err();
-        assert!(err.to_string().contains("boolean"));
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.dependencies["redis"].measured_data.paths(),
+            &["/config/hello"]
+        );
     }
 
     #[test]
@@ -1088,8 +1508,8 @@ measured-data = ["./config/hello"]
 format = 2
 
 [package]
-measured-data = ["./config/hello", "./config/cert.pem"]
-unmeasured-data = ["./additional-data/key"]
+measured-data = ["/config/hello", "/config/cert.pem"]
+unmeasured-data = ["/additional-data/key"]
 
 [workload]
 name = "test"
@@ -1101,11 +1521,63 @@ measured-data = true
         let cfg: WorkloadConfig = toml::from_str(toml).unwrap();
         assert_eq!(
             cfg.measured_data_paths(),
-            &["./config/hello", "./config/cert.pem"]
+            &["/config/hello", "/config/cert.pem"]
         );
-        assert_eq!(cfg.unmeasured_data_paths(), &["./additional-data/key"]);
-        assert!(cfg.workload.measured_data);
-        assert!(!cfg.workload.unmeasured_data);
+        assert_eq!(cfg.unmeasured_data_paths(), &["/additional-data/key"]);
+        assert!(cfg.workload.measured_data.is_enabled());
+        assert!(!cfg.workload.unmeasured_data.is_enabled());
+    }
+
+    #[test]
+    fn parses_env_file_aliases_and_unmeasured_env_file() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+env-file = ["./defaults.env"]
+unmeasured-env-file = "/runtime.env"
+
+[dependencies.sidecar]
+image = "sidecar:latest"
+env_file = "./legacy.env"
+unmeasured-env-file = ["/sidecar.env"]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            cfg.workload.env_file.unwrap().as_vec(),
+            vec!["./defaults.env"]
+        );
+        assert_eq!(
+            cfg.workload.unmeasured_env_file.unwrap().as_vec(),
+            vec!["/runtime.env"]
+        );
+        let dep = &cfg.dependencies["sidecar"];
+        assert_eq!(dep.env_file.clone().unwrap().as_vec(), vec!["./legacy.env"]);
+        assert_eq!(
+            dep.unmeasured_env_file.clone().unwrap().as_vec(),
+            vec!["/sidecar.env"]
+        );
+    }
+
+    #[test]
+    fn rejects_both_env_file_spellings() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "test"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "test:latest"
+env-file = "./defaults.env"
+env_file = "./legacy.env"
+"#;
+        let err = WorkloadConfig::load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("both `env-file`"));
     }
 
     #[test]

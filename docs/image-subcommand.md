@@ -22,7 +22,7 @@ List available CVM base image releases.
 |------|---------|-------------|
 | `--limit N` | 10 | Maximum releases to show |
 | `--all` | false | Show all releases (not just those with disk images) |
-| `--tag REF` | - | Show a specific release by tag (e.g. `automata-linux:v0.5.0`) |
+| `--tag REF` | - | Show a specific release by tag (e.g. `automata-linux:v0.2.6-debug`) |
 | `--repo OWNER/REPO` | - | GitHub repository in `owner/repo` format. If omitted, queries all configured repositories. |
 | `--remote` | false | Query remote releases (GitHub API). Default is local-only. |
 
@@ -34,8 +34,8 @@ Pull CVM base images for a specific release.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `IMAGE` | no | Release tag (e.g. `automata-linux:v0.5.0`). If omitted, uses latest. |
-| `PLATFORMS` | no | Comma-separated platforms: `gcp,aws,azure`. If omitted, pulls all. |
+| `IMAGE` | no | Release tag (e.g. `automata-linux:v0.2.6-debug`). If omitted, uses latest. |
+| `PLATFORMS` | no | Comma-separated platforms: `gcp,aws,azure,qemu`. If omitted, pulls all. |
 
 ### `image rm`
 
@@ -43,7 +43,7 @@ Remove locally downloaded CVM base images.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `IMAGE` | yes | Release tag to remove (e.g. `automata-linux:v0.5.0`) |
+| `IMAGE` | yes | Release tag to remove (e.g. `automata-linux:v0.2.6-debug`) |
 
 ### `image export`
 
@@ -51,11 +51,11 @@ Export an image from the local store as a portable `.atabi` archive.
 
 | Argument/Flag | Required | Description |
 |---------------|----------|-------------|
-| `IMAGE` | yes | Image reference to export (e.g. `automata-linux:v0.1.6`) |
+| `IMAGE` | yes | Image reference to export (e.g. `automata-linux:v0.2.6-debug`) |
 | `-o DIR` | no | Output directory (default: current directory) |
 | `--gz` | no | Use gzip compression instead of zstd |
 
-Exports all locally available platforms for the given image. The archive is named `{repository}-{tag}-{platforms}.atabi` (e.g. `automata-linux-v0.1.6-gcp.atabi`, `automata-linux-v0.1.6-all.atabi`).
+Exports all locally available platforms for the given image. The archive is named `{repository}-{tag}-{platforms}.atabi` (e.g. `automata-linux-v0.2.6-debug-gcp.atabi`, `automata-linux-v0.2.6-debug-all.atabi`).
 
 ### `image import`
 
@@ -70,11 +70,11 @@ Import a `.atabi` archive into the image store.
 
 ### ImageRef
 
-Reference to a specific image: `repository:tag` (e.g. `automata-linux:v0.5.0`). The `repository` part must not contain `/` (this is the local store name, not the GitHub owner/repo path).
+Reference to a specific image: `repository:tag` (e.g. `automata-linux:v0.2.6-debug`). The `repository` part must not contain `/` (this is the local store name, not the GitHub owner/repo path).
 
 ### Platform
 
-Target cloud platform: `Gcp`, `Aws`, `Azure`.
+Target platform: `Gcp`, `Aws`, `Azure`, `Qemu`.
 
 ### AssetKind
 
@@ -82,7 +82,7 @@ Classification of a release asset by filename:
 - `ImageArchive(Vec<Platform>)` -- `.atabi` archive containing images for listed platforms
 - `Unknown` -- unrecognised asset
 
-Filenames are parsed as `{repo}-{tag}-{suffix}.atabi` where suffix is `all` or dash-joined platform names (e.g. `gcp`, `aws-azure`).
+Filenames are parsed as `{repo}-{tag}-{suffix}.atabi` where suffix is `all` or dash-joined platform names (e.g. `gcp`, `aws-azure`, `qemu`).
 
 ### Release / Asset
 

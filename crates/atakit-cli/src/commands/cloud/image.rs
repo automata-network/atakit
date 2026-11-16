@@ -166,8 +166,60 @@ pub async fn run_upload(
     Ok(())
 }
 
-pub async fn run_rm(_args: CloudImageRmArgs, _env: &Env, _config: &Config) -> Result<()> {
-    bail!("cloud image rm is not yet implemented")
+pub async fn run_rm(args: CloudImageRmArgs, env: &Env, config: &Config) -> Result<()> {
+    let _image_lock = CloudImages::lock(&env.data_dir, &args.image, &args.provider)?;
+    let provider = config.cloud.providers.get(&args.provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider '{}' not found in [cloud.providers]",
+            args.provider
+        )
+    })?;
+    let images = CloudImages::load(&env.data_dir)?;
+    let record = images.get(&args.image, &args.provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "image '{}' is not tracked for provider '{}'",
+            args.image,
+            args.provider
+        )
+    })?;
+    atakit_cloud::image_removal::ensure_unused(
+        &env.data_dir,
+        &args.image,
+        &args.provider,
+        record,
+        provider,
+    )?;
+    let runner = atakit_cloud::ProcessRunner::default();
+    let plan = atakit_cloud::image_removal::prepare(record, provider, &runner).await?;
+    eprintln!(
+        "Remove cloud image '{}' from '{}':",
+        args.image, args.provider
+    );
+    eprint!("{plan}");
+    eprintln!("Local image files, upload buckets, galleries, and VMs are preserved.");
+    if !args.yes {
+        eprint!("Proceed? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+    atakit_cloud::image_removal::ensure_unused(
+        &env.data_dir,
+        &args.image,
+        &args.provider,
+        record,
+        provider,
+    )?;
+    atakit_cloud::image_removal::remove(&env.data_dir, &args.image, &args.provider, plan, &runner)
+        .await?;
+    eprintln!(
+        "Removed cloud image '{}' from '{}'.",
+        args.image, args.provider
+    );
+    Ok(())
 }
 
 pub async fn run_gc(_args: CloudImageGcArgs, _env: &Env, _config: &Config) -> Result<()> {

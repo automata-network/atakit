@@ -5,8 +5,23 @@
 # `atakit workload build` compiles it into a deterministic .atawl archive
 # containing manifest.json + images + measured-data.
 
-# Schema version. Must be 2.
-format = 2
+# Schema version. v0.3.6 Portal accepts only format 16.
+format = 16
+# Optional nofile = 262144 under [workload], a dependency, or a baby slot.
+# Omit it to use the base-image default (1048576 on v0.3.6).
+# Each value sets both soft and hard limits, within the base-image ceiling.
+# Optional [workload.cpu-frequency]: governor = "performance", required = true.
+# CPU controls require format = 16 and a v0.3.6 or newer base image.
+# Add cpuset = "0-3" under [workload], a dependency, or a baby slot.
+# Optional [workload.cpu-idle]: driver = "intel_idle", governor = "menu",
+# disabled-states = ["C6"], required = true. Settings apply VM-wide.
+# Operator choices are denied by default. Opt in under [workload] with
+# allow-operator-cpu-tuning = true; override individual cpu-idle or cpuset-policy
+# fields to narrow the signed permissions. The preset permits menu/teo and any
+# exposed idle state, plus guest CPU placement for declared services/baby slots.
+# The preset uses driver = "auto" (v0.3.7+): use the active guest idle driver.
+# Set an exact driver to require it. A VM with no active driver skips optional idle settings.
+# Frequency delegation needs an explicit allow-operator and allowed-governors list.
 
 # ── package data ────────────────────────────────────────────────
 #
@@ -16,18 +31,26 @@ format = 2
 # via per-container measured-data / unmeasured-data booleans.
 #
 # measured-data: files included in the archive and integrity-verified via PCR23.
-# Paths must start with "./" and must not contain "..". Files must exist
-# at build time. Mounted read-only at /atakit-portal/measured-data/ in containers
-# that set measured-data = true.
+# Paths are logical absolute paths under the measured-data root (default:
+# <workload-dir>/measured-data). Files must exist at build time. Mounted
+# read-only at /atakit-portal/measured-data/ in containers that set
+# measured-data = true.
 #
 # unmeasured-data: operator-provided files NOT included in the archive.
-# Not verified by PCR23 -- the operator supplies them at deploy time.
-# Mounted read-only at /atakit-portal/unmeasured-data/ in containers
-# that set unmeasured-data = true.
+# Paths are logical absolute paths under the unmeasured-data root (default:
+# <workload-dir>/unmeasured-data). Not verified by PCR23 -- the operator
+# supplies them at deploy time. Exact file declarations need no local files.
+# Directory declarations must end in / and must exist at build time so their
+# member file paths can be enumerated. unmeasured-env-file templates must also
+# exist at build time to define allowed variable names; their values are ignored.
+# At deploy/init, a missing source prompts for a directory or no upload.
+# Use --no-unmeasured-data to explicitly skip upload in scripts.
+# Mounted read-only at
+# /atakit-portal/unmeasured-data/ in containers that set unmeasured-data = true.
 #
 # [package]
-# measured-data = ["./config/cert.pem", "./config/settings.json"]
-# unmeasured-data = ["./runtime-data/signing-key.pem"]
+# measured-data = ["/config/cert.pem", "/config/settings.json"]
+# unmeasured-data = ["/runtime-data/signing-key.pem"]
 
 [workload]
 # Workload identity. The on-chain workload ID is derived from name + version
@@ -37,6 +60,11 @@ format = 2
 # version: must start with "v", followed by alphanumeric/.-_ chars.
 name = "{{name}}"
 version = "v0.0.1"
+
+# Services that must be started before the main workload. Entries may name
+# dependency keys declared below. Dependencies may refer back to this workload
+# with its exact `name`. Cycles are rejected.
+# depends_on = ["redis"]
 
 # ── on-chain parameters ──────────────────────────────────────────
 #
@@ -50,7 +78,7 @@ base-image-mode = "blacklist"
 # base-image: list of base image references (name:version) for the whitelist/blacklist.
 # Used by `cloud deploy` for local validation and by `workload publish` to derive
 # on-chain base image IDs. Override with `--base-image-id` on publish if needed.
-# base-image = ["automata-linux:v0.1.6", "automata-linux:v0.1.5"]
+# base-image = ["automata-linux:v0.2.6-debug", "example-linux:v1.0.0"]
 
 # session-ttl: session TTL in seconds. Determines how long a CVM session
 # remains valid after attestation. Default: 0 (contract default, 30 days).
@@ -95,6 +123,16 @@ image = "{{name}}:latest"
 # entrypoint: override the container ENTRYPOINT. String or array.
 # entrypoint = ["/app/entrypoint.sh"]
 #
+# env-file: measured build-time .env files. Parsed during `workload build`,
+# merged into the manifest environment, and overridden by explicit
+# [workload.environment] values.
+# env-file = "./defaults.env"
+#
+# unmeasured-env-file: runtime operator-supplied .env files. Each file must be
+# declared in [package] unmeasured-data; only the path and receiving service
+# are measured. Contents are provided at init/deploy time.
+# unmeasured-env-file = "/runtime-data/secrets.env"
+#
 # atakit-portal: mount the atakit-portal Unix socket into the container.
 # Required for workloads that communicate with the host agent.
 # atakit-portal = true
@@ -127,13 +165,18 @@ image = "{{name}}:latest"
 # RUST_LOG = "info"
 # LISTEN_ADDR = "0.0.0.0:3000"
 #
-# env_file: load variables from a dotenv file. Path must start with "./"
-# and must not contain "..". Can be a string or array of strings.
-# env_file = "./.env"
-# env_file = ["./.env", "./.env.production"]
+# env-file: load variables from measured dotenv files. Path must start with
+# "./" and must not contain "..". Can be a string or array of strings.
+# env-file = "./.env"
+# env-file = ["./.env", "./.env.production"]
 #
-# Resolution order when a key appears in both: env_file values are loaded
+# Resolution order when a key appears in both: env-file values are loaded
 # first, then [workload.environment] overrides them.
+#
+# ip-env: opt in to VM network identity env vars. When true, the portal
+# injects ATAKIT_PUBLIC_IP and ATAKIT_INTERNAL_IP at runtime; unavailable
+# values are empty strings. Injected values override matching user env vars.
+# ip-env = true
 
 # ── data mount booleans ──────────────────────────────────────────
 #
@@ -147,19 +190,39 @@ image = "{{name}}:latest"
 # Files are defined in the [package] section above.
 # unmeasured-data = true
 
-# ── persistent disk mounts ───────────────────────────────────────
+# ── persistent storage mounts ────────────────────────────────────
 #
-# Maps disk names (defined in [disks.*] below) to container mount paths.
-# Disks can be shared between the workload and dependencies.
-# [workload.disks]
-# my-disk = "/data"
+# Mount a subpath of a declared disk into this container.
+# `disk` references [disks.<name>] below. `base-path` is resolved under the
+# mounted disk root and is created if missing. `access` is required.
+# Add "execute" to run binaries or load native modules from this mount.
+# [workload.storage.data]
+# disk = "my-disk"
+# base-path = "/app"
+# mount-path = "/data"
+# access = ["read", "write"]
+
+# ── attributes ───────────────────────────────────────────────────
+#
+# Custom attribute values are strings. Reserved verified TEE attributes use
+# the types and rules shown below. A missing Boolean requirement permits only
+# false. A missing Intel TDX TCB status requirement permits only "ok". An empty
+# custom array requires the attribute to exist and accepts any declared value.
+[workload.attributes]
+# "example.operator.attribute" = ["production"]
+# "atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+# "atakit.attestation.v1.tee.intel-tdx.tcb.status.allowed" = ["ok"]
+# "atakit.attestation.v1.tee.amd-sev-snp.debug.enabled" = [false]
+# "atakit.attestation.v1.tee.amd-sev-snp.migrate-ma.enabled" = [false, true]
+# "atakit.attestation.v1.tee.amd-sev-snp.tcb.minimum" = ["0x00000000de1d000400000000de1d000400000000de1d000400000000de1d0004"]
+# "atakit.attestation.v1.tee.amd-sev-snp.platform-info.policy" = ["0x0000000000000000000000000000000000000000000000010000000000000020"]
 
 # ── dependencies ──────────────────────────────────────────────────
 #
 # Sidecar containers that run alongside the main workload. Each dependency
 # has its own image, ports, restart, command, entrypoint, environment,
-# env_file, depends_on, and disk mounts. Host ports must be unique
-# across all containers.
+# env-file, unmeasured-env-file, depends_on, and storage mounts. Host ports
+# must be unique across all containers.
 #
 # Dependencies can also specify measured-data and unmeasured-data arrays
 # to control which workload-level data files get mounted into their
@@ -169,11 +232,14 @@ image = "{{name}}:latest"
 # image = "redis:7"
 # ports = ["6379:6379"]
 # restart = "unless-stopped"
+# ip-env = true
 # depends_on = []
 # [dependencies.redis.environment]
 # REDIS_PASSWORD = "secret"
-# [dependencies.redis.disks]
-# redis-data = "/cache"
+# [dependencies.redis.storage.cache]
+# disk = "redis-data"
+# base-path = "/redis"
+# mount-path = "/cache"
 
 # ── firewall ─────────────────────────────────────────────────────
 #
@@ -205,6 +271,7 @@ image = "{{name}}:latest"
 # [baby-container.slots.analysis-job]
 # parent-service = "{{name}}"           # service whose portal UDS may manage this slot
 # image-selection = "single"            # or "multiple"
+# ip-env = true
 #
 # [baby-container.slots.analysis-job.lifecycle]
 # image-retention = "session"           # or "disk"
@@ -215,8 +282,8 @@ image = "{{name}}:latest"
 # ── persistent disks ─────────────────────────────────────────────
 #
 # Define persistent disks that survive container restarts. Referenced by
-# [workload.disks] or [dependencies.<name>.disks]. Disks can be shared
-# between multiple containers.
+# [workload.storage.<label>] or [dependencies.<name>.storage.<label>].
+# Disks can be shared between multiple containers.
 #
 # index: device LUN / index. Must be >= 10, unique across all disks.
 #        Auto-assigned from 10 in alphabetical order if omitted.

@@ -1,37 +1,222 @@
+pub mod configure;
 pub mod deploy;
 pub mod destroy;
+pub mod diagnose;
+pub mod disk;
+pub(crate) mod disk_progress;
 pub mod image;
 pub mod init;
 pub mod list;
+mod output;
 pub mod provider;
+pub mod reboot;
+pub mod resume;
 pub mod serial;
+pub mod session;
+mod session_access;
 pub mod ssh;
 pub mod status;
+mod unmeasured;
+pub mod unmeasured_data;
+pub mod verify_session;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::io::{Read, Seek};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy_ext::core::primitives::Address;
+use alloy_ext::core::primitives::{Address, B256};
 use alloy_ext::ext::NetworkProvider;
 use anyhow::{bail, Context, Result};
+use atakit_attestation::MeasurementPolicy;
 use atakit_cloud::aws::AwsProvider;
 use atakit_cloud::azure::AzureProvider;
 use atakit_cloud::cloud_images::{CloudImage, CloudImages};
 use atakit_cloud::config::CloudProviderConfig;
 use atakit_cloud::gcp::GcpProvider;
-use atakit_cloud::init::{InitChainConfig, InitKeyConfig};
+use atakit_cloud::init::{
+    InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig, PortalTerminalState,
+    RemoteAtawlSource,
+};
+use atakit_cloud::pcr_policy::{
+    resolve_init_pcr_policy as resolve_pcr_policy_for_init, PcrPolicyIdentifiers,
+    ResolvedPcrPolicyConfig,
+};
 use atakit_cloud::plan::DeployStep;
 use atakit_cloud::provider::CloudProvider;
 use atakit_cloud::{
-    AzureResourceNames, CloudTarget, DeployState, PersistedInitEnv, PlatformKind, ProcessRunner,
+    AzureResourceNames, CloudTarget, DeployState, DeployStatus, PersistedInitEnv, PlatformKind,
+    ProcessRunner,
 };
 use atakit_core::Env;
 use atakit_image::{import_image_archive, ImageRef, ImageStore, Platform as ImagePlatform};
 use atakit_workload::WorkloadStore;
 use automata_tee_workload_measurement::stubs::SessionRegistry::SessionRegistryInstance;
+use automata_tee_workload_measurement::types::AppRef;
+use owo_colors::OwoColorize;
+use sha2::{Digest, Sha256};
 
-use crate::config::{ChainConfig, KeyMode, KeySpec};
+use crate::config::{ChainConfig, Config, KeyMode, KeySpec, ProverSpec};
+
+pub(crate) const WAIT_FOR_PORTAL_RUNNING_STEP: &str = "Wait for portal Running";
+
+pub(crate) fn resolve_remote_atawl_source(
+    uri: Option<&str>,
+    supplied_sha256: Option<&str>,
+    archive_size_bytes: u64,
+    expected_archive_sha256: &[u8; 32],
+    workload_app_ref: &AppRef,
+) -> Result<Option<RemoteAtawlSource>> {
+    let (Some(uri), Some(supplied_sha256)) = (uri, supplied_sha256) else {
+        if uri.is_some() || supplied_sha256.is_some() {
+            bail!("--atawl-uri and --atawl-sha256 must be supplied together");
+        }
+        return Ok(None);
+    };
+
+    let supplied_sha256 = parse_remote_atawl_sha256(supplied_sha256)?;
+    if supplied_sha256 != *expected_archive_sha256 {
+        bail!(
+            "--atawl-sha256 does not match the locally resolved ATAWL; use the hash of the exact archive at the remote URI"
+        );
+    }
+
+    let workload_id = crate::commands::workload::compute_workload_id(workload_app_ref);
+
+    let source = RemoteAtawlSource {
+        format: 1,
+        uri: uri.to_string(),
+        archive_sha256: format!("0x{}", hex::encode(supplied_sha256)),
+        archive_size_bytes,
+        workload_id: format!("{workload_id:#x}"),
+    };
+    atakit_cloud::init::validate_remote_atawl_source(&source)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(Some(source))
+}
+
+fn parse_remote_atawl_sha256(value: &str) -> Result<[u8; 32]> {
+    let value = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("0x"))
+        .unwrap_or(value);
+    let bytes = hex::decode(value)
+        .map_err(|_| anyhow::anyhow!("--atawl-sha256 must contain exactly 32 bytes of hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("--atawl-sha256 must contain exactly 32 bytes of hex"))
+}
+
+#[cfg(test)]
+mod remote_atawl_source_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_uses_the_publisher_measured_in_the_manifest() {
+        let meta = atakit_workload::manifest::ManifestMeta {
+            format: atakit_workload::FORMAT_VERSION,
+            publisher: format!("0x{}", "33".repeat(32)),
+            name: "developer-workload".to_string(),
+            version: "v1".to_string(),
+        };
+
+        assert_eq!(
+            crate::commands::workload::measured_workload_ref(&meta)
+                .unwrap()
+                .publisher,
+            B256::repeat_byte(0x33)
+        );
+    }
+
+    #[test]
+    fn source_uses_the_inspected_archive_size_hash_and_workload_id() {
+        let expected = [0x11; 32];
+        let app_ref = AppRef::new(B256::repeat_byte(0x22), "example", "v1");
+
+        let source = resolve_remote_atawl_source(
+            Some("http://repo.internal/workload.atawl"),
+            Some(&format!("sha256:{}", "11".repeat(32))),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source.format, 1);
+        assert_eq!(source.archive_size_bytes, 5);
+        assert_eq!(source.archive_sha256, format!("0x{}", "11".repeat(32)));
+        assert_eq!(source.workload_id.len(), 66);
+    }
+
+    #[test]
+    fn source_rejects_a_different_hash_and_does_not_echo_uri_secrets() {
+        let expected = [0x11; 32];
+        let app_ref = AppRef::new(B256::repeat_byte(0x22), "example", "v1");
+        let mismatch = resolve_remote_atawl_source(
+            Some("https://repo.example/workload.atawl"),
+            Some(&"22".repeat(32)),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"));
+
+        let invalid_uri = resolve_remote_atawl_source(
+            Some("https://user:secret@repo.example/workload.atawl"),
+            Some(&"11".repeat(32)),
+            5,
+            &expected,
+            &app_ref,
+        )
+        .unwrap_err();
+        assert!(!invalid_uri.to_string().contains("secret"));
+    }
+}
+
+pub(crate) fn terminal_initialization_error(
+    target_name: &str,
+    instance_name: &str,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{error}; this deployment cannot resume after portal initialization; run `atakit cloud destroy {instance_name} --target {target_name}`, then run `atakit cloud deploy` again"
+    )
+}
+
+pub(crate) fn persist_portal_terminal_failure(
+    state: &mut DeployState,
+    data_dir: &Path,
+    target_name: &str,
+    instance_name: &str,
+    terminal: PortalTerminalState,
+) -> Result<anyhow::Error> {
+    let detail = match terminal {
+        PortalTerminalState::Failed { detail } if detail.is_empty() => {
+            "portal reached terminal Failed state".to_string()
+        }
+        PortalTerminalState::Failed { detail } => {
+            format!("portal reached terminal Failed state: {detail}")
+        }
+        PortalTerminalState::CleanHalt { detail } if detail.is_empty() => {
+            "portal reached terminal CleanHalt state".to_string()
+        }
+        PortalTerminalState::CleanHalt { detail } => {
+            format!("portal reached terminal CleanHalt state: {detail}")
+        }
+        PortalTerminalState::Running => bail!("cannot persist Running as a terminal failure"),
+    };
+    let error = terminal_initialization_error(target_name, instance_name, detail);
+    state.set_status(
+        DeployStatus::Failed {
+            step: WAIT_FOR_PORTAL_RUNNING_STEP.to_string(),
+            message: error.to_string(),
+        },
+        data_dir,
+    )?;
+    Ok(error)
+}
 
 /// Resolve init env references with precedence: CLI > target config.
 pub struct InitEnvResolver<'a> {
@@ -49,11 +234,10 @@ impl<'a> InitEnvResolver<'a> {
             .filter(|value| !value.is_empty())
     }
 
-    /// Optional SP1 prover-network key name. Read from the target (already
-    /// merged with `[cloud.defaults] sp1_payer` via `apply_defaults`); `None`
-    /// when no separate SP1 key is configured (portal reuses gas_wallet).
-    pub fn sp1_payer(&self) -> Option<String> {
-        self.target.sp1_payer.clone()
+    /// Optional backend-neutral prover credential. Read from the target after
+    /// `[cloud.defaults]` has been applied.
+    pub fn prover_credential(&self) -> Option<String> {
+        self.target.prover_credential.clone()
     }
 
     /// Resolve persisted init references without panicking on missing fields.
@@ -71,8 +255,178 @@ impl<'a> InitEnvResolver<'a> {
                 .map(String::from)
                 .or_else(|| self.target.gas_wallet.clone())
                 .unwrap_or_default(),
-            sp1_payer: self.sp1_payer(),
+            prover_credential: self.prover_credential(),
         }
+    }
+}
+
+/// Check the selected prover before provisioning or sending /init.
+pub(crate) fn validate_init_prover(
+    config: &Config,
+    chain_name: &str,
+    cc_type: atakit_cloud::config::CcType,
+    registration_off: bool,
+) -> Result<()> {
+    if registration_off {
+        return Ok(());
+    }
+    let chain = config
+        .chains
+        .get(chain_name)
+        .with_context(|| format!("chain '{chain_name}' not found in [chains]"))?;
+    let uses_zk = chain.tee_backend == "zk"
+        || (chain.tee_backend == "auto" && cc_type == atakit_cloud::config::CcType::SevSnp);
+    if uses_zk && chain.prover.is_none() {
+        bail!("[chains.{chain_name}] requires a prover because the effective TEE backend is ZK; set prover = \"<profile-name>\" to select an existing [provers.<profile-name>] profile");
+    }
+    if let Some(name) = &chain.prover {
+        if !config.provers.contains_key(name) {
+            bail!("[chains.{chain_name}] selects undefined prover '{name}'; define [provers.{name}] or select an existing prover profile");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the separately named credential used by a prover. A chain profile
+/// takes precedence over the persisted or target value. The gas wallet is not
+/// a prover credential.
+pub(crate) fn effective_prover_credential(
+    config: &Config,
+    chain_name: Option<&str>,
+    fallback: Option<String>,
+    registration_off: bool,
+) -> Result<Option<String>> {
+    if registration_off {
+        return Ok(None);
+    }
+    let chain = chain_name.and_then(|name| config.chains.get(name));
+    let prover = chain
+        .and_then(|chain| chain.prover.as_deref())
+        .and_then(|name| config.provers.get(name));
+    let credential = prover
+        .and_then(|prover| prover.credential.clone())
+        .or_else(|| fallback.filter(|value| !value.is_empty()));
+    let explicit_network_prover = prover.is_some_and(|prover| prover.execution == "network");
+    if explicit_network_prover && credential.is_none() {
+        bail!(
+            "the selected network prover requires a separately named prover_credential; configure it on the prover profile, cloud target, or [cloud.defaults]"
+        );
+    }
+    Ok(credential)
+}
+
+#[cfg(test)]
+mod prover_credential_tests {
+    use super::*;
+
+    #[test]
+    fn init_prover_checks_effective_backend_and_profile() {
+        use atakit_cloud::config::CcType;
+        let mut config = config();
+        for (backend, cc, required) in [
+            ("auto", CcType::SevSnp, true),
+            ("auto", CcType::Tdx, false),
+            ("zk", CcType::SevSnp, true),
+            ("zk", CcType::Tdx, true),
+            ("solidity", CcType::Tdx, false),
+        ] {
+            let chain = config.chains.get_mut("primary").unwrap();
+            chain.tee_backend = backend.into();
+            chain.prover = None;
+            let result = validate_init_prover(&config, "primary", cc, false);
+            assert_eq!(result.is_err(), required, "{backend}/{cc}");
+            if let Err(error) = result {
+                assert!(error
+                    .to_string()
+                    .contains("[chains.primary] requires a prover"));
+            }
+            assert!(validate_init_prover(&config, "primary", cc, true).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("sp1".into());
+            assert!(validate_init_prover(&config, "primary", cc, false).is_ok());
+            config.chains.get_mut("primary").unwrap().prover = Some("missing".into());
+            assert!(validate_init_prover(&config, "primary", cc, false)
+                .unwrap_err()
+                .to_string()
+                .contains("undefined prover 'missing'"));
+        }
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, true).is_ok());
+        assert!(validate_init_prover(&config, "missing", CcType::Tdx, false).is_err());
+    }
+
+    fn config() -> Config {
+        Config::load_from_str(
+            r#"
+            [keys.profile]
+            type = "es256k"
+            mode = "self_generated"
+
+            [keys.target]
+            type = "es256k"
+            mode = "self_generated"
+
+            [keys.gas]
+            type = "es256k"
+            mode = "self_generated"
+
+            [provers.sp1]
+            backend = "sp1"
+            credential = "profile"
+
+            [chains.primary]
+            rpc_url = "https://rpc.example"
+            session_registry = "0x1"
+            prover = "sp1"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn profile_precedes_persisted_target() {
+        let config = config();
+        assert_eq!(
+            effective_prover_credential(&config, Some("primary"), Some("target".into()), false,)
+                .unwrap()
+                .as_deref(),
+            Some("profile")
+        );
+    }
+
+    #[test]
+    fn fallback_and_registration_off_are_deterministic() {
+        let config = config();
+        assert_eq!(
+            effective_prover_credential(&config, Some("unknown"), Some("target".into()), false,)
+                .unwrap()
+                .as_deref(),
+            Some("target")
+        );
+        assert_eq!(
+            effective_prover_credential(&config, Some("primary"), Some("target".into()), true,)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn network_prover_requires_a_separate_credential() {
+        let config = Config::load_from_str(
+            r#"
+            [provers.sp1]
+            backend = "sp1"
+            execution = "network"
+
+            [chains.primary]
+            rpc_url = "https://rpc.example"
+            session_registry = "0x1"
+            prover = "sp1"
+            "#,
+        )
+        .unwrap();
+        let error = effective_prover_credential(&config, Some("primary"), None, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("separately named prover_credential"));
     }
 }
 
@@ -90,15 +444,41 @@ pub(crate) fn synthesize_off_init_chain() -> InitChainConfig {
         session_registry: ZERO_ADDR.to_string(),
         workload_registry: ZERO_ADDR.to_string(),
         base_image_registry: ZERO_ADDR.to_string(),
-        expire_offset: 3600,
         registration: Some("off".to_string()),
         chain_id: None,
-        proving_strategy: None,
+        tee_backend: "auto".to_string(),
+        prover: None,
     }
 }
 
 pub(crate) fn registration_is_off(registration: Option<&str>) -> bool {
     registration == Some("off")
+}
+
+pub(crate) async fn resolve_init_pcr_policy(
+    path: Option<&Path>,
+    config: &InitConfig,
+    registration_off: bool,
+    verified_tls: Option<&atakit_cloud::init::VerifiedPortalTls>,
+    workload_ref: &AppRef,
+) -> Result<Option<ResolvedPcrPolicyConfig>> {
+    let identifiers = verified_tls.and_then(|verified| {
+        Some(PcrPolicyIdentifiers {
+            workload_id: crate::commands::workload::compute_workload_id(workload_ref).0,
+            base_image_id: verified.identity().base_image_id?,
+            platform_profile_id: verified.identity().platform_profile_id?,
+            measurement_variant_id: verified.identity().variant_id?,
+        })
+    });
+    resolve_pcr_policy_for_init(
+        registration_off,
+        path,
+        &config.chain,
+        identifiers,
+        &config.platform,
+    )
+    .await
+    .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
@@ -107,6 +487,120 @@ pub(crate) fn synthesize_self_generated_key() -> InitKeyConfig {
         key_type: "es256k".to_string(),
         private_key: None,
     }
+}
+
+pub(crate) fn warn_unsafe_skip_tls_attestation() {
+    eprintln!(
+        "{}",
+        "WARNING: --unsafe-skip-tls-attestation disables portal TLS attestation and accepts the self-signed certificate without verification."
+            .yellow()
+    );
+}
+
+/// The operator-supplied base-image measurement policy, if there is one.
+///
+/// Returns `None` when no `--measurements` was given, which means the chain is
+/// the authority and [`atakit_cloud::init::portal_tls_mode_for_init_chain`]
+/// resolves the policy from the registry instead. It no longer resolves the
+/// chain policy itself: that was the "explicit wins, otherwise chain"
+/// precedence the exclusive-source rule withdrew, and it applied to every
+/// command except `atakit cloud verify-session`.
+pub(crate) async fn resolve_explicit_tls_measurement_policy(
+    measurements: Option<&std::path::Path>,
+    expected_base_image: Option<&str>,
+    untrusted_portal_base_image_id: Option<[u8; 32]>,
+    measurement_publisher_keys: &[String],
+    data_dir: &std::path::Path,
+    init_chain: &InitChainConfig,
+) -> Result<Option<MeasurementPolicy>> {
+    if measurements.is_some() {
+        return atakit_cloud::init::load_measurement_policy(
+            measurements,
+            expected_base_image,
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"))
+        .map(Some);
+    }
+    if !measurement_publisher_keys.is_empty() {
+        bail!("--measurement-publisher-key requires --measurements");
+    }
+
+    if !chain_measurement_policy_available(init_chain) {
+        bail!(
+            "normal portal TLS attestation requires a configured chain with BaseImageRegistry or SessionRegistry; select a chain or provide --measurements for explicit offline verification"
+        );
+    }
+
+    // The portal's claimed identifier selects which registry record is read, so
+    // when the operator also named a base image the two must agree. Without
+    // this a portal could steer the verifier at another image's policy.
+    if let (Some(expected_base_image), Some(reported)) =
+        (expected_base_image, untrusted_portal_base_image_id)
+    {
+        let expected_ref: AppRef = expected_base_image.parse()?;
+        let expected_id = B256::from(atakit_cvm_encoding::base_image_id(
+            &atakit_cvm_types::AppRef::new(
+                expected_ref.publisher.into(),
+                expected_ref.name,
+                expected_ref.version,
+            ),
+        ));
+        let reported_id = B256::from(reported);
+        if expected_id != reported_id {
+            bail!(
+                "GET /status claimed base_image_id {} but --base-image {expected_base_image} resolves to {}",
+                hex0x(reported_id),
+                hex0x(expected_id)
+            );
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve base-image measurement collateral from sources selected by the
+/// verifier. An explicit measurement path wins; otherwise the verifier's
+/// selected chain is used. The automatic deployment-local cache is
+/// intentionally excluded from this path.
+pub(crate) async fn resolve_verifier_tls_measurement_policy(
+    measurements: Option<&std::path::Path>,
+    base_image: &str,
+    measurement_publisher_keys: &[String],
+    data_dir: &std::path::Path,
+    chain_client: Option<&atakit_attestation_client::AttestationClient>,
+) -> Result<MeasurementPolicy> {
+    if measurements.is_some() {
+        return atakit_cloud::init::load_measurement_policy(
+            measurements,
+            Some(base_image),
+            measurement_publisher_keys,
+            Some(data_dir),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("explicit measurement source returned no policy"));
+    }
+
+    if let Some(chain_client) = chain_client {
+        return chain_client
+            .resolve_base_image_measurement_policy(base_image)
+            .await
+            .map_err(anyhow::Error::new);
+    }
+
+    bail!(
+        "no trusted base-image measurement collateral is available; select a verifier chain with --chain or provide --measurements"
+    )
+}
+
+fn chain_measurement_policy_available(init_chain: &InitChainConfig) -> bool {
+    !init_chain.rpc_url.trim().is_empty()
+        && (init_chain.base_image_registry != ZERO_ADDR || init_chain.session_registry != ZERO_ADDR)
+}
+
+fn hex0x(bytes: impl AsRef<[u8]>) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 pub(crate) fn init_key_from_config(
@@ -135,13 +629,14 @@ pub(crate) async fn init_chain_from_config(
     chain_name: &str,
     chain: &ChainConfig,
     registration: Option<&str>,
+    prover: Option<&ProverSpec>,
 ) -> Result<InitChainConfig> {
     let registries = if registration_is_off(registration) {
         None
     } else {
         Some(derive_registries_from_session(chain_name, chain).await?)
     };
-    build_init_chain_config(chain_name, chain, registration, registries.as_ref())
+    build_init_chain_config(chain_name, chain, registration, registries.as_ref(), prover)
 }
 
 async fn derive_registries_from_session(
@@ -201,6 +696,7 @@ fn build_init_chain_config(
     chain: &ChainConfig,
     registration: Option<&str>,
     registries: Option<&ChainRegistries>,
+    prover: Option<&ProverSpec>,
 ) -> Result<InitChainConfig> {
     let placeholder_ok = registration_is_off(registration);
     let workload_registry = resolve_registry_address(
@@ -218,15 +714,28 @@ fn build_init_chain_config(
         placeholder_ok,
     )?;
 
+    let prover = prover
+        .filter(|_| !registration_is_off(registration))
+        .map(|prover| InitProverConfig {
+            backend: prover.backend.clone(),
+            execution: prover.execution.clone(),
+            endpoint: prover.endpoint.clone(),
+            credential: prover.credential.clone(),
+            options: prover
+                .options
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        });
     Ok(InitChainConfig {
         rpc_url: chain.rpc_url.clone(),
         session_registry: chain.session_registry.clone(),
         workload_registry,
         base_image_registry,
-        expire_offset: chain.expire_offset,
         registration: registration.map(str::to_string),
         chain_id: chain.chain_id,
-        proving_strategy: chain.proving_strategy.clone(),
+        tee_backend: chain.tee_backend.clone(),
+        prover,
     })
 }
 
@@ -303,6 +812,8 @@ pub(super) struct ResolvedImage {
     pub source_path: Option<String>,
     /// Local secure-boot cert directory from the image store, if available.
     pub certs_dir: Option<String>,
+    /// Publisher-qualified identity measured inside a stored base image.
+    pub measured_base_image_ref: Option<String>,
 }
 
 /// Resolve the `--image` argument into a display name and optional source path.
@@ -353,6 +864,7 @@ pub(super) fn resolve_image(
         display_name: image_arg.to_string(),
         source_path: None,
         certs_dir: None,
+        measured_base_image_ref: None,
     })
 }
 
@@ -389,12 +901,43 @@ fn resolve_store_image(
         display_name: image_ref.to_string(),
         source_path: Some(disk_path.display().to_string()),
         certs_dir: Some(store.certs_dir(image_ref).display().to_string()),
+        measured_base_image_ref: Some(read_measured_base_image_ref(store, image_ref)?),
     })
+}
+
+fn read_measured_base_image_ref(store: &ImageStore, image_ref: &ImageRef) -> Result<String> {
+    let path = store
+        .base_dir()
+        .join(&image_ref.repository)
+        .join(&image_ref.tag)
+        .join("baseimage.toml");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let document: toml::Value =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let value = document
+        .get("meta")
+        .and_then(|meta| meta.get("base-image-ref"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{} does not define meta.base-image-ref", path.display()))?;
+    let measured: AppRef = value.parse().with_context(|| {
+        format!(
+            "{}.meta.base-image-ref is not a publisher-qualified base-image reference",
+            path.display()
+        )
+    })?;
+    Ok(measured.to_string())
 }
 
 /// Resolved workload source: archive path + name/version + declared ports + disks.
 pub(crate) struct ResolvedWorkload {
+    /// Policy parsed from the same archive snapshot as archive_sha256.
+    pub manifest: atakit_workload::manifest::Manifest,
     pub archive_path: PathBuf,
+    /// SHA-256 of the same immutable archive bytes used to parse the manifest.
+    pub archive_sha256: [u8; 32],
+    /// Size of the same open archive file used for the hash and manifest.
+    pub archive_size_bytes: u64,
     pub name: String,
     pub version: String,
     pub ports: Vec<String>,
@@ -408,12 +951,16 @@ pub(crate) struct ResolvedWorkload {
     pub base_image_mode: String,
     /// Base image references for whitelist/blacklist filtering.
     pub base_image: Vec<String>,
-    /// Declared unmeasured-data file paths from the manifest, as deploy-relative
-    /// paths (the `unmeasured-data/` prefix stripped). The operator must supply
-    /// exactly this set at `/init`.
+    /// Verified TEE attribute requirements from the measured manifest.
+    pub attributes: atakit_core::tee_attributes::AttributeRequirements,
+    /// Declared unmeasured-data allowlist paths from the manifest, as
+    /// deploy-relative paths (the `unmeasured-data/` prefix stripped). The
+    /// operator may supply any subset of this set at `/init`.
     pub unmeasured_data_paths: Vec<String>,
     /// Workload source directory (available in dir mode, None for store-ref/file modes).
     pub workload_dir: Option<PathBuf>,
+    /// Owner fingerprint recorded in the measured workload manifest.
+    pub publisher: alloy_ext::core::primitives::B256,
 }
 
 /// Resolve workload from source arg, falling back to dir mode.
@@ -421,31 +968,41 @@ pub(crate) fn resolve_workload(
     source: &Option<String>,
     dir: &Option<PathBuf>,
     env: &Env,
+    config: &Config,
     skip_freshness_check: bool,
+    unmeasured_data_root: Option<&Path>,
 ) -> Result<ResolvedWorkload> {
     if let Some(ref src) = source {
-        // Store reference: name:version
+        // Store reference: <publisher>/<name>:<version>
         if crate::commands::workload::looks_like_store_ref(src) {
-            let (name, version) = src
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
+            let workload_ref = crate::commands::workload::parse_workload_ref(src, &config.alias)?;
             let store = WorkloadStore::new(&env.workload_dir);
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = workload_ref.workload_id();
+            let entry = store
+                .get(&workload_id)?
+                .ok_or_else(|| anyhow::anyhow!("workload not found in store: {src}"))?;
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
+                bail!("no archive blob for {src} in store");
             }
-            let inspect_opts = atakit_workload::InspectOptions {
-                archive: Some(blob.clone()),
-                workload_dir: None,
-                engine: None,
-                verbose: false,
-            };
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(atakit_workload::inspect_workload(&inspect_opts))
-            })
-            .context("failed to inspect store archive")?;
+            let (result, archive_sha256, archive_size_bytes) =
+                inspect_workload_archive_snapshot(&blob)
+                    .context("failed to inspect store archive")?;
+            let publisher =
+                crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
+            let entry_publisher: B256 = entry
+                .meta
+                .publisher
+                .parse()
+                .context("store entry has an invalid publisher")?;
+            if entry_publisher != publisher
+                || entry.meta.name != result.manifest.meta.name
+                || entry.meta.version != result.manifest.meta.version
+            {
+                bail!(
+                    "store entry identity does not match the measured workload manifest for {src}"
+                );
+            }
             let disks = result
                 .manifest
                 .disks
@@ -461,15 +1018,20 @@ pub(crate) fn resolve_workload(
             let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
             return Ok(ResolvedWorkload {
                 archive_path: blob,
-                name,
-                version,
+                archive_sha256,
+                archive_size_bytes,
+                publisher,
+                name: result.manifest.meta.name.clone(),
+                version: result.manifest.meta.version.clone(),
                 ports,
                 disks,
-                boot_disk_size: result.manifest.config.boot_disk_size,
-                base_image_mode: result.manifest.config.base_image_mode,
-                base_image: result.manifest.config.base_image,
+                boot_disk_size: result.manifest.config.boot_disk_size.clone(),
+                base_image_mode: result.manifest.config.base_image_mode.clone(),
+                base_image: result.manifest.config.base_image.clone(),
+                attributes: result.manifest.config.attributes.clone(),
                 unmeasured_data_paths: unmeasured_paths,
                 workload_dir: None,
+                manifest: result.manifest,
             });
         }
 
@@ -478,16 +1040,8 @@ pub(crate) fn resolve_workload(
         if !path.exists() {
             bail!("archive not found: {src}");
         }
-        let opts = atakit_workload::InspectOptions {
-            archive: Some(path.clone()),
-            workload_dir: None,
-            engine: None,
-            verbose: false,
-        };
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&opts))
-        })
-        .context("failed to inspect archive")?;
+        let (result, archive_sha256, archive_size_bytes) =
+            inspect_workload_archive_snapshot(&path).context("failed to inspect archive")?;
         let disks = result
             .manifest
             .disks
@@ -501,17 +1055,24 @@ pub(crate) fn resolve_workload(
             .collect();
         let ports = collect_firewall_ports(&result.manifest);
         let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+        let publisher =
+            crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
         return Ok(ResolvedWorkload {
             archive_path: path,
-            name: result.manifest.meta.name,
-            version: result.manifest.meta.version,
+            archive_sha256,
+            archive_size_bytes,
+            publisher,
+            name: result.manifest.meta.name.clone(),
+            version: result.manifest.meta.version.clone(),
             ports,
             disks,
-            boot_disk_size: result.manifest.config.boot_disk_size,
-            base_image_mode: result.manifest.config.base_image_mode,
-            base_image: result.manifest.config.base_image,
+            boot_disk_size: result.manifest.config.boot_disk_size.clone(),
+            base_image_mode: result.manifest.config.base_image_mode.clone(),
+            base_image: result.manifest.config.base_image.clone(),
+            attributes: result.manifest.config.attributes.clone(),
             unmeasured_data_paths: unmeasured_paths,
             workload_dir: None,
+            manifest: result.manifest,
         });
     }
 
@@ -527,11 +1088,18 @@ pub(crate) fn resolve_workload(
     }
     let archive_path = crate::commands::workload::find_versioned_archive(&workload_dir)?;
 
-    // Check if any source file is newer than the archive.
+    // Runtime inputs are not build sources. The archive already commits their
+    // allowed paths and env names; deployment must not re-enumerate that policy.
     if !skip_freshness_check {
+        let (runtime_roots, build_sources) = freshness_paths(&workload_dir, unmeasured_data_root)?;
         if let Ok(archive_meta) = std::fs::metadata(&archive_path) {
             if let Ok(archive_mtime) = archive_meta.modified() {
-                if let Some(stale_file) = find_newer_source(&workload_dir, &archive_mtime) {
+                if let Some(stale_file) = find_newer_source(
+                    &workload_dir,
+                    &archive_mtime,
+                    &runtime_roots,
+                    &build_sources,
+                ) {
                     bail!(
                         "'{}' is newer than {} - run 'atakit workload build' first, or pass --skip-freshness-check to skip this check",
                         stale_file.display(),
@@ -542,16 +1110,8 @@ pub(crate) fn resolve_workload(
         }
     }
 
-    let inspect_opts = atakit_workload::InspectOptions {
-        archive: Some(archive_path.clone()),
-        workload_dir: None,
-        engine: None,
-        verbose: false,
-    };
-    let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(atakit_workload::inspect_workload(&inspect_opts))
-    })
-    .context("failed to inspect archive")?;
+    let (result, archive_sha256, archive_size_bytes) =
+        inspect_workload_archive_snapshot(&archive_path).context("failed to inspect archive")?;
     let ports = collect_firewall_ports(&result.manifest);
     let disks = result
         .manifest
@@ -567,18 +1127,57 @@ pub(crate) fn resolve_workload(
     // The declared unmeasured-data set comes from the manifest (committed to
     // PCR23), not the source TOML, so every deploy mode resolves the same set.
     let unmeasured_paths = manifest_unmeasured_paths(&result.manifest);
+    let publisher =
+        crate::commands::workload::measured_workload_ref(&result.manifest.meta)?.publisher;
     Ok(ResolvedWorkload {
+        publisher,
         archive_path,
-        name: result.manifest.meta.name,
-        version: result.manifest.meta.version,
+        archive_sha256,
+        archive_size_bytes,
+        name: result.manifest.meta.name.clone(),
+        version: result.manifest.meta.version.clone(),
         ports,
         disks,
-        boot_disk_size: result.manifest.config.boot_disk_size,
-        base_image_mode: result.manifest.config.base_image_mode,
-        base_image: result.manifest.config.base_image,
+        boot_disk_size: result.manifest.config.boot_disk_size.clone(),
+        base_image_mode: result.manifest.config.base_image_mode.clone(),
+        base_image: result.manifest.config.base_image.clone(),
+        attributes: result.manifest.config.attributes.clone(),
         unmeasured_data_paths: unmeasured_paths,
         workload_dir: Some(workload_dir),
+        manifest: result.manifest,
     })
+}
+
+fn inspect_workload_archive_snapshot(
+    archive_path: &Path,
+) -> Result<(atakit_workload::InspectResult, [u8; 32], u64)> {
+    let mut file = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
+    let archive_size_bytes = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "failed to read archive metadata for {}",
+                archive_path.display()
+            )
+        })?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash archive {}", archive_path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let archive_sha256 = hasher.finalize().into();
+    file.rewind()
+        .with_context(|| format!("failed to rewind archive {}", archive_path.display()))?;
+    let inspection = atakit_workload::inspect_workload_archive_reader(file)?;
+    Ok((inspection, archive_sha256, archive_size_bytes))
 }
 
 /// The declared unmeasured-data file paths from the manifest, as deploy-relative
@@ -592,41 +1191,258 @@ fn manifest_unmeasured_paths(m: &atakit_workload::manifest::Manifest) -> Vec<Str
         .collect()
 }
 
-/// Walk a workload directory and return the first file newer than `threshold`.
-/// Skips `.git`, `target`, and `.atawl` files. Only compares file mtimes,
-/// not directory mtimes (directories update on unrelated changes like new files).
-fn find_newer_source(
-    dir: &std::path::Path,
-    threshold: &std::time::SystemTime,
-) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str == ".git"
-            || name_str == "target"
-            || name_str == ".claude"
-            || name_str == ".codex"
-        {
-            continue;
-        }
-        if name_str.ends_with(".atawl") {
-            continue;
-        }
-        let path = entry.path();
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.is_dir() {
-                if let Some(found) = find_newer_source(&path, threshold) {
-                    return Some(found);
+/// Resolve runtime roots using the same cwd-relative meaning as upload source
+/// selection. Canonical paths also cover symlink and `..` spellings.
+fn freshness_paths(
+    workload_dir: &Path,
+    explicit_root: Option<&Path>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    use atakit_workload::config::{ImageSource, WorkloadConfig};
+    let config = WorkloadConfig::from_dir(workload_dir)?;
+    let default_root = atakit_workload::data::default_unmeasured_data_root(workload_dir);
+    let runtime_roots = std::iter::once(default_root.as_path())
+        .chain(explicit_root)
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    // A runtime source may overlap build inputs. Those inputs must still be
+    // checked, even if the operator selects the workload directory itself.
+    let mut sources = vec![
+        workload_dir.join("atakit-workload.toml"),
+        workload_dir.join("measured-data"),
+        workload_dir.join("Dockerfile"),
+        workload_dir.join("Containerfile"),
+        workload_dir.join(".dockerignore"),
+        workload_dir.join(".containerignore"),
+    ];
+    let services = std::iter::once((&config.workload.image, &config.workload.env_file)).chain(
+        config
+            .dependencies
+            .values()
+            .map(|dep| (&dep.image, &dep.env_file)),
+    );
+    for (image, env_files) in services {
+        match image {
+            ImageSource::Build {
+                build,
+                containerfile,
+                ..
+            } => {
+                let context = workload_dir.join(build);
+                if let Some(file) = containerfile {
+                    sources.push(context.join(file));
                 }
-            } else if let Ok(mtime) = meta.modified() {
-                if mtime > *threshold {
+                sources.push(context);
+            }
+            ImageSource::File { file } => sources.push(workload_dir.join(file)),
+            ImageSource::Registry(_) => {}
+        }
+        if let Some(files) = env_files {
+            sources.extend(
+                files
+                    .as_vec()
+                    .into_iter()
+                    .map(|file| workload_dir.join(file)),
+            );
+        }
+    }
+    let build_sources = sources
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    Ok((runtime_roots, build_sources))
+}
+
+/// Ignore runtime-only subtrees, while preserving checks for overlapping build
+/// inputs. Track visited directories so symlink aliases cannot create cycles.
+fn find_newer_source(
+    dir: &Path,
+    threshold: &std::time::SystemTime,
+    runtime_roots: &[PathBuf],
+    build_sources: &[PathBuf],
+) -> Option<PathBuf> {
+    fn walk(
+        dir: &Path,
+        threshold: &std::time::SystemTime,
+        runtime_roots: &[PathBuf],
+        build_sources: &[PathBuf],
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        if !visited.insert(dir.canonicalize().ok()?) {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), ".git" | "target" | ".claude" | ".codex")
+                || name.ends_with(".atawl")
+            {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            let runtime_only = runtime_roots.iter().any(|root| canonical.starts_with(root))
+                && !build_sources
+                    .iter()
+                    .any(|source| canonical.starts_with(source) || source.starts_with(&canonical));
+            if runtime_only {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.is_dir() {
+                    if let Some(found) =
+                        walk(&path, threshold, runtime_roots, build_sources, visited)
+                    {
+                        return Some(found);
+                    }
+                } else if meta.modified().is_ok_and(|mtime| mtime > *threshold) {
                     return Some(path);
                 }
             }
         }
+        None
     }
-    None
+    walk(
+        dir,
+        threshold,
+        runtime_roots,
+        build_sources,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+#[cfg(test)]
+mod source_freshness_tests {
+    use super::{find_newer_source, freshness_paths};
+    use std::{
+        path::Path,
+        time::{Duration, SystemTime},
+    };
+
+    fn newer_file(root: &Path, relative: &str) -> std::path::PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(200))
+            .unwrap();
+        path
+    }
+
+    fn config(root: &Path, fields: &str) {
+        std::fs::write(
+            root.join("atakit-workload.toml"),
+            format!("format = 9\n[workload]\nname = \"test\"\nversion = \"v0.0.1\"\nbase-image-mode = \"blacklist\"\n{fields}\n"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("atakit-workload.toml"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+    }
+
+    #[test]
+    fn custom_runtime_root_resolves_dotdot_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        config(tmp.path(), "image = \"test:latest\"");
+        newer_file(tmp.path(), "operator-inputs/value");
+        std::os::unix::fs::symlink(tmp.path().join("operator-inputs"), tmp.path().join("alias"))
+            .unwrap();
+        let root = tmp.path().join("alias/../operator-inputs");
+        let (runtime, sources) = freshness_paths(tmp.path(), Some(&root)).unwrap();
+        assert_eq!(
+            find_newer_source(
+                tmp.path(),
+                &(SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+                &runtime,
+                &sources
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_root_cannot_hide_overlapping_build_inputs() {
+        for (fields, relative) in [
+            ("image = \"test:latest\"", "atakit-workload.toml"),
+            ("image = \"test:latest\"", "measured-data/value"),
+            ("image = \"test:latest\"\nenv-file = \"./operator-inputs/build.env\"", "operator-inputs/build.env"),
+            ("image = { file = \"./operator-inputs/image.tar\" }", "operator-inputs/image.tar"),
+            ("image = { build = \"./operator-inputs\" }", "operator-inputs/source"),
+            ("image = { build = \"./context\", containerfile = \"../operator-inputs/Buildfile\" }", "operator-inputs/Buildfile"),
+            ("image = \"test:latest\"\n[dependencies.helper]\nimage = \"test:latest\"\nenv-file = \"./operator-inputs/dependency.env\"", "operator-inputs/dependency.env"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            config(tmp.path(), fields);
+            std::fs::create_dir(tmp.path().join("context")).unwrap();
+            let path = if relative == "atakit-workload.toml" {
+                let path = tmp.path().join(relative);
+                std::fs::File::options().write(true).open(&path).unwrap()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(200)).unwrap();
+                path
+            } else { newer_file(tmp.path(), relative) };
+            let (runtime, sources) = freshness_paths(tmp.path(), Some(tmp.path())).unwrap();
+            assert_eq!(find_newer_source(tmp.path(), &(SystemTime::UNIX_EPOCH + Duration::from_secs(100)), &runtime, &sources), Some(path), "{relative}");
+        }
+    }
+
+    #[test]
+    fn runtime_alias_cannot_hide_measured_files_or_loop_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        config(tmp.path(), "image = \"test:latest\"");
+        let path = newer_file(tmp.path(), "measured-data/value");
+        std::os::unix::fs::symlink(
+            tmp.path().join("measured-data"),
+            tmp.path().join("runtime-alias"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+        let (runtime, sources) =
+            freshness_paths(tmp.path(), Some(&tmp.path().join("runtime-alias"))).unwrap();
+        let found = find_newer_source(
+            tmp.path(),
+            &(SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+            &runtime,
+            &sources,
+        )
+        .unwrap();
+        assert_eq!(found.canonicalize().unwrap(), path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn runtime_inputs_do_not_make_the_archive_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let root = tmp.path().join("unmeasured-data");
+        newer_file(tmp.path(), "unmeasured-data/config/key.pem");
+        newer_file(tmp.path(), "unmeasured-data/runtime.env");
+        assert_eq!(
+            find_newer_source(tmp.path(), &threshold, &[root], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn measured_and_build_sources_still_make_the_archive_stale() {
+        for relative in [
+            "atakit-workload.toml",
+            "Dockerfile",
+            "measured-data/config.json",
+            "measured-data/unmeasured-data/config.json",
+            "src/unmeasured-data/input.txt",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+            let path = newer_file(tmp.path(), relative);
+            let root = tmp.path().join("unmeasured-data");
+            assert_eq!(
+                find_newer_source(tmp.path(), &threshold, &[root], &[]),
+                Some(path)
+            );
+        }
+    }
 }
 
 /// Collect resolved firewall ports from a manifest as `"port/proto"` strings.
@@ -682,7 +1498,7 @@ pub(crate) fn portal_endpoints(state: &DeployState) -> Result<(String, u16, u16)
 
 /// Validate that the given image ref is allowed by the workload's base-image policy.
 pub(super) fn validate_base_image(
-    image_display_name: &str,
+    selected_base_image_ref: &str,
     base_image_mode: &str,
     base_image: &[String],
 ) -> Result<()> {
@@ -690,40 +1506,45 @@ pub(super) fn validate_base_image(
         return Ok(());
     }
 
-    // Every entry must parse as a valid ImageRef (repository:tag).
-    for entry in base_image {
-        if entry.parse::<ImageRef>().is_err() {
-            bail!(
-                "invalid base-image entry '{}': must be repository:tag format \
-                 (e.g. 'automata-linux:v0.1.6')",
-                entry,
-            );
-        }
-    }
+    let allowed: Vec<AppRef> = base_image
+        .iter()
+        .map(|entry| {
+            entry
+                .parse()
+                .with_context(|| format!("invalid publisher-qualified base-image entry {entry:?}"))
+        })
+        .collect::<Result<_>>()?;
+    let selected: AppRef = selected_base_image_ref.parse().with_context(|| {
+        format!(
+            "selected base image {selected_base_image_ref:?} has no publisher-qualified \
+             measured identity; pass --base-image <publisher>/<name>:<version>"
+        )
+    })?;
+    let selected_is_listed = allowed.iter().any(|entry| entry == &selected);
 
     match base_image_mode {
         "whitelist" => {
             // Empty whitelist = nothing allowed.
-            if !base_image.iter().any(|b| b == image_display_name) {
+            if !selected_is_listed {
                 if base_image.is_empty() {
                     bail!(
                         "image '{}' rejected: base-image-mode is 'whitelist' but \
                          base-image list is empty (no images are allowed)",
-                        image_display_name,
+                        selected_base_image_ref,
                     );
                 }
                 bail!(
                     "image '{}' is not in the workload's base-image whitelist: [{}]",
-                    image_display_name,
+                    selected_base_image_ref,
                     base_image.join(", "),
                 );
             }
         }
         "blacklist" => {
-            if base_image.iter().any(|b| b == image_display_name) {
+            if selected_is_listed {
                 bail!(
                     "image '{}' is blacklisted by the workload",
-                    image_display_name,
+                    selected_base_image_ref,
                 );
             }
         }
@@ -737,144 +1558,270 @@ pub(super) fn validate_base_image(
     Ok(())
 }
 
-/// Resolve the operator-supplied unmeasured-data into a tar.gz for `/init`,
-/// given the manifest's declared path set.
-///
-/// Gated on the **declared path set** (not the per-container mount boolean),
-/// because the portal verifies the uploaded set against the manifest's
-/// `unmeasured-data` array unconditionally. When the manifest declares paths but
-/// no `--unmeasured-data-dir` (and no workload source dir) is available, this is
-/// a hard **error**, not a warning: the portal would reject `/init` for the
-/// missing set, and failing here avoids provisioning a VM that can never init.
-pub(crate) fn resolve_unmeasured_tar(
-    declared_paths: &[String],
-    unmeasured_data_dir: Option<&PathBuf>,
-    workload_dir: Option<&PathBuf>,
-) -> Result<Option<Vec<u8>>> {
-    if declared_paths.is_empty() {
-        return Ok(None);
-    }
-    let Some(dir) = unmeasured_data_dir.or(workload_dir) else {
-        bail!(
-            "workload declares {} unmeasured-data file(s) but no source directory is available; \
-             pass --unmeasured-data-dir with the declared files (the portal requires exactly the \
-             declared set at /init)",
-            declared_paths.len(),
+#[cfg(test)]
+mod base_image_validation_tests {
+    use super::*;
+
+    const PUBLISHER_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUBLISHER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn stored_image_uses_its_measured_publisher_qualified_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            format!("[meta]\nformat = 2\nbase-image-ref = \"{PUBLISHER_A}/automata-linux:v1\"\n"),
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        assert_eq!(
+            read_measured_base_image_ref(&store, &image_ref).unwrap(),
+            format!("{PUBLISHER_A}/automata-linux:v1")
         );
-    };
-    collect_unmeasured_tar(declared_paths, dir)
+    }
+
+    #[test]
+    fn stored_image_rejects_a_base_image_reference_without_a_publisher() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_ref: ImageRef = "automata-linux:v1".parse().unwrap();
+        let image_dir = directory.path().join("automata-linux/v1");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(
+            image_dir.join("baseimage.toml"),
+            "[meta]\nformat = 2\nbase-image-ref = \"automata-linux:v1\"\n",
+        )
+        .unwrap();
+
+        let store = ImageStore::new(directory.path());
+        let error = read_measured_base_image_ref(&store, &image_ref).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_whitelist_entry() {
+        validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bare_store_image_ref_cannot_discard_the_publisher() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("has no publisher-qualified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_base_image_assertion_matches_the_publisher_too() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_B}/automata-linux:v1"),
+            "whitelist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not in"), "{error}");
+    }
+
+    #[test]
+    fn malformed_policy_entry_is_rejected() {
+        let error = validate_base_image(
+            "automata-linux:v1",
+            "whitelist",
+            &["automata-linux:v1".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid publisher-qualified base-image entry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_image_ref_matches_publisher_qualified_blacklist_entry() {
+        let error = validate_base_image(
+            &format!("{PUBLISHER_A}/automata-linux:v1"),
+            "blacklist",
+            &[format!("{PUBLISHER_A}/automata-linux:v1")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("blacklisted"), "{error}");
+    }
+}
+
+/// Resolve operator input before provisioning or initialization, then upload
+/// only declared files. Missing sources require an interactive or explicit choice.
+pub(crate) fn resolve_unmeasured_tar(
+    archive_dir: &Path,
+    declared_paths: &[String],
+    env_allowlists: &BTreeMap<String, Vec<String>>,
+    root: Option<&PathBuf>,
+    alias: Option<&PathBuf>,
+    workload_dir: Option<&PathBuf>,
+    skip: bool,
+) -> Result<Option<atakit_core::unmeasured_data::Archive>> {
+    let source = unmeasured::resolve_source(declared_paths, root, alias, workload_dir, skip)?;
+    if let Some(source) = source {
+        let policy = atakit_core::unmeasured_data::Policy {
+            paths: declared_paths
+                .iter()
+                .map(|p| format!("unmeasured-data/{p}"))
+                .collect(),
+            env: env_allowlists.clone(),
+        };
+        let files = atakit_core::unmeasured_data::Tree::collect(&source, &policy)
+            .map_err(anyhow::Error::msg)?;
+        for path in declared_paths {
+            if files.paths().any(|selected| selected == path) {
+                eprintln!("  Supply unmeasured file: {path:?}");
+            } else {
+                eprintln!("  Missing unmeasured file (allowed): {path:?}");
+            }
+        }
+        if files.is_empty() {
+            eprintln!("No unmeasured data supplied.");
+            return Ok(None);
+        }
+        atakit_core::unmeasured_data::prepare_archive_in(&files, archive_dir)
+            .map(Some)
+            .map_err(anyhow::Error::msg)
+    } else {
+        if !declared_paths.is_empty() {
+            eprintln!("No unmeasured data supplied.");
+            for path in declared_paths {
+                eprintln!("  Not supplied: {path:?}");
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Collect the operator-provided unmeasured-data files into a gzipped tar,
-/// after verifying the directory contains *exactly* the set the manifest
-/// declares.
+/// by selecting the declared files that are present under the source root.
 ///
-/// `declared` are deploy-relative file paths (no `./` prefix, e.g.
+/// `declared` are paths relative to the unmeasured-data root (for example
 /// `"secrets/api_key"`) — the manifest's `unmeasured-data` list with the
 /// `unmeasured-data/` prefix stripped. `data_dir` is the operator's
-/// `--unmeasured-data-dir`. Bails if any declared file is missing, or if the
-/// directory holds files the manifest does not declare: the set is committed to
-/// PCR23, so it must match exactly. Returns `None` only when nothing is declared.
+/// `--unmeasured-data-root`. Missing declared files are allowed: the manifest
+/// commits to the permitted path set, not to file presence or contents.
+/// Undeclared files under the root are ignored by the CLI and therefore are
+/// not uploaded. The portal still rejects undeclared paths if they appear in
+/// the uploaded tar. Returns `None` when nothing declared is present.
+#[cfg(test)]
 pub(crate) fn collect_unmeasured_tar(
     declared: &[String],
-    data_dir: &std::path::Path,
+    data_dir: &Path,
 ) -> Result<Option<Vec<u8>>> {
-    if declared.is_empty() {
+    let policy = atakit_core::unmeasured_data::Policy {
+        paths: declared
+            .iter()
+            .map(|p| format!("unmeasured-data/{p}"))
+            .collect(),
+        env: Default::default(),
+    };
+    let files =
+        atakit_core::unmeasured_data::collect(data_dir, &policy).map_err(anyhow::Error::msg)?;
+    if files.0.is_empty() {
         return Ok(None);
     }
-
-    let canon_base = data_dir
-        .canonicalize()
-        .with_context(|| format!("--unmeasured-data-dir not found: {}", data_dir.display()))?;
-
-    // Enumerate what's actually present, then diff against the declared set.
-    let mut actual: BTreeSet<String> = BTreeSet::new();
-    enumerate_files(&canon_base, &canon_base, &mut actual)?;
-    let declared_set: BTreeSet<String> = declared.iter().cloned().collect();
-
-    let missing: Vec<&str> = declared_set
-        .difference(&actual)
-        .map(String::as_str)
-        .collect();
-    let extra: Vec<&str> = actual
-        .difference(&declared_set)
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() || !extra.is_empty() {
-        let mut msg = format!(
-            "unmeasured-data in {} does not match the manifest's declared set",
-            data_dir.display()
-        );
-        if !missing.is_empty() {
-            msg.push_str(&format!(
-                "\n  missing (declared in manifest, not found): {}",
-                missing.join(", ")
-            ));
-        }
-        if !extra.is_empty() {
-            msg.push_str(&format!(
-                "\n  extra (present but not declared in manifest): {}",
-                extra.join(", ")
-            ));
-        }
-        bail!(msg);
-    }
-
-    // Set matches: build the tar from exactly the declared files.
-    let buf = Vec::new();
-    let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
-    let mut tar = tar::Builder::new(encoder);
-    for rel_path in declared {
-        let src = canon_base.join(rel_path);
-        let metadata = std::fs::metadata(&src)
-            .with_context(|| format!("read unmeasured-data file {rel_path}"))?;
-        let mut header = tar::Header::new_gnu();
-        header.set_size(metadata.len());
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mode(0o644);
-        header.set_cksum();
-        let file = std::fs::File::open(&src)?;
-        tar.append_data(&mut header, rel_path, file)?;
-    }
-
-    let encoder = tar.into_inner()?;
-    let bytes = encoder.finish()?;
-    Ok(Some(bytes))
+    atakit_core::unmeasured_data::archive(&files)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
 }
 
-/// Recursively collect file paths under `dir`, relative to `base`, joined with
-/// `/`. Symlinked files are resolved and verified to stay within `base`.
-fn enumerate_files(
-    dir: &std::path::Path,
-    base: &std::path::Path,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            enumerate_files(&path, base, out)?;
-        } else if path.is_file() {
-            let canon = path.canonicalize()?;
-            if !canon.starts_with(base) {
-                bail!(
-                    "unmeasured-data file resolves outside the data directory: {}",
-                    path.display(),
-                );
-            }
-            let rel = path
-                .strip_prefix(base)
-                .expect("path is under base")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.insert(rel);
+#[cfg(test)]
+mod unmeasured_data_tests {
+    use super::*;
+
+    fn write(path: &std::path::Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
         }
+        std::fs::write(path, bytes).unwrap();
     }
-    Ok(())
+
+    fn tar_entries(bytes: &[u8]) -> Vec<String> {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut out = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn explicit_skip_needs_no_source() {
+        assert!(resolve_unmeasured_tar(
+            Path::new("."),
+            &["runtime.env".into()],
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+            true
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_allows_missing_declared_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+
+        let declared = vec!["runtime.env".to_string(), "missing.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
+
+    #[test]
+    fn collect_unmeasured_tar_ignores_undeclared_source_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path().join("runtime.env").as_path(), b"PORT=8080\n");
+        write(tmp.path().join("extra.env").as_path(), b"BAD=1\n");
+
+        let declared = vec!["runtime.env".to_string()];
+        let tar = collect_unmeasured_tar(&declared, tmp.path())
+            .unwrap()
+            .expect("present allowlisted file should produce a tar");
+
+        assert_eq!(tar_entries(&tar), vec!["runtime.env"]);
+    }
 }
 
 /// Build a `CloudImage` record for the given platform.
@@ -896,6 +1843,7 @@ pub(super) fn build_cloud_image_record(
                 image_version: None,
                 cc_types: cc_types.to_vec(),
                 uploaded_at: chrono::Utc::now(),
+                removal: None,
             }
         }
         PlatformKind::Azure => {
@@ -911,6 +1859,7 @@ pub(super) fn build_cloud_image_record(
                 image_version: Some(names.image_version),
                 cc_types: cc_types.to_vec(),
                 uploaded_at: chrono::Utc::now(),
+                removal: None,
             }
         }
         PlatformKind::Aws => {
@@ -924,6 +1873,7 @@ pub(super) fn build_cloud_image_record(
                 image_version: None,
                 cc_types: cc_types.to_vec(),
                 uploaded_at: chrono::Utc::now(),
+                removal: None,
             }
         }
         PlatformKind::Qemu => unreachable!(
@@ -956,7 +1906,9 @@ pub(super) async fn ensure_cloud_image(
     env: &Env,
     verbose: bool,
 ) -> Result<UploadResult> {
+    let _image_lock = CloudImages::lock(&env.data_dir, image_ref, provider_name)?;
     let mut cloud_imgs = CloudImages::load(&env.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cloud_imgs.ensure_not_removing(image_ref, provider_name)?;
 
     let cloud_provider: Box<dyn CloudProvider> = match provider_config.platform {
         PlatformKind::Gcp => {
@@ -1136,9 +2088,9 @@ fn test_chain_config() -> ChainConfig {
         session_registry: "0x1111111111111111111111111111111111111111".to_string(),
         workload_registry: None,
         base_image_registry: None,
-        expire_offset: 300,
         chain_id: None,
-        proving_strategy: None,
+        tee_backend: "auto".to_string(),
+        prover: None,
     }
 }
 
@@ -1158,9 +2110,21 @@ mod chain_init_tests {
     }
 
     #[test]
+    fn off_chain_drops_inherited_prover_profile() {
+        let chain = test_chain_config();
+        let prover = serde_json::from_value(serde_json::json!({
+            "backend": "sp1", "execution": "network", "endpoint": "http://prover.invalid"
+        }))
+        .unwrap();
+        let got =
+            build_init_chain_config("offchain", &chain, Some("off"), None, Some(&prover)).unwrap();
+        assert!(got.prover.is_none());
+    }
+
+    #[test]
     fn registration_off_does_not_require_derived_registries() {
         let chain = test_chain_config();
-        let got = build_init_chain_config("offchain", &chain, Some("off"), None).unwrap();
+        let got = build_init_chain_config("offchain", &chain, Some("off"), None, None).unwrap();
         assert_eq!(got.registration.as_deref(), Some("off"));
         assert_eq!(got.workload_registry, ZERO_ADDR);
         assert_eq!(got.base_image_registry, ZERO_ADDR);
@@ -1174,8 +2138,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let got =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+        let got = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap();
 
         assert_eq!(got.workload_registry, derived.workload_registry);
         assert_eq!(got.base_image_registry, derived.base_image_registry);
@@ -1191,8 +2155,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let got =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap();
+        let got = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap();
 
         assert_eq!(got.workload_registry, chain.workload_registry.unwrap());
         assert_eq!(got.base_image_registry, chain.base_image_registry.unwrap());
@@ -1207,8 +2171,8 @@ mod chain_init_tests {
             base_image_registry: "0x3333333333333333333333333333333333333333".to_string(),
         };
 
-        let err =
-            build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived)).unwrap_err();
+        let err = build_init_chain_config("hoodi", &chain, Some("required"), Some(&derived), None)
+            .unwrap_err();
 
         assert!(err.to_string().contains("workload_registry"), "{err}");
         assert!(err.to_string().contains("does not match"), "{err}");
@@ -1217,7 +2181,7 @@ mod chain_init_tests {
     #[test]
     fn qemu_forces_registration_off() {
         let chain = test_chain_config();
-        let got = build_init_chain_config("local", &chain, Some("off"), None).unwrap();
+        let got = build_init_chain_config("local", &chain, Some("off"), None, None).unwrap();
         assert_eq!(got.registration.as_deref(), Some("off"));
         assert_eq!(got.workload_registry, ZERO_ADDR);
         assert_eq!(got.base_image_registry, ZERO_ADDR);
@@ -1268,8 +2232,21 @@ mod portal_endpoint_tests {
     fn base_state(platform: PlatformKind) -> DeployState {
         let now = chrono::Utc::now();
         DeployState {
-            format: 1,
+            cleanup: Default::default(),
+            provisioning: Default::default(),
+            created_boot_disk: None,
+            automatic_disk_setup: Default::default(),
+            disk_configuration: Default::default(),
+            created_disks: Default::default(),
+            initialization: None,
+            provisioning_complete: false,
+            cloud_instance_id: None,
+            init_auth_required: None,
+            init_auth_key_file: None,
+            format: 3,
             instance_name: "test-instance".to_string(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".to_string(),
             workload_name: "test-workload".to_string(),
             workload_version: "v0.0.1".to_string(),
             target_name: "test-target".to_string(),
@@ -1281,6 +2258,7 @@ mod portal_endpoint_tests {
                 ip: "127.0.0.1".to_string(),
             },
             image_ref: "test-image:v1".to_string(),
+            base_image_ref: Some("test-image:v1".to_string()),
             archive_path: "/tmp/test.atawl".to_string(),
             archive_hash: "abc123".to_string(),
             init_env: PersistedInitEnv::default(),
@@ -1308,6 +2286,7 @@ mod portal_endpoint_tests {
     fn cloud_platform_uses_external_ip_and_well_known_ports() {
         let mut state = base_state(PlatformKind::Aws);
         state.resources.aws = Some(atakit_cloud::AwsResources {
+            disks: Vec::new(),
             region: "us-east-1".to_string(),
             bucket: None,
             snapshot: None,
@@ -1338,5 +2317,103 @@ mod portal_endpoint_tests {
         let got = portal_endpoints(&state).unwrap();
 
         assert_eq!(got, ("203.0.113.10".to_string(), 6024, 5024));
+    }
+}
+
+#[cfg(test)]
+mod tls_measurement_policy_tests {
+    use super::*;
+
+    #[test]
+    fn chain_measurement_policy_is_available_with_registration_off() {
+        let mut chain = synthesize_off_init_chain();
+        chain.registration = Some("off".to_string());
+        chain.rpc_url = "https://rpc.example.com".to_string();
+        chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        assert!(chain_measurement_policy_available(&chain));
+
+        chain.base_image_registry = ZERO_ADDR.to_string();
+        chain.session_registry = "0x2222222222222222222222222222222222222222".to_string();
+        assert!(chain_measurement_policy_available(&chain));
+    }
+
+    #[tokio::test]
+    async fn default_tls_policy_does_not_read_local_measurement_cache() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let pack_dir = data_dir
+            .path()
+            .join("baseimage")
+            .join("measurements")
+            .join("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("measurement-pack.json"), b"{}").unwrap();
+
+        let chain = synthesize_off_init_chain();
+
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured chain with BaseImageRegistry or SessionRegistry"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_image_flag_is_only_an_assertion_against_status_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut chain = synthesize_off_init_chain();
+        chain.rpc_url = "https://rpc.example.com".to_string();
+        chain.base_image_registry = "0x1111111111111111111111111111111111111111".to_string();
+
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            Some("0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f/base:v1"),
+            Some([0x11; 32]),
+            &[],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--base-image"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("GET /status claimed base_image_id"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_publisher_key_requires_explicit_measurements() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chain = synthesize_off_init_chain();
+        let error = resolve_explicit_tls_measurement_policy(
+            None,
+            None,
+            Some([0x11; 32]),
+            &["0x02".to_string()],
+            data_dir.path(),
+            &chain,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--measurement-publisher-key requires --measurements"
+        );
     }
 }

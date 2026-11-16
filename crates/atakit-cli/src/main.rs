@@ -3,7 +3,7 @@ mod config;
 mod progress;
 
 use anyhow::Result;
-use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand};
+use atakit_cloud::cli::{CloudCommand, CloudImageCommand, CloudProviderCommand, SessionCommand};
 use atakit_core::Env;
 use atakit_image::ImageCommand;
 use atakit_workload::cli::WorkloadCommand;
@@ -33,7 +33,13 @@ enum Command {
     Workload(WorkloadCommand),
     /// Manage cloud deployments
     #[command(subcommand)]
-    Cloud(CloudCommand),
+    Cloud(Box<CloudCommand>),
+    /// Inspect the signing keys declared in `[keys]`
+    #[command(subcommand)]
+    Keys(commands::keys::KeysCommand),
+    /// Produce and inspect `.atatp` trust packs
+    #[command(subcommand)]
+    TrustPack(commands::trustpack::TrustPackCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -121,17 +127,35 @@ async fn main() -> Result<()> {
                 commands::workload::push::run(args, &env, &config, cli.verbose).await
             }
             WorkloadCommand::Import(args) => commands::workload::import::run(args, &env).await,
-            WorkloadCommand::Export(args) => commands::workload::export::run(args, &env),
+            WorkloadCommand::Export(args) => commands::workload::export::run(args, &env, &config),
             WorkloadCommand::Add(args) => commands::workload::add::run(args, &env, &config).await,
-            WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env),
-            WorkloadCommand::Init(args) => commands::workload::init::run(args, &env, &config).await,
+            WorkloadCommand::Rm(args) => commands::workload::rm::run(args, &env, &config),
+            WorkloadCommand::Init(args) => {
+                commands::workload::init::run(*args, &env, &config).await
+            }
+            WorkloadCommand::Disk(atakit_workload::cli::WorkloadDiskCommand::Unlock(args)) => {
+                commands::cloud::disk::run_host(*args, &env, &config).await
+            }
         },
-        Command::Cloud(cmd) => match cmd {
+        Command::Cloud(cmd) => match *cmd {
+            CloudCommand::UnmeasuredData(args) => {
+                commands::cloud::unmeasured_data::run(args, &env, &config).await
+            }
+            CloudCommand::Configure(args) => {
+                commands::cloud::configure::run(args, &env, &config).await
+            }
             CloudCommand::Deploy(args) => {
                 commands::cloud::deploy::run(args, &env, &config, cli.verbose).await
             }
             CloudCommand::Destroy(args) => commands::cloud::destroy::run(args, &env, &config).await,
+            CloudCommand::Disk(atakit_cloud::cli::DiskCommand::Unlock(args)) => {
+                commands::cloud::disk::run(args, &env, &config).await
+            }
             CloudCommand::Status(args) => commands::cloud::status::run(args, &env, &config).await,
+            CloudCommand::Diagnose(args) => {
+                commands::cloud::diagnose::run(args, &env, &config).await
+            }
+            CloudCommand::Reboot(args) => commands::cloud::reboot::run(args, &env, &config).await,
             CloudCommand::Ls(args) => commands::cloud::list::run(args, &env, &config).await,
             CloudCommand::Ssh(args) => commands::cloud::ssh::run(args, &env, &config),
             CloudCommand::Serial(args) => commands::cloud::serial::run(args, &env, &config).await,
@@ -151,6 +175,40 @@ async fn main() -> Result<()> {
                 CloudProviderCommand::Ls => commands::cloud::provider::run(&config),
             },
             CloudCommand::Init(args) => commands::cloud::init::run(args, &env, &config).await,
+            CloudCommand::Resume(args) => commands::cloud::resume::run(args, &env, &config).await,
+            CloudCommand::VerifySession(args) => {
+                commands::cloud::verify_session::run(args, &env, &config).await
+            }
+            CloudCommand::Session(command) => match command {
+                SessionCommand::New(args) => {
+                    commands::cloud::session::run_new(args, &env, &config).await
+                }
+                SessionCommand::RotateKey(args) => {
+                    commands::cloud::session::run_rotate_key(args, &env, &config).await
+                }
+                SessionCommand::Renew(args) => {
+                    commands::cloud::session::run_renew(args, &env, &config).await
+                }
+                SessionCommand::Recover(args) => {
+                    commands::cloud::session::run_recover(args, &env, &config).await
+                }
+                SessionCommand::Status(args) => {
+                    commands::cloud::session::run_status(args, &env, &config).await
+                }
+            },
+        },
+        Command::Keys(cmd) => match cmd {
+            commands::keys::KeysCommand::CreateInit => commands::keys::create_init(&env),
+            commands::keys::KeysCommand::Ls(args) => commands::keys::ls(args, &config),
+            commands::keys::KeysCommand::Show(args) => commands::keys::show(args, &config),
+        },
+        Command::TrustPack(cmd) => match cmd {
+            commands::trustpack::TrustPackCommand::Build(args) => {
+                commands::trustpack::build(args, &config).await
+            }
+            commands::trustpack::TrustPackCommand::Inspect(args) => {
+                commands::trustpack::inspect(args)
+            }
         },
         Command::External(args) => {
             let subcmd = &args[0];
@@ -165,5 +223,120 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn deployment_commands_accept_explicit_unmeasured_skip_and_reject_conflicts() {
+        for command in [
+            vec!["atakit", "cloud", "deploy", "--target", "test"],
+            vec!["atakit", "cloud", "init", "test", "--target", "test"],
+            vec!["atakit", "workload", "init", "127.0.0.1"],
+        ] {
+            let mut skip = command.clone();
+            skip.push("--no-unmeasured-data");
+            assert!(Cli::try_parse_from(&skip).is_ok(), "{skip:?}");
+            for flag in ["--unmeasured-data-root", "--unmeasured-data-dir"] {
+                let mut conflict = skip.clone();
+                conflict.extend([flag, "./secrets"]);
+                assert!(Cli::try_parse_from(conflict).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn workload_disk_unlock_accepts_host_without_cloud_record() {
+        let args = [
+            "atakit",
+            "workload",
+            "disk",
+            "unlock",
+            "192.0.2.10",
+            "--disk",
+            "data",
+            "--workload",
+            "publisher/app:v1",
+            "--owner-key",
+            "owner",
+            "--chain",
+            "test-chain",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Workload(WorkloadCommand::Disk(
+            atakit_workload::cli::WorkloadDiskCommand::Unlock(args),
+        )) = cli.command
+        else {
+            panic!("expected workload disk unlock");
+        };
+        assert_eq!(args.host, "192.0.2.10");
+        assert_eq!(args.port, 2024);
+        assert_eq!(args.workload, "publisher/app:v1");
+        assert_eq!(args.verification.chain.as_deref(), Some("test-chain"));
+    }
+
+    #[test]
+    fn workload_disk_unlock_requires_identity_and_refuses_secret_arguments() {
+        let base = [
+            "atakit",
+            "workload",
+            "disk",
+            "unlock",
+            "::1",
+            "--disk",
+            "data",
+            "--workload",
+            "app.atawl",
+            "--owner-key",
+            "owner",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for flag in [
+            "--passphrase",
+            "--disk-passphrase",
+            "--unsafe-skip-tls-attestation",
+        ] {
+            let mut args = base.to_vec();
+            args.extend([flag, "secret"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(&base[..9]).is_err());
+    }
+
+    #[test]
+    fn workload_init_uses_the_shared_initialization_timeout_flag() {
+        let cli = Cli::try_parse_from(["atakit", "workload", "init", "127.0.0.1"])
+            .expect("workload init arguments");
+        let Command::Workload(WorkloadCommand::Init(args)) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = Cli::try_parse_from([
+            "atakit",
+            "workload",
+            "init",
+            "127.0.0.1",
+            "--init-timeout",
+            "1400",
+        ])
+        .expect("workload init arguments");
+        let Command::Workload(WorkloadCommand::Init(args)) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(Cli::try_parse_from([
+            "atakit",
+            "workload",
+            "init",
+            "127.0.0.1",
+            "--timeout",
+            "1400",
+        ])
+        .is_err());
     }
 }

@@ -36,8 +36,8 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     // Inspect workload to get PCR23 and manifest
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => Some(
-            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        None if config.build.container_engine != crate::config::ContainerEngine::Auto => Some(
+            atakit_workload::ContainerEngine::from_str_opt(config.build.container_engine.as_str())?,
         ),
         None => None,
     };
@@ -46,13 +46,10 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         let archive_str = archive_arg.to_string_lossy();
         if looks_like_store_ref(&archive_str) {
             let store = WorkloadStore::new(&env.workload_dir);
-            let (name, version) = archive_str
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = super::parse_workload_ref(&archive_str, &config.alias)?.workload_id();
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                bail!("no archive blob for {name}:{version} in store");
+                bail!("no archive blob for {archive_str} in store");
             }
             blob
         } else {
@@ -67,78 +64,22 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     };
 
     let opts = atakit_workload::InspectOptions {
+        publisher: None,
         archive: Some(archive),
         workload_dir: None,
         engine,
         verbose,
+        measured_data_root: None,
+        unmeasured_data_root: None,
     };
 
     let result = atakit_workload::inspect_workload(&opts).await?;
     let manifest = &result.manifest;
-
-    // Final PCR23 register value (computed by inspect).
-    let pcr23_hex = result.pcr23.strip_prefix("0x").unwrap_or(&result.pcr23);
-    let pcr23_bytes: [u8; 32] = hex::decode(pcr23_hex)
-        .context("invalid PCR23 hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("PCR23 must be 32 bytes"))?;
-    let pcr23_b256 = alloy_ext::core::primitives::B256::from(pcr23_bytes);
-
-    // Derive base image IDs from manifest's base-image list (name:version -> on-chain ID).
-    // --base-image-id CLI args override if provided.
-    let base_image_ids = if !args.base_image_id.is_empty() {
-        let mut ids = Vec::new();
-        for id_str in &args.base_image_id {
-            let hex_str = id_str.strip_prefix("0x").unwrap_or(id_str);
-            let bytes: [u8; 32] = hex::decode(hex_str)
-                .context(format!("invalid base image ID hex: {id_str}"))?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("base image ID must be 32 bytes: {id_str}"))?;
-            ids.push(alloy_ext::core::primitives::B256::from(bytes));
-        }
-        ids
-    } else {
-        manifest
-            .config
-            .base_image
-            .iter()
-            .map(|entry| {
-                let (name, version) = entry.split_once(':').ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid base-image entry '{}': expected name:version format",
-                        entry,
-                    )
-                })?;
-                Ok(super::compute_base_image_id(name, version))
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    // Map base-image-mode string to AccessMode enum value
-    // Solidity: ANY=0, BLACKLIST=1, WHITELIST=2
-    let base_image_mode = match manifest.config.base_image_mode.as_str() {
-        "any" => 0u8,
-        "blacklist" => 1u8,
-        "whitelist" => 2u8,
-        other => bail!("unknown base-image-mode: {other}"),
-    };
-
-    // Build WorkloadSpec using the contract's generated types
-    use automata_tee_workload_measurement::stubs::WorkloadRegistry::{PcrSpec, WorkloadSpec};
-
-    let spec = WorkloadSpec {
-        name: manifest.meta.name.clone(),
-        version: manifest.meta.version.clone(),
-        ttl: args.session_ttl.unwrap_or(manifest.config.session_ttl),
-        baseImageMode: base_image_mode,
-        baseImageIds: base_image_ids,
-        requirements: vec![],
-        pcrs: vec![PcrSpec {
-            pcrIndex: 23,
-            verifyType: 0, // STATIC
-            matchData: vec![pcr23_b256],
-        }],
-    };
+    let publisher = super::owner_fingerprint(&private_key_raw)?;
+    let resolved =
+        super::policy::resolve(&result, publisher, args.session_ttl, &args.base_image_id)?;
+    let spec = resolved.chain;
+    let base_image_mode = spec.baseImageMode;
 
     // Resolve relay key for transaction submission.
     let relay_key_raw = super::resolve_relay_key(args.relay_key.as_deref(), config)?;
@@ -165,9 +106,17 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
 
     let registry = measurement.workload_registry();
 
-    // Compute workload ID and display summary before publishing.
-    let workload_id = super::compute_workload_id(&manifest.meta.name, &manifest.meta.version);
-    let workload_id_hex = format!("0x{}", hex::encode(workload_id));
+    // The workload is published as whoever signs the registration, so the
+    // owner key's fingerprint is its publisher and therefore part of its
+    // identifier.
+    let publisher_hex = format!("{publisher:#x}");
+    let workload_app_ref = automata_tee_workload_measurement::types::AppRef::new(
+        publisher,
+        manifest.meta.name.clone(),
+        manifest.meta.version.clone(),
+    );
+    let workload_id = super::compute_workload_id(&workload_app_ref);
+    let workload_id_hex = format!("{workload_id:#x}");
     let base_image_mode_str = &manifest.config.base_image_mode;
 
     println!(
@@ -178,7 +127,7 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!();
     println!("  {:<20}{}", "Workload ID:".dimmed(), workload_id_hex);
     println!("  {:<20}{}", "Manifest SHA256:".dimmed(), result.sha256);
-    println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23);
+    println!("  {:<20}{}", "PCR23:".dimmed(), result.pcr23_sha256);
     println!(
         "  {:<20}{} ({})",
         "Base Image Mode:".dimmed(),
@@ -216,12 +165,71 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     println!(
         "  {:<20}{}",
         "TTL:".dimmed(),
-        if spec.ttl == 0 {
+        if spec.sessionTtl == 0 {
             "contract default (30 days)".to_string()
         } else {
-            format!("{}s ({} days)", spec.ttl, spec.ttl / 86400)
+            format!("{}s ({} days)", spec.sessionTtl, spec.sessionTtl / 86400)
         }
     );
+    if spec.requirements.is_empty() {
+        println!("  {:<20}{}", "Attributes:".dimmed(), "none".dimmed());
+    } else {
+        for (index, requirement) in spec.requirements.iter().enumerate() {
+            let key: [u8; 32] = requirement.key.into();
+            let attribute = atakit_core::tee_attributes::VerifiedTeeAttribute::from_key(&key);
+            let name = attribute
+                .map(|attribute| attribute.name())
+                .or_else(|| {
+                    manifest
+                        .config
+                        .attributes
+                        .keys()
+                        .find(|name| atakit_core::tee_attributes::attribute_key(name) == key)
+                        .map(String::as_str)
+                })
+                .unwrap_or("unknown");
+            let values = if attribute.is_none() {
+                manifest
+                    .config
+                    .attributes
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|value| match value {
+                        atakit_core::tee_attributes::AttributeValue::String(value) => {
+                            format!("{value:?}")
+                        }
+                        atakit_core::tee_attributes::AttributeValue::Boolean(value) => {
+                            value.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                requirement
+                    .allowedValues
+                    .iter()
+                    .map(|value| {
+                        let value: [u8; 32] = (*value).into();
+                        attribute
+                            .and_then(|attribute| {
+                                atakit_core::tee_attributes::readable_reserved_value(
+                                    attribute, &value,
+                                )
+                            })
+                            .unwrap_or_else(|| format!("0x{}", hex::encode(value)))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "  {:<20}{} = [{}]",
+                if index == 0 { "Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     if let Ok(existing) = registry.get_workload_spec(workload_id).await {
@@ -276,22 +284,31 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         {
             let store = WorkloadStore::new(&env.workload_dir);
             let now = chrono::Local::now().to_rfc3339();
-            let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
+            let existing_meta = match store.load_meta(&workload_id_hex) {
+                Ok(meta) => meta,
+                Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let meta = match existing_meta {
                 Some(mut m) => {
                     m.workload_id = workload_id_hex.clone();
+                    m.publisher = publisher_hex.clone();
+                    m.publisher = publisher_hex.clone();
                     m.sha256 = Some(result.sha256.clone());
-                    m.pcr23 = Some(result.pcr23.clone());
+                    m.pcr23 = Some(result.pcr23_sha256.clone());
                     apply_chain_data_to_meta(&mut m, &chain_data);
                     m.added_at = now;
                     m
                 }
                 None => {
                     let mut m = WorkloadMeta {
+                        metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                         workload_id: workload_id_hex.clone(),
+                        publisher: publisher_hex.clone(),
                         name: manifest.meta.name.clone(),
                         version: manifest.meta.version.clone(),
                         sha256: Some(result.sha256.clone()),
-                        pcr23: Some(result.pcr23.clone()),
+                        pcr23: Some(result.pcr23_sha256.clone()),
                         owner: None,
                         archive_size: None,
                         on_chain_spec: None,
@@ -321,12 +338,12 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
         }
     }
 
-    println!("Submitting registerWorkload transaction...");
-    let expire_offset = args.expire_offset.unwrap_or(chain.expire_offset);
+    println!("Submitting registerWorkloadV2 transaction...");
+    let op_expiry_seconds = args.op_expiry_seconds.unwrap_or(chain.op_expiry_seconds);
     let result_id = registry
-        .register_workload(&signer, spec, expire_offset)
+        .register_workload_v2(&signer, spec, op_expiry_seconds)
         .await
-        .context("registerWorkload failed")?;
+        .context("registerWorkloadV2 failed")?;
 
     println!();
     println!("{}", "Workload published successfully.".green().bold());
@@ -336,22 +353,30 @@ pub async fn run(args: PublishArgs, env: &Env, config: &Config, verbose: bool) -
     if let Ok(chain_data) = query_chain_data(workload_id, &rpc_url, &chain.session_registry).await {
         let store = WorkloadStore::new(&env.workload_dir);
         let now = chrono::Local::now().to_rfc3339();
-        let meta = match store.load_meta(&manifest.meta.name, &manifest.meta.version)? {
+        let existing_meta = match store.load_meta(&workload_id_hex) {
+            Ok(meta) => meta,
+            Err(atakit_workload::WorkloadError::UnsupportedMeta { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let meta = match existing_meta {
             Some(mut m) => {
                 m.workload_id = workload_id_hex.clone();
+                m.publisher = publisher_hex.clone();
                 m.sha256 = Some(result.sha256.clone());
-                m.pcr23 = Some(result.pcr23.clone());
+                m.pcr23 = Some(result.pcr23_sha256.clone());
                 apply_chain_data_to_meta(&mut m, &chain_data);
                 m.added_at = now;
                 m
             }
             None => {
                 let mut m = WorkloadMeta {
+                    metadata_format: atakit_workload::store::WORKLOAD_META_FORMAT_VERSION,
                     workload_id: workload_id_hex.clone(),
+                    publisher: publisher_hex.clone(),
                     name: manifest.meta.name.clone(),
                     version: manifest.meta.version.clone(),
                     sha256: Some(result.sha256.clone()),
-                    pcr23: Some(result.pcr23.clone()),
+                    pcr23: Some(result.pcr23_sha256.clone()),
                     owner: None,
                     archive_size: None,
                     on_chain_spec: None,

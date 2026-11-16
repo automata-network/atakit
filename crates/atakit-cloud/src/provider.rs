@@ -8,6 +8,9 @@ use crate::state::{DeployState, PersistedInitEnv, PortalPorts};
 
 /// Options for a deploy operation.
 pub struct DeployOptions {
+    pub disk_configuration: crate::disk_profiles::ResolvedDiskConfiguration,
+    /// Public bootstrap only; private credentials never enter a deployment plan.
+    pub init_auth: Option<String>,
     pub instance_name: String,
     pub target_name: String,
     pub target: CloudTarget,
@@ -35,6 +38,10 @@ pub struct DeployOptions {
     pub workload_disks: Vec<(String, u32, u64)>,
     /// Minimum boot/OS disk size in GB. Cloud default if None.
     pub boot_disk_size_gb: Option<u64>,
+    /// Existing operator-managed static public IP resource to attach.
+    pub static_ip: Option<String>,
+    /// Azure resource group containing `static_ip`.
+    pub static_ip_resource_group: Option<String>,
 }
 
 /// Open the deploy-selected portal ports plus workload-declared ports.
@@ -65,9 +72,11 @@ pub struct DestroyOptions {
 }
 
 /// Abstraction over cloud providers (GCP, Azure).
+// async_trait generates a must_use future that Clippy already treats as must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait CloudProvider: Send + Sync {
-    /// Check that required CLI tools are installed and authenticated.
+    /// Check that required CLI tools are installed. Deployment authentication is checked by `preflight::check`.
     fn check_deps(&self) -> Result<(), CloudError>;
 
     /// Generate a deployment plan.

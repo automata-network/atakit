@@ -2,9 +2,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [master]
+    branches: [atakit-ng]
   push:
-    branches: [master]
+    branches: [atakit-ng]
 
 permissions:
   contents: read
@@ -56,3 +56,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release --locked
+
+  macos-cli:
+    name: macOS ARM64 CLI
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and check CLI
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p atakit-cli --target aarch64-apple-darwin
+          bin=target/aarch64-apple-darwin/release/atakit
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atakit-cli"))')
+          test "$("$bin" --version)" = "atakit $version"
+          "$bin" --help
+          strip "$bin"
+          mkdir -p dist
+          out="atakit-v${version}-macos-arm64"
+          cp "$bin" "dist/$out"
+          (cd dist && shasum -a 256 "$out" > "$out.sha256")
+          git rev-parse HEAD > dist/source-commit.txt
+      - name: Save CLI build for verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: atakit-macos-arm64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error

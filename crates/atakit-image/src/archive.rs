@@ -7,7 +7,7 @@ use crate::error::{ImageError, Result};
 use crate::types::{ImageRef, Platform};
 
 /// Current format version for .atabi archives.
-pub const IMAGE_FORMAT_VERSION: u32 = 1;
+pub const IMAGE_FORMAT_VERSION: u32 = 2;
 
 /// Manifest embedded in an .atabi archive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +126,15 @@ pub fn create_image_archive(
 /// Returns the `ImageRef` parsed from the embedded manifest.
 pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Result<ImageRef> {
     let manifest = read_manifest(archive_path)?;
+    if manifest.meta.format != IMAGE_FORMAT_VERSION {
+        return Err(ImageError::ArchiveInvalid {
+            path: archive_path.to_path_buf(),
+            message: format!(
+                ".atabi format {} is not supported; rebuild the base image with format {}",
+                manifest.meta.format, IMAGE_FORMAT_VERSION
+            ),
+        });
+    }
 
     // Validate manifest-derived path components before using them to build paths.
     validate_path_component(&manifest.meta.name, "manifest name", archive_path)?;
@@ -169,6 +178,7 @@ pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Resul
     // The archive has a top-level directory named after the repository.
     // We need to strip that prefix and extract into dest_dir.
     let strip_prefix = &image_ref.repository;
+    let mut saw_baseimage_config = false;
 
     for entry in archive.entries().map_err(|e| ImageError::ArchiveRead {
         path: archive_path.to_path_buf(),
@@ -251,12 +261,22 @@ pub fn import_image_archive(archive_path: &Path, store_base_dir: &Path) -> Resul
                 path: target.clone(),
                 source: e,
             })?;
+            if relative == Path::new("baseimage.toml") {
+                saw_baseimage_config = true;
+            }
 
             // Compress VHD files to save disk space.
             if target.extension().is_some_and(|e| e == "vhd") {
                 compress_to_zst(&target, archive_path)?;
             }
         }
+    }
+
+    if !saw_baseimage_config {
+        return Err(ImageError::ArchiveInvalid {
+            path: archive_path.to_path_buf(),
+            message: "format 2 .atabi archive is missing baseimage.toml".to_string(),
+        });
     }
 
     Ok(image_ref)
@@ -530,6 +550,14 @@ fn write_archive_contents<W: std::io::Write>(
 ) -> Result<()> {
     append_dir_entry(tar, prefix)?;
     append_file_bytes(tar, &prefix.join("manifest.toml"), manifest_toml.as_bytes())?;
+    let baseimage_config = tag_dir.join("baseimage.toml");
+    if !baseimage_config.is_file() {
+        return Err(ImageError::ArchiveInvalid {
+            path: tag_dir.to_path_buf(),
+            message: "format 2 image store entry is missing baseimage.toml".to_string(),
+        });
+    }
+    append_file(tar, &baseimage_config, &prefix.join("baseimage.toml"))?;
 
     // Only include disk images for the specified platforms.
     let disk_images_src = tag_dir.join("disk_images");
@@ -786,6 +814,14 @@ mod tests {
 
     use super::*;
 
+    fn write_baseimage_config(tag_dir: &Path) {
+        std::fs::write(
+            tag_dir.join("baseimage.toml"),
+            "[meta]\nformat = 2\nbase-image-ref = \"test:v1\"\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn manifest_serde_roundtrip() {
         let manifest = ImageManifest {
@@ -812,6 +848,7 @@ mod tests {
         let certs_dir = tag_dir.join("secure_boot_certs");
         std::fs::create_dir_all(&disk_dir).unwrap();
         std::fs::create_dir_all(&certs_dir).unwrap();
+        write_baseimage_config(&tag_dir);
         std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"fake-gcp-image").unwrap();
         std::fs::write(certs_dir.join("PK.crt"), b"fake-pk-cert").unwrap();
 
@@ -857,6 +894,77 @@ mod tests {
         let imported_cert = store_dir.join("test-repo/v1.0.0/secure_boot_certs/PK.crt");
         assert!(imported_cert.exists());
         assert_eq!(std::fs::read(&imported_cert).unwrap(), b"fake-pk-cert");
+        assert_eq!(
+            std::fs::read_to_string(store_dir.join("test-repo/v1.0.0/baseimage.toml")).unwrap(),
+            "[meta]\nformat = 2\nbase-image-ref = \"test:v1\"\n"
+        );
+    }
+
+    #[test]
+    fn legacy_gzip_archive_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tag_dir = tmp.path().join("tag");
+        let disk_dir = tag_dir.join("disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        write_baseimage_config(&tag_dir);
+        std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"legacy-gzip-disk").unwrap();
+
+        let image_ref: ImageRef = "legacy-image:v1".parse().unwrap();
+        let out_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let archive_path = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &[Platform::Gcp],
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::Gz,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&archive_path).unwrap();
+        assert_eq!(manifest.meta.format, IMAGE_FORMAT_VERSION);
+        assert_eq!(manifest.meta.name, "legacy-image");
+
+        let store_dir = tmp.path().join("store");
+        assert_eq!(
+            import_image_archive(&archive_path, &store_dir).unwrap(),
+            image_ref
+        );
+        assert_eq!(
+            std::fs::read(store_dir.join("legacy-image/v1/disk_images/gcp_disk.tar.gz")).unwrap(),
+            b"legacy-gzip-disk"
+        );
+    }
+
+    #[test]
+    fn new_archive_uses_current_zstd_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tag_dir = tmp.path().join("tag");
+        let disk_dir = tag_dir.join("disk_images");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        write_baseimage_config(&tag_dir);
+        std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"current-disk").unwrap();
+
+        let image_ref: ImageRef = "current-image:v1".parse().unwrap();
+        let out_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let archive_path = create_image_archive(
+            &tag_dir,
+            &image_ref,
+            &[Platform::Gcp],
+            &out_dir,
+            &NullReporter,
+            ArchiveCompression::default(),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&archive_path).unwrap();
+        assert_eq!(&bytes[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(
+            read_manifest(&archive_path).unwrap().meta.format,
+            IMAGE_FORMAT_VERSION
+        );
     }
 
     #[cfg(unix)]
@@ -867,6 +975,7 @@ mod tests {
         let tag_dir = tmp.path().join("tag");
         let disk_dir = tag_dir.join("disk_images");
         std::fs::create_dir_all(&disk_dir).unwrap();
+        write_baseimage_config(&tag_dir);
         std::fs::write(disk_dir.join("gcp_disk.tar.gz"), b"fake-gcp-image").unwrap();
 
         let image_ref: ImageRef = "test-repo:v1.0.0".parse().unwrap();
@@ -924,6 +1033,24 @@ mod tests {
         manifest_prefix: &str,
         name: &str,
         version: &str,
+        extra_entries: &[RawEntry],
+    ) -> PathBuf {
+        build_test_archive_with_format(
+            dir,
+            manifest_prefix,
+            name,
+            version,
+            IMAGE_FORMAT_VERSION,
+            extra_entries,
+        )
+    }
+
+    fn build_test_archive_with_format(
+        dir: &Path,
+        manifest_prefix: &str,
+        name: &str,
+        version: &str,
+        format_version: u32,
         extra_entries: &[RawEntry],
     ) -> PathBuf {
         use std::io::Write;
@@ -994,7 +1121,7 @@ mod tests {
 
         // Manifest entry.
         let manifest = format!(
-            "[meta]\nformat = 1\nname = {name:?}\nversion = {version:?}\nplatforms = [\"gcp\"]\n"
+            "[meta]\nformat = {format_version}\nname = {name:?}\nversion = {version:?}\nplatforms = [\"gcp\"]\n"
         );
         write_raw_entry(
             &mut tar_bytes,
@@ -1027,6 +1154,39 @@ mod tests {
         enc.finish().unwrap();
 
         archive_path
+    }
+
+    #[test]
+    fn import_rejects_format_1_with_rebuild_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = build_test_archive_with_format(tmp.path(), "repo", "repo", "v1", 1, &[]);
+        let store_dir = tmp.path().join("store");
+        let error = import_image_archive(&archive, &store_dir).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(".atabi format 1 is not supported; rebuild the base image with format 2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_format_2_without_baseimage_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = build_malicious_archive(
+            tmp.path(),
+            "repo",
+            "v1",
+            &[RawEntry::File("repo/disk_images/gcp_disk.tar.gz", b"data")],
+        );
+        let store_dir = tmp.path().join("store");
+        let error = import_image_archive(&archive, &store_dir).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("format 2 .atabi archive is missing baseimage.toml"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

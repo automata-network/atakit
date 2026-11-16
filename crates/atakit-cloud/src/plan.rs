@@ -81,6 +81,8 @@ pub enum DeployStep {
         resource_group: Option<String>,
     },
     CreateInstance {
+        #[serde(default)]
+        boot_disk_performance: Option<crate::disk_profiles::DiskPerformance>,
         instance_name: String,
         machine_type: String,
         zone: String,
@@ -89,6 +91,7 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
     },
     WaitForPortal {
         timeout_secs: u64,
@@ -114,6 +117,8 @@ pub enum DeployStep {
         force: bool,
     },
     CreateInstanceAzure {
+        #[serde(default)]
+        availability_zone: Option<String>,
         instance_name: String,
         vm_size: String,
         image_id: String,
@@ -125,6 +130,8 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
+        static_ip_resource_group: Option<String>,
     },
     // AWS-specific steps.
     UploadImageAws {
@@ -142,6 +149,8 @@ pub enum DeployStep {
         force: bool,
     },
     CreateInstanceAws {
+        #[serde(default)]
+        boot_disk_performance: Option<crate::disk_profiles::DiskPerformance>,
         instance_name: String,
         instance_type: String,
         /// AMI name; the AMI id is resolved by name at execution time.
@@ -150,6 +159,7 @@ pub enum DeployStep {
         metadata: Vec<(String, String)>,
         disks: Vec<DiskSpec>,
         boot_disk_size_gb: Option<u64>,
+        static_ip: Option<String>,
     },
     // QEMU-specific steps.
     /// Provision a local QEMU instance: create the boot-disk qcow2 overlay,
@@ -176,6 +186,8 @@ pub enum DeployStep {
 /// Persistent disk specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskSpec {
+    #[serde(default)]
+    pub performance: Option<crate::disk_profiles::DiskPerformance>,
     /// Cloud disk resource name (e.g. `{instance}-{disk_name}`).
     pub name: String,
     /// Manifest disk name, used as device-name/serial for CVM agent discovery.
@@ -213,6 +225,9 @@ pub enum DestroyStep {
         name: String,
     },
     // Azure-specific destroy steps.
+    DeleteAzureResource {
+        resource: crate::provisioning_cleanup::AzureResource,
+    },
     DeleteResourceGroup {
         name: String,
     },
@@ -381,6 +396,9 @@ impl fmt::Display for DestroyStep {
             DestroyStep::DeleteBucket { name } => write!(f, "Delete GCS bucket '{name}'"),
             DestroyStep::DeleteResourceGroup { name } => {
                 write!(f, "Delete resource group '{name}'")
+            }
+            DestroyStep::DeleteAzureResource { resource } => {
+                write!(f, "Delete Azure resource '{}'", resource.id)
             }
             DestroyStep::DeleteImageVersion {
                 image_definition,

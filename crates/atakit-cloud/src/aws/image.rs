@@ -108,8 +108,20 @@ pub async fn import_snapshot(
             ],
         )
         .await
-        .map_err(|e| CloudError::ImageUploadFailed {
-            message: format!("import-snapshot failed: {e}"),
+        .map_err(|e| {
+            let mut message = format!("import-snapshot failed: {e}");
+            if message.contains("service role") && message.contains("vmimport") {
+                message.push_str(&format!(
+                    "\nAWS requires the IAM role 'vmimport'. Check it with \
+                     `aws iam get-role --role-name vmimport` using the same AWS profile. \
+                     Its trust policy must allow vmie.amazonaws.com to call sts:AssumeRole \
+                     with sts:Externalid=vmimport. Its permissions must allow reading \
+                     s3://{bucket}/{key} and importing the snapshot. The calling identity \
+                     also needs iam:PassRole for vmimport. See docs/aws-image-import.md \
+                     and https://docs.aws.amazon.com/vm-import/latest/userguide/required-permissions.html"
+                ));
+            }
+            CloudError::ImageUploadFailed { message }
         })?;
 
     let parsed: serde_json::Value = serde_json::from_str(&output.stdout)?;

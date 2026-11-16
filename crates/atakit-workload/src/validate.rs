@@ -1,11 +1,135 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
-use crate::config::{self, ImageSource, WorkloadConfig};
+use crate::config::{
+    self, AttributeRequirements, AttributeValue, DataMount, DiskSection, ImageSource,
+    ServiceStorageSection, WorkloadConfig,
+};
+use crate::data::{
+    logical_data_path_rel, namespaced_data_path, validate_logical_data_path, DataRoots,
+};
 use crate::WorkloadError;
+
+const MIN_DATA_DISK_GB: u64 = 10;
+
+pub fn normalize_attributes(
+    attributes: &AttributeRequirements,
+) -> Result<AttributeRequirements, WorkloadError> {
+    use atakit_core::tee_attributes::{
+        bytes32_hex, parse_bytes32_hex, tdx_tcb_status_mask, tdx_tcb_status_names,
+        valid_amd_sev_snp_platform_info_policy, valid_amd_sev_snp_tcb,
+        validate_boolean_allowed_values, ReservedAttributeValueKind, VerifiedTeeAttribute,
+        TEE_ATTRIBUTE_NAMESPACE,
+    };
+
+    let mut normalized = attributes.clone();
+    for (name, values) in attributes {
+        let Some(reserved) = VerifiedTeeAttribute::from_name(name) else {
+            if name.starts_with(TEE_ATTRIBUTE_NAMESPACE) {
+                return Err(WorkloadError::Validation(format!(
+                    "unknown workload.attributes name `{name}` in the reserved namespace"
+                )));
+            }
+            if !values
+                .iter()
+                .all(|value| matches!(value, AttributeValue::String(_)))
+            {
+                return Err(WorkloadError::Validation(format!(
+                    "workload.attributes `{name}` custom values must be strings"
+                )));
+            }
+            continue;
+        };
+
+        match reserved.value_kind() {
+            ReservedAttributeValueKind::Boolean => {
+                let bools: Option<Vec<bool>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::Boolean(value) => Some(*value),
+                        AttributeValue::String(_) => None,
+                    })
+                    .collect();
+                if !bools
+                    .as_deref()
+                    .is_some_and(validate_boolean_allowed_values)
+                {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must be [false] or [false, true]"
+                    )));
+                }
+            }
+            ReservedAttributeValueKind::IntelTdxTcbStatusMask => {
+                let names: Option<Vec<&str>> = values
+                    .iter()
+                    .map(|value| match value {
+                        AttributeValue::String(value) => Some(value.as_str()),
+                        AttributeValue::Boolean(_) => None,
+                    })
+                    .collect();
+                let Some(mask) = names
+                    .as_ref()
+                    .and_then(|names| tdx_tcb_status_mask(names.iter().copied()))
+                else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain unique supported Intel TDX TCB status names and include \"ok\""
+                    )));
+                };
+                normalized.insert(
+                    name.clone(),
+                    tdx_tcb_status_names(mask)
+                        .expect("validated mask")
+                        .into_iter()
+                        .map(|value| AttributeValue::String(value.to_string()))
+                        .collect(),
+                );
+            }
+            ReservedAttributeValueKind::AmdSevSnpTcb
+            | ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                if values.len() != 1 {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                }
+                let AttributeValue::String(value) = &values[0] else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let Some(encoded) = parse_bytes32_hex(value) else {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` must contain exactly one 0x-prefixed bytes32 string"
+                    )));
+                };
+                let valid = match reserved.value_kind() {
+                    ReservedAttributeValueKind::AmdSevSnpTcb => valid_amd_sev_snp_tcb(&encoded),
+                    ReservedAttributeValueKind::AmdSevSnpPlatformInfoPolicy => {
+                        valid_amd_sev_snp_platform_info_policy(&encoded)
+                    }
+                    _ => unreachable!(),
+                };
+                if !valid {
+                    return Err(WorkloadError::Validation(format!(
+                        "workload.attributes `{name}` contains an invalid packed value"
+                    )));
+                }
+                normalized.insert(
+                    name.clone(),
+                    vec![AttributeValue::String(bytes32_hex(&encoded))],
+                );
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 /// Reject paths containing `..` components (lexical check, works on non-existent paths).
 fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
+    if path.as_bytes().contains(&0) {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must not contain NUL: {path:?}"
+        )));
+    }
     let p = Path::new(path);
     for component in p.components() {
         if component == Component::ParentDir {
@@ -17,10 +141,24 @@ fn ensure_no_traversal(path: &str, context: &str) -> Result<(), WorkloadError> {
     Ok(())
 }
 
+fn validate_package_relative_path(path: &str, context: &str) -> Result<(), WorkloadError> {
+    if !path.starts_with("./") {
+        return Err(WorkloadError::Validation(format!(
+            "{context} path must start with \"./\": {path:?}"
+        )));
+    }
+    ensure_no_traversal(path, context)
+}
+
 fn ensure_absolute_clean_path(path: &str, context: &str) -> Result<(), WorkloadError> {
     if path.as_bytes().contains(&0) {
         return Err(WorkloadError::Validation(format!(
             "{context}: path must not contain NUL: {path:?}"
+        )));
+    }
+    if path.contains(':') || path.contains(',') {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: path must not contain ':' or ',': {path:?}"
         )));
     }
     let p = Path::new(path);
@@ -56,7 +194,7 @@ fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), Workload
     })?;
     if !canon_path.starts_with(&canon_base) {
         return Err(WorkloadError::Validation(format!(
-            "{context}: path escapes workload directory: {}",
+            "{context}: path escapes its allowed root: {}",
             path.display()
         )));
     }
@@ -65,29 +203,166 @@ fn ensure_within(path: &Path, base: &Path, context: &str) -> Result<(), Workload
 
 /// Validate a parsed config against the spec rules.
 ///
-/// `workload_dir` is the directory containing `atakit-workload.toml`, used to
-/// resolve relative paths.
 pub fn validate_config(
     config: &WorkloadConfig,
     workload_dir: &Path,
 ) -> Result<Vec<String>, WorkloadError> {
+    let roots = DataRoots::resolve(workload_dir, None, None);
+    validate_config_with_roots(config, workload_dir, &roots)
+}
+
+/// Validate a parsed config against the spec rules with explicit data roots.
+///
+/// `workload_dir` is the directory containing `atakit-workload.toml`. Package
+/// measured/unmeasured paths are logical absolute paths resolved under
+/// `data_roots`, not under `workload_dir`.
+pub fn validate_config_with_roots(
+    config: &WorkloadConfig,
+    workload_dir: &Path,
+    data_roots: &DataRoots,
+) -> Result<Vec<String>, WorkloadError> {
     let mut warnings = Vec::new();
     let w = &config.workload;
+    atakit_core::nofile::validate_requests(
+        config.format,
+        w.nofile
+            .into_iter()
+            .chain(config.dependencies.values().filter_map(|d| d.nofile))
+            .chain(
+                config
+                    .baby_container
+                    .iter()
+                    .flat_map(|b| b.slots.values())
+                    .filter_map(|s| s.nofile),
+            ),
+    )
+    .map_err(WorkloadError::Validation)?;
+    for rule in w
+        .cpuset_policy
+        .iter()
+        .chain(
+            config
+                .dependencies
+                .values()
+                .filter_map(|d| d.cpuset_policy.as_ref()),
+        )
+        .chain(
+            config
+                .baby_container
+                .iter()
+                .flat_map(|b| b.slots.values())
+                .filter_map(|s| s.cpuset_policy.as_ref()),
+        )
+    {
+        rule.validate().map_err(WorkloadError::Validation)?;
+    }
+    atakit_core::cpu_config::validate_rules(
+        config.format,
+        w.cpu_idle.as_ref(),
+        w.cpu_frequency.as_ref(),
+        w.cpuset
+            .iter()
+            .map(String::as_str)
+            .chain(
+                config
+                    .dependencies
+                    .values()
+                    .filter_map(|d| d.cpuset.as_deref()),
+            )
+            .chain(
+                config
+                    .baby_container
+                    .iter()
+                    .flat_map(|b| b.slots.values())
+                    .filter_map(|s| s.cpuset.as_deref()),
+            ),
+    )
+    .map_err(WorkloadError::Validation)?;
+
+    if w.readiness.is_some() || config.dependencies.values().any(|d| d.readiness.is_some()) {
+        if config.format < 9 {
+            return Err(WorkloadError::Validation(
+                "readiness requires format = 9".into(),
+            ));
+        }
+        for check in w.readiness.iter().chain(
+            config
+                .dependencies
+                .values()
+                .filter_map(|d| d.readiness.as_ref()),
+        ) {
+            check.validate().map_err(WorkloadError::Validation)?;
+        }
+    }
 
     // ── format version ───────────────────────────────────
     if config.format < 2 {
         return Err(WorkloadError::Validation(format!(
-            "atakit-workload.toml format version {} is no longer supported; update to format = 2",
+            "atakit-workload.toml format version {} is no longer supported; update to format = 2 or newer",
             config.format
         )));
     }
-    if config.format > crate::FORMAT_VERSION {
+    if config.format > crate::SOURCE_FORMAT_VERSION {
         return Err(WorkloadError::Validation(format!(
             "atakit-workload.toml format version {} is newer than supported ({}); upgrade atakit",
             config.format,
-            crate::FORMAT_VERSION
+            crate::SOURCE_FORMAT_VERSION
         )));
     }
+    for storage in config.workload.storage.values().chain(
+        config
+            .dependencies
+            .values()
+            .flat_map(|d| d.storage.values()),
+    ) {
+        storage
+            .validate_access(config.format)
+            .map_err(WorkloadError::Validation)?;
+    }
+    for storage in config
+        .baby_container
+        .iter()
+        .flat_map(|b| b.slots.values())
+        .flat_map(|s| s.storage.values())
+    {
+        storage
+            .validate_access(config.format)
+            .map_err(WorkloadError::Validation)?;
+    }
+    if config.format < 13
+        && (config.workload.storage.values().any(|s| s.executable())
+            || config
+                .dependencies
+                .values()
+                .any(|d| d.storage.values().any(|s| s.executable()))
+            || config.baby_container.as_ref().is_some_and(|b| {
+                b.slots
+                    .values()
+                    .any(|slot| slot.storage.values().any(|s| s.executable()))
+            }))
+    {
+        return Err(WorkloadError::Validation(
+            "executable storage requires format = 13".into(),
+        ));
+    }
+    if config.format < 8
+        && (!w.depends_on.is_empty()
+            || config
+                .dependencies
+                .values()
+                .any(|dep| dep.depends_on.iter().any(|name| name == &w.name)))
+    {
+        return Err(WorkloadError::Validation(
+            "workload-wide depends_on references require format = 8".into(),
+        ));
+    }
+
+    if config.format < 6 && !w.attributes.is_empty() {
+        return Err(WorkloadError::Validation(
+            "workload.attributes requires format = 6".into(),
+        ));
+    }
+    normalize_attributes(&w.attributes)?;
 
     // ── gid-group ────────────────────────────────────────
     if let Some(ref gg) = w.gid_group {
@@ -133,24 +408,39 @@ pub fn validate_config(
         )));
     }
 
-    // ── base-image entries (must be name:version, no / in name) ──
+    // ── base-image entries (canonical <publisher>/<name>:<version>) ──
+    //
+    // The compiled manifest is hashed into PCR23, so these strings are
+    // measured. They carry the canonical publisher-qualified form: a
+    // name-and-version pair alone names an identity anyone can claim to speak
+    // for, and an offline verifier reading a signed archive cannot consult the
+    // registry access control that closes that gap on chain.
     for entry in &w.base_image {
-        let Some((name, version)) = entry.split_once(':') else {
+        let Some((publisher, rest)) = entry.split_once('/') else {
             return Err(WorkloadError::Validation(format!(
-                "base-image entry must be name:version format, got {:?}",
-                entry,
+                "base-image entry must be <publisher>/<name>:<version>, got {entry:?}; \
+                 a reference without a publisher is no longer accepted"
+            )));
+        };
+        if !atakit_core::is_canonical_id(publisher) {
+            return Err(WorkloadError::Validation(format!(
+                "base-image publisher must be '0x' followed by 64 lowercase hexadecimal \
+                 characters, got {publisher:?} in {entry:?}"
+            )));
+        }
+        let Some((name, version)) = rest.split_once(':') else {
+            return Err(WorkloadError::Validation(format!(
+                "base-image entry must be <publisher>/<name>:<version>, got {entry:?}"
             )));
         };
         if name.is_empty() || version.is_empty() {
             return Err(WorkloadError::Validation(format!(
-                "base-image entry has empty name or version: {:?}",
-                entry,
+                "base-image entry has empty name or version: {entry:?}"
             )));
         }
         if name.contains('/') {
             return Err(WorkloadError::Validation(format!(
-                "base-image name must not contain '/': {:?}",
-                entry,
+                "base-image name must not contain '/': {entry:?}"
             )));
         }
     }
@@ -236,27 +526,17 @@ pub fn validate_config(
 
     // ── package measured-data paths ─────────────────────────
     for p in config.measured_data_paths() {
-        if !p.starts_with("./") {
-            return Err(WorkloadError::Validation(format!(
-                "package measured-data path must start with \"./\": {p:?}"
-            )));
-        }
-        ensure_no_traversal(p, "package measured-data")?;
-        let abs = workload_dir.join(p);
+        let rel = validate_logical_data_path(p, "package measured-data")?;
+        let abs = data_roots.measured.join(rel);
         if !abs.exists() {
             return Err(WorkloadError::MeasuredDataMissing(abs));
         }
-        ensure_within(&abs, workload_dir, "package measured-data")?;
+        ensure_within(&abs, &data_roots.measured, "package measured-data")?;
     }
 
     // ── package unmeasured-data paths (format check only, files need not exist) ──
     for p in config.unmeasured_data_paths() {
-        if !p.starts_with("./") {
-            return Err(WorkloadError::Validation(format!(
-                "package unmeasured-data path must start with \"./\": {p:?}"
-            )));
-        }
-        ensure_no_traversal(p, "package unmeasured-data")?;
+        validate_logical_data_path(p, "package unmeasured-data")?;
     }
 
     // ── package ↔ service opt-in consistency ───────────────
@@ -266,11 +546,11 @@ pub fn validate_config(
     // inconsistent shape at build time so a no-op opt-in doesn't ship.
     {
         let mut measured_offenders: Vec<String> = Vec::new();
-        if w.measured_data {
+        if w.measured_data.is_enabled() {
             measured_offenders.push("workload".to_string());
         }
         for (name, dep) in &config.dependencies {
-            if dep.measured_data {
+            if dep.measured_data.is_enabled() {
                 measured_offenders.push(format!("dependencies.{name}"));
             }
         }
@@ -282,11 +562,11 @@ pub fn validate_config(
         }
 
         let mut unmeasured_offenders: Vec<String> = Vec::new();
-        if w.unmeasured_data {
+        if w.unmeasured_data.is_enabled() {
             unmeasured_offenders.push("workload".to_string());
         }
         for (name, dep) in &config.dependencies {
-            if dep.unmeasured_data {
+            if dep.unmeasured_data.is_enabled() {
                 unmeasured_offenders.push(format!("dependencies.{name}"));
             }
         }
@@ -298,22 +578,34 @@ pub fn validate_config(
         }
     }
 
-    // ── env_file ──────────────────────────────────────────
-    if let Some(ref env_files) = w.env_file {
-        for ef in env_files.as_vec() {
-            if !ef.starts_with("./") {
-                return Err(WorkloadError::Validation(format!(
-                    "env_file path must start with \"./\": {ef:?}"
-                )));
-            }
-            ensure_no_traversal(&ef, "env_file")?;
-            let abs = workload_dir.join(&ef);
-            if !abs.exists() {
-                return Err(WorkloadError::EnvFileMissing(abs));
-            }
-            ensure_within(&abs, workload_dir, "env_file")?;
-        }
-    }
+    let declared_measured_data = crate::manifest::normalize_measured_data(
+        config.measured_data_paths(),
+        &data_roots.measured,
+    );
+    let declared_unmeasured_data = crate::manifest::normalize_unmeasured_data(
+        config.unmeasured_data_paths(),
+        &data_roots.unmeasured,
+    )?;
+    validate_data_mount(
+        &w.measured_data,
+        &declared_measured_data,
+        "measured-data",
+        "workload.measured-data",
+    )?;
+    validate_data_mount(
+        &w.unmeasured_data,
+        &declared_unmeasured_data,
+        "unmeasured-data",
+        "workload.unmeasured-data",
+    )?;
+
+    validate_env_files(&w.env_file, workload_dir, "env-file")?;
+    validate_unmeasured_env_files(
+        &w.unmeasured_env_file,
+        &declared_unmeasured_data,
+        &data_roots.unmeasured,
+        "unmeasured-env-file",
+    )?;
 
     // ── boot-disk-size ─────────────────────────────────────
     if let Some(ref bds) = w.boot_disk_size {
@@ -324,14 +616,14 @@ pub fn validate_config(
         }
     }
 
-    // ── disk references ───────────────────────────────────
-    for disk_name in w.disks.keys() {
-        if !config.disks.contains_key(disk_name) {
-            return Err(WorkloadError::Validation(format!(
-                "workload.disks references undefined disk: {disk_name:?}"
-            )));
-        }
-    }
+    // ── service storage references ────────────────────────
+    validate_service_storage_compat(
+        config.format,
+        "workload",
+        &w.storage,
+        &w.disks,
+        &config.disks,
+    )?;
 
     // ── firewall ──────────────────────────────────────────
     if let Some(ref fw) = config.firewall {
@@ -379,15 +671,29 @@ pub fn validate_config(
                     disk.size
                 )));
             }
-            if let Some(gb) = parse_size_gb(&disk.size) {
-                if gb < 10 {
+            if let Some(mb) = parse_size_mb(&disk.size) {
+                if mb < MIN_DATA_DISK_GB * 1024 {
                     return Err(WorkloadError::Validation(format!(
-                        "disk {name:?} size must be at least 10GB, got {:?}",
+                        "disk {name:?} size must be at least {MIN_DATA_DISK_GB}GB, got {:?}",
                         disk.size
                     )));
                 }
             }
             let enc = &disk.encryption;
+            if let Some(value) = &enc.integrity {
+                if value != "hmac-sha256" {
+                    return Err(WorkloadError::Validation(format!(
+                        "disk {name:?}: unsupported encryption.integrity {value:?}"
+                    )));
+                }
+                if enc.unlock_method != ["tpm"]
+                    || !["baseimage", "workload"]
+                        .iter()
+                        .all(|required| enc.bind.iter().any(|b| b == required))
+                {
+                    return Err(WorkloadError::Validation(format!("disk {name:?}: encryption.integrity requires TPM-only unlock and both baseimage and workload bindings")));
+                }
+            }
             const SUPPORTED_METHODS: &[&str] = &["tpm", "passphrase"];
             const NOT_YET_IMPLEMENTED_METHODS: &[&str] = &["keyfile", "kms"];
             for method in &enc.unlock_method {
@@ -433,22 +739,22 @@ pub fn validate_config(
                 return Err(WorkloadError::Validation(format!(
                     "disk {name:?} uses tpm unlock but encryption.bind is empty; \
                      tpm seals the disk key under a PCR policy and must bind to at \
-                     least one of {valid_bind:?} (platform = firmware PCRs 0-7, \
+                     least one of {valid_bind:?} (platform = firmware and Secure Boot, \
                      baseimage = base image PCR 11, workload = manifest PCR 23)"
                 )));
             }
         }
     }
 
-    // ── dependency disk refs ────────────────────────────
+    // ── dependency storage refs ────────────────────────────
     for (dep_name, dep) in &config.dependencies {
-        for disk_name in dep.disks.keys() {
-            if !config.disks.contains_key(disk_name) {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.disks references undefined disk: {disk_name:?}"
-                )));
-            }
-        }
+        validate_service_storage_compat(
+            config.format,
+            &format!("dependencies.{dep_name}"),
+            &dep.storage,
+            &dep.disks,
+            &config.disks,
+        )?;
     }
 
     // ── firewall cross-reference with ports ───────────────
@@ -476,45 +782,34 @@ pub fn validate_config(
     }
 
     // ── dependencies ───────────────────────────────────────
-    let dep_names: HashSet<&str> = config.dependencies.keys().map(|s| s.as_str()).collect();
+    validate_service_dependencies(config)?;
     for (dep_name, dep) in &config.dependencies {
         // Image source validation.
         validate_image_source(&dep.image, workload_dir)?;
 
-        // depends_on must reference other defined dependencies.
-        for ref_name in &dep.depends_on {
-            if !dep_names.contains(ref_name.as_str()) {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.depends_on references undefined dependency: {ref_name:?}"
-                )));
-            }
-            if ref_name == dep_name {
-                return Err(WorkloadError::Validation(format!(
-                    "dependencies.{dep_name}.depends_on cannot reference itself"
-                )));
-            }
-        }
-
-        // env_file validation.
-        if let Some(ref env_files) = dep.env_file {
-            for ef in env_files.as_vec() {
-                if !ef.starts_with("./") {
-                    return Err(WorkloadError::Validation(format!(
-                        "dependencies.{dep_name}.env_file path must start with \"./\": {ef:?}"
-                    )));
-                }
-                ensure_no_traversal(&ef, &format!("dependencies.{dep_name}.env_file"))?;
-                let abs = workload_dir.join(&ef);
-                if !abs.exists() {
-                    return Err(WorkloadError::EnvFileMissing(abs));
-                }
-                ensure_within(
-                    &abs,
-                    workload_dir,
-                    &format!("dependencies.{dep_name}.env_file"),
-                )?;
-            }
-        }
+        validate_env_files(
+            &dep.env_file,
+            workload_dir,
+            &format!("dependencies.{dep_name}.env-file"),
+        )?;
+        validate_unmeasured_env_files(
+            &dep.unmeasured_env_file,
+            &declared_unmeasured_data,
+            &data_roots.unmeasured,
+            &format!("dependencies.{dep_name}.unmeasured-env-file"),
+        )?;
+        validate_data_mount(
+            &dep.measured_data,
+            &declared_measured_data,
+            "measured-data",
+            &format!("dependencies.{dep_name}.measured-data"),
+        )?;
+        validate_data_mount(
+            &dep.unmeasured_data,
+            &declared_unmeasured_data,
+            "unmeasured-data",
+            &format!("dependencies.{dep_name}.unmeasured-data"),
+        )?;
 
         // gid-group validation.
         if let Some(ref gg) = dep.gid_group {
@@ -560,6 +855,289 @@ pub fn validate_config(
     validate_log_grants(config)?;
 
     Ok(warnings)
+}
+
+fn validate_service_dependencies(config: &WorkloadConfig) -> Result<(), WorkloadError> {
+    let workload_name = config.workload.name.as_str();
+    if config.dependencies.contains_key(workload_name) {
+        return Err(WorkloadError::Validation(format!(
+            "dependency name {workload_name:?} conflicts with the workload name"
+        )));
+    }
+
+    let mut service_names: HashSet<&str> = config.dependencies.keys().map(String::as_str).collect();
+    service_names.insert(workload_name);
+
+    validate_depends_on_entries(
+        workload_name,
+        "workload.depends_on",
+        &config.workload.depends_on,
+        &service_names,
+    )?;
+    for (name, dep) in &config.dependencies {
+        validate_depends_on_entries(
+            name,
+            &format!("dependencies.{name}.depends_on"),
+            &dep.depends_on,
+            &service_names,
+        )?;
+    }
+
+    let mut graph = BTreeMap::new();
+    graph.insert(
+        config.workload.name.clone(),
+        config.workload.depends_on.clone(),
+    );
+    for (name, dep) in &config.dependencies {
+        graph.insert(name.clone(), dep.depends_on.clone());
+    }
+
+    validate_dependency_graph(&graph)
+}
+
+fn validate_depends_on_entries(
+    owner: &str,
+    context: &str,
+    entries: &[String],
+    service_names: &HashSet<&str>,
+) -> Result<(), WorkloadError> {
+    let mut seen = HashSet::new();
+    for name in entries {
+        if !service_names.contains(name.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context} references undefined service: {name:?}"
+            )));
+        }
+        if name == owner {
+            return Err(WorkloadError::Validation(format!(
+                "{context} cannot reference itself"
+            )));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context} contains duplicate service: {name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dependency_graph(graph: &BTreeMap<String, Vec<String>>) -> Result<(), WorkloadError> {
+    let mut states: BTreeMap<String, u8> = BTreeMap::new();
+
+    for root in graph.keys() {
+        if states.get(root).copied() == Some(2) {
+            continue;
+        }
+
+        states.insert(root.clone(), 1);
+        let mut path = vec![root.clone()];
+        let mut frames = vec![(root.clone(), 0usize)];
+
+        while let Some((name, next_dependency)) = frames.last().cloned() {
+            let dependencies = graph
+                .get(&name)
+                .expect("validated dependency graph contains every service");
+
+            if let Some(dependency) = dependencies.get(next_dependency) {
+                frames
+                    .last_mut()
+                    .expect("dependency traversal frame exists")
+                    .1 += 1;
+
+                match states.get(dependency).copied() {
+                    Some(2) => {}
+                    Some(1) => {
+                        let start = path.iter().position(|item| item == dependency).unwrap_or(0);
+                        let mut cycle = path[start..].to_vec();
+                        cycle.push(dependency.clone());
+                        return Err(WorkloadError::Validation(format!(
+                            "depends_on cycle detected: {}",
+                            cycle.join(" -> ")
+                        )));
+                    }
+                    _ => {
+                        states.insert(dependency.clone(), 1);
+                        path.push(dependency.clone());
+                        frames.push((dependency.clone(), 0));
+                    }
+                }
+            } else {
+                let (finished, _) = frames.pop().expect("dependency traversal frame exists");
+                path.pop();
+                states.insert(finished, 2);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_env_files(
+    env_files: &Option<config::StringOrArray>,
+    workload_dir: &Path,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    if let Some(env_files) = env_files {
+        for ef in env_files.as_vec() {
+            validate_package_relative_path(&ef, context)?;
+            let abs = workload_dir.join(&ef);
+            if !abs.exists() {
+                return Err(WorkloadError::EnvFileMissing(abs));
+            }
+            ensure_within(&abs, workload_dir, context)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_unmeasured_env_files(
+    env_files: &Option<config::StringOrArray>,
+    declared_unmeasured_data: &BTreeSet<String>,
+    unmeasured_data_root: &Path,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    if let Some(env_files) = env_files {
+        let mut seen = BTreeSet::new();
+        for ef in env_files.as_vec() {
+            validate_logical_data_path(&ef, context)?;
+            if ef.ends_with('/') {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: env-file {ef:?} must be a file, not a directory"
+                )));
+            }
+            let normalized = namespaced_data_path("unmeasured-data", &ef);
+            if !seen.insert(normalized.clone()) {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: duplicate path {normalized:?}"
+                )));
+            }
+            if !declared_unmeasured_data.contains(&normalized) {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: {normalized:?} must be declared in [package] unmeasured-data"
+                )));
+            }
+            let path = unmeasured_data_root.join(logical_data_path_rel(&ef));
+            if !path.is_file() {
+                return Err(WorkloadError::EnvFileMissing(path));
+            }
+            ensure_within(&path, unmeasured_data_root, context)?;
+            let content =
+                std::fs::read_to_string(&path).map_err(|source| WorkloadError::ReadFile {
+                    path: path.clone(),
+                    source,
+                })?;
+            crate::manifest::parse_unmeasured_env_file_names(&path, &content)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_data_mount(
+    mount: &DataMount,
+    declared_paths: &BTreeSet<String>,
+    prefix: &str,
+    context: &str,
+) -> Result<(), WorkloadError> {
+    let DataMount::Paths(paths) = mount else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        validate_logical_data_path(path, context)?;
+        let normalized = namespaced_data_path(prefix, path);
+        if !seen.insert(normalized.clone()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: duplicate path {normalized:?}"
+            )));
+        }
+        let matched = declared_paths
+            .iter()
+            .any(|declared| crate::manifest::data_selector_matches(prefix, path, declared));
+        if !matched {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: {normalized:?} must match a path declared in [package] {prefix}; unmeasured directory selectors must end with '/'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_storage(
+    context: &str,
+    storage: &BTreeMap<String, ServiceStorageSection>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    let mut seen_mount_paths = BTreeSet::new();
+    for (storage_name, item) in storage {
+        let item_context = format!("{context}.{storage_name}");
+        if !is_stable_identifier(storage_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{item_context}: storage name must be a stable identifier"
+            )));
+        }
+        if !disks.contains_key(&item.disk) {
+            return Err(WorkloadError::Validation(format!(
+                "{item_context}.disk references undefined disk {:?}",
+                item.disk
+            )));
+        }
+        ensure_absolute_clean_path(&item.base_path, &format!("{item_context}.base-path"))?;
+        ensure_absolute_clean_path(&item.mount_path, &format!("{item_context}.mount-path"))?;
+        if !seen_mount_paths.insert(item.mount_path.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: duplicate mount-path {:?}",
+                item.mount_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_service_disk_mounts(
+    context: &str,
+    mounts: &BTreeMap<String, String>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    let mut seen_mount_paths = BTreeSet::new();
+    for (disk_name, mount_path) in mounts {
+        if !disks.contains_key(disk_name) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.disks references undefined disk: {disk_name:?}"
+            )));
+        }
+        ensure_absolute_clean_path(mount_path, &format!("{context}.disks.{disk_name}"))?;
+        if !seen_mount_paths.insert(mount_path.as_str()) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.disks: duplicate mount path {mount_path:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_storage_compat(
+    format: u32,
+    context: &str,
+    storage: &BTreeMap<String, ServiceStorageSection>,
+    legacy_disks: &BTreeMap<String, String>,
+    disks: &BTreeMap<String, DiskSection>,
+) -> Result<(), WorkloadError> {
+    if !storage.is_empty() && !legacy_disks.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}: cannot use both legacy `disks` and `storage`; use `storage` for format = 3"
+        )));
+    }
+    if format >= 3 && !legacy_disks.is_empty() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.disks is only supported for format = 2 compatibility; use {context}.storage"
+        )));
+    }
+    validate_service_storage(&format!("{context}.storage"), storage, disks)?;
+    if format == 2 {
+        validate_legacy_service_disk_mounts(context, legacy_disks, disks)?;
+    }
+    Ok(())
 }
 
 fn validate_baby_container(config: &WorkloadConfig) -> Result<(), WorkloadError> {
@@ -671,20 +1249,89 @@ fn validate_baby_container(config: &WorkloadConfig) -> Result<(), WorkloadError>
                 slot.lifecycle.restart
             )));
         }
-        if slot.lifecycle.rootfs != "read-only" {
+        if !matches!(slot.lifecycle.rootfs.as_str(), "read-only" | "writable") {
             return Err(WorkloadError::Validation(format!(
-                "{context}.lifecycle.rootfs must be \"read-only\" in v1, got {:?}",
-                slot.lifecycle.rootfs
+                "{context}.lifecycle.rootfs must be read-only or writable"
             )));
         }
-        if let Some(trust_policy) = &slot.trust_policy {
-            if !is_stable_identifier(trust_policy) {
+        match (slot.lifecycle.rootfs.as_str(), slot.lifecycle.rootfs_size_mib) {
+            ("writable", Some(size)) if size > 0 && size.checked_mul(1024 * 1024).is_some() => {}
+            ("writable", _) => return Err(WorkloadError::Validation(format!("{context}.lifecycle.rootfs-size-mib must be positive and fit in bytes for writable roots"))),
+            (_, Some(_)) => return Err(WorkloadError::Validation(format!("{context}.lifecycle.rootfs-size-mib is only valid for writable roots"))),
+            _ => {}
+        }
+        if let Some(disk) = &slot.lifecycle.rootfs_disk {
+            if slot.lifecycle.rootfs != "writable" || !config.disks.contains_key(disk) {
                 return Err(WorkloadError::Validation(format!(
-                    "{context}.trust-policy must be a stable identifier"
+                    "{context}: rootfs-disk requires a writable root and a declared disk"
                 )));
             }
+            if config.format < 11 {
+                return Err(WorkloadError::Validation(format!(
+                    "{context}: rootfs-disk requires format = 11"
+                )));
+            }
+            let exposed = config.workload.storage.values().any(|m| &m.disk == disk)
+                || config
+                    .dependencies
+                    .values()
+                    .any(|d| d.storage.values().any(|m| &m.disk == disk))
+                || bc
+                    .slots
+                    .values()
+                    .any(|s| s.storage.values().any(|m| &m.disk == disk));
+            if exposed {
+                return Err(WorkloadError::Validation(format!("{context}: rootfs-disk {disk:?} is reserved for private baby filesystems and cannot be exposed as a volume")));
+            }
+        }
+        if slot.lifecycle.rootfs == "writable"
+            && slot.lifecycle.instance_retention == "disk"
+            && slot.lifecycle.image_retention != "disk"
+        {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: writable disk instances require disk image retention"
+            )));
+        }
+        let mut caps = std::collections::HashSet::new();
+        for cap in &slot.allowed_capabilities {
+            if !matches!(
+                cap.as_str(),
+                "CHOWN" | "SETUID" | "SETGID" | "SYS_CHROOT" | "FOWNER" | "DAC_OVERRIDE"
+            ) || !caps.insert(cap)
+            {
+                return Err(WorkloadError::Validation(format!("{context}: allowed capabilities must be unique and supported (CHOWN, SETUID, SETGID, SYS_CHROOT, FOWNER, DAC_OVERRIDE)")));
+            }
+        }
+        if slot.trust_policy.is_some() {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: named baby trust policies are not implemented"
+            )));
+        }
+        if (slot.lifecycle.rootfs == "writable" || !slot.allowed_capabilities.is_empty())
+            && config.format < 10
+        {
+            return Err(WorkloadError::Validation(format!(
+                "{context}: writable roots and capability grants require format = 10"
+            )));
         }
         validate_logging(&format!("{context}.logging"), &slot.logging, &service_names)?;
+        if !matches!(
+            slot.logging.access.as_deref(),
+            None | Some("parent") | Some("none")
+        ) {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging.access must be \"parent\" or \"none\""
+            )));
+        }
+        if config.format < crate::BABY_LOG_POLICY_FORMAT_VERSION
+            && (slot.logging.access.as_deref() == Some("none")
+                || !slot.logging.log_readers.is_empty())
+        {
+            return Err(WorkloadError::Validation(format!(
+                "{context}.logging access restrictions and log-readers require format = {}",
+                crate::BABY_LOG_POLICY_FORMAT_VERSION
+            )));
+        }
 
         for (storage_name, storage) in &slot.storage {
             let storage_context = format!("{context}.storage.{storage_name}");
@@ -726,11 +1373,41 @@ fn validate_baby_container(config: &WorkloadConfig) -> Result<(), WorkloadError>
                     storage.scope
                 )));
             }
+            let parent_mounts = if slot.parent_service == w.name {
+                Some(&config.workload.storage)
+            } else {
+                config
+                    .dependencies
+                    .get(&slot.parent_service)
+                    .map(|d| &d.storage)
+            };
+            if let Some(mounts) = parent_mounts {
+                for mount in mounts.values().filter(|m| m.disk == storage.disk) {
+                    let parent = std::path::Path::new(&mount.base_path);
+                    let baby = std::path::Path::new(&storage.base_path);
+                    if atakit_core::baby_storage::may_overlap_parent(
+                        parent,
+                        baby,
+                        &storage.scope,
+                        slot_name,
+                    ) && !storage.parent_allows(mount.read_only(), mount.executable())
+                    {
+                        return Err(WorkloadError::Validation(format!(
+                            "{storage_context}: parent mount contradicts {}",
+                            if config.format >= 14 {
+                                "parent-access"
+                            } else {
+                                "permissions.parent"
+                            }
+                        )));
+                    }
+                }
+            }
             for (field, value) in [
-                ("permissions.baby", &storage.permissions.baby),
-                ("permissions.parent", &storage.permissions.parent),
+                ("permissions.baby", storage.baby_permission()),
+                ("permissions.parent", storage.parent_permission()),
             ] {
-                if !matches!(value.as_str(), "none" | "ro" | "rw") {
+                if !matches!(value, "none" | "ro" | "rw") {
                     return Err(WorkloadError::Validation(format!(
                         "{storage_context}.{field} must be \"none\", \"ro\", or \"rw\", got {value:?}"
                     )));
@@ -834,7 +1511,7 @@ const LOG_MAX_FILE_CEILING: u32 = 20;
 
 /// Parse a size suffix like `"50m"`, `"1g"`, `"1024k"`, or a bare integer
 /// (interpreted as bytes). Case-insensitive on the suffix.
-fn parse_size_suffix(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size_suffix(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty size value".to_string());
@@ -869,6 +1546,11 @@ fn validate_logging(
     logging: &config::LoggingSection,
     valid_service_names: &HashSet<&str>,
 ) -> Result<(), WorkloadError> {
+    if !context.starts_with("baby-container.slots.") && logging.access.is_some() {
+        return Err(WorkloadError::Validation(format!(
+            "{context}.access is only valid for baby-container slot logging"
+        )));
+    }
     // 1. driver in allowlist
     if !LOG_DRIVER_ALLOWLIST.contains(&logging.driver.as_str()) {
         return Err(WorkloadError::Validation(format!(
@@ -967,6 +1649,38 @@ fn validate_log_grants(config: &WorkloadConfig) -> Result<(), WorkloadError> {
     for (name, dep) in &config.dependencies {
         producers.push((name.as_str(), &dep.logging));
     }
+    let service_gid_group = |service: &str| -> &str {
+        if service == config.workload.name {
+            config
+                .workload
+                .gid_group
+                .as_deref()
+                .unwrap_or(&config.workload.name)
+        } else {
+            config
+                .dependencies
+                .get(service)
+                .and_then(|dependency| dependency.gid_group.as_deref())
+                .unwrap_or(&config.workload.name)
+        }
+    };
+    if let Some(baby) = &config.baby_container {
+        for (name, slot) in &baby.slots {
+            producers.push((name.as_str(), &slot.logging));
+            let slot_group = slot
+                .gid_group
+                .as_deref()
+                .unwrap_or_else(|| service_gid_group(&slot.parent_service));
+            for reader in &slot.logging.log_readers {
+                let reader_group = service_gid_group(reader);
+                if reader_group != slot_group {
+                    return Err(WorkloadError::Validation(format!(
+                        "baby-container.slots.{name}.logging.log-readers: {reader:?} must use the baby's gid-group to read its logs"
+                    )));
+                }
+            }
+        }
+    }
 
     // Build reader -> producers map for rule 11.
     let mut grants_for: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -1003,6 +1717,9 @@ fn validate_log_grants(config: &WorkloadConfig) -> Result<(), WorkloadError> {
 
     // Rule 11: R.workload-logs = true → at least one producer grants R.
     for (s_name, _) in &producers {
+        if *s_name != config.workload.name && !config.dependencies.contains_key(*s_name) {
+            continue;
+        }
         if workload_logs_for(s_name) && !grants_for.contains_key(s_name) {
             return Err(WorkloadError::Validation(format!(
                 "{s_name} sets workload-logs = true but no producer grants it access in log-readers"
@@ -1075,23 +1792,21 @@ fn is_valid_size(s: &str) -> bool {
     false
 }
 
-/// Parse a size string to gigabytes. Returns None for invalid formats.
-fn parse_size_gb(s: &str) -> Option<u64> {
+/// Parse a size string to megabytes without rounding.
+pub(crate) fn parse_size_mb(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num_str, suffix) = if let Some(n) = s.strip_suffix("TB") {
         (n, "TB")
     } else if let Some(n) = s.strip_suffix("GB") {
         (n, "GB")
-    } else if let Some(n) = s.strip_suffix("MB") {
-        (n, "MB")
     } else {
-        return None;
+        (s.strip_suffix("MB")?, "MB")
     };
     let num: u64 = num_str.trim().parse().ok()?;
     match suffix {
-        "TB" => Some(num * 1024),
-        "GB" => Some(num),
-        "MB" => Some(num.div_ceil(1024)),
+        "TB" => num.checked_mul(1024 * 1024),
+        "GB" => num.checked_mul(1024),
+        "MB" => Some(num),
         _ => None,
     }
 }
@@ -1162,11 +1877,287 @@ image = "my-app:latest"
     }
 
     #[test]
+    fn executable_storage_requires_source_format_13() {
+        let dir = tempfile::tempdir().unwrap();
+        for section in [
+            "workload.storage.app",
+            "dependencies.helper.storage.app",
+            "baby-container.slots.dev.storage.app",
+        ] {
+            let source = format!("{}\n[disks.data]\nsize='10GB'\nencryption={{unlock_method=[],bind=[]}}\n[dependencies.helper]\nimage='helper:latest'\n[baby-container]\nenabled=false\n[baby-container.slots.dev]\nparent-service='my-app'\n[{section}]\ndisk='data'\nbase-path='/'\nmount-path='/app'\nexecutable=true\n", minimal_toml());
+            for format in [11, 12, 13, 14] {
+                let cfg: WorkloadConfig =
+                    toml::from_str(&source.replace("format = 2", &format!("format = {format}")))
+                        .unwrap();
+                let result = validate_config(&cfg, dir.path());
+                if format == 13 {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains(if format < 13 {
+                            "requires format = 13"
+                        } else {
+                            "requires access"
+                        }),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn access_contract_applies_to_every_mount_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        for section in [
+            "workload.storage.app",
+            "dependencies.helper.storage.app",
+            "baby-container.slots.dev.storage.app",
+        ] {
+            let source = format!("{}\n[disks.data]\nsize='10GB'\nencryption={{unlock_method=[],bind=[]}}\n[dependencies.helper]\nimage='helper:latest'\n[baby-container]\nenabled=false\n[baby-container.slots.dev]\nparent-service='my-app'\n[{section}]\ndisk='data'\nbase-path='/app'\nmount-path='/app'\n", minimal_toml().replace("format = 2", "format = 14"));
+            for rights in [
+                "['read']",
+                "['read','write']",
+                "['read','execute']",
+                "['execute','read','write']",
+            ] {
+                let config: WorkloadConfig =
+                    toml::from_str(&(source.clone() + "access=" + rights)).unwrap();
+                validate_config(&config, dir.path()).unwrap();
+            }
+            for invalid in [
+                "",
+                "access=[]",
+                "access=['write']",
+                "access=['read','read']",
+                "access=['admin']",
+                "access=['read']\nread-only=false",
+                "access=['read']\nexecutable=false",
+            ] {
+                let parsed = toml::from_str::<WorkloadConfig>(&(source.clone() + invalid));
+                assert!(
+                    parsed.is_err() || validate_config(&parsed.unwrap(), dir.path()).is_err(),
+                    "{section}: {invalid}"
+                );
+            }
+            let old: WorkloadConfig =
+                toml::from_str(&(source.replace("format = 14", "format = 13") + "access=['read']"))
+                    .unwrap();
+            assert!(validate_config(&old, dir.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn baby_storage_validates_scoped_parent_access() {
+        let source = format!(
+            r#"{}
+atakit-portal = true
+[disks.data]
+size = "10GB"
+encryption = {{ unlock_method = ["tpm"], bind = ["workload"] }}
+[workload.storage.parent]
+disk = "data"
+base-path = "/data/parent"
+mount-path = "/data"
+[baby-container]
+enabled = true
+max-instances = 1
+[baby-container.slots.tools]
+parent-service = "my-app"
+[baby-container.slots.tools.storage.private]
+disk = "data"
+base-path = "/data"
+mount-path = "/private"
+scope = "slot"
+[baby-container.slots.tools.storage.private.permissions]
+baby = "rw"
+parent = "none"
+"#,
+            minimal_toml()
+        );
+        for (scope, actual) in [("slot", "/data/tools"), ("key:shared", "/data/key/shared")] {
+            let mut cfg: WorkloadConfig =
+                toml::from_str(&source.replace("scope = \"slot\"", &format!("scope = {scope:?}")))
+                    .unwrap();
+            assert!(validate_baby_container(&cfg).is_ok());
+            for overlap in ["/", "/data", actual, &format!("{actual}/child")] {
+                cfg.workload.storage.get_mut("parent").unwrap().base_path = overlap.into();
+                assert!(validate_baby_container(&cfg).is_err(), "{scope}: {overlap}");
+            }
+            cfg.baby_container
+                .as_mut()
+                .unwrap()
+                .slots
+                .get_mut("tools")
+                .unwrap()
+                .storage
+                .get_mut("private")
+                .unwrap()
+                .permissions
+                .as_mut()
+                .unwrap()
+                .parent = "ro".into();
+            assert!(validate_baby_container(&cfg).is_err());
+            cfg.workload.storage.get_mut("parent").unwrap().read_only = Some(true);
+            assert!(validate_baby_container(&cfg).is_ok());
+        }
+        for scope in ["image", "instance"] {
+            let cfg: WorkloadConfig =
+                toml::from_str(&source.replace("scope = \"slot\"", &format!("scope = {scope:?}")))
+                    .unwrap();
+            assert!(validate_baby_container(&cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn writable_baby_contract_validation() {
+        let source = r#"
+format = 10
+[workload]
+name = "app"
+version = "v1"
+base-image-mode = "blacklist"
+image = "app:latest"
+atakit-portal = true
+[baby-container]
+enabled = true
+max-instances = 1
+[baby-container.slots.tools]
+parent-service = "app"
+allowed-capabilities = ["CHOWN", "SETUID", "FOWNER", "DAC_OVERRIDE"]
+[baby-container.slots.tools.lifecycle]
+rootfs = "writable"
+rootfs-size-mib = 20480
+image-retention = "disk"
+instance-retention = "disk"
+"#;
+        let disk_source = source.replace("format = 10", "format = 11")
+            .replace("rootfs-size-mib = 20480", "rootfs-size-mib = 20480\nrootfs-disk = \"baby-data\"")
+            + "\n[disks.baby-data]\nsize = \"32GB\"\n[disks.baby-data.encryption]\nunlock_method = []\nbind = []\n";
+        let disk: WorkloadConfig = toml::from_str(&disk_source).unwrap();
+        assert!(validate_baby_container(&disk).is_ok());
+        for source in [
+            disk_source.replace("format = 11", "format = 10"),
+            disk_source.replace("rootfs-disk = \"baby-data\"", "rootfs-disk = \"missing\""),
+            format!("{disk_source}\n[workload.storage.leak]\ndisk = \"baby-data\"\nbase-path = \"/\"\nmount-path = \"/leak\"\n"),
+        ] {
+            let cfg: WorkloadConfig = toml::from_str(&source).unwrap();
+            assert!(validate_baby_container(&cfg).is_err(), "{source}");
+        }
+        let valid: WorkloadConfig = toml::from_str(source).unwrap();
+        assert!(validate_baby_container(&valid).is_ok());
+        for changed in [
+            source.replace("rootfs-size-mib = 20480", "rootfs-size-mib = 0"),
+            source.replace("rootfs-size-mib = 20480", ""),
+            source.replace("rootfs = \"writable\"", "rootfs = \"read-only\""),
+            source.replace(
+                "image-retention = \"disk\"",
+                "image-retention = \"session\"",
+            ),
+            source.replace("CHOWN", "NET_ADMIN"),
+            source.replace("CHOWN", "SETUID"),
+            source.replace("format = 10", "format = 9"),
+            source.replace(
+                "parent-service = \"app\"",
+                "parent-service = \"app\"\ntrust-policy = \"opaque\"",
+            ),
+        ] {
+            let cfg: WorkloadConfig = toml::from_str(&changed).unwrap();
+            assert!(validate_baby_container(&cfg).is_err(), "{changed}");
+        }
+    }
+
+    #[test]
     fn valid_minimal_config() {
         let cfg: crate::config::WorkloadConfig = toml::from_str(minimal_toml()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let warnings = validate_config(&cfg, tmp.path()).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn validates_canonical_tee_attribute_requirements() {
+        for values in ["[false]", "[false, true]"] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            validate_config(&cfg, tmp.path()).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_noncanonical_tee_attribute_requirements() {
+        for (name, values) in [
+            ("atakit.attestation.v1.tee.unknown", "[false]"),
+            ("atakit.attestation.v1.tee.intel-tdx.debug.enabled", "[]"),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[false, false]",
+            ),
+            (
+                "atakit.attestation.v1.tee.intel-tdx.debug.enabled",
+                "[true, false]",
+            ),
+        ] {
+            let toml = format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"{name}" = {values}
+"#
+            );
+            let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                validate_config(&cfg, tmp.path()).is_err(),
+                "{name} {values}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_attributes_before_format_six() {
+        let toml = r#"
+format = 5
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [false]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("requires format = 6"));
     }
 
     #[test]
@@ -1223,7 +2214,7 @@ image = "x:latest"
 format = 2
 
 [package]
-measured-data = ["./does-not-exist"]
+measured-data = ["/does-not-exist"]
 
 [workload]
 name = "app"
@@ -1330,6 +2321,62 @@ unmeasured-data = true
     }
 
     #[test]
+    fn accepts_selective_data_mounts_declared_in_package() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["/config/public.txt", "/config/private.txt"]
+unmeasured-data = ["/runtime/public.env", "/runtime/private.env"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = ["/config/public.txt"]
+unmeasured-data = ["/runtime/public.env"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("measured-data/config")).unwrap();
+        std::fs::write(tmp.path().join("measured-data/config/public.txt"), "public").unwrap();
+        std::fs::write(
+            tmp.path().join("measured-data/config/private.txt"),
+            "private",
+        )
+        .unwrap();
+
+        let warnings = validate_config(&cfg, tmp.path()).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_selective_data_mount_not_declared_in_package() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["/config/public.txt"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+measured-data = ["/config/private.txt"]
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("measured-data/config")).unwrap();
+        std::fs::write(tmp.path().join("measured-data/config/public.txt"), "public").unwrap();
+
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must match a path declared"), "got: {msg}");
+    }
+
+    #[test]
     fn rejects_duplicate_host_port() {
         let toml = r#"
 format = 2
@@ -1369,7 +2416,90 @@ depends_on = ["nonexistent"]
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("undefined dependency"));
+        assert!(err.to_string().contains("undefined service"));
+    }
+
+    #[test]
+    fn accepts_workload_and_dependency_startup_order() {
+        let toml = r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+
+[dependencies.log-shipper]
+image = "fluent-bit:latest"
+depends_on = ["api"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_depends_on_cycle_through_workload() {
+        let toml = r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["sidecar"]
+
+[dependencies.sidecar]
+image = "sidecar:latest"
+depends_on = ["api"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("depends_on cycle detected"), "{error}");
+    }
+
+    #[test]
+    fn validates_deep_dependency_chain_without_recursion() {
+        const SERVICE_COUNT: usize = 20_000;
+        let mut graph = BTreeMap::new();
+        for index in 0..SERVICE_COUNT {
+            let dependencies = if index + 1 < SERVICE_COUNT {
+                vec![format!("service-{:05}", index + 1)]
+            } else {
+                Vec::new()
+            };
+            graph.insert(format!("service-{index:05}"), dependencies);
+        }
+
+        assert!(validate_dependency_graph(&graph).is_ok());
+    }
+
+    #[test]
+    fn rejects_workload_depends_on_before_format_eight() {
+        let toml = r#"
+format = 7
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let error = validate_config(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("require format = 8"), "{error}");
     }
 
     #[test]
@@ -1386,8 +2516,10 @@ image = "x:latest"
 [dependencies.sidecar]
 image = "redis:7"
 
-[dependencies.sidecar.disks]
-missing-disk = "/data"
+[dependencies.sidecar.storage.data]
+disk = "missing-disk"
+base-path = "/"
+mount-path = "/data"
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1418,6 +2550,46 @@ encryption = { unlock_method = [], bind = [] }
     }
 
     #[test]
+    fn disk_integrity_rejects_invalid_policy() {
+        let root = tempfile::tempdir().unwrap();
+        for (methods, bindings, algorithm, accepted) in [
+            (
+                r#"["tpm"]"#,
+                r#"["baseimage", "workload"]"#,
+                "hmac-sha256",
+                true,
+            ),
+            (r#"["tpm"]"#, r#"["baseimage"]"#, "hmac-sha256", false),
+            (
+                r#"["tpm", "passphrase"]"#,
+                r#"["baseimage", "workload"]"#,
+                "hmac-sha256",
+                false,
+            ),
+            ("[]", "[]", "hmac-sha256", false),
+            (r#"["tpm"]"#, r#"["baseimage", "workload"]"#, "crc32", false),
+        ] {
+            let source = format!(
+                r#"
+format = 2
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+[disks.data]
+index = 10
+size = "10GB"
+encryption = {{ unlock_method = {methods}, bind = {bindings}, integrity = "{algorithm}" }}
+"#
+            );
+            let cfg: crate::config::WorkloadConfig = toml::from_str(&source).unwrap();
+            let result = validate_config(&cfg, root.path());
+            assert_eq!(result.is_ok(), accepted, "{source}: {result:?}");
+        }
+    }
+
+    #[test]
     fn accepts_valid_disk_sizes() {
         let toml = r#"
 format = 2
@@ -1441,6 +2613,71 @@ encryption = { unlock_method = [], bind = [] }
 [disks.c]
 index = 12
 size = "1TB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_disk_size_below_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "4GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("size must be at least 10GB"));
+    }
+
+    #[test]
+    fn rejects_disk_size_mb_that_rounds_up_below_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10239MB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("size must be at least 10GB"));
+    }
+
+    #[test]
+    fn accepts_disk_size_mb_at_minimum() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10240MB"
 encryption = { unlock_method = [], bind = [] }
 "#;
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
@@ -1508,14 +2745,18 @@ version = "v0.0.1"
 base-image-mode = "blacklist"
 image = "x:latest"
 
-[workload.disks]
-shared = "/data"
+[workload.storage.data]
+disk = "shared"
+base-path = "/workload"
+mount-path = "/data"
 
 [dependencies.sidecar]
 image = "redis:7"
 
-[dependencies.sidecar.disks]
-shared = "/cache"
+[dependencies.sidecar.storage.cache]
+disk = "shared"
+base-path = "/sidecar"
+mount-path = "/cache"
 
 [disks.shared]
 index = 10
@@ -1591,7 +2832,58 @@ deny = [3000]
     }
 
     #[test]
-    fn rejects_undefined_disk_ref() {
+    fn rejects_undefined_storage_disk_ref() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[workload.storage.data]
+disk = "missing-disk"
+base-path = "/"
+mount-path = "/data"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_storage_path_delimiters() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[workload.storage.data]
+disk = "data"
+base-path = "/workload"
+mount-path = "/data:ro"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_v2_legacy_disk_mount_path_delimiters() {
         let toml = r#"
 format = 2
 
@@ -1602,11 +2894,58 @@ base-image-mode = "blacklist"
 image = "x:latest"
 
 [workload.disks]
-missing-disk = "/data"
+data = "/data:ro"
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
 "#;
-        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        assert!(validate_config(&cfg, tmp.path()).is_err());
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_baby_storage_path_delimiters() {
+        let toml = r#"
+format = 3
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+atakit-portal = true
+
+[disks.data]
+index = 10
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[baby-container]
+enabled = true
+max-instances = 1
+
+[baby-container.slots.worker]
+parent-service = "app"
+
+[baby-container.slots.worker.storage.workspace]
+disk = "data"
+base-path = "/workspace,shared"
+mount-path = "/workspace"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ':' or ','"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1615,7 +2954,7 @@ missing-disk = "/data"
 format = 2
 
 [package]
-measured-data = ["./../etc/passwd"]
+measured-data = ["/../etc/passwd"]
 
 [workload]
 name = "app"
@@ -1635,7 +2974,7 @@ image = "x:latest"
 format = 2
 
 [package]
-unmeasured-data = ["./../secrets"]
+unmeasured-data = ["/../secrets"]
 
 [workload]
 name = "app"
@@ -1647,6 +2986,46 @@ image = "x:latest"
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
         assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn rejects_relative_measured_data_path() {
+        let toml = r#"
+format = 2
+
+[package]
+measured-data = ["config/app.conf"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("logical absolute path"));
+    }
+
+    #[test]
+    fn rejects_dot_slash_unmeasured_data_path() {
+        let toml = r#"
+format = 2
+
+[package]
+unmeasured-data = ["./secrets"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+"#;
+        let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("logical absolute path"));
     }
 
     #[test]
@@ -1757,7 +3136,127 @@ env_file = "prod.env"
         let cfg: crate::config::WorkloadConfig = toml::from_str(toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let err = validate_config(&cfg, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("env_file path must start with"));
+        assert!(err.to_string().contains("env-file path must start with"));
+    }
+
+    #[test]
+    fn exact_unmeasured_files_need_no_build_source_but_env_templates_do() {
+        let source = r#"
+format = 4
+[package]
+unmeasured-data = ["/config/runtime.env"]
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-data = ["/config/runtime.env"]
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::WorkloadConfig::load_from_str(source).unwrap();
+        validate_config(&cfg, tmp.path()).unwrap();
+        let cfg = crate::config::WorkloadConfig::load_from_str(&format!(
+            "{source}\nunmeasured-env-file = \"/config/runtime.env\"\n"
+        ))
+        .unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_err());
+        std::fs::create_dir_all(tmp.path().join("unmeasured-data/config")).unwrap();
+        std::fs::write(
+            tmp.path().join("unmeasured-data/config/runtime.env"),
+            "API_TOKEN=\n",
+        )
+        .unwrap();
+        validate_config(&cfg, tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn accepts_unmeasured_env_file_declared_in_package() {
+        let toml = r#"
+format = 2
+
+[package]
+unmeasured-data = ["/secrets/runtime.env"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "/secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("unmeasured-data/secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::write(secrets_dir.join("runtime.env"), "API_TOKEN=template\n").unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn accepts_measured_data_selected_from_trailing_slash_package_dir() {
+        let toml = r#"
+format = 4
+
+[package]
+measured-data = ["/config/"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+
+[dependencies.fluent-bit]
+image = "x:latest"
+measured-data = ["/config/fluent-bit-entrypoint.sh"]
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("measured-data/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("fluent-bit-entrypoint.sh"), "#!/bin/sh\n").unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn accepts_unmeasured_env_file_from_trailing_slash_package_dir() {
+        let toml = r#"
+format = 4
+
+[package]
+unmeasured-data = ["/secrets/"]
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "/secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("unmeasured-data/secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::write(secrets_dir.join("runtime.env"), "A=B\n").unwrap();
+        assert!(validate_config(&cfg, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn rejects_unmeasured_env_file_missing_package_declaration() {
+        let toml = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "x:latest"
+unmeasured-env-file = "/secrets/runtime.env"
+"#;
+        let cfg = crate::config::WorkloadConfig::load_from_str(toml).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_config(&cfg, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("[package] unmeasured-data"));
     }
 
     #[test]
@@ -2270,10 +3769,10 @@ options = { max-size = "50m", max-file = "0" }
 workload-logs = true
 [workload.logging]
 driver = "none"
-log-readers = ["app"]
+log-readers = ["shipper"]
 "#,
             r#"
-[dependencies.app]
+[dependencies.shipper]
 image = "x:latest"
 workload-logs = true
 "#,
@@ -2289,10 +3788,10 @@ workload-logs = true
         let toml = logging_toml(
             r#"
 [workload.logging]
-log-readers = ["app", "app"]
+log-readers = ["shipper", "shipper"]
 "#,
             r#"
-[dependencies.app]
+[dependencies.shipper]
 image = "x:latest"
 workload-logs = true
 "#,
@@ -2387,5 +3886,72 @@ workload-logs = true
         let cfg = crate::config::WorkloadConfig::load_from_str(&toml).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         validate_config(&cfg, tmp.path()).expect("matched grant+opt-in should validate");
+    }
+
+    #[test]
+    fn baby_log_access_and_sidecar_grant_are_checked_at_build_time() {
+        let source = r#"
+format = 15
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+atakit-portal = true
+gid-group = "shared"
+[dependencies.shipper]
+image = "shipper:latest"
+workload-logs = true
+gid-group = "shared"
+[baby-container]
+enabled = true
+max-instances = 1
+[baby-container.slots.tools]
+parent-service = "app"
+[baby-container.slots.tools.logging]
+access = "none"
+log-readers = ["shipper"]
+"#;
+        let config = crate::config::WorkloadConfig::load_from_str(source).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        validate_config(&config, tmp.path()).unwrap();
+        assert_eq!(
+            config.baby_container.as_ref().unwrap().slots["tools"]
+                .logging
+                .options["max-size"],
+            "50m"
+        );
+
+        let default_group = source.replace("gid-group = \"shared\"\n", "").replace(
+            "parent-service = \"app\"",
+            "parent-service = \"app\"\ngid-group = \"app\"",
+        );
+        let config = crate::config::WorkloadConfig::load_from_str(&default_group).unwrap();
+        validate_config(&config, tmp.path()).unwrap();
+
+        let downlevel = source.replace("format = 15", "format = 14");
+        let config = crate::config::WorkloadConfig::load_from_str(&downlevel).unwrap();
+        assert!(validate_config(&config, tmp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("format = 15"));
+
+        let wrong_group = source
+            .replace(
+                "[dependencies.shipper]\nimage",
+                "[dependencies.shipper]\ngid-group = \"other\"\nimage",
+            )
+            .replace(
+                "workload-logs = true\ngid-group = \"shared\"",
+                "workload-logs = true",
+            );
+        let config = crate::config::WorkloadConfig::load_from_str(&wrong_group).unwrap();
+        assert!(validate_config(&config, tmp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("gid-group"));
+
+        let unknown = source.replace("access = \"none\"", "acess = \"none\"");
+        assert!(crate::config::WorkloadConfig::load_from_str(&unknown).is_err());
     }
 }

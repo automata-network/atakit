@@ -9,8 +9,98 @@ pub struct CommandOutput {
 }
 
 /// Trait for executing shell commands (gcloud, az).
+// async_trait generates a must_use future that Clippy already treats as must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
+    async fn create_resource(
+        &self,
+        key: &str,
+        request: &crate::provisioning::CreateRequest,
+    ) -> Result<serde_json::Value, CloudError> {
+        let creation = crate::provisioning::Creation {
+            outcome: Default::default(),
+            request: request.clone(),
+            token: uuid::Uuid::new_v4().to_string(),
+            sent: false,
+            receipt: None,
+            result: None,
+        };
+        crate::provisioning::execute(self, key, &creation, false).await
+    }
+    async fn creation_recorded(&self, _key: &str) -> Result<bool, CloudError> {
+        Ok(false)
+    }
+    async fn recorded_creation(
+        &self,
+        _key: &str,
+    ) -> Result<Option<crate::provisioning::Creation>, CloudError> {
+        Ok(None)
+    }
+    async fn record_creation_receipt(
+        &self,
+        _key: &str,
+        _receipt: &serde_json::Value,
+    ) -> Result<(), CloudError> {
+        Ok(())
+    }
+    async fn gcp_api(
+        &self,
+        _method: &str,
+        _url: &str,
+        _body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, CloudError> {
+        Err(crate::provisioning::error(
+            "runner does not implement GCP API transport",
+        ))
+    }
+    async fn azure_api(
+        &self,
+        _method: &str,
+        _url: &str,
+        _body: Option<&serde_json::Value>,
+        _create_only: bool,
+    ) -> Result<serde_json::Value, CloudError> {
+        Err(crate::provisioning::error(
+            "runner does not implement Azure API transport",
+        ))
+    }
+    async fn record_boot_disk(
+        &self,
+        _disk: &crate::disk_inventory::ObservedDisk,
+    ) -> Result<(), CloudError> {
+        Ok(())
+    }
+    async fn record_azure_resource(
+        &self,
+        _resource: &crate::provisioning_cleanup::AzureResource,
+    ) -> Result<(), CloudError> {
+        Ok(())
+    }
+    /// Read the saved disk record before resuming its provisioning.
+    async fn recorded_disk(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::disk_inventory::CreatedDisk>, CloudError> {
+        Ok(None)
+    }
+    /// Record each fresh disk before a later provisioning step can fail.
+    async fn record_created_disk(
+        &self,
+        _disk: &crate::disk_inventory::CreatedDisk,
+    ) -> Result<(), CloudError> {
+        Ok(())
+    }
+    /// Persist VM creation before any later waiter or disk attachment can fail.
+    async fn record_created_instance(
+        &self,
+        _instance: &str,
+        _ip: &str,
+        _complete: bool,
+        _identity: Option<&str>,
+    ) -> Result<(), CloudError> {
+        Ok(())
+    }
     /// Run a command and capture stdout + stderr.
     async fn run_capture(&self, program: &str, args: &[&str]) -> Result<CommandOutput, CloudError>;
 
@@ -38,6 +128,23 @@ impl ProcessRunner {
 
 #[async_trait::async_trait]
 impl CommandRunner for ProcessRunner {
+    async fn azure_api(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&serde_json::Value>,
+        create_only: bool,
+    ) -> Result<serde_json::Value, CloudError> {
+        crate::provisioning::azure_api(self, method, url, body, create_only).await
+    }
+    async fn gcp_api(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, CloudError> {
+        crate::provisioning::gcp_api(self, method, url, body).await
+    }
     async fn run_capture(&self, program: &str, args: &[&str]) -> Result<CommandOutput, CloudError> {
         tracing::debug!(program, ?args, "running command");
         if self.verbose {

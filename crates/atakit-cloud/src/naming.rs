@@ -227,14 +227,14 @@ mod tests {
         // Same image + same region → same storage account (shared across
         // every instance of that image). Different instance names must NOT
         // change the storage account name.
-        let a = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.2", "eastus");
-        let b = AzureResourceNames::for_azure("inst-b", "dev-baseimage:v0.0.2", "eastus");
+        let a = AzureResourceNames::for_azure("inst-a", "example-image:v0.0.2", "eastus");
+        let b = AzureResourceNames::for_azure("inst-b", "example-image:v0.0.2", "eastus");
         assert_eq!(a.storage_account, b.storage_account);
         // Different image_ref → different storage account.
-        let c = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.3", "eastus");
+        let c = AzureResourceNames::for_azure("inst-a", "example-image:v0.0.3", "eastus");
         assert_ne!(a.storage_account, c.storage_account);
         // Different region → different storage account (regional resource).
-        let d = AzureResourceNames::for_azure("inst-a", "dev-baseimage:v0.0.2", "westus");
+        let d = AzureResourceNames::for_azure("inst-a", "example-image:v0.0.2", "westus");
         assert_ne!(a.storage_account, d.storage_account);
         assert!(a.storage_account.starts_with("atakit"));
         assert!(a.storage_account.ends_with("eastus"));

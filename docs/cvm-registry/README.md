@@ -1,7 +1,6 @@
 # CVM Registry Contracts -- Architecture Overview
 
-**Source**: `~/work/automata-tee-workload-measurement/`
-**Total**: ~5,487 lines of Solidity across 30 source files
+**Source**: [public registry contracts](https://github.com/automata-network/automata-tee-workload-measurement)
 **Framework**: Foundry
 
 ## High-Level Architecture
@@ -11,7 +10,7 @@ Three-tier on-chain registry establishing cryptographic chains of trust from TEE
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    SessionRegistry                          │
-│         (orchestrator: 9-step attestation pipeline)         │
+│       (orchestrator: attestation and policy pipeline)       │
 │   Merges policies from both registries below, verifies     │
 │   TEE + TPM evidence, creates time-bounded sessions        │
 ├──────────────────────────┬──────────────────────────────────┤
@@ -29,9 +28,11 @@ Three-tier on-chain registry establishing cryptographic chains of trust from TEE
            │                              │
      ┌─────┴──────────────┐      ┌────────┴────────┐
      │ TpmVerifier         │      │  KeyResolver    │
-     │ AkCollateralVerifier│      │ (fingerprint    │
-     │ (TPM quote/certify) │      │  directory)     │
-     └─────────────────────┘      └─────────────────┘
+     │ (external TPM       │      │ (fingerprint    │
+     │  quote/certify)     │      │  directory)     │
+     └─────────┬───────────┘      └─────────────────┘
+               │ external
+        AkCollateralVerifier ── MaaKeyRegistry
 ```
 
 ## Core Design Principles
@@ -42,36 +43,57 @@ Three-tier on-chain registry establishing cryptographic chains of trust from TEE
 
 3. **Policy hierarchy** -- Platform invariants + machine-specific variant overrides are merged at session registration time. By convention, BaseImage carries platform PCR policy and Workload carries workload PCR policy.
 
-4. **Stateless verifiers** -- `TeeVerifier` and `SignatureVerifier` are immutable, stateless, shared across registries. No storage, no upgrades needed.
+4. **Verified TEE attribute policy** -- `TeeVerifier` extracts report-bound
+   states. `TeeSecurityPolicyVerifier` first evaluates ordinary metadata, then
+   requires the applicable reserved states to match the effective base-image
+   declaration and workload policy. `AmdSnpSecurityPolicyRegistry` supplies the
+   default TCB and `PLATFORM_INFO` policy for each exact AMD CPUID. An explicit
+   value replaces that default on its policy side.
 
-5. **UUPS upgradeable registries** -- `BaseImageRegistry` (gap=46), `WorkloadRegistry` (gap=47), `SessionRegistry` (gap=47), `KeyResolver` (gap=49) all use UUPS proxy pattern with storage gaps.
+5. **Stateless verifiers** -- `TeeVerifier`, `TeeSecurityPolicyVerifier`,
+   `TpmVerifier`, `AkCollateralVerifier`, and `SignatureVerifier` are immutable contracts.
+   `SessionRegistry` holds their addresses as immutable constructor
+   dependencies.
 
-6. **Nonce-based replay protection** -- Per-owner nonce in SessionRegistry, bound into TPM quote `extraData`.
+6. **UUPS upgradeable registries** -- `BaseImageRegistry` (gap=46), `WorkloadRegistry` (gap=47), `SessionRegistry` (gap=45), `AmdSnpSecurityPolicyRegistry` (gap=49), and `KeyResolver` (gap=49) use the UUPS proxy pattern with storage gaps.
 
-7. **Polymorphic verification backends** -- Solidity (on-chain), ZK RiscZero, ZK Succinct. TEE verification can be offloaded to ZK proofs.
+7. **Nonce-based replay protection** -- Per-owner nonce in SessionRegistry, bound into TPM quote `extraData`.
+
+8. **Exact ZK program routes** -- `ZkVerifierRegistry` binds one
+   `(ZkProofType, VerificationBackendType, programIdentifier)` tuple to one
+   enabled typed adapter. Every ZK proof carries its exact program identity.
 
 ## Directory Structure
 
 ```
 src/
-├── BaseImageRegistry.sol          (524 lines)
-├── WorkloadRegistry.sol           (304 lines)
-├── SessionRegistry.sol            (1,312 lines)
-├── KeyResolver.sol                (101 lines)
-├── TeeVerifier.sol                (298 lines)
-├── SignatureVerifier.sol          (172 lines)
+├── BaseImageRegistry.sol
+├── WorkloadRegistry.sol
+├── SessionRegistry.sol
+├── AmdSnpSecurityPolicyRegistry.sol
+├── TeeSecurityPolicyVerifier.sol
+├── KeyResolver.sol
+├── MaaKeyRegistry.sol
+├── ZkVerifierRegistry.sol
+├── TeeVerifier.sol
+├── SignatureVerifier.sol
 ├── bases/
-│   ├── TpmBase.sol                (29 lines)
-│   ├── TpmVerifier.sol            (196 lines)
-│   └── AkCollateralVerifier.sol   (190 lines)
+│   ├── TpmBase.sol
+│   ├── TpmVerifier.sol
+│   └── AkCollateralVerifier.sol
 ├── interfaces/
+│   ├── IAkCollateralVerifier.sol
 │   ├── ISignatureVerifier.sol
 │   ├── ITeeVerifier.sol
 │   ├── registries/
 │   │   ├── IBaseImageRegistry.sol
 │   │   ├── IWorkloadRegistry.sol
 │   │   ├── ISessionRegistry.sol
-│   │   └── IKeyResolver.sol
+│   │   ├── IZkVerifierRegistry.sol
+│   │   ├── IKeyResolver.sol
+│   │   └── IMaaKeyRegistry.sol
+│   ├── zk/
+│   │   └── IZkVerifierAdapters.sol
 │   └── external/
 │       ├── IDcapAttestation.sol   (Intel DCAP)
 │       ├── ISnpAttestation.sol    (AMD SNP)
@@ -79,6 +101,7 @@ src/
 ├── types/
 │   ├── Common.sol                 (core data structures)
 │   ├── Evidence.sol               (attestation evidence types)
+│   ├── Zk.sol                     (program-bound proofs and journals)
 │   └── Constants.sol              (domain separators, algo IDs)
 ├── lib/
 │   ├── LibKey.sol                 (key fingerprinting & conversion)
@@ -97,9 +120,11 @@ src/
 
 ```
 SessionRegistry
-  ├── inherits: ISessionRegistry, TpmVerifier, AkCollateralVerifier, OwnableUpgradeable, UUPSUpgradeable
-  ├── immutable refs: ITeeVerifier, ISignatureVerifier, IBaseImageRegistry, IWorkloadRegistry
-  └── uses: LibKey, LibBytes, Sha2Ext
+  ├── inherits: ISessionRegistry, OwnableUpgradeable, UUPSUpgradeable
+  ├── immutable refs: ITeeVerifier, TpmVerifier, IAkCollateralVerifier,
+  │                   ISignatureVerifier, IBaseImageRegistry, IWorkloadRegistry,
+  │                   ITeeSecurityPolicyVerifier
+  └── uses: LibKey, LibBytes
 
 BaseImageRegistry
   ├── inherits: IBaseImageRegistry, OwnableUpgradeable, PausableUpgradeable, UUPSUpgradeable
@@ -113,8 +138,8 @@ WorkloadRegistry
 
 TeeVerifier
   ├── inherits: ITeeVerifier
-  ├── immutable refs: IDcapAttestation, ISnpAttestation
-  └── uses: (inline assembly for byte manipulation -- no library imports)
+  ├── immutable refs: IDcapAttestation, IZkVerifierRegistry
+  └── uses: AmdSnpPolicy, LibBytes, Sha2Ext
 
 SignatureVerifier
   ├── inherits: ISignatureVerifier
@@ -124,12 +149,14 @@ KeyResolver
   ├── inherits: IKeyResolver, OwnableUpgradeable, UUPSUpgradeable
   └── uses: LibKey
 
-TpmVerifier (abstract)
+TpmVerifier
   ├── inherits: TpmBase
-  └── uses: LibKey
+  ├── immutable ref: IZkVerifierRegistry
+  └── uses: LibKey, LibBytes, Sha2Ext
 
-AkCollateralVerifier (abstract)
-  ├── inherits: TpmBase
+AkCollateralVerifier
+  ├── implements: IAkCollateralVerifier; inherits: TpmBase
+  ├── immutable refs: IMaaKeyRegistry, ISignatureVerifier, IZkVerifierRegistry
   └── uses: LibString, Base64 (Solady), LibKey, LibX509
 
 TpmBase (abstract)
@@ -138,17 +165,42 @@ TpmBase (abstract)
 
 ## Important Implementation Notes
 
-1. **PCR index split is not hard-enforced** -- `BaseImageRegistry` and `WorkloadRegistry` only validate sorted `pcrIndex < 24`. The usual platform-vs-workload split is a convention, not a contract-level guardrail.
+1. **Supported PCR indexes are exact** -- Both registries accept only PCR0
+   through PCR16 and PCR23. SHA-256 and SHA-384 arrays are validated
+   independently. The platform-vs-workload split remains a convention.
 
-2. **`getVariant()` does existence checks only** -- `BaseImageRegistry.getVariant(baseImageId, platformProfileId, variantId)` verifies each ID exists, but does not verify that `platformProfileId` belongs to `baseImageId` or that `variantId` belongs to `platformProfileId`.
+2. **`getVariant()` enforces parent-child binding** -- `BaseImageRegistry.getVariant(baseImageId, platformProfileId, variantId)` verifies each ID exists AND that `platformProfileId` was registered under the supplied `baseImageId` and `variantId` was registered under the supplied `platformProfileId`. Implementation recomputes each child ID from the caller-provided parent and the stored child name; mismatch reverts `HierarchyMismatch(baseImageId, platformProfileId, variantId)`. SessionRegistry's `_lookupPolicy` depends on this guarantee.
+
+3. **The verified report path selects the TEE policy** -- `PlatformProfile`
+   has no TEE-type field. `TeeReport.teeType` selects a type-specific
+   verification path, which returns success only for evidence with that TEE's
+   signed format and valid cryptography. SessionRegistry then evaluates only
+   the reserved attributes assigned to `teeResult.teeType`. A base image and a
+   workload may contain policy for both Intel TDX and AMD SEV-SNP.
+
+4. **Only exact hashes are reserved on chain** -- The contracts recognize six
+   exact attribute hashes. They cannot recover a textual namespace from any
+   other hash. Text-based tools reject unknown names under
+   `atakit.attestation.v1.tee.` before publication.
+
+5. **Rotation has no new provider evidence** -- `rotateKey` has no new TEE
+   report. It evaluates the current registered PCR policy without a generated
+   provider rule and inherits the launch state accepted by the predecessor's
+   complete registration or renewal.
 
 ## PCR Evaluation Modes
 
 | Mode | Semantics |
 |---|---|
 | `STATIC` | Exact match: `actual == expected` |
-| `DYNAMIC_SUBSET` | Each PCR event hash must appear in `matchData` (order irrelevant) |
-| `DYNAMIC_SUBSEQUENCE` | `matchData` values must appear as subsequence in PCR events (order matters) |
+| `DYNAMIC_SUBSET` | Every landmark in `comparison` must appear in the PCR events; order does not matter and extra events are permitted |
+| `DYNAMIC_SUBSEQUENCE` | The landmarks in `comparison` must appear as an ordered subsequence of the PCR events |
+| `DYNAMIC_INDEXED_EVENT_SETS` | The event count must match exactly; every listed event index must match one allowed digest; unlisted indexes are skipped |
+| `EXTEND_FROM_ZERO` | The authenticated PCR must equal one bank-width TPM extend from the all-zero value |
+
+Each PCR rule contains only `pcrIndex` and one opaque `comparison` byte blob.
+`TpmVerifier` decodes `comparison`; the registries and `SessionRegistry` pass it
+unchanged.
 
 ## ID Derivation Scheme
 
@@ -158,39 +210,39 @@ NOTE: All use `abi.encode` (not `encodePacked`).
 | Entity | Formula |
 |---|---|
 | Key fingerprint | `keccak256(abi.encode(KEY_DOMAIN, typeId, key))` |
-| Base image ID | `keccak256(abi.encode(BASEIMAGE_DOMAIN, name, version))` -- NO ownerFingerprint |
+| Base image ID | `keccak256(abi.encode(BASEIMAGE_DOMAIN, ownerFingerprint, name, version))` |
 | Platform profile ID | `keccak256(abi.encode(PLATFORM_PROFILE_DOMAIN, baseImageId, profileName))` |
 | Variant ID | `keccak256(abi.encode(PLATFORM_VARIANT_DOMAIN, platformProfileId, variantName))` |
-| Workload ID | `keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))` -- NO ownerFingerprint |
+| Workload ID | `keccak256(abi.encode(WORKLOAD_DOMAIN, ownerFingerprint, name, version))` |
 | Session ID | `keccak256(abi.encode(SESSION_DOMAIN, tpmSignatureHash, teeReportBytesHash))` |
 
 ## Message Signing Convention
 
 All owner-signed messages use **sha256** (NOT keccak256) and include **chainid + address(this)** for replay protection:
 ```
-message = sha256(abi.encode(MSG_SEPARATOR, block.chainid, address(this), expireAt, ...params))
+message = sha256(abi.encode(MSG_SEPARATOR, block.chainid, address(this), opExpiresAt, ...params))
 ```
 
-## Deployment (Hoodi Testnet)
+## Deployment
 
-| Contract | Address |
-|---|---|
-| SessionRegistry | `0xD1860020870ffEd23a644d0CD4CA9E7b3Ff53D6c` |
-| BaseImageRegistry | `0x15A8F7A012b2dBad3fAD6020a0dF1F81E86F6171` |
-| WorkloadRegistry | `0xFA8Eb822594d7aA7221aBE3Cd7f3F17c3F16bA9E` |
-| TeeVerifier | `0x80c17Fb23a7f747174DCD29Ec94B8D5a7227F266` |
-| SignatureVerifier | `0x996eB4a6E1FEbF1788B027FA990643B2328A5E72` |
-| KeyResolver | `0x74Ee5a4c6e9207cFDa2Bb28E79bf97CcA42F18E4` |
+Read the target chain configuration and verify each proxy implementation and
+immutable dependency against that chain. Contract bindings must match the
+selected network.
 
 ## TEE Platform Support
 
 | TEE | Cloud | AK Binding | PCR15 Binding |
 |---|---|---|---|
-| Intel TDX | Azure | `reportData[0:32] == sha256(akJsonBytes)` | N/A |
-| Intel TDX | GCP | Certificate chain via `ITpmAttestation.verifyCertChain` | `sha256(bytes32(0) \|\| sha256(UUID))` from RTMR3 |
+| Intel TDX | Azure | MAA-signed JWT (RS256); `tdx_report_data` claim commits to `sha256(hclVarData)`; JWT signature verified against per-region MAA RSA-2048 key from MaaKeyRegistry | N/A |
+| AMD SEV-SNP | Azure | MAA-signed JWT (RS256); `x-ms-sevsnpvm-reportdata` claim commits to `sha256(hclVarData)`; same per-region MAA RSA-2048 key as the TDX path | N/A |
+| Intel TDX | GCP | Certificate chain via `ITpmAttestation.verifyCertChain` | `sha256(bytes32(0) \|\| (bytes16(0) \|\| UUID))`; UUID also bound in RTMR3 via `sha384(bytes48(0) \|\| (bytes32(0) \|\| UUID))` |
 | AMD SEV-SNP | GCP | Certificate chain | `sha256(bytes32(0) \|\| report_id)` |
+| AMD SEV-SNP | AWS | `aws_nitrotpm.v1` verifies the NitroTPM Attestation Document, P-256 Attestation Key, qualifying data, trusted root, exact report hash, and `REPORT_DATA` binding to the complete `PcrCommitment` | Generated SHA-384 PCR15 `EXTEND_FROM_ZERO` binds the Quote to `REPORT_ID`; dual-bank policy adds the same SHA-256 rule; NitroTPM, TPM Quote, and evidence `PcrCommitment` values must be equal |
 
-NOTE: Azure binding path in `_verifyTeeAkBinding` uses `extractDcapReportData` (TDX-specific). Azure SNP binding is not currently implemented -- the code dispatches on collateral type (`AzureAkPubJson`), not TEE type, and only handles DCAP report data extraction.
+For Azure TDX and Azure SEV-SNP, `_verifyAzureAkCollateral` returns the
+MAA-signed `sha256(hclVarData)` as `bindingHash`. `_verifyProviderEvidence` then
+requires the independently verified raw TEE report's `REPORT_DATA` to equal
+`bindingHash || bytes32(0)`. Azure does not use PCR15 for this binding.
 
 ## Signature Algorithm Support
 

@@ -1,5 +1,85 @@
 use crate::error::CloudError;
 use crate::exec::CommandRunner;
+use crate::firewall::{error, parse_ports};
+
+/// Add missing inbound ports without broadening any existing allow rule.
+pub async fn update_ingress_rules(
+    region: &str,
+    group_name: &str,
+    ports: &[String],
+    runner: &dyn CommandRunner,
+) -> Result<(), CloudError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Response {
+        security_groups: Vec<Group>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Group {
+        group_id: String,
+        ip_permissions: Vec<Permission>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Permission {
+        ip_protocol: String,
+        from_port: Option<i32>,
+        to_port: Option<i32>,
+    }
+
+    let ports = parse_ports(ports)?;
+    let output = runner
+        .run_capture(
+            "aws",
+            &[
+                "ec2",
+                "describe-security-groups",
+                "--region",
+                region,
+                "--filters",
+                &format!("Name=group-name,Values={group_name}"),
+                "--output",
+                "json",
+            ],
+        )
+        .await?;
+    let response: Response = serde_json::from_str(&output.stdout)
+        .map_err(|e| error(format!("invalid AWS security group response: {e}")))?;
+    let [group] = response.security_groups.as_slice() else {
+        return Err(error(
+            "saved AWS security group name must identify exactly one group",
+        ));
+    };
+    if group.group_id.is_empty() {
+        return Err(error("AWS security group response has an empty group ID"));
+    }
+    for rule in &group.ip_permissions {
+        if rule.ip_protocol.is_empty()
+            || (matches!(rule.ip_protocol.as_str(), "tcp" | "udp" | "6" | "17")
+                && !matches!((rule.from_port, rule.to_port), (Some(start), Some(end))
+                    if 0 <= start && start <= end && end <= 65535))
+        {
+            return Err(error("invalid AWS inbound protocol or port range"));
+        }
+    }
+    let missing = ports
+        .iter()
+        .filter(|port| {
+            !group.ip_permissions.iter().any(|rule| {
+                if rule.ip_protocol == "-1" {
+                    return true;
+                }
+                let number = if port.protocol == "tcp" { "6" } else { "17" };
+                (rule.ip_protocol == port.protocol || rule.ip_protocol == number)
+                    && matches!((rule.from_port, rule.to_port), (Some(start), Some(end))
+                if start <= i32::from(port.number) && i32::from(port.number) <= end)
+            })
+        })
+        .map(|port| port.entry())
+        .collect::<Vec<_>>();
+    add_ingress_rules(region, &group.group_id, &missing, runner).await
+}
 
 /// Look up the default VPC id for the region.
 pub async fn default_vpc_id(

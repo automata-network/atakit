@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use atakit_core::{ArchiveCompression, ProgressHandle};
 
+use crate::data::{logical_data_path_rel, validate_logical_data_path};
 use crate::WorkloadError;
 
 /// Staging directory layout for a workload archive.
@@ -34,26 +35,18 @@ impl StagingDir {
 
     /// Copy measured-data files from source into the staging directory.
     ///
-    /// Preserves directory structure relative to `workload_dir`.
+    /// Preserves directory structure relative to `measured_data_root`.
     /// Returns the number of files copied.
     pub fn stage_measured_data(
         &self,
         paths: &[String],
-        workload_dir: &Path,
+        measured_data_root: &Path,
     ) -> Result<usize, WorkloadError> {
         let mut count = 0;
         for p in paths {
-            let rel = p.strip_prefix("./").unwrap_or(p);
-            // Defense-in-depth: reject any ".." components before joining
-            if Path::new(rel)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-            {
-                return Err(WorkloadError::Validation(format!(
-                    "measured-data path must not contain \"..\": {p:?}"
-                )));
-            }
-            let src = workload_dir.join(p);
+            validate_logical_data_path(p, "package measured-data")?;
+            let rel = logical_data_path_rel(p);
+            let src = measured_data_root.join(&rel);
             let dest = self.measured_dir.join(rel);
             count += copy_recursive(&src, &dest)?;
         }
@@ -81,6 +74,8 @@ impl StagingDir {
 /// Create a `.atawl` archive from the staging directory.
 ///
 /// The archive contains a single top-level directory named after the workload.
+/// All compression options produce zstd, the format accepted by the portal.
+/// The compression argument is retained for source compatibility.
 /// Returns the path to the created archive.
 pub fn create_archive(
     staging_root: &Path,
@@ -88,7 +83,7 @@ pub fn create_archive(
     workload_version: &str,
     output_dir: &Path,
     progress: &dyn ProgressHandle,
-    compression: ArchiveCompression,
+    _compression: ArchiveCompression,
 ) -> Result<PathBuf, WorkloadError> {
     let archive_path = output_dir.join(format!("{workload_name}-{workload_version}.atawl"));
     let file = std::fs::File::create(&archive_path).map_err(|e| WorkloadError::WriteFile {
@@ -96,57 +91,40 @@ pub fn create_archive(
         source: e,
     })?;
 
-    match compression {
-        ArchiveCompression::Zstd => {
-            let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
-            let counting = ProgressWriter {
-                inner: enc,
-                progress,
-            };
-            let mut tar = tar::Builder::new(counting);
-            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
-            tar.into_inner()
-                .map_err(WorkloadError::Io)?
-                .inner
-                .finish()
-                .map_err(WorkloadError::Io)?;
-        }
-        ArchiveCompression::Gz => {
-            let enc = flate2::GzBuilder::new()
-                .mtime(0)
-                .write(file, flate2::Compression::default());
-            let counting = ProgressWriter {
-                inner: enc,
-                progress,
-            };
-            let mut tar = tar::Builder::new(counting);
-            append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
-            tar.into_inner()
-                .map_err(WorkloadError::Io)?
-                .inner
-                .finish()
-                .map_err(WorkloadError::Io)?;
-        }
-    }
+    let enc = zstd::Encoder::new(file, 0).map_err(WorkloadError::Io)?;
+    let counting = ProgressWriter {
+        inner: enc,
+        progress,
+    };
+    let mut tar = tar::Builder::new(counting);
+    append_dir_deterministic(&mut tar, staging_root, Path::new(workload_name))?;
+    tar.into_inner()
+        .map_err(WorkloadError::Io)?
+        .inner
+        .finish()
+        .map_err(WorkloadError::Io)?;
 
     Ok(archive_path)
 }
 
-/// Open an archive file with auto-detected decompression (zstd or gzip).
-pub(crate) fn open_decoder(
-    mut file: std::fs::File,
-) -> Result<Box<dyn std::io::Read>, WorkloadError> {
-    use std::io::{Read, Seek, SeekFrom};
+/// Open an archive reader with auto-detected decompression (zstd or gzip).
+pub(crate) fn open_decoder<'a, R>(
+    mut reader: R,
+) -> Result<Box<dyn std::io::Read + 'a>, WorkloadError>
+where
+    R: std::io::Read + std::io::Seek + 'a,
+{
+    use std::io::SeekFrom;
 
     let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).map_err(WorkloadError::Io)?;
-    file.seek(SeekFrom::Start(0)).map_err(WorkloadError::Io)?;
+    reader.read_exact(&mut magic).map_err(WorkloadError::Io)?;
+    reader.seek(SeekFrom::Start(0)).map_err(WorkloadError::Io)?;
 
     if magic[..2] == [0x1F, 0x8B] {
-        Ok(Box::new(flate2::read::GzDecoder::new(file)))
+        Ok(Box::new(flate2::read::GzDecoder::new(reader)))
     } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {
         Ok(Box::new(
-            zstd::Decoder::new(file).map_err(WorkloadError::Io)?,
+            zstd::Decoder::new(reader).map_err(WorkloadError::Io)?,
         ))
     } else {
         Err(WorkloadError::Validation(
@@ -342,15 +320,15 @@ mod tests {
     #[test]
     fn stage_measured_data_copies_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let wl_dir = tmp.path().join("workload");
-        std::fs::create_dir_all(wl_dir.join("config")).unwrap();
-        std::fs::write(wl_dir.join("config/hello"), "world").unwrap();
+        let measured_root = tmp.path().join("measured-data");
+        std::fs::create_dir_all(measured_root.join("config")).unwrap();
+        std::fs::write(measured_root.join("config/hello"), "world").unwrap();
 
         let staging_tmp = tempfile::tempdir().unwrap();
         let staging = StagingDir::create(staging_tmp.path(), "test").unwrap();
 
         let count = staging
-            .stage_measured_data(&["./config/hello".into()], &wl_dir)
+            .stage_measured_data(&["/config/hello".into()], &measured_root)
             .unwrap();
         assert_eq!(count, 1);
         assert!(staging.measured_dir.join("config/hello").exists());

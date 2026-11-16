@@ -2,14 +2,29 @@ pub mod aws;
 pub mod azure;
 pub mod cloud_images;
 pub mod config;
+pub mod diagnose;
+pub mod disk_inventory;
+pub mod disk_profiles;
 pub mod error;
 pub mod exec;
+#[cfg(test)]
+mod fast_disk_tests;
+pub mod firewall;
 pub mod gcp;
+pub mod image_removal;
 pub mod init;
+pub mod init_auth;
 pub mod naming;
+pub mod pcr_policy;
 pub mod plan;
+pub mod preflight;
 pub mod provider;
+pub mod provisioning;
+pub mod provisioning_cleanup;
 pub mod qemu;
+pub mod resume;
+pub mod session;
+pub mod session_lifecycle;
 pub mod state;
 
 #[cfg(feature = "cli")]
@@ -21,7 +36,7 @@ pub use config::{
 };
 pub use error::CloudError;
 pub use exec::{CommandOutput, CommandRunner, ProcessRunner};
-pub use init::{InitChainConfig, InitConfig, InitKeyConfig};
+pub use init::{InitChainConfig, InitConfig, InitKeyConfig, InitProverConfig};
 pub use naming::{AzureResourceNames, ResourceNames};
 pub use plan::{
     DeployPlan, DeployStep, DestroyPlan, DestroyStep, DiskSpec, ResourceUpdates, StepResult,

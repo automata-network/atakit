@@ -1,0 +1,1089 @@
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use atakit_attestation::{
+    BindingMode, SessionAttributeRequirement, SessionPcrPolicy, SessionPcrPolicy384,
+    VerifiedSession,
+};
+use atakit_attestation_client::{
+    verify_current_session, AttestationClient, AttestationClientConfig, SessionAuthorityKind,
+    SessionWorkloadSelector, TrustedWorkloadSessionPolicy,
+};
+use atakit_cloud::cli::SessionVerificationArgs;
+use atakit_cloud::init::{self, InitChainConfig, VerifiedPortalTls};
+use atakit_cloud::state::{DeployState, DeployStatus};
+use atakit_core::Env;
+use atakit_cvm_encoding::pcr_comparison::{encode_static256, encode_static384};
+use atakit_workload::{inspect_workload, InspectOptions};
+
+use super::{
+    init_chain_from_config, portal_endpoints, registration_is_off,
+    resolve_explicit_tls_measurement_policy, resolve_instance, synthesize_off_init_chain,
+};
+use crate::config::{ChainConfig, Config};
+
+pub(crate) async fn connect_attestation_client(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<AttestationClient> {
+    AttestationClient::connect(AttestationClientConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        expected_chain_id: chain.chain_id,
+        expected_base_image_registry: chain.base_image_registry.clone(),
+        expected_workload_registry: chain.workload_registry.clone(),
+    })
+    .await
+    .with_context(|| format!("connect attestation client for chain '{chain_name}'"))
+}
+
+pub(crate) struct VerifiedPortalAccess {
+    pub target_name: String,
+    pub instance_name: String,
+    pub state: DeployState,
+    pub host: String,
+    pub status_port: u16,
+    pub chain_name: Option<String>,
+    pub verified_tls: VerifiedPortalTls,
+    pub(crate) registration: Option<String>,
+}
+
+pub(crate) struct VerifiedCloudSessionAccess {
+    pub target_name: String,
+    pub instance_name: String,
+    pub state: DeployState,
+    pub host: String,
+    pub status_port: u16,
+    pub chain_name: Option<String>,
+    pub required_binding: Option<BindingMode>,
+    pub verified_tls: VerifiedPortalTls,
+    /// What identifies the workload for the authority that verified portal TLS.
+    ///
+    /// One value, not a policy beside an optional chain client: that shape
+    /// carried no evidence of which authority produced the policy, so the two
+    /// fields could disagree.
+    workload: SessionWorkloadSelector,
+}
+
+impl VerifiedCloudSessionAccess {
+    pub async fn verify_current_session(&self) -> Result<VerifiedSession> {
+        verify_current_session(
+            &self.verified_tls,
+            &self.host,
+            self.status_port,
+            &self.workload,
+            self.required_binding,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+}
+
+pub(crate) async fn resolve_verified_portal_access(
+    instance: &str,
+    target_filter: Option<&str>,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    config: &Config,
+) -> Result<VerifiedPortalAccess> {
+    resolve_portal_access(instance, target_filter, verification, env, config, false).await
+}
+
+pub(crate) async fn resolve_disk_unlock_access(
+    instance: &str,
+    target_filter: Option<&str>,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    config: &Config,
+) -> Result<VerifiedPortalAccess> {
+    resolve_portal_access(instance, target_filter, verification, env, config, true).await
+}
+
+fn permits_portal_access(status: &DeployStatus, allow_pending: bool) -> bool {
+    matches!(status, DeployStatus::Deployed { .. })
+        || (allow_pending && matches!(status, DeployStatus::Deploying { .. }))
+}
+
+pub(super) async fn current_portal_endpoints(
+    state: &DeployState,
+    runner: &dyn atakit_cloud::CommandRunner,
+) -> Result<(String, u16, u16)> {
+    if state.platform == atakit_cloud::PlatformKind::Qemu {
+        return portal_endpoints(state);
+    }
+    let expected = atakit_cloud::diagnose::expected_vm_id(state)
+        .filter(|id| !id.is_empty())
+        .context(
+            "saved cloud VM identity is missing; cannot establish the current Portal address",
+        )?;
+    // Read the address and immutable VM identity together. A stop/start may
+    // change the public IP, but a replacement VM must never be selected by name.
+    let vm = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        atakit_cloud::diagnose::observe_vm(state, runner),
+    )
+    .await
+    .context("current cloud VM lookup timed out")?
+    .context("could not establish the current cloud VM address")?;
+    if vm.id != expected {
+        bail!("cloud VM identity differs from the saved deployment; refusing Portal access");
+    }
+    let host = vm
+        .address
+        .context("cloud VM has no current public address")?;
+    Ok((host, state.portal_ports.status, state.portal_ports.init))
+}
+
+async fn resolve_portal_access(
+    instance: &str,
+    target_filter: Option<&str>,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    config: &Config,
+    allow_pending: bool,
+) -> Result<VerifiedPortalAccess> {
+    let (target_name, instance_name) = resolve_instance(&env.data_dir, instance, target_filter)?;
+    let state = DeployState::load(&env.data_dir, &target_name, &instance_name)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if !permits_portal_access(&state.status, allow_pending) {
+        bail!("deployment {target_name}/{instance_name} is not available for this operation");
+    }
+    if state.workload_name.is_empty() || state.workload_version.is_empty() {
+        bail!("deployment {target_name}/{instance_name} has no initialized workload");
+    }
+    let target = config
+        .cloud
+        .targets
+        .get(&target_name)
+        .ok_or_else(|| anyhow::anyhow!("target '{target_name}' not found in config"))?;
+    let (host, status_port, _) =
+        current_portal_endpoints(&state, &atakit_cloud::diagnose::DiagnosticRunner).await?;
+
+    let chain_name = verification
+        .chain
+        .as_deref()
+        .or((!state.init_env.chain.is_empty()).then_some(state.init_env.chain.as_str()))
+        .or(target.chain.as_deref())
+        .map(str::to_string);
+    let init_chain = match chain_name.as_deref() {
+        Some(name) => match config.chains.get(name) {
+            Some(chain) => {
+                if tls_needs_registry_derivation(
+                    verification.measurements.is_some(),
+                    chain.base_image_registry.is_some(),
+                ) {
+                    let prover = chain
+                        .prover
+                        .as_ref()
+                        .and_then(|prover| config.provers.get(prover));
+                    init_chain_from_config(name, chain, target.registration.as_deref(), prover)
+                        .await?
+                } else {
+                    verification_chain_without_registry_derivation(
+                        chain,
+                        target.registration.as_deref(),
+                    )
+                }
+            }
+            None => bail!("chain '{name}' not found in [chains]"),
+        },
+        None if registration_is_off(target.registration.as_deref()) => synthesize_off_init_chain(),
+        None => bail!("no chain config is available for verifier trust lookup"),
+    };
+
+    let verified_tls = verify_disk_portal_tls(
+        &host,
+        status_port,
+        verification,
+        env,
+        &init_chain,
+        &init::cloud_tls_attestation_report_path(&env.data_dir, &target_name, &instance_name),
+    )
+    .await?;
+    Ok(VerifiedPortalAccess {
+        target_name,
+        instance_name,
+        state,
+        host,
+        status_port,
+        chain_name,
+        verified_tls,
+        registration: target.registration.clone(),
+    })
+}
+
+pub(crate) async fn verify_disk_portal_tls(
+    host: &str,
+    status_port: u16,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    init_chain: &InitChainConfig,
+    report: &Path,
+) -> Result<VerifiedPortalTls> {
+    verify_portal_tls_with_report(
+        host,
+        status_port,
+        verification,
+        env,
+        init_chain,
+        Some(report),
+    )
+    .await
+}
+
+pub(crate) async fn verify_portal_tls_with_report(
+    host: &str,
+    status_port: u16,
+    verification: &SessionVerificationArgs,
+    env: &Env,
+    init_chain: &InitChainConfig,
+    report: Option<&Path>,
+) -> Result<VerifiedPortalTls> {
+    let untrusted_portal_base_image_id = if verification.measurements.is_none() {
+        Some(
+            init::read_untrusted_portal_base_image_id(host, status_port)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        )
+    } else {
+        None
+    };
+    let measurement_policy = resolve_explicit_tls_measurement_policy(
+        verification.measurements.as_deref(),
+        verification.base_image.as_deref(),
+        untrusted_portal_base_image_id,
+        &verification.measurement_publisher_key,
+        &env.data_dir,
+        init_chain,
+    )
+    .await?;
+    let tls_verification_trust =
+        init::load_tls_verification_trust(init::TlsVerificationTrustFiles {
+            gcp_ak_root_certs: &verification.gcp_ak_root_cert,
+            azure_maa_certs: &verification.azure_maa_cert,
+            aws_nitro_root_certs: &verification.aws_nitro_root_cert,
+            amd_ark_root_certs: &verification.amd_ark_root_cert,
+            amd_snp_crls: &verification.amd_snp_crl,
+            amd_snp_security_policy: verification.amd_snp_security_policy.as_deref(),
+            aws_document_maximum_age_seconds: verification.aws_document_maximum_age_seconds,
+            aws_document_allowed_future_clock_difference_seconds: verification
+                .aws_document_allowed_future_clock_difference_seconds,
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let automata_read_strategy = init::tdx_dcap_automata_read_strategy(
+        &verification.tdx_dcap_automata_read_strategy,
+        verification.tdx_dcap_automata_multicall3_address.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let tdx_dcap = init::tdx_dcap_collateral_config_with_read_strategy(
+        verification.tdx_dcap_collateral.clone(),
+        verification.tdx_dcap_pccs_url.clone(),
+        verification.tdx_dcap_automata_collateral_rpc_url.clone(),
+        verification.tdx_dcap_automata_pcs_dao.clone(),
+        automata_read_strategy,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let tls_mode = init::portal_tls_mode_for_init_chain(
+        init_chain,
+        tls_verification_trust,
+        tdx_dcap,
+        measurement_policy,
+        untrusted_portal_base_image_id,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verified_tls = init::bootstrap_portal_tls(host, status_port, &tls_mode, None, None, report)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    Ok(verified_tls)
+}
+
+/// Why the workload policy inputs disagree with the authority portal TLS used,
+/// if they do.
+///
+/// A function rather than an inline check so the command and its test run the
+/// same code. The session half used to re-derive its authority from
+/// `chain_name` and could reach a different answer than the TLS half, which is
+/// how a chain-resolved policy ended up with operator PCR23 values appended.
+pub(super) fn workload_policy_authority_conflict(
+    authority: SessionAuthorityKind,
+    verification: &SessionVerificationArgs,
+) -> Option<String> {
+    let manual = verification.trusted_workload_pcr23_sha256.is_some()
+        || verification.trusted_workload_pcr23_sha384.is_some();
+    if authority != SessionAuthorityKind::Explicit && manual {
+        return Some(format!(
+            "portal TLS verified under {} authority, which also supplies the workload policy; \
+             --trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 cannot be added \
+             to it",
+            authority.name()
+        ));
+    }
+    None
+}
+
+pub(crate) async fn resolve_verified_session_access(
+    portal: VerifiedPortalAccess,
+    verification: &SessionVerificationArgs,
+    _config: &Config,
+) -> Result<VerifiedCloudSessionAccess> {
+    // Registered workload policies come from the authority portal TLS used.
+    // Registration off instead uses the hash-checked deployment archive.
+    // Session binding is separate and is checked later against the deployment's
+    // registration policy.
+    // Read back from the verified TLS itself rather than kept alongside it. A
+    // second copy of the authority is a second thing that can disagree, and a
+    // string one silently mapped trust-pack onto the operator branch.
+    let authority = portal.verified_tls.authority_kind().ok_or_else(|| {
+        anyhow::anyhow!("verified portal TLS carries no session verification inputs")
+    })?;
+    if let Some(message) = workload_policy_authority_conflict(authority, verification) {
+        bail!(message);
+    }
+    if authority != SessionAuthorityKind::Chain {
+        // Explicit mode has no chain from which to resolve a registered policy,
+        // so it must not connect to one.
+        return build_session_access(portal, verification, authority).await;
+    }
+    // No second chain client is connected here. The authority recorded during
+    // portal TLS already holds the one that verified the connection, and
+    // connecting another was itself the crossing risk: two clients meant two
+    // chains could disagree.
+    build_session_access(portal, verification, authority).await
+}
+
+/// Whether this authority resolves its own workload policy from a reference.
+///
+/// Both chain and trust-pack do. Trust-pack used to fall through to the
+/// operator branch, which `authority_accepts` then refused — so the mode failed
+/// closed, but could never work through this command at all.
+fn selects_workload_reference(authority: SessionAuthorityKind) -> bool {
+    match authority {
+        SessionAuthorityKind::Chain | SessionAuthorityKind::Packs => true,
+        SessionAuthorityKind::Explicit => false,
+    }
+}
+
+/// Assemble the verified session access from the authority portal TLS used.
+async fn build_session_access(
+    portal: VerifiedPortalAccess,
+    verification: &SessionVerificationArgs,
+    authority: SessionAuthorityKind,
+) -> Result<VerifiedCloudSessionAccess> {
+    // The deployment records its workload's publisher, so the identifier is
+    // recomputable from state rather than being stored opaquely.
+    let workload_publisher = portal
+        .state
+        .workload_publisher
+        .parse()
+        .context("deployment state has an invalid workload publisher")?;
+    let workload_ref = automata_tee_workload_measurement::types::AppRef::new(
+        workload_publisher,
+        portal.state.workload_name.clone(),
+        portal.state.workload_version.clone(),
+    );
+    let workload_id = crate::commands::workload::compute_workload_id(&workload_ref);
+    // Local deployment verification uses the saved archive. Registered modes
+    // keep the policy source selected by the platform verification authority.
+    let workload = select_session_workload(
+        &portal.state,
+        verification,
+        authority,
+        portal.registration.as_deref(),
+        workload_id.0,
+    )
+    .await?;
+    let required_binding = required_binding_for_registration(portal.registration.as_deref());
+
+    Ok(VerifiedCloudSessionAccess {
+        target_name: portal.target_name,
+        instance_name: portal.instance_name,
+        state: portal.state,
+        host: portal.host,
+        status_port: portal.status_port,
+        chain_name: portal.chain_name,
+        required_binding,
+        verified_tls: portal.verified_tls,
+        workload,
+    })
+}
+
+pub(crate) fn verification_chain_without_registry_derivation(
+    chain: &ChainConfig,
+    registration: Option<&str>,
+) -> InitChainConfig {
+    InitChainConfig {
+        rpc_url: chain.rpc_url.clone(),
+        session_registry: chain.session_registry.clone(),
+        workload_registry: chain
+            .workload_registry
+            .clone()
+            .unwrap_or_else(|| super::ZERO_ADDR.to_string()),
+        base_image_registry: chain
+            .base_image_registry
+            .clone()
+            .unwrap_or_else(|| super::ZERO_ADDR.to_string()),
+        registration: registration.map(str::to_string),
+        chain_id: chain.chain_id,
+        tee_backend: chain.tee_backend.clone(),
+        prover: None,
+    }
+}
+
+fn tls_needs_registry_derivation(
+    has_explicit_measurements: bool,
+    has_configured_base_image_registry: bool,
+) -> bool {
+    !has_explicit_measurements && !has_configured_base_image_registry
+}
+
+/// Registration off uses the saved archive independently of platform authority.
+/// Other registration modes retain their existing workload policy source.
+async fn select_session_workload(
+    state: &DeployState,
+    verification: &SessionVerificationArgs,
+    authority: SessionAuthorityKind,
+    registration: Option<&str>,
+    workload_id: [u8; 32],
+) -> Result<SessionWorkloadSelector> {
+    let workload = if registration_is_off(registration) {
+        if verification.trusted_workload_pcr23_sha256.is_some()
+            || verification.trusted_workload_pcr23_sha384.is_some()
+        {
+            bail!("registration off verifies the saved .atawl archive; manual workload PCR overrides are not supported");
+        }
+        SessionWorkloadSelector::LocalArchivePolicy(
+            load_local_workload_policy(state, workload_id).await?,
+        )
+    } else if selects_workload_reference(authority) {
+        SessionWorkloadSelector::Reference(atakit_cvm_types::AppRef::new(
+            state
+                .workload_publisher
+                .parse::<alloy_ext::core::primitives::B256>()?
+                .0,
+            state.workload_name.clone(),
+            state.workload_version.clone(),
+        ))
+    } else {
+        SessionWorkloadSelector::OperatorPolicy(
+            resolve_operator_workload_policy(state, verification, workload_id).await?,
+        )
+    };
+    Ok(workload)
+}
+
+async fn resolve_operator_workload_policy(
+    state: &DeployState,
+    verification: &SessionVerificationArgs,
+    workload_id: [u8; 32],
+) -> Result<TrustedWorkloadSessionPolicy> {
+    let Some((sha256, sha384)) = trusted_workload_pcr23(verification)? else {
+        return load_local_workload_policy(state, workload_id).await;
+    };
+    Ok(TrustedWorkloadSessionPolicy {
+        workload_id,
+        pcr_specs256: vec![static_pcr23_policy(sha256)],
+        pcr_specs384: vec![static_pcr23_policy384(sha384)],
+        attribute_requirements: Vec::new(),
+    })
+}
+
+/// Decode the paired workload measurements without opening a deployment archive.
+pub(super) fn trusted_workload_pcr23(
+    verification: &SessionVerificationArgs,
+) -> Result<Option<([u8; 32], [u8; 48])>> {
+    match (
+        verification.trusted_workload_pcr23_sha256.as_deref(),
+        verification.trusted_workload_pcr23_sha384.as_deref(),
+    ) {
+        (Some(sha256), Some(sha384)) => Ok(Some((
+            decode_hex_32(sha256, "--trusted-workload-pcr23-sha256")?,
+            decode_hex_48(sha384, "--trusted-workload-pcr23-sha384")?,
+        ))),
+        (None, None) => Ok(None),
+        _ => bail!(
+            "--trusted-workload-pcr23-sha256 and --trusted-workload-pcr23-sha384 must be supplied together"
+        ),
+    }
+}
+
+async fn load_local_workload_policy(
+    state: &DeployState,
+    workload_id: [u8; 32],
+) -> Result<TrustedWorkloadSessionPolicy> {
+    let archive_path = Path::new(&state.archive_path);
+    if archive_path.extension().and_then(|value| value.to_str()) != Some("atawl") {
+        bail!(
+            "saved workload archive {} is not a .atawl file; restore the original deployment archive",
+            archive_path.display()
+        );
+    }
+    if state.archive_hash.is_empty() {
+        bail!("saved deployment has no trusted workload archive hash");
+    }
+    let actual_archive_hash = atakit_workload::hash::hash_file(archive_path)
+        .with_context(|| format!("hash trusted workload archive {}", archive_path.display()))?;
+    if !atakit_workload::hex_equal(&state.archive_hash, &actual_archive_hash) {
+        bail!(
+            "trusted workload archive hash mismatch: saved {} actual {}",
+            state.archive_hash,
+            actual_archive_hash
+        );
+    }
+    let inspection = inspect_workload(&InspectOptions {
+        publisher: None,
+        archive: Some(archive_path.to_path_buf()),
+        workload_dir: None,
+        engine: None,
+        verbose: false,
+        measured_data_root: None,
+        unmeasured_data_root: None,
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "inspect trusted workload archive {}",
+            archive_path.display()
+        )
+    })?;
+    if inspection.manifest.meta.name != state.workload_name
+        || inspection.manifest.meta.version != state.workload_version
+    {
+        bail!(
+            "trusted workload archive identity {}/{} does not match saved workload {}/{}",
+            inspection.manifest.meta.name,
+            inspection.manifest.meta.version,
+            state.workload_name,
+            state.workload_version
+        );
+    }
+
+    Ok(TrustedWorkloadSessionPolicy {
+        workload_id,
+        pcr_specs256: vec![static_pcr23_policy(decode_hex_32(
+            &inspection.pcr23_sha256,
+            "trusted workload archive PCR23",
+        )?)],
+        pcr_specs384: vec![static_pcr23_policy384(decode_hex_48(
+            &inspection.pcr23_sha384,
+            "trusted workload archive SHA-384 PCR23",
+        )?)],
+        attribute_requirements: inspection
+            .manifest
+            .config
+            .attributes
+            .iter()
+            .map(|(name, values)| {
+                let (key, allowed_values) =
+                    atakit_core::tee_attributes::encode_requirement(name, values)
+                        .map_err(anyhow::Error::msg)?;
+                Ok(SessionAttributeRequirement {
+                    key,
+                    allowed_values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+pub(crate) fn static_pcr23_policy(value: [u8; 32]) -> SessionPcrPolicy {
+    SessionPcrPolicy {
+        pcr_index: 23,
+        comparison: format!("0x{}", hex::encode(encode_static256(value))),
+    }
+}
+
+pub(crate) fn static_pcr23_policy384(value: [u8; 48]) -> SessionPcrPolicy384 {
+    SessionPcrPolicy384 {
+        pcr_index: 23,
+        comparison: format!("0x{}", hex::encode(encode_static384(value))),
+    }
+}
+
+pub(crate) fn decode_hex_32(value: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .with_context(|| format!("decode {label} as hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label} must be exactly 32 bytes"))
+}
+
+pub(crate) fn decode_hex_48(value: &str, label: &str) -> Result<[u8; 48]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .with_context(|| format!("decode {label} as hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label} must be exactly 48 bytes"))
+}
+
+fn required_binding_for_registration(registration: Option<&str>) -> Option<BindingMode> {
+    match registration {
+        Some("off") => Some(BindingMode::Local),
+        Some("optional") => None,
+        Some("required") | None => Some(BindingMode::Chain),
+        Some(_) => Some(BindingMode::Chain),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn disk_unlock_allows_pending_deployments_without_relaxing_session_access() {
+        use super::*;
+        let pending = DeployStatus::Deploying { step: 4, total: 5 };
+        assert!(permits_portal_access(&pending, true));
+        assert!(!permits_portal_access(&pending, false));
+        let deployed = DeployStatus::Deployed {
+            ip: "127.0.0.1".into(),
+        };
+        assert!(permits_portal_access(&deployed, true));
+        assert!(permits_portal_access(&deployed, false));
+        for status in [
+            DeployStatus::Destroyed,
+            DeployStatus::Destroying,
+            DeployStatus::Failed {
+                step: "create".into(),
+                message: "failure".into(),
+            },
+        ] {
+            assert!(!permits_portal_access(&status, true));
+        }
+    }
+    use std::io::Cursor;
+
+    use atakit_cloud::{NewDeployParams, PersistedInitEnv, PlatformKind, PortalPorts};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn deployed_state(archive_path: String, archive_hash: String) -> DeployState {
+        let mut state = DeployState::new(NewDeployParams {
+            instance_name: "instance".into(),
+            workload_publisher:
+                "0x9f2c1d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f".into(),
+            workload_name: "test".into(),
+            workload_version: "v0.0.1".into(),
+            target_name: "gcp-tdx".into(),
+            provider_name: "gcp".into(),
+            platform: PlatformKind::Gcp,
+            image_ref: "automata-linux:v1".into(),
+            base_image_ref: Some("automata-linux:v1".into()),
+            archive_path,
+            archive_hash,
+            init_env: PersistedInitEnv::default(),
+            portal_ports: PortalPorts::default(),
+            total_steps: 1,
+        });
+        state.status = DeployStatus::Deployed {
+            ip: "192.0.2.10".into(),
+        };
+        state
+    }
+
+    struct AddressRunner {
+        response: Option<serde_json::Value>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl atakit_cloud::CommandRunner for AddressRunner {
+        async fn run_capture(
+            &self,
+            program: &str,
+            _: &[&str],
+        ) -> std::result::Result<atakit_cloud::CommandOutput, atakit_cloud::CloudError> {
+            self.calls.lock().unwrap().push(program.into());
+            let response =
+                self.response
+                    .as_ref()
+                    .ok_or_else(|| atakit_cloud::CloudError::State {
+                        message: "provider unavailable".into(),
+                    })?;
+            Ok(atakit_cloud::CommandOutput {
+                status: 0,
+                stdout: response.to_string(),
+                stderr: String::new(),
+            })
+        }
+        async fn run_stream(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: bool,
+        ) -> std::result::Result<atakit_cloud::CommandOutput, atakit_cloud::CloudError> {
+            panic!("address lookup must be read-only")
+        }
+    }
+
+    fn address_fixture(
+        platform: PlatformKind,
+        id: &str,
+        address: Option<&str>,
+    ) -> (DeployState, AddressRunner) {
+        use atakit_cloud::state::{AwsResources, AzureResources, GcpResources};
+        use serde_json::json;
+        let mut state = deployed_state(String::new(), String::new());
+        state.platform = platform;
+        state.cloud_instance_id = Some("original".into());
+        state.resources.gcp = Some(GcpResources {
+            instance: Some("vm".into()),
+            external_ip: Some("192.0.2.10".into()),
+            ..Default::default()
+        });
+        state.resources.aws = Some(AwsResources {
+            instance: Some("original".into()),
+            ..Default::default()
+        });
+        state.resources.azure = Some(AzureResources {
+            instance: Some("vm".into()),
+            resource_group: Some("group".into()),
+            ..Default::default()
+        });
+        let response = match platform {
+            PlatformKind::Gcp => {
+                json!({"id":id,"status":"RUNNING","networkInterfaces":[{"accessConfigs":[{"natIP":address}]}]})
+            }
+            PlatformKind::Aws => {
+                json!({"Reservations":[{"Instances":[{"InstanceId":id,"State":{"Name":"running"},"PublicIpAddress":address}]}]})
+            }
+            PlatformKind::Azure => json!({"vmId":id,"powerState":"VM running","publicIps":address}),
+            PlatformKind::Qemu => unreachable!(),
+        };
+        (
+            state,
+            AddressRunner {
+                response: Some(response),
+                calls: Default::default(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn portal_access_uses_current_address_from_the_same_vm_observation() {
+        for (platform, program) in [
+            (PlatformKind::Gcp, "gcloud"),
+            (PlatformKind::Aws, "aws"),
+            (PlatformKind::Azure, "az"),
+        ] {
+            let (state, runner) = address_fixture(platform, "original", Some("192.0.2.20"));
+            let before = serde_json::to_value(&state).unwrap();
+            let (host, status, init) = current_portal_endpoints(&state, &runner).await.unwrap();
+            assert_eq!(host, "192.0.2.20");
+            assert_eq!(
+                (status, init),
+                (state.portal_ports.status, state.portal_ports.init)
+            );
+            assert_eq!(*runner.calls.lock().unwrap(), vec![program]);
+            assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn portal_access_never_falls_back_to_a_saved_ip_after_failed_cloud_checks() {
+        for platform in [PlatformKind::Gcp, PlatformKind::Aws, PlatformKind::Azure] {
+            for case in 0..3 {
+                let (state, mut runner) = address_fixture(
+                    platform,
+                    if case == 0 { "replacement" } else { "original" },
+                    if case == 1 { None } else { Some("192.0.2.20") },
+                );
+                if case == 2 {
+                    runner.response = None;
+                }
+                assert!(current_portal_endpoints(&state, &runner).await.is_err());
+                assert_eq!(runner.calls.lock().unwrap().len(), 1);
+            }
+        }
+        let (mut state, runner) =
+            address_fixture(PlatformKind::Gcp, "original", Some("192.0.2.20"));
+        state.cloud_instance_id = None;
+        assert!(current_portal_endpoints(&state, &runner).await.is_err());
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_portal_access_keeps_qemu_port_forwarding_without_cloud_queries() {
+        let (mut state, runner) =
+            address_fixture(PlatformKind::Gcp, "original", Some("192.0.2.20"));
+        state.platform = PlatformKind::Qemu;
+        state.resources.qemu = Some(atakit_cloud::state::QemuResources {
+            host_status_port: 12024,
+            host_init_port: 11024,
+            ..Default::default()
+        });
+        assert_eq!(
+            current_portal_endpoints(&state, &runner).await.unwrap(),
+            ("127.0.0.1".into(), 12024, 11024)
+        );
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    fn write_test_archive(dir: &Path) -> (String, String) {
+        let path = dir.join("test-v0.0.1.atawl");
+        let file = std::fs::File::create(&path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let manifest = serde_json::json!({
+            "meta": {
+                "format": atakit_workload::FORMAT_VERSION,
+                "publisher": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "test",
+                "version": "v0.0.1"
+            },
+            "config": {
+                "image": "test:v0.0.1",
+                "base-image-mode": "blacklist",
+                "base-image": [],
+                "attributes": {
+                    "atakit.attestation.v1.tee.intel-tdx.debug.enabled": [false, true]
+                },
+                "ports": [],
+                "depends_on": [],
+                "restart": "no",
+                "command": null,
+                "entrypoint": null,
+                "session-ttl": 0,
+                "atakit-portal": false,
+                "gid-group": "test",
+                "measured-data": false,
+                "unmeasured-data": false,
+                "environment": {},
+                "unmeasured-env-files": [],
+                "storage": {},
+                "dependencies": null,
+                "firewall-ports": [],
+                "baby-container": null,
+                "boot-disk-size": null,
+                "cap-add": [],
+                "cap-drop": [],
+                "logging": {
+                    "driver": "k8s-file",
+                    "options": {"max-file": "5", "max-size": "50m"},
+                    "log-readers": []
+                },
+                "workload-logs": false
+            },
+            "disks": {},
+            "hashes": {},
+            "unmeasured-data": [],
+            "unmeasured-env-files": {},
+            "images": {}
+        })
+        .to_string();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "test/manifest.json", Cursor::new(manifest))
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        let hash = atakit_workload::hash::hash_file(&path).unwrap();
+        (path.display().to_string(), hash)
+    }
+
+    #[test]
+    fn registration_policy_maps_to_required_binding() {
+        assert_eq!(
+            required_binding_for_registration(None),
+            Some(BindingMode::Chain)
+        );
+        assert_eq!(
+            required_binding_for_registration(Some("required")),
+            Some(BindingMode::Chain)
+        );
+        assert_eq!(
+            required_binding_for_registration(Some("off")),
+            Some(BindingMode::Local)
+        );
+        assert_eq!(required_binding_for_registration(Some("optional")), None);
+    }
+
+    #[test]
+    fn only_default_chain_tls_needs_base_image_registry_derivation() {
+        assert!(!tls_needs_registry_derivation(true, false));
+        assert!(!tls_needs_registry_derivation(false, true));
+        assert!(tls_needs_registry_derivation(false, false));
+    }
+
+    #[tokio::test]
+    async fn registration_off_uses_archive_for_every_platform_authority() {
+        let dir = TempDir::new().unwrap();
+        let (path, hash) = write_test_archive(dir.path());
+        let state = deployed_state(path, hash);
+        for authority in [
+            SessionAuthorityKind::Chain,
+            SessionAuthorityKind::Packs,
+            SessionAuthorityKind::Explicit,
+        ] {
+            let selected = select_session_workload(
+                &state,
+                &SessionVerificationArgs::default(),
+                authority,
+                Some("off"),
+                [0x33; 32],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                selected,
+                SessionWorkloadSelector::LocalArchivePolicy(_)
+            ));
+        }
+        for registration in [None, Some("required"), Some("optional")] {
+            let selected = select_session_workload(
+                &state,
+                &SessionVerificationArgs::default(),
+                SessionAuthorityKind::Chain,
+                registration,
+                [0x33; 32],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(selected, SessionWorkloadSelector::Reference(_)));
+        }
+        let mut missing = state;
+        missing.archive_path = dir.path().join("missing.atawl").display().to_string();
+        assert!(select_session_workload(
+            &missing,
+            &SessionVerificationArgs::default(),
+            SessionAuthorityKind::Chain,
+            Some("off"),
+            [0x33; 32]
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn registration_off_loads_and_checks_saved_workload_archive() {
+        let dir = TempDir::new().unwrap();
+        let (archive_path, archive_hash) = write_test_archive(dir.path());
+        let state = deployed_state(archive_path, archive_hash);
+
+        let policy = load_local_workload_policy(&state, [0x33; 32])
+            .await
+            .unwrap();
+        assert_eq!(policy.workload_id, [0x33; 32]);
+        assert_eq!(policy.pcr_specs256.len(), 1);
+        assert_eq!(policy.pcr_specs256[0].pcr_index, 23);
+        let comparison = hex::decode(
+            policy.pcr_specs256[0]
+                .comparison
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            atakit_cvm_encoding::pcr_comparison::decode256(&comparison).unwrap(),
+            atakit_cvm_encoding::pcr_comparison::PcrComparison256::Static(_)
+        ));
+        assert_eq!(policy.attribute_requirements.len(), 1);
+        assert_eq!(
+            policy.attribute_requirements[0].key,
+            atakit_core::tee_attributes::INTEL_TDX_DEBUG_KEY
+        );
+        assert_eq!(
+            policy.attribute_requirements[0].allowed_values,
+            [
+                atakit_core::tee_attributes::ATTRIBUTE_FALSE,
+                atakit_core::tee_attributes::ATTRIBUTE_TRUE
+            ]
+        );
+
+        let mut mismatched = state;
+        mismatched.archive_hash = "0x00".into();
+        assert!(load_local_workload_policy(&mismatched, [0x33; 32])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("archive hash mismatch"));
+    }
+
+    /// Only explicit authority accepts operator PCR23 values.
+    ///
+    /// Previously this compared a string, and every value except `"chain"` was
+    /// treated as the operator branch — so trust-pack silently took the
+    /// operator path. A typed authority makes all three cases explicit.
+    #[test]
+    fn only_explicit_authority_accepts_operator_supplied_workload_pcr23() {
+        let with_values = SessionVerificationArgs {
+            trusted_workload_pcr23_sha256: Some(format!("0x{}", hex::encode([0x55; 32]))),
+            trusted_workload_pcr23_sha384: Some(format!("0x{}", hex::encode([0x66; 48]))),
+            ..Default::default()
+        };
+        let without = SessionVerificationArgs::default();
+
+        for authority in [SessionAuthorityKind::Chain, SessionAuthorityKind::Packs] {
+            let message = workload_policy_authority_conflict(authority, &with_values)
+                .unwrap_or_else(|| panic!("{} must refuse operator values", authority.name()));
+            assert!(
+                message.contains(authority.name())
+                    && message.contains("--trusted-workload-pcr23-sha256"),
+                "the failure must name the authority and the flag; got {message}"
+            );
+            assert!(
+                workload_policy_authority_conflict(authority, &without).is_none(),
+                "{} without operator values is the normal case",
+                authority.name()
+            );
+        }
+
+        assert!(
+            workload_policy_authority_conflict(SessionAuthorityKind::Explicit, &with_values)
+                .is_none(),
+            "explicit mode is where those values belong"
+        );
+    }
+
+    /// The selector the command builds, for every authority.
+    ///
+    /// The earlier test only exercised the early guard, so it could not see
+    /// that trust-pack fell into the operator branch below it.
+    #[test]
+    fn both_resolving_authorities_select_a_reference() {
+        for authority in [SessionAuthorityKind::Chain, SessionAuthorityKind::Packs] {
+            assert!(
+                selects_workload_reference(authority),
+                "{} resolves its own policy from a reference",
+                authority.name()
+            );
+        }
+        assert!(
+            !selects_workload_reference(SessionAuthorityKind::Explicit),
+            "explicit authority supplies the policy itself"
+        );
+    }
+
+    /// Explicit policy resolution fails when its saved archive is unavailable.
+    #[tokio::test]
+    async fn explicit_policy_requires_a_usable_archive_without_manual_pcrs() {
+        let state = deployed_state("/missing/local-workload.atawl".into(), String::new());
+        let verification = SessionVerificationArgs::default();
+
+        let error = resolve_operator_workload_policy(&state, &verification, [0x66; 32])
+            .await
+            .expect_err("the fixture has no usable local archive");
+        assert!(
+            error.to_string().contains("workload archive"),
+            "archive error must identify the missing input; got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manually_trusted_workload_pcr23_banks_are_available_without_a_local_archive() {
+        let state = deployed_state("/missing/workload.atawl".into(), String::new());
+        let verification = SessionVerificationArgs {
+            trusted_workload_pcr23_sha256: Some(format!("0x{}", hex::encode([0x55; 32]))),
+            trusted_workload_pcr23_sha384: Some(format!("0x{}", hex::encode([0x66; 48]))),
+            ..Default::default()
+        };
+        let policy = resolve_operator_workload_policy(&state, &verification, [0x66; 32])
+            .await
+            .unwrap();
+        assert_eq!(policy.pcr_specs256, [static_pcr23_policy([0x55; 32])]);
+        assert_eq!(policy.pcr_specs384, [static_pcr23_policy384([0x66; 48])]);
+    }
+}

@@ -2,6 +2,7 @@
 name = "atakit-github"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 atakit-core.workspace = true

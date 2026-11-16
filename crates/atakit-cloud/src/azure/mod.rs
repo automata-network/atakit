@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod deps;
 pub mod disk;
 pub mod firewall;
@@ -118,6 +119,7 @@ impl CloudProvider for AzureProvider {
         let mut disks = Vec::new();
         for (disk_name, index, size_gb) in &opts.workload_disks {
             disks.push(DiskSpec {
+                performance: None,
                 name: format!("{}-{disk_name}", names.instance),
                 device_name: disk_name.clone(),
                 index: *index,
@@ -125,15 +127,14 @@ impl CloudProvider for AzureProvider {
                 disk_type: "Premium_LRS".to_string(),
             });
         }
-        if !disks.is_empty() {
-            steps.push(DeployStep::CreateDisks {
-                disks: disks.clone(),
-                resource_group: Some(names.resource_group.clone()),
-            });
+        for disk in &mut disks {
+            opts.disk_configuration.apply(disk);
         }
+        disks.retain(|disk| disk.disk_type != "local-ssd");
 
         // Create instance - image_id will be resolved during execution.
         steps.push(DeployStep::CreateInstanceAzure {
+            availability_zone: opts.target.availability_zone.clone(),
             instance_name: names.instance.clone(),
             vm_size: opts.target.vmtype.clone(),
             image_id: String::new(), // resolved at execution time
@@ -145,13 +146,22 @@ impl CloudProvider for AzureProvider {
                 .metadata
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(
+                    opts.init_auth
+                        .iter()
+                        .map(|value| ("atakit-init-auth".to_string(), value.clone())),
+                )
                 .collect(),
             disks,
             boot_disk_size_gb: opts.boot_disk_size_gb,
+            static_ip: opts.static_ip.clone(),
+            static_ip_resource_group: opts.static_ip_resource_group.clone(),
         });
 
         if !opts.skip_init {
-            steps.push(DeployStep::WaitForPortal { timeout_secs: 300 });
+            steps.push(DeployStep::WaitForPortal {
+                timeout_secs: crate::init::PORTAL_READINESS_TIMEOUT_SECONDS,
+            });
             steps.push(DeployStep::InitializeWorkload {
                 archive_path: opts.archive_path.clone(),
             });
@@ -398,7 +408,15 @@ impl CloudProvider for AzureProvider {
                     firewall_rule.strip_suffix("-nsg").unwrap_or(firewall_rule)
                 );
 
-                if firewall::check_nsg_exists(&self.subscription, &rg_name, firewall_rule, runner)
+                if !runner
+                    .creation_recorded(&format!("network:{firewall_rule}"))
+                    .await?
+                    && firewall::check_nsg_exists(
+                        &self.subscription,
+                        &rg_name,
+                        firewall_rule,
+                        runner,
+                    )
                     .await?
                 {
                     tracing::info!("NSG '{firewall_rule}' already exists");
@@ -427,18 +445,25 @@ impl CloudProvider for AzureProvider {
                 })?;
 
                 for spec in disks {
-                    if disk::check_disk_exists(&self.subscription, rg_name, &spec.name, runner)
+                    if !runner
+                        .creation_recorded(&format!("disk:{}", spec.device_name))
                         .await?
+                        && disk::check_disk_exists(&self.subscription, rg_name, &spec.name, runner)
+                            .await?
                     {
-                        tracing::info!("disk '{}' already exists", spec.name);
-                    } else {
-                        disk::create_disk(&self.subscription, rg_name, spec, runner).await?;
+                        return Err(crate::provisioning::error(format!(
+                            "disk '{}' already exists; refusing reuse or modification",
+                            spec.name
+                        )));
                     }
+                    disk::create_disk(&self.subscription, rg_name, &self.region, spec, runner)
+                        .await?;
                     updates.disks.push(spec.name.clone());
                 }
             }
 
             DeployStep::CreateInstanceAzure {
+                availability_zone,
                 instance_name,
                 vm_size,
                 image_id: _,
@@ -449,20 +474,50 @@ impl CloudProvider for AzureProvider {
                 metadata,
                 disks,
                 boot_disk_size_gb,
+                static_ip,
+                static_ip_resource_group,
             } => {
                 // The image_id in the step is empty at plan time. Look up the
                 // gallery image version ID using the image_ref for naming.
                 let names = AzureResourceNames::for_azure(instance_name, image_ref, &self.region);
-                let image_id = image::get_image_version_id(
-                    &self.subscription,
-                    &names.gallery_rg,
-                    &names.gallery,
-                    &names.image_definition,
-                    &names.image_version,
-                    runner,
-                )
-                .await
-                .unwrap_or_default();
+                let recorded_instance = runner.creation_recorded("instance").await?;
+                let image_id = if recorded_instance {
+                    String::new()
+                } else {
+                    image::get_image_version_id(
+                        &self.subscription,
+                        &names.gallery_rg,
+                        &names.gallery,
+                        &names.image_definition,
+                        &names.image_version,
+                        runner,
+                    )
+                    .await?
+                };
+
+                let static_ip_id = if recorded_instance {
+                    None
+                } else {
+                    match (static_ip, static_ip_resource_group) {
+                        (Some(name), Some(rg)) => Some(
+                            instance::resolve_static_public_ip(
+                                &self.subscription,
+                                rg,
+                                name,
+                                runner,
+                            )
+                            .await?,
+                        ),
+                        (Some(name), None) => {
+                            return Err(CloudError::Config {
+                                message: format!(
+                                    "Azure static_ip '{name}' requires static_ip_resource_group"
+                                ),
+                            });
+                        }
+                        (None, _) => None,
+                    }
+                };
 
                 let ip = instance::create_instance(
                     &self.subscription,
@@ -474,18 +529,19 @@ impl CloudProvider for AzureProvider {
                     nsg,
                     metadata,
                     *boot_disk_size_gb,
+                    static_ip_id.as_deref(),
+                    disks,
+                    availability_zone.as_deref(),
                     runner,
                 )
                 .await?;
 
-                // Attach disks with explicit LUN assignments after VM creation.
                 for disk in disks {
-                    instance::attach_disk(
+                    disk::record_vm_created_disk(
                         &self.subscription,
                         resource_group,
                         instance_name,
-                        &disk.name,
-                        disk.index,
+                        disk,
                         runner,
                     )
                     .await?;
@@ -493,6 +549,14 @@ impl CloudProvider for AzureProvider {
 
                 updates.instance = Some(instance_name.clone());
                 updates.external_ip = Some(ip);
+                runner
+                    .record_created_instance(
+                        instance_name,
+                        updates.external_ip.as_deref().unwrap_or_default(),
+                        true,
+                        None,
+                    )
+                    .await?;
             }
 
             DeployStep::WaitForPortal { .. } => {
@@ -559,10 +623,33 @@ impl CloudProvider for AzureProvider {
         // CLI's `--clean-image` opt-in.
         let _ = &opts.preserve; // intentionally unused: image is always preserved on destroy
 
-        // Delete the deployment resource group (per-instance: VM, disks, NSG).
-        // The shared storage account lives in the gallery RG and is untouched.
-        if let Some(ref name) = az.resource_group {
-            steps.push(DestroyStep::DeleteResourceGroup { name: name.clone() });
+        // Never cascade-delete a group: it can contain preserved or foreign disks.
+        // Network resources are deleted only with saved creation identities.
+        let mut owned: Vec<_> = az.owned_resources.values().collect();
+        owned.sort_by_key(|r| {
+            let id = r.id.to_lowercase();
+            if id.contains("/networkinterfaces/") {
+                0
+            } else if id.contains("/publicipaddresses/") {
+                1
+            } else if id.contains("/virtualnetworks/") {
+                2
+            } else {
+                3
+            }
+        });
+        for resource in owned {
+            if opts.preserve.iter().any(|v| v == "firewall")
+                && resource
+                    .id
+                    .to_lowercase()
+                    .contains("/networksecuritygroups/")
+            {
+                continue;
+            }
+            steps.push(DestroyStep::DeleteAzureResource {
+                resource: resource.clone(),
+            });
         }
 
         Ok(DestroyPlan { steps })
@@ -621,9 +708,12 @@ impl CloudProvider for AzureProvider {
                 )
                 .await
             }
-            DestroyStep::DeleteResourceGroup { name } => {
-                instance::delete_resource_group(&self.subscription, name, runner).await
+            DestroyStep::DeleteAzureResource { resource } => {
+                crate::provisioning_cleanup::delete_azure_resource(resource, runner).await
             }
+            DestroyStep::DeleteResourceGroup { .. } => Err(crate::provisioning::error(
+                "resource-group deletion is not safe; delete owned resources individually",
+            )),
             // GCP / AWS / QEMU steps.
             DestroyStep::DeleteImage { .. }
             | DestroyStep::DeleteBucket { .. }
@@ -757,6 +847,10 @@ mod tests {
 
     fn test_target() -> CloudTarget {
         CloudTarget {
+            availability_zone: None,
+            boot_disk: Default::default(),
+            disks: Default::default(),
+            runtime: Default::default(),
             provider: "test-azure".to_string(),
             vmtype: "Standard_DC4as_v5".into(),
             uefi: None,
@@ -765,16 +859,20 @@ mod tests {
             name: None,
             metadata: BTreeMap::new(),
             boot_disk_size: None,
+            static_ip: None,
+            static_ip_resource_group: None,
             chain: Some("testnet".to_string()),
             registration: None,
             owner_key: Some("owner".to_string()),
             gas_wallet: Some("gas".to_string()),
-            sp1_payer: None,
+            prover_credential: None,
         }
     }
 
     fn test_deploy_opts(image_ref: &str) -> DeployOptions {
         DeployOptions {
+            disk_configuration: Default::default(),
+            init_auth: None,
             instance_name: "test-instance".into(),
             target_name: "test-target".into(),
             target: test_target(),
@@ -794,6 +892,8 @@ mod tests {
             portal_ports: Default::default(),
             workload_disks: vec![],
             boot_disk_size_gb: None,
+            static_ip: None,
+            static_ip_resource_group: None,
         }
     }
 
@@ -822,16 +922,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ssd_plan_skips_managed_disk_and_retains_other_profiles() {
+        let provider = AzureProvider::new("sub".into(), "eastus".into());
+        let mut opts = test_deploy_opts("test-image:v1");
+        opts.target.vmtype = "Standard_DC32eds_v6".into();
+        opts.target.availability_zone = Some("1".into());
+        opts.workload_disks = vec![("database".into(), 10, 100), ("logs".into(), 11, 32)];
+        for (name, kind) in [("database", "local-ssd"), ("logs", "PremiumV2_LRS")] {
+            opts.disk_configuration.disks.insert(
+                name.into(),
+                crate::disk_profiles::DiskPerformance {
+                    disk_type: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let plan = provider.plan_deploy(&opts).await.unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| matches!(s, DeployStep::CreateInstanceAzure { .. }))
+            .unwrap();
+        if let DeployStep::CreateInstanceAzure {
+            disks,
+            availability_zone,
+            ..
+        } = step
+        {
+            assert_eq!(disks.len(), 1);
+            assert_eq!(disks[0].device_name, "logs");
+            assert_eq!(disks[0].disk_type, "PremiumV2_LRS");
+            assert_eq!(disks[0].index, 11);
+            assert_eq!(availability_zone.as_deref(), Some("1"));
+        }
+    }
+
+    #[tokio::test]
     async fn plan_deploy_disks_carry_the_created_resource_group() {
         // Regression: disk steps used to re-derive the RG from the disk name
         // via rsplit_once('-'), which broke when the instance name and disk
         // name both contained hyphens (e.g. instance
-        // "multi-container-example-azure-tdx" + disk "shared-data" produced
+        // "example-app-with-hyphens" + disk "shared-data" produced
         // a bogus "...-shared-rg" instead of "...-rg"). The RG must now match
         // the one the CreateResourceGroup step actually creates.
         let provider = AzureProvider::new("sub-123".into(), "eastus".into());
         let mut opts = test_deploy_opts("test-baseimage:v0.0.5");
-        opts.instance_name = "multi-container-example-azure-tdx".into();
+        opts.instance_name = "example-app-with-hyphens".into();
         opts.workload_disks = vec![("shared-data".to_string(), 10, 10)];
 
         let plan = provider.plan_deploy(&opts).await.unwrap();
@@ -841,14 +977,16 @@ mod tests {
             _ => None,
         });
         let disk_rg = plan.steps.iter().find_map(|s| match s {
-            DeployStep::CreateDisks { resource_group, .. } => Some(resource_group.clone()),
+            DeployStep::CreateInstanceAzure { resource_group, .. } => Some(resource_group.clone()),
             _ => None,
         });
 
         let created_rg = created_rg.expect("plan must create a resource group");
-        let disk_rg = disk_rg
-            .expect("plan must contain CreateDisks")
-            .expect("Azure CreateDisks must carry a resource group");
+        let disk_rg = disk_rg.expect("plan must create data disks with the VM");
+        assert!(!plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, DeployStep::CreateDisks { .. })));
         assert_eq!(
             disk_rg, created_rg,
             "disk RG must match the resource group that is actually created"

@@ -1,13 +1,15 @@
+use atakit_core::storage_access::{self, StorageAccess};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ImageSource, StringOrArray, WorkloadConfig};
+use crate::config::{AttributeRequirements, DataMount, ImageSource, StringOrArray, WorkloadConfig};
+use crate::data::{logical_data_path_rel, namespaced_data_path};
 use crate::WorkloadError;
 
 /// Top-level manifest written to `manifest.json` inside the archive.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub meta: ManifestMeta,
     pub config: ManifestConfig,
@@ -20,7 +22,7 @@ pub struct Manifest {
     /// the `measured-data/` keys in `hashes`. Unlike `hashes`, there is no
     /// content hash: the files are never bundled into the archive -- only the
     /// declared path *set* is committed to the manifest (and thus PCR23). The
-    /// portal verifies the operator-supplied tar matches this set exactly at
+    /// portal verifies the operator-supplied tar is a subset of this set at
     /// `/init`; contents stay unverified. A `BTreeSet` because this is a path
     /// *set* with no associated value (unlike `hashes`): it serialises to a
     /// JSON array, sorted + deduped, so canonical JSON is byte-deterministic.
@@ -28,12 +30,36 @@ pub struct Manifest {
     /// declares no operator-provided files).
     #[serde(default, rename = "unmeasured-data")]
     pub unmeasured_data: BTreeSet<String>,
+    /// Measured variable-name allowlist for each unmeasured env file.
+    ///
+    /// Keys are normalized `unmeasured-data/...` paths. Values are sorted,
+    /// unique variable names. Runtime values are intentionally absent.
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: BTreeMap<String, Vec<String>>,
     /// Per-service image metadata: archive path + immutable image config
     /// digest ("image ID"). Keyed by service name (workload + each
     /// dependency). Always serialised; defaults to empty when reading
     /// archives that pre-date this field.
     #[serde(default)]
     pub images: BTreeMap<String, ManifestImage>,
+}
+
+// Use the same format-aware writer as the other component. Nested optional
+// CPU/integrity/legacy storage fields need the top-level format to emit defaults.
+impl Serialize for Manifest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        atakit_core::workload_manifest::ManifestSections {
+            format: self.meta.format,
+            meta: &self.meta,
+            config: &self.config,
+            disks: &self.disks,
+            hashes: &self.hashes,
+            unmeasured_data: &self.unmeasured_data,
+            unmeasured_env_files: &self.unmeasured_env_files,
+            images: &self.images,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Per-service image metadata.
@@ -52,19 +78,52 @@ pub struct ManifestImage {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestMeta {
     pub format: u32,
+    /// Fingerprint of the key that publishes this workload: `0x` followed by 64
+    /// lowercase hexadecimal characters.
+    ///
+    /// The identifier is `keccak256(abi.encode(domain, publisher, name,
+    /// version))`, so a workload cannot be identified by name and version
+    /// alone. Recording the publisher here places it inside the measured
+    /// manifest, which is what lets the portal derive the identifier it reports
+    /// rather than be told what to claim.
+    pub publisher: String,
     pub name: String,
     pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+    #[serde(default, rename = "cpu-idle", skip_serializing_if = "Option::is_none")]
+    pub cpu_idle: Option<atakit_core::cpu_config::CpuIdleRules>,
+    #[serde(
+        default,
+        rename = "cpu-frequency",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpu_frequency: Option<atakit_core::cpu_config::CpuFrequencyRules>,
+
+    #[serde(default)]
+    pub readiness: Option<atakit_core::readiness::Readiness>,
     pub image: String,
     #[serde(rename = "base-image-mode")]
     pub base_image_mode: String,
     #[serde(default, rename = "base-image")]
     pub base_image: Vec<String>,
     #[serde(default)]
+    pub attributes: AttributeRequirements,
+    #[serde(default)]
     pub ports: Vec<String>,
+    pub depends_on: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
     #[serde(default)]
@@ -78,13 +137,17 @@ pub struct ManifestConfig {
     #[serde(rename = "gid-group")]
     pub gid_group: String,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: ManifestDataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: ManifestDataMount,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: Vec<String>,
     #[serde(default)]
-    pub disks: BTreeMap<String, String>,
+    pub storage: BTreeMap<String, ManifestServiceStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     #[serde(default)]
     pub dependencies: Option<BTreeMap<String, ManifestDependency>>,
     #[serde(default, rename = "firewall-ports")]
@@ -106,14 +169,42 @@ pub struct ManifestConfig {
     pub workload_logs: bool,
 }
 
-/// Container logging configuration emitted into manifest.json. All fields
-/// always serialise (no `skip_serializing_if`) so PCR23 binds concrete values.
+/// Container logging configuration emitted into manifest.json. Common fields
+/// are explicit; `access` applies only to baby logging in formats 15+.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestLogging {
     pub driver: String,
     pub options: BTreeMap<String, String>,
     #[serde(rename = "log-readers")]
     pub log_readers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+}
+
+/// Service data mount declaration in `manifest.json`.
+///
+/// Old manifest formats used a boolean. Format 5 emits the exact path-list
+/// form, but the enum keeps older manifests parseable by local tooling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManifestDataMount {
+    All(bool),
+    Paths(Vec<String>),
+}
+
+impl Default for ManifestDataMount {
+    fn default() -> Self {
+        Self::All(false)
+    }
+}
+
+impl ManifestDataMount {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::All(enabled) => *enabled,
+            Self::Paths(paths) => !paths.is_empty(),
+        }
+    }
 }
 
 fn default_restart() -> String {
@@ -159,6 +250,19 @@ impl<'de> Deserialize<'de> for StringOrArrayOut {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestDependency {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+
+    #[serde(default)]
+    pub readiness: Option<atakit_core::readiness::Readiness>,
     pub image: String,
     #[serde(default)]
     pub ports: Vec<String>,
@@ -174,14 +278,17 @@ pub struct ManifestDependency {
     pub gid_group: String,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "unmeasured-env-files")]
+    pub unmeasured_env_files: Vec<String>,
     pub depends_on: Vec<String>,
     #[serde(default, rename = "measured-data")]
-    pub measured_data: bool,
+    pub measured_data: ManifestDataMount,
     #[serde(default, rename = "unmeasured-data")]
-    pub unmeasured_data: bool,
+    pub unmeasured_data: ManifestDataMount,
     #[serde(default)]
-    pub disks: BTreeMap<String, String>,
+    pub storage: BTreeMap<String, ManifestServiceStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     #[serde(default, rename = "cap-add")]
     pub cap_add: Vec<String>,
     #[serde(default, rename = "cap-drop")]
@@ -189,6 +296,39 @@ pub struct ManifestDependency {
     pub logging: ManifestLogging,
     #[serde(rename = "workload-logs")]
     pub workload_logs: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestServiceStorage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<Vec<StorageAccess>>,
+    pub disk: String,
+    pub base_path: String,
+    pub mount_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "storage_execution_disabled")]
+    pub executable: Option<bool>,
+}
+impl ManifestServiceStorage {
+    pub fn read_only(&self) -> bool {
+        storage_access::read_only(&self.access, self.read_only)
+    }
+    pub fn executable(&self) -> bool {
+        storage_access::executable(&self.access, self.executable)
+    }
+    pub fn validate_access(&self, format: u32) -> Result<(), String> {
+        if format < 14 && self.read_only.is_none() {
+            return Err("legacy storage requires read_only".into());
+        }
+        storage_access::validate_mount_access(
+            format,
+            &self.access,
+            self.read_only,
+            self.executable,
+        )?;
+        Ok(())
+    }
 }
 
 /// A resolved firewall port to open: port number + protocol.
@@ -216,18 +356,37 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestBabyContainerSlot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+    #[serde(
+        default,
+        rename = "cpuset-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpuset_policy: Option<atakit_core::cpu_config::CpusetRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
+
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
     pub parent_service: String,
     pub gid_group: String,
     pub image_selection: String,
     pub max_instances: u32,
     pub lifecycle: ManifestBabyContainerLifecycle,
     pub storage: BTreeMap<String, ManifestBabyContainerStorage>,
+    #[serde(default)]
+    pub ip_env: bool,
     pub logging: ManifestLogging,
     pub trust_policy: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestBabyContainerLifecycle {
+    #[serde(default)]
+    pub rootfs_size_mib: Option<u64>,
+    #[serde(default)]
+    pub rootfs_disk: Option<String>,
     pub image_retention: String,
     pub instance_retention: String,
     pub restart: String,
@@ -236,13 +395,73 @@ pub struct ManifestBabyContainerLifecycle {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestBabyContainerStorage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<Vec<StorageAccess>>,
     pub disk: String,
     pub base_path: String,
     pub mount_path: String,
-    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "storage_execution_disabled")]
+    pub executable: Option<bool>,
     pub retention: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_access: Option<Vec<StorageAccess>>,
     pub scope: String,
-    pub permissions: ManifestBabyContainerStoragePermissions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<ManifestBabyContainerStoragePermissions>,
+}
+impl ManifestBabyContainerStorage {
+    pub fn read_only(&self) -> bool {
+        storage_access::read_only(&self.access, self.read_only)
+    }
+    pub fn executable(&self) -> bool {
+        storage_access::executable(&self.access, self.executable)
+    }
+    pub fn validate_access(&self, format: u32) -> Result<(), String> {
+        if format < 14 && self.read_only.is_none() {
+            return Err("legacy storage requires read_only".into());
+        }
+        storage_access::validate_mount_access(
+            format,
+            &self.access,
+            self.read_only,
+            self.executable,
+        )?;
+        if format >= 14 {
+            if self.permissions.is_some() {
+                return Err(
+                    "format 14 storage requires access and parent-access instead of permissions"
+                        .into(),
+                );
+            }
+            storage_access::validate_access(self.parent_access.as_deref().unwrap_or(&[]), true)?;
+        } else if self.parent_access.is_some() {
+            return Err("parent-access requires format 14".into());
+        } else if self.permissions.is_none() {
+            return Err("legacy baby storage requires permissions".into());
+        }
+        Ok(())
+    }
+    pub fn baby_permission(&self) -> &str {
+        self.permissions.as_ref().map_or("rw", |p| p.baby.as_str())
+    }
+    pub fn parent_permission(&self) -> &str {
+        self.permissions
+            .as_ref()
+            .map_or("none", |p| p.parent.as_str())
+    }
+    pub fn parent_allows(&self, read_only: bool, executable: bool) -> bool {
+        if self.access.is_some() {
+            storage_access::parent_allows(
+                self.parent_access.as_deref().unwrap_or(&[]),
+                read_only,
+                executable,
+            )
+        } else {
+            self.parent_permission() != "none" && (self.parent_permission() != "ro" || read_only)
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -265,6 +484,8 @@ pub struct ManifestDisk {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ManifestDiskEncryption {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
     pub unlock_method: Vec<String>,
     pub bind: Vec<String>,
 }
@@ -299,6 +520,94 @@ pub fn parse_env_file(path: &Path, content: &str) -> Result<Vec<(String, String)
     Ok(pairs)
 }
 
+/// Return whether `name` is a portable shell-style environment name.
+pub fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    matches!(chars.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && chars.all(|c| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// Parse the measured variable-name allowlist from a developer-side
+/// unmeasured env-file template. Values are deliberately ignored.
+pub fn parse_unmeasured_env_file_names(
+    path: &Path,
+    content: &str,
+) -> Result<Vec<String>, WorkloadError> {
+    let mut names = BTreeSet::new();
+    for (i, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, _value)) = line.split_once('=') else {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: "expected KEY=VALUE".into(),
+            });
+        };
+        let key = key.trim();
+        if !is_valid_env_name(key) {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("invalid environment variable name {key:?}"),
+            });
+        }
+        if key.starts_with("ATAKIT_") || key.starts_with("VERIFIERD_") {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("reserved environment variable name {key:?}"),
+            });
+        }
+        if !names.insert(key.to_string()) {
+            return Err(WorkloadError::EnvFileParse {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: format!("duplicate environment variable name {key:?}"),
+            });
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Read every referenced developer-side unmeasured env-file template and
+/// build the top-level measured name allowlists.
+pub fn resolve_unmeasured_env_allowlists(
+    config: &WorkloadConfig,
+    unmeasured_data_root: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, WorkloadError> {
+    let mut allowlists = BTreeMap::new();
+    let service_files = std::iter::once(&config.workload.unmeasured_env_file).chain(
+        config
+            .dependencies
+            .values()
+            .map(|dependency| &dependency.unmeasured_env_file),
+    );
+
+    for files in service_files.flatten() {
+        for logical_path in files.as_vec() {
+            let normalized = namespaced_data_path("unmeasured-data", &logical_path);
+            if allowlists.contains_key(&normalized) {
+                continue;
+            }
+            let path = unmeasured_data_root.join(logical_data_path_rel(&logical_path));
+            let content =
+                std::fs::read_to_string(&path).map_err(|source| WorkloadError::ReadFile {
+                    path: path.clone(),
+                    source,
+                })?;
+            allowlists.insert(
+                normalized,
+                parse_unmeasured_env_file_names(&path, &content)?,
+            );
+        }
+    }
+
+    Ok(allowlists)
+}
+
 /// Resolve environment: merge env_file values first, then explicit environment overrides.
 pub fn resolve_environment(
     env_file: &Option<StringOrArray>,
@@ -329,47 +638,206 @@ pub fn resolve_environment(
     Ok(merged)
 }
 
-/// Strip leading `./` from a path string.
+/// Normalize a package-relative path string for manifest storage.
 pub fn strip_dot_slash(p: &str) -> &str {
-    p.strip_prefix("./").unwrap_or(p)
+    p.strip_prefix("./").unwrap_or(p).trim_end_matches('/')
 }
 
 /// Normalize declared `[package] unmeasured-data` entries into the sorted,
 /// deduped, `unmeasured-data/`-prefixed path list recorded in the manifest.
 ///
-/// An entry that resolves to an existing directory under `workload_dir` is
-/// enumerated into its member file paths (so declaring `./config` yields the
-/// same set as declaring each `./config/<file>`). A file, or an entry absent at
-/// build time, is recorded as a single leaf path -- operator-provided secrets
-/// need not exist on the author's machine.
-pub fn normalize_unmeasured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
+/// A trailing slash declares a directory and requires enumeration at build
+/// time. Other entries declare files; absent files need no source directory.
+pub fn normalize_unmeasured_data(
+    paths: &[String],
+    root: &Path,
+) -> Result<BTreeSet<String>, WorkloadError> {
     let mut out = BTreeSet::new();
     for entry in paths {
-        let rel = strip_dot_slash(entry);
+        let rel = crate::data::validate_logical_data_path(entry, "package unmeasured-data")?;
+        let abs = root.join(&rel);
+        if entry.ends_with('/') {
+            if !abs.is_dir() {
+                return Err(WorkloadError::Validation(format!(
+                    "unmeasured-data directory {entry:?} must exist at build time under {} (use --unmeasured-data-root to select its source)", root.display()
+                )));
+            }
+            collect_unmeasured_members(&abs, &rel, &mut out)?;
+        } else {
+            match std::fs::metadata(&abs) {
+                Ok(meta) if meta.is_dir() => {
+                    return Err(WorkloadError::Validation(format!(
+                    "unmeasured-data {entry:?} is a directory; declare {entry}/ with a trailing '/'"
+                )))
+                }
+                Ok(meta) if !meta.is_file() => {
+                    return Err(WorkloadError::Validation(format!(
+                        "unmeasured-data {entry:?} is not a regular file"
+                    )))
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(WorkloadError::ReadFile {
+                        path: abs,
+                        source: error,
+                    })
+                }
+                _ => {}
+            }
+            out.insert(namespaced_data_path("unmeasured-data", entry));
+        }
+    }
+    Ok(out)
+}
+
+/// Enumeration errors must not silently remove paths from the measured manifest.
+fn collect_unmeasured_members(
+    dir: &Path,
+    rel: &str,
+    out: &mut BTreeSet<String>,
+) -> Result<(), WorkloadError> {
+    let read_error = |source| WorkloadError::ReadFile {
+        path: dir.to_owned(),
+        source,
+    };
+    for entry in std::fs::read_dir(dir).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            WorkloadError::Validation(format!(
+                "unmeasured-data directory {} contains a non-UTF-8 name",
+                dir.display()
+            ))
+        })?;
+        let child = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        crate::data::validate_logical_data_path(
+            &format!("/{child}"),
+            "unmeasured-data directory member",
+        )?;
+        let kind = entry.file_type().map_err(read_error)?;
+        if kind.is_dir() {
+            collect_unmeasured_members(&entry.path(), &child, out)?;
+        } else if kind.is_file() {
+            out.insert(format!("unmeasured-data/{child}"));
+        } else {
+            return Err(WorkloadError::Validation(format!(
+                "unmeasured-data directory member {} must be a regular file or directory (links are not enumerated)", entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalize declared `[package] measured-data` entries into the sorted,
+/// deduped, `measured-data/`-prefixed path set staged into the archive.
+pub fn normalize_measured_data(paths: &[String], workload_dir: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for entry in paths {
+        let rel = logical_data_path_rel(entry);
         let abs = workload_dir.join(rel);
         if abs.is_dir() {
-            collect_member_files(&abs, rel, &mut out);
+            collect_member_files_with_prefix(
+                &abs,
+                &logical_data_path_rel(entry),
+                "measured-data",
+                &mut out,
+            );
         } else {
-            out.insert(format!("unmeasured-data/{rel}"));
+            out.insert(namespaced_data_path("measured-data", entry));
         }
     }
     out
 }
 
-/// Recursively collect files under `dir` as `unmeasured-data/<rel_prefix>/<...>`
-/// paths into the set.
-fn collect_member_files(dir: &Path, rel_prefix: &str, out: &mut BTreeSet<String>) {
+/// Extract the archive-relative measured-data path set from manifest hashes.
+pub fn measured_data_from_hashes(hashes: &BTreeMap<String, String>) -> BTreeSet<String> {
+    hashes
+        .keys()
+        .filter(|path| path.starts_with("measured-data/"))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn data_selector_matches(prefix: &str, path: &str, entry: &str) -> bool {
+    let normalized = namespaced_data_path(prefix, path);
+    let child = entry
+        .strip_prefix(&normalized)
+        .is_some_and(|suffix| suffix.starts_with('/'));
+    if prefix == "unmeasured-data" {
+        if path.ends_with('/') {
+            child
+        } else {
+            entry == normalized
+        }
+    } else {
+        entry == normalized || child
+    }
+}
+
+fn expand_data_mount(
+    mount: &DataMount,
+    full_set: &BTreeSet<String>,
+    prefix: &str,
+) -> ManifestDataMount {
+    match mount {
+        DataMount::Bool(enabled) => {
+            if *enabled {
+                ManifestDataMount::Paths(full_set.iter().cloned().collect())
+            } else {
+                ManifestDataMount::Paths(Vec::new())
+            }
+        }
+        DataMount::Paths(paths) => {
+            let mut selected = BTreeSet::new();
+            for path in paths {
+                for entry in full_set {
+                    if data_selector_matches(prefix, path, entry) {
+                        selected.insert(entry.clone());
+                    }
+                }
+            }
+            ManifestDataMount::Paths(selected.into_iter().collect())
+        }
+    }
+}
+
+/// Normalize per-service runtime env-file declarations to manifest paths.
+pub fn normalize_unmeasured_env_files(env_files: &Option<StringOrArray>) -> Vec<String> {
+    env_files
+        .as_ref()
+        .map(|files| {
+            files
+                .as_vec()
+                .into_iter()
+                .map(|p| namespaced_data_path("unmeasured-data", &p))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_member_files_with_prefix(
+    dir: &Path,
+    rel_prefix: &str,
+    prefix: &str,
+    out: &mut BTreeSet<String>,
+) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in read.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let child_rel = format!("{rel_prefix}/{name}");
-        if path.is_dir() {
-            collect_member_files(&path, &child_rel, out);
+        let child_rel = if rel_prefix.is_empty() {
+            name
         } else {
-            out.insert(format!("unmeasured-data/{child_rel}"));
+            format!("{rel_prefix}/{name}")
+        };
+        if path.is_dir() {
+            collect_member_files_with_prefix(&path, &child_rel, prefix, out);
+        } else {
+            out.insert(format!("{prefix}/{child_rel}"));
         }
     }
 }
@@ -400,16 +868,83 @@ fn convert_string_or_array(s: &Option<StringOrArray>) -> Option<StringOrArrayOut
 /// `images` contains per-service image metadata (archive path + image ID).
 /// `environment` is the already-resolved (env_file merged) environment.
 /// `dep_environments` contains resolved environments for each dependency.
+/// `publisher` is the fingerprint of the publishing key; it is measured, so it
+/// is validated here rather than trusted.
+// Keep each measured manifest section explicit at this deterministic build
+// boundary. Grouping them would hide which inputs affect the canonical bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_manifest(
     config: &WorkloadConfig,
+    publisher: &str,
     resolved_image: &str,
     environment: BTreeMap<String, String>,
     dep_environments: BTreeMap<String, BTreeMap<String, String>>,
     hashes: BTreeMap<String, String>,
     unmeasured_data: BTreeSet<String>,
+    unmeasured_env_files: BTreeMap<String, Vec<String>>,
     images: BTreeMap<String, ManifestImage>,
-) -> Manifest {
+) -> Result<Manifest, WorkloadError> {
+    // A malformed publisher would be measured into PCR23 and would derive an
+    // identifier registered to nobody, so it is rejected at the boundary rather
+    // than baked into the archive.
+    if !atakit_core::is_canonical_id(publisher) {
+        return Err(WorkloadError::Validation(format!(
+            "publisher must be '0x' followed by 64 lowercase hexadecimal \
+             characters, got '{publisher}'"
+        )));
+    }
+    if config.format < crate::BABY_LOG_POLICY_FORMAT_VERSION
+        && config.baby_container.as_ref().is_some_and(|baby| {
+            baby.slots.values().any(|slot| {
+                slot.logging.access.as_deref() == Some("none")
+                    || !slot.logging.log_readers.is_empty()
+            })
+        })
+    {
+        return Err(WorkloadError::Validation(format!(
+            "baby log access restrictions and log-readers require format = {}",
+            crate::BABY_LOG_POLICY_FORMAT_VERSION
+        )));
+    }
     let w = &config.workload;
+    atakit_core::nofile::validate_requests(
+        config.format,
+        w.nofile
+            .into_iter()
+            .chain(config.dependencies.values().filter_map(|d| d.nofile))
+            .chain(
+                config
+                    .baby_container
+                    .iter()
+                    .flat_map(|b| b.slots.values())
+                    .filter_map(|s| s.nofile),
+            ),
+    )
+    .map_err(WorkloadError::Validation)?;
+    atakit_core::cpu_config::validate_rules(
+        config.format,
+        w.cpu_idle.as_ref(),
+        w.cpu_frequency.as_ref(),
+        w.cpuset
+            .iter()
+            .map(String::as_str)
+            .chain(
+                config
+                    .dependencies
+                    .values()
+                    .filter_map(|d| d.cpuset.as_deref()),
+            )
+            .chain(
+                config
+                    .baby_container
+                    .iter()
+                    .flat_map(|b| b.slots.values())
+                    .filter_map(|s| s.cpuset.as_deref()),
+            ),
+    )
+    .map_err(WorkloadError::Validation)?;
+    let attributes = crate::validate::normalize_attributes(&w.attributes)?;
+    let measured_data = measured_data_from_hashes(&hashes);
 
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
     // Firewall: resolve auto-derived ports + allow - deny into a flat list.
@@ -485,10 +1020,26 @@ pub fn build_manifest(
                             .clone()
                             .unwrap_or_else(|| default_gid_group.clone()),
                         environment: env,
+                        unmeasured_env_files: normalize_unmeasured_env_files(
+                            &dep.unmeasured_env_file,
+                        ),
+                        readiness: dep.readiness.clone(),
+                        cpuset: dep.cpuset.clone(),
+                        cpuset_policy: dep.cpuset_policy.clone(),
+                        nofile: dep.nofile,
                         depends_on: dep.depends_on.clone(),
-                        measured_data: dep.measured_data,
-                        unmeasured_data: dep.unmeasured_data,
-                        disks: dep.disks.clone(),
+                        measured_data: expand_data_mount(
+                            &dep.measured_data,
+                            &measured_data,
+                            "measured-data",
+                        ),
+                        unmeasured_data: expand_data_mount(
+                            &dep.unmeasured_data,
+                            &unmeasured_data,
+                            "unmeasured-data",
+                        ),
+                        storage: convert_service_storage_compat(&dep.storage, &dep.disks),
+                        ip_env: dep.ip_env,
                         cap_add: dep.cap_add.clone(),
                         cap_drop: dep.cap_drop.clone(),
                         logging: convert_logging(&dep.logging),
@@ -530,13 +1081,27 @@ pub fn build_manifest(
                                     disk: storage.disk.clone(),
                                     base_path: storage.base_path.clone(),
                                     mount_path: storage.mount_path.clone(),
-                                    read_only: storage.read_only,
+                                    read_only: storage
+                                        .access
+                                        .is_none()
+                                        .then(|| storage.read_only()),
+                                    access: storage_access::canonical_access(&storage.access),
+                                    parent_access: storage.access.as_ref().map(|_| {
+                                        storage_access::canonical_access(&storage.parent_access)
+                                            .unwrap_or_default()
+                                    }),
+                                    executable: storage
+                                        .access
+                                        .is_none()
+                                        .then(|| storage.executable()),
                                     retention: storage.retention.clone(),
                                     scope: storage.scope.clone(),
-                                    permissions: ManifestBabyContainerStoragePermissions {
-                                        baby: storage.permissions.baby.clone(),
-                                        parent: storage.permissions.parent.clone(),
-                                    },
+                                    permissions: storage.access.is_none().then(|| {
+                                        ManifestBabyContainerStoragePermissions {
+                                            baby: storage.baby_permission().to_string(),
+                                            parent: storage.parent_permission().to_string(),
+                                        }
+                                    }),
                                 },
                             )
                         })
@@ -544,6 +1109,10 @@ pub fn build_manifest(
                     (
                         slot_name.clone(),
                         ManifestBabyContainerSlot {
+                            allowed_capabilities: slot.allowed_capabilities.clone(),
+                            cpuset: slot.cpuset.clone(),
+                            cpuset_policy: slot.cpuset_policy.clone(),
+                            nofile: slot.nofile,
                             parent_service: slot.parent_service.clone(),
                             gid_group: slot
                                 .gid_group
@@ -552,13 +1121,25 @@ pub fn build_manifest(
                             image_selection: slot.image_selection.clone(),
                             max_instances: slot.max_instances,
                             lifecycle: ManifestBabyContainerLifecycle {
+                                rootfs_size_mib: slot.lifecycle.rootfs_size_mib,
+                                rootfs_disk: slot.lifecycle.rootfs_disk.clone(),
                                 image_retention: slot.lifecycle.image_retention.clone(),
                                 instance_retention: slot.lifecycle.instance_retention.clone(),
                                 restart: slot.lifecycle.restart.clone(),
                                 rootfs: slot.lifecycle.rootfs.replace('-', "_"),
                             },
                             storage,
-                            logging: convert_logging(&slot.logging),
+                            ip_env: slot.ip_env,
+                            logging: ManifestLogging {
+                                access: (config.format >= crate::BABY_LOG_POLICY_FORMAT_VERSION)
+                                    .then(|| {
+                                        slot.logging
+                                            .access
+                                            .clone()
+                                            .unwrap_or_else(|| "parent".into())
+                                    }),
+                                ..convert_logging(&slot.logging)
+                            },
                             trust_policy: slot.trust_policy.clone(),
                         },
                     )
@@ -591,6 +1172,7 @@ pub fn build_manifest(
         .iter()
         .map(|(name, d)| {
             let enc = ManifestDiskEncryption {
+                integrity: d.encryption.integrity.clone(),
                 unlock_method: d.encryption.unlock_method.clone(),
                 bind: d.encryption.bind.clone(),
             };
@@ -606,9 +1188,38 @@ pub fn build_manifest(
         })
         .collect();
 
-    Manifest {
+    let mut manifest = Manifest {
         meta: ManifestMeta {
-            format: crate::FORMAT_VERSION,
+            format: if config.format >= 16 {
+                atakit_core::cpu::CPU_POLICY_FORMAT
+            } else if config.format >= 15 {
+                crate::BABY_LOG_POLICY_FORMAT_VERSION
+            } else if config.format >= 14 {
+                crate::ACCESS_STORAGE_FORMAT_VERSION
+            } else if config.format >= 13
+                || config.workload.storage.values().any(|s| s.executable())
+                || config
+                    .dependencies
+                    .values()
+                    .any(|d| d.storage.values().any(|s| s.executable()))
+                || config.baby_container.as_ref().is_some_and(|b| {
+                    b.enabled
+                        && b.slots
+                            .values()
+                            .any(|slot| slot.storage.values().any(|s| s.executable()))
+                })
+            {
+                crate::EXECUTABLE_STORAGE_FORMAT_VERSION
+            } else if config
+                .disks
+                .values()
+                .any(|d| d.encryption.integrity.is_some())
+            {
+                crate::INTEGRITY_FORMAT_VERSION
+            } else {
+                crate::FORMAT_VERSION
+            },
+            publisher: publisher.to_string(),
             name: w.name.clone(),
             version: w.version.clone(),
         },
@@ -616,7 +1227,15 @@ pub fn build_manifest(
             image: resolved_image.to_string(),
             base_image_mode: w.base_image_mode.clone(),
             base_image: w.base_image.clone(),
+            attributes,
             ports: w.ports.clone(),
+            readiness: w.readiness.clone(),
+            cpuset: w.cpuset.clone(),
+            cpuset_policy: w.cpuset_policy.clone(),
+            nofile: w.nofile,
+            cpu_idle: w.cpu_idle.clone(),
+            cpu_frequency: w.cpu_frequency.clone(),
+            depends_on: w.depends_on.clone(),
             restart: w.restart.clone(),
             command: convert_string_or_array(&w.command),
             entrypoint: convert_string_or_array(&w.entrypoint),
@@ -626,10 +1245,16 @@ pub fn build_manifest(
                 .gid_group
                 .clone()
                 .unwrap_or_else(|| default_gid_group.clone()),
-            measured_data: w.measured_data,
-            unmeasured_data: w.unmeasured_data,
+            measured_data: expand_data_mount(&w.measured_data, &measured_data, "measured-data"),
+            unmeasured_data: expand_data_mount(
+                &w.unmeasured_data,
+                &unmeasured_data,
+                "unmeasured-data",
+            ),
             environment,
-            disks: w.disks.clone(),
+            unmeasured_env_files: normalize_unmeasured_env_files(&w.unmeasured_env_file),
+            storage: convert_service_storage_compat(&w.storage, &w.disks),
+            ip_env: w.ip_env,
             dependencies,
             firewall_ports,
             baby_container,
@@ -642,8 +1267,11 @@ pub fn build_manifest(
         disks,
         hashes,
         unmeasured_data,
+        unmeasured_env_files,
         images,
-    }
+    };
+    crate::manifest_normalization::normalize(&mut manifest)?;
+    Ok(manifest)
 }
 
 fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
@@ -651,6 +1279,60 @@ fn convert_logging(logging: &crate::config::LoggingSection) -> ManifestLogging {
         driver: logging.driver.clone(),
         options: logging.options.clone(),
         log_readers: logging.log_readers.clone(),
+        access: None,
+    }
+}
+
+fn convert_service_storage(
+    storage: &BTreeMap<String, crate::config::ServiceStorageSection>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    storage
+        .iter()
+        .map(|(name, item)| {
+            (
+                name.clone(),
+                ManifestServiceStorage {
+                    disk: item.disk.clone(),
+                    base_path: item.base_path.clone(),
+                    mount_path: item.mount_path.clone(),
+                    read_only: item.access.is_none().then(|| item.read_only()),
+                    access: storage_access::canonical_access(&item.access),
+                    executable: item.access.is_none().then(|| item.executable()),
+                },
+            )
+        })
+        .collect()
+}
+
+fn convert_legacy_service_disks(
+    disks: &BTreeMap<String, String>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    disks
+        .iter()
+        .map(|(disk, mount_path)| {
+            (
+                disk.clone(),
+                ManifestServiceStorage {
+                    disk: disk.clone(),
+                    base_path: "/".to_string(),
+                    mount_path: mount_path.clone(),
+                    read_only: Some(false),
+                    executable: Some(false),
+                    access: None,
+                },
+            )
+        })
+        .collect()
+}
+
+fn convert_service_storage_compat(
+    storage: &BTreeMap<String, crate::config::ServiceStorageSection>,
+    legacy_disks: &BTreeMap<String, String>,
+) -> BTreeMap<String, ManifestServiceStorage> {
+    if storage.is_empty() {
+        convert_legacy_service_disks(legacy_disks)
+    } else {
+        convert_service_storage(storage)
     }
 }
 
@@ -681,13 +1363,511 @@ fn remove_port_protos(open: &mut HashSet<(u16, String)>, port: u16, protocol: &O
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
     #[test]
+    fn operator_preset_expands_canonically_with_explicit_overrides() {
+        let base = r#"format = 16
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+allow-operator-cpu-tuning = true
+atakit-portal = true
+[dependencies.logger]
+image = "logger:latest"
+[baby-container]
+enabled = true
+[baby-container.slots.tools]
+parent-service = "app"
+"#;
+        let build = |source: &str| {
+            let config = WorkloadConfig::load_from_str(source).unwrap();
+            let manifest = super::build_manifest(
+                &config,
+                TEST_PUBLISHER,
+                "app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+            serialize_canonical_json(&manifest).unwrap()
+        };
+        let compiled = build(base);
+        let json: serde_json::Value = serde_json::from_str(&compiled).unwrap();
+        assert!(json["config"].get("allow-operator-cpu-tuning").is_none());
+        for pointer in [
+            "/config",
+            "/config/dependencies/logger",
+            "/config/baby-container/slots/tools",
+        ] {
+            assert_eq!(
+                json.pointer(pointer).unwrap()["cpuset-policy"]["allow-operator"],
+                true
+            );
+            assert_eq!(
+                json.pointer(pointer).unwrap()["cpuset-policy"]["allowed-cpus"],
+                "online"
+            );
+        }
+        assert_eq!(
+            json["config"]["cpu-idle"],
+            serde_json::json!({
+                "driver": "auto", "governor": null, "disabled-states": [],
+                "allow-operator": true, "required": false,
+                "allowed-governors": ["haltpoll", "menu", "teo"], "allowed-disabled-states": ["*"]
+            })
+        );
+        for driver in ["intel_idle", "acpi_idle"] {
+            let explicit_driver = build(&format!(
+                "{base}\n[workload.cpu-idle]\ndriver = '{driver}'\n"
+            ));
+            let value: serde_json::Value = serde_json::from_str(&explicit_driver).unwrap();
+            assert_eq!(value["config"]["cpu-idle"]["driver"], driver);
+        }
+        let disabled = build(
+            &(base.to_string() + "\n[dependencies.logger.cpuset-policy]\nallow-operator = false\n"),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&disabled).unwrap()["config"]["dependencies"]
+                ["logger"]["cpuset-policy"]["allow-operator"],
+            false
+        );
+        let explicit = base.replace("allow-operator-cpu-tuning = true", "")
+            + r#"
+[workload.cpu-idle]
+driver = "auto"
+allow-operator = true
+required = false
+allowed-governors = ["teo", "haltpoll", "menu", "teo"]
+allowed-disabled-states = ["*"]
+[workload.cpu-frequency]
+allow-operator = false
+required = false
+allowed-governors = []
+[workload.cpuset-policy]
+allow-operator = true
+allowed-cpus = "online"
+required = false
+[dependencies.logger.cpuset-policy]
+allow-operator = true
+allowed-cpus = "online"
+required = false
+[baby-container.slots.tools.cpuset-policy]
+allow-operator = true
+allowed-cpus = "online"
+required = false
+"#;
+        assert_eq!(compiled, build(&explicit));
+        let fixed = build(&(base.to_string() + "\n[workload.cpu-idle]\ngovernor = 'menu'\n"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fixed).unwrap()["config"]["cpu-idle"]
+                ["required"],
+            true
+        );
+        let no_macro = build(&base.replace("allow-operator-cpu-tuning = true", ""));
+        let no_macro: serde_json::Value = serde_json::from_str(&no_macro).unwrap();
+        for pointer in [
+            "/config",
+            "/config/dependencies/logger",
+            "/config/baby-container/slots/tools",
+        ] {
+            assert!(no_macro
+                .pointer(pointer)
+                .unwrap()
+                .get("cpuset-policy")
+                .unwrap()
+                .is_null());
+        }
+    }
+
+    #[test]
+    fn nofile_defaults_values_and_equivalent_integers_have_canonical_output() {
+        let source = r#"
+format = 16
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+atakit-portal = true
+[dependencies.logger]
+image = "logger:latest"
+[baby-container]
+enabled = true
+[baby-container.slots.tools]
+parent-service = "app"
+"#;
+        let build = |source: &str| -> Result<String, WorkloadError> {
+            let config = WorkloadConfig::load_from_str(source)?;
+            let manifest = super::build_manifest(
+                &config,
+                TEST_PUBLISHER,
+                "app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )?;
+            serialize_canonical_json(&manifest)
+        };
+        let absent = build(source).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&absent).unwrap();
+        for (section, pointer) in [
+            ("workload", "/config/nofile"),
+            ("dependencies.logger", "/config/dependencies/logger/nofile"),
+            (
+                "baby-container.slots.tools",
+                "/config/baby-container/slots/tools/nofile",
+            ),
+        ] {
+            assert_eq!(json.pointer(pointer), Some(&serde_json::Value::Null));
+            let with = |value: &str| {
+                source.replace(
+                    &format!("[{section}]"),
+                    &format!("[{section}]\nnofile = {value}"),
+                )
+            };
+            let explicit = build(&with("262144")).unwrap();
+            assert_ne!(absent, explicit);
+            assert_eq!(explicit, build(&with("262_144")).unwrap());
+            assert_eq!(explicit, build(&with("0x40000")).unwrap());
+            let json: serde_json::Value = serde_json::from_str(&explicit).unwrap();
+            assert_eq!(json.pointer(pointer), Some(&serde_json::json!(262144)));
+            for bad in ["0", "-1", "1.5", "\"unlimited\"", "9223372036854775807"] {
+                assert!(build(&with(bad)).is_err(), "{section}: {bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_controls_are_measured_and_require_format_16() {
+        let source = r#"
+format = 16
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+atakit-portal = true
+cpuset = "0-1"
+[workload.cpu-idle]
+driver = "intel_idle"
+governor = "menu"
+disabled-states = ["C6"]
+[workload.cpu-frequency]
+governor = "performance"
+[dependencies.logger]
+image = "logger:latest"
+cpuset = "0"
+[baby-container]
+enabled = true
+[baby-container.slots.dev]
+parent-service = "app"
+cpuset = "2-3"
+"#;
+        let build = |source: &str| {
+            let config = WorkloadConfig::load_from_str(source).unwrap();
+            super::build_manifest(
+                &config,
+                TEST_PUBLISHER,
+                "app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+        let manifest = build(source).unwrap();
+        assert_eq!(manifest.meta.format, 16);
+        assert!(manifest.config.cpu_idle.as_ref().unwrap().required);
+        assert!(manifest.config.cpu_frequency.as_ref().unwrap().required);
+        assert_eq!(manifest.config.cpuset.as_deref(), Some("0,1"));
+        assert_eq!(
+            manifest.config.dependencies.as_ref().unwrap()["logger"]
+                .cpuset
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            manifest.config.baby_container.slots["dev"]
+                .cpuset
+                .as_deref(),
+            Some("2,3")
+        );
+        let original = serialize_canonical_json(&manifest).unwrap();
+        for modified in [
+            source.replace("0-1", "1"),
+            source.replace("C6", "C1"),
+            source.replace("2-3", "3"),
+            source.replace("menu", "teo"),
+            source.replace("performance", "powersave"),
+        ] {
+            assert_ne!(
+                original,
+                serialize_canonical_json(&build(&modified).unwrap()).unwrap()
+            );
+        }
+        assert!(build(&source.replace("format = 16", "format = 15"))
+            .unwrap_err()
+            .to_string()
+            .contains("format = 16"));
+    }
+
+    #[test]
+    fn baby_log_access_is_in_canonical_manifest() {
+        let source = r#"
+format = 15
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+atakit-portal = true
+[baby-container]
+enabled = true
+[baby-container.slots.dev]
+parent-service = "app"
+[baby-container.slots.dev.logging]
+access = "none"
+"#;
+        let config = WorkloadConfig::load_from_str(source).unwrap();
+        let manifest = build_manifest(
+            &config,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(manifest.meta.format, crate::BABY_LOG_POLICY_FORMAT_VERSION);
+        assert_eq!(
+            manifest.config.baby_container.slots["dev"]
+                .logging
+                .access
+                .as_deref(),
+            Some("none")
+        );
+        assert!(serde_json::to_string(&manifest)
+            .unwrap()
+            .contains("\"access\":\"none\""));
+        assert!(manifest.config.logging.access.is_none());
+    }
+
+    #[test]
+    fn format_14_baby_logging_keeps_legacy_manifest_shape() {
+        let source = r#"
+format = 14
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+atakit-portal = true
+[baby-container]
+enabled = true
+[baby-container.slots.dev]
+parent-service = "app"
+[baby-container.slots.dev.logging]
+access = "parent"
+"#;
+        let config = WorkloadConfig::load_from_str(source).unwrap();
+        let manifest = build_manifest(
+            &config,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(manifest.meta.format, crate::ACCESS_STORAGE_FORMAT_VERSION);
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            value["config"]["baby-container"]["slots"]["dev"]["logging"],
+            serde_json::json!({"driver":"k8s-file", "options":{}, "log-readers":[]})
+        );
+    }
+
+    /// Fixed publisher for tests that are not about the publisher itself, so
+    /// every manifest they build is identified consistently.
+    const TEST_PUBLISHER: &str =
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_manifest(
+        config: &WorkloadConfig,
+        resolved_image: &str,
+        environment: BTreeMap<String, String>,
+        dep_environments: BTreeMap<String, BTreeMap<String, String>>,
+        hashes: BTreeMap<String, String>,
+        unmeasured_data: BTreeSet<String>,
+        unmeasured_env_files: BTreeMap<String, Vec<String>>,
+        images: BTreeMap<String, ManifestImage>,
+    ) -> Manifest {
+        super::build_manifest(
+            config,
+            TEST_PUBLISHER,
+            resolved_image,
+            environment,
+            dep_environments,
+            hashes,
+            unmeasured_data,
+            unmeasured_env_files,
+            images,
+        )
+        .expect("valid test manifest")
+    }
+
+    #[test]
+    fn executable_storage_is_opt_in_and_measured_for_all_mount_owners() {
+        let source = r#"
+format = 13
+[workload]
+name = "app"
+version = "v1"
+image = "app:latest"
+base-image-mode = "blacklist"
+[workload.storage.app]
+disk = "data"
+base-path = "/app"
+mount-path = "/app"
+[dependencies.helper]
+image = "helper:latest"
+[dependencies.helper.storage.app]
+disk = "data"
+base-path = "/app"
+mount-path = "/app"
+[baby-container]
+enabled = true
+[baby-container.slots.dev]
+parent-service = "app"
+[baby-container.slots.dev.storage.app]
+disk = "data"
+base-path = "/baby"
+mount-path = "/app"
+"#;
+        let build = |cfg: &WorkloadConfig| {
+            build_manifest(
+                cfg,
+                "app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+        let cfg: WorkloadConfig = toml::from_str(source).unwrap();
+        let baseline = serde_json::to_value(build(&cfg)).unwrap();
+        assert_eq!(baseline["meta"]["format"], 13);
+        for path in [
+            "/config/storage/app/executable",
+            "/config/dependencies/helper/storage/app/executable",
+            "/config/baby-container/slots/dev/storage/app/executable",
+        ] {
+            assert_eq!(baseline.pointer(path), Some(&serde_json::json!(false)));
+        }
+        for owner in 0..3 {
+            let mut cfg: WorkloadConfig = toml::from_str(source).unwrap();
+            match owner {
+                0 => cfg.workload.storage.get_mut("app").unwrap().executable = Some(true),
+                1 => {
+                    cfg.dependencies
+                        .get_mut("helper")
+                        .unwrap()
+                        .storage
+                        .get_mut("app")
+                        .unwrap()
+                        .executable = Some(true)
+                }
+                _ => {
+                    cfg.baby_container
+                        .as_mut()
+                        .unwrap()
+                        .slots
+                        .get_mut("dev")
+                        .unwrap()
+                        .storage
+                        .get_mut("app")
+                        .unwrap()
+                        .executable = Some(true)
+                }
+            }
+            let manifest = build(&cfg);
+            assert_eq!(
+                manifest.meta.format,
+                crate::EXECUTABLE_STORAGE_FORMAT_VERSION
+            );
+            let json = serde_json::to_value(&manifest).unwrap();
+            let storage = match owner {
+                0 => &json["config"]["storage"]["app"],
+                1 => &json["config"]["dependencies"]["helper"]["storage"]["app"],
+                _ => &json["config"]["baby-container"]["slots"]["dev"]["storage"]["app"],
+            };
+            assert_eq!(storage["executable"], true);
+            assert_ne!(json, baseline);
+            let decoded: Manifest = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        }
+        // Format 14 writes only canonical access lists for every mount owner.
+        let source14 = source.replace("format = 13", "format = 14").replace(
+            "mount-path = \"/app\"",
+            "mount-path = \"/app\"\naccess = [\"execute\", \"read\", \"write\"]",
+        );
+        let cfg14: WorkloadConfig = toml::from_str(&source14).unwrap();
+        let json14 = serde_json::to_value(build(&cfg14)).unwrap();
+        assert_eq!(json14["meta"]["format"], 14);
+        for path in [
+            "/config/storage/app",
+            "/config/dependencies/helper/storage/app",
+            "/config/baby-container/slots/dev/storage/app",
+        ] {
+            let mount = json14.pointer(path).unwrap();
+            assert_eq!(
+                mount["access"],
+                serde_json::json!(["read", "write", "execute"])
+            );
+            for old in ["read_only", "executable", "permissions"] {
+                assert!(mount.get(old).is_none());
+            }
+        }
+        let reordered: WorkloadConfig = toml::from_str(&source14.replace(
+            "[\"execute\", \"read\", \"write\"]",
+            "[\"write\", \"execute\", \"read\"]",
+        ))
+        .unwrap();
+        assert_eq!(serde_json::to_value(build(&reordered)).unwrap(), json14);
+        let no_exec: WorkloadConfig =
+            toml::from_str(&source14.replace("\"execute\", ", "")).unwrap();
+        assert_ne!(serde_json::to_value(build(&no_exec)).unwrap(), json14);
+        assert!(toml::from_str::<crate::config::ServiceStorageSection>(
+            "disk='d'\nbase-path='/'\nmount-path='/d'\nexecutable='true'"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn strip_dot_slash_works() {
         assert_eq!(strip_dot_slash("./config/hello"), "config/hello");
+        assert_eq!(strip_dot_slash("./config/"), "config");
         assert_eq!(strip_dot_slash("config/hello"), "config/hello");
+        assert_eq!(strip_dot_slash("config/"), "config");
         assert_eq!(strip_dot_slash("./a"), "a");
     }
 
@@ -708,6 +1888,29 @@ mod tests {
         let path = Path::new("test.env");
         let err = parse_env_file(path, content).unwrap_err();
         assert!(matches!(err, WorkloadError::EnvFileParse { line: 1, .. }));
+    }
+
+    #[test]
+    fn unmeasured_env_file_names_are_sorted_and_values_are_ignored() {
+        let path = Path::new("runtime.env");
+        let first = parse_unmeasured_env_file_names(path, "ZED=one\nALPHA=two\n").unwrap();
+        let second =
+            parse_unmeasured_env_file_names(path, "ZED=changed\nALPHA=also-changed\n").unwrap();
+        assert_eq!(first, vec!["ALPHA", "ZED"]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unmeasured_env_file_names_reject_duplicates_invalid_and_reserved_names() {
+        let path = Path::new("runtime.env");
+        for content in [
+            "TOKEN=one\nTOKEN=two\n",
+            "BAD-NAME=value\n",
+            "ATAKIT_PUBLIC_IP=value\n",
+            "VERIFIERD_PORTAL_ALLOWED_PORTS=[2024]\n",
+        ] {
+            assert!(parse_unmeasured_env_file_names(path, content).is_err());
+        }
     }
 
     #[test]
@@ -744,6 +1947,28 @@ mod tests {
     }
 
     #[test]
+    fn measured_environment_sources_allow_verifierd_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("verifierd.env");
+        std::fs::write(
+            &env_path,
+            "VERIFIERD_RPC_URL=https://rpc.example\nVERIFIERD_CHAIN_ID=560048\n",
+        )
+        .unwrap();
+
+        let env_file = Some(StringOrArray::Single("verifierd.env".into()));
+        let explicit = BTreeMap::from([
+            ("VERIFIERD_TRUST_MODE".into(), "chain".into()),
+            ("VERIFIERD_CHAIN_ID".into(), "1".into()),
+        ]);
+
+        let result = resolve_environment(&env_file, &explicit, tmp.path()).unwrap();
+        assert_eq!(result["VERIFIERD_RPC_URL"], "https://rpc.example");
+        assert_eq!(result["VERIFIERD_TRUST_MODE"], "chain");
+        assert_eq!(result["VERIFIERD_CHAIN_ID"], "1");
+    }
+
+    #[test]
     fn minimal_manifest_serializes() {
         let toml_str = r#"
 format = 2
@@ -774,21 +1999,27 @@ image = "my-app:latest"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
         let output = serialize_canonical_json(&manifest).unwrap();
         // Canonical JSON: verify key fields are present
-        assert!(output.contains("\"format\":2"));
+        assert!(output.contains("\"format\":11"));
+        // The publisher is measured: it is part of the canonical bytes PCR23
+        // covers, not metadata carried alongside them.
+        assert!(output.contains(&format!("\"publisher\":\"{TEST_PUBLISHER}\"")));
+        assert!(output.contains("\"attributes\":{}"));
         assert!(output.contains("\"name\":\"my-app\""));
         assert!(output.contains("\"version\":\"v0.0.1\""));
         assert!(output.contains("\"image\":\"my-app:latest\""));
+        assert!(output.contains("\"depends_on\":[]"));
         assert!(output.contains("images/my-app.tar"));
         // gid-group defaults to workload name
         assert!(output.contains("\"gid-group\":\"my-app\""));
-        // measured-data and unmeasured-data are booleans
-        assert!(output.contains("\"measured-data\":false"));
-        assert!(output.contains("\"unmeasured-data\":false"));
+        // measured-data and unmeasured-data are selective path arrays.
+        assert!(output.contains("\"measured-data\":[]"));
+        assert!(output.contains("\"unmeasured-data\":[]"));
         // top-level unmeasured-data path list is always emitted (empty here)
         assert!(output.contains("\"unmeasured-data\":[]"));
         // session-ttl defaults to 0
@@ -796,6 +2027,418 @@ image = "my-app:latest"
         // images section is present and surfaces image-id
         assert!(output.contains("\"images\":"));
         assert!(output.contains("\"image-id\":\"sha256:def456\""));
+    }
+
+    #[test]
+    fn materializes_optional_readiness_for_workload_and_dependencies() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 9
+[workload]
+name="api"
+version="v1"
+base-image-mode="blacklist"
+image="api:latest"
+depends_on=["db"]
+[workload.readiness]
+command=["/app/check"]
+interval-seconds=1
+attempt-timeout-seconds=2
+deadline-seconds=10
+[dependencies.db]
+image="db:latest"
+[dependencies.db.readiness]
+command=["/app/db-check","a b","$HOME"]
+interval-seconds=2
+attempt-timeout-seconds=3
+deadline-seconds=20
+"#,
+        )
+        .unwrap();
+        let manifest = build_manifest(
+            &config,
+            "api:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(manifest.config.readiness, config.workload.readiness);
+        assert_eq!(
+            manifest.config.dependencies.as_ref().unwrap()["db"].readiness,
+            config.dependencies["db"].readiness
+        );
+        let output = serde_json::to_value(manifest).unwrap();
+        assert_eq!(output["meta"]["format"], crate::FORMAT_VERSION);
+        assert_eq!(
+            output["config"]["dependencies"]["db"]["readiness"]["command"],
+            serde_json::json!(["/app/db-check", "a b", "$HOME"])
+        );
+    }
+
+    #[test]
+    fn materializes_workload_depends_on() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 8
+
+[workload]
+name = "api"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "api:latest"
+depends_on = ["db"]
+
+[dependencies.db]
+image = "postgres:17"
+"#,
+        )
+        .unwrap();
+
+        let manifest = build_manifest(
+            &config,
+            "api:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(manifest.meta.format, crate::FORMAT_VERSION);
+        assert_eq!(manifest.config.depends_on, vec!["db"]);
+        assert_eq!(
+            manifest.config.dependencies.unwrap()["db"].depends_on,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn attributes_are_canonical_and_change_manifest_measurement_bytes() {
+        let config = |values: &str| {
+            WorkloadConfig::load_from_str(&format!(
+                r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = {values}
+"#
+            ))
+            .unwrap()
+        };
+        let build = |config: &WorkloadConfig| {
+            build_manifest(
+                config,
+                "my-app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+
+        let false_only = serialize_canonical_json(&build(&config("[false]"))).unwrap();
+        let false_or_true = serialize_canonical_json(&build(&config("[false, true]"))).unwrap();
+
+        assert!(false_only.contains(
+            "\"attributes\":{\"atakit.attestation.v1.tee.intel-tdx.debug.enabled\":[false]}"
+        ));
+        assert_ne!(false_only, false_or_true);
+        assert_eq!(
+            false_only,
+            serialize_canonical_json(&build(&config("[false]"))).unwrap()
+        );
+    }
+
+    fn minimal_config() -> WorkloadConfig {
+        WorkloadConfig::load_from_str(
+            r#"
+format = 8
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn build_with_publisher(publisher: &str) -> Result<Manifest, WorkloadError> {
+        super::build_manifest(
+            &minimal_config(),
+            publisher,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// The publisher is part of the workload's identity, so it has to be part of
+    /// what PCR23 covers. If it were carried outside the measured bytes, an
+    /// operator could run one publisher's workload and attest another's
+    /// identity.
+    #[test]
+    fn publisher_changes_the_measured_bytes() {
+        let a = serialize_canonical_json(
+            &build_with_publisher(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let b = serialize_canonical_json(
+            &build_with_publisher(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            a, b,
+            "two publishers must not produce the same measured manifest"
+        );
+    }
+
+    /// A malformed publisher would be measured and would derive an identifier
+    /// registered to nobody, so it is refused at the build boundary rather than
+    /// written into an archive.
+    #[test]
+    fn build_manifest_rejects_a_malformed_publisher() {
+        for bad in [
+            "",
+            "automata",
+            "0xNOTHEX",
+            // Correct length, but uppercase: two spellings of one identifier
+            // would compare unequal.
+            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            // Missing the 0x prefix.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let error = build_with_publisher(bad)
+                .expect_err(&format!("expected publisher '{bad}' to be refused"));
+            assert!(
+                error.to_string().contains("publisher must be"),
+                "unexpected error for '{bad}': {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_manifest_returns_invalid_attribute_error() {
+        let config = WorkloadConfig::load_from_str(
+            r#"
+format = 6
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+
+[workload.attributes]
+"atakit.attestation.v1.tee.intel-tdx.debug.enabled" = [true]
+"#,
+        )
+        .unwrap();
+
+        let error = super::build_manifest(
+            &config,
+            TEST_PUBLISHER,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must be [false] or [false, true]"));
+    }
+
+    #[test]
+    fn format_2_legacy_service_disks_compile_to_manifest_storage() {
+        let toml_str = r#"
+format = 2
+
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+
+[workload.disks]
+data = "/data"
+
+[dependencies.sidecar]
+image = "redis:7"
+
+[dependencies.sidecar.disks]
+cache = "/cache"
+
+[disks.data]
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+
+[disks.cache]
+size = "10GB"
+encryption = { unlock_method = [], bind = [] }
+"#;
+        let cfg: WorkloadConfig = toml::from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        let workload_storage = &manifest.config.storage["data"];
+        assert_eq!(workload_storage.disk, "data");
+        assert_eq!(workload_storage.base_path, "/");
+        assert_eq!(workload_storage.mount_path, "/data");
+        assert!(!workload_storage.read_only());
+
+        let sidecar_storage = &manifest.config.dependencies.unwrap()["sidecar"].storage["cache"];
+        assert_eq!(sidecar_storage.disk, "cache");
+        assert_eq!(sidecar_storage.base_path, "/");
+        assert_eq!(sidecar_storage.mount_path, "/cache");
+        assert!(!sidecar_storage.read_only());
+    }
+
+    #[test]
+    fn unmeasured_env_files_are_normalized_into_manifest() {
+        let toml_str = r#"
+format = 2
+
+[package]
+unmeasured-data = ["/secrets/runtime.env"]
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+unmeasured-env-file = ["/secrets/runtime.env"]
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml_str).unwrap();
+        let manifest = build_manifest(
+            &cfg,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from(["unmeasured-data/secrets/runtime.env".to_string()]),
+            BTreeMap::from([(
+                "unmeasured-data/secrets/runtime.env".to_string(),
+                vec!["API_TOKEN".to_string()],
+            )]),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            manifest.config.unmeasured_env_files,
+            vec!["unmeasured-data/secrets/runtime.env"]
+        );
+        assert_eq!(
+            manifest.unmeasured_env_files,
+            BTreeMap::from([(
+                "unmeasured-data/secrets/runtime.env".to_string(),
+                vec!["API_TOKEN".to_string()],
+            )])
+        );
+    }
+
+    #[test]
+    fn service_data_arrays_expand_against_declared_sets() {
+        let toml_str = r#"
+format = 4
+
+[package]
+measured-data = ["/config/a.txt", "/config/b.txt"]
+unmeasured-data = ["/runtime/a.env", "/runtime/b.env"]
+
+[workload]
+name = "my-app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "my-app:latest"
+measured-data = ["/config/a.txt"]
+unmeasured-data = ["/runtime/"]
+
+[dependencies.helper]
+image = "helper:latest"
+measured-data = true
+unmeasured-data = false
+"#;
+        let cfg = WorkloadConfig::load_from_str(toml_str).unwrap();
+        let mut hashes = BTreeMap::new();
+        hashes.insert("measured-data/config/a.txt".into(), "sha256:aaa".into());
+        hashes.insert("measured-data/config/b.txt".into(), "sha256:bbb".into());
+        let unmeasured_data = BTreeSet::from([
+            "unmeasured-data/runtime/a.env".to_string(),
+            "unmeasured-data/runtime/b.env".to_string(),
+        ]);
+
+        let manifest = build_manifest(
+            &cfg,
+            "my-app:latest",
+            BTreeMap::new(),
+            BTreeMap::new(),
+            hashes,
+            unmeasured_data,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            manifest.config.measured_data,
+            ManifestDataMount::Paths(vec!["measured-data/config/a.txt".to_string()])
+        );
+        assert_eq!(
+            manifest.config.unmeasured_data,
+            ManifestDataMount::Paths(vec![
+                "unmeasured-data/runtime/a.env".to_string(),
+                "unmeasured-data/runtime/b.env".to_string(),
+            ])
+        );
+        let helper = manifest
+            .config
+            .dependencies
+            .as_ref()
+            .unwrap()
+            .get("helper")
+            .unwrap();
+        assert_eq!(
+            helper.measured_data,
+            ManifestDataMount::Paths(vec![
+                "measured-data/config/a.txt".to_string(),
+                "measured-data/config/b.txt".to_string(),
+            ])
+        );
+        assert_eq!(helper.unmeasured_data, ManifestDataMount::Paths(vec![]));
     }
 
     #[test]
@@ -820,6 +2463,7 @@ image = "test:latest"
             BTreeMap::new(),
             hashes.clone(),
             BTreeSet::new(),
+            BTreeMap::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -829,6 +2473,7 @@ image = "test:latest"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
@@ -880,6 +2525,7 @@ image = "redis:7"
             BTreeMap::new(),
             hashes.clone(),
             BTreeSet::new(),
+            BTreeMap::new(),
             images.clone(),
         );
         let m2 = build_manifest(
@@ -889,6 +2535,7 @@ image = "redis:7"
             BTreeMap::new(),
             hashes,
             BTreeSet::new(),
+            BTreeMap::new(),
             images,
         );
 
@@ -928,6 +2575,7 @@ image = "redis:7"
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
         );
         let json = serialize_canonical_json(&manifest).unwrap();
@@ -977,6 +2625,7 @@ cap-drop = ["KILL"]
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
 
         assert_eq!(manifest.config.cap_add, vec!["NET_ADMIN".to_string()]);
@@ -1000,6 +2649,44 @@ cap-drop = ["KILL"]
         assert!(json.contains("\"cap-drop\":[\"NET_BIND_SERVICE\"]"));
         assert!(json.contains("\"cap-add\":[\"NET_RAW\"]"));
         assert!(json.contains("\"cap-drop\":[\"KILL\"]"));
+    }
+
+    #[test]
+    fn disk_integrity_is_measured_and_requires_format_12() {
+        for integrity in ["", ", integrity = \"hmac-sha256\""] {
+            let source = format!(
+                r#"
+format = 2
+[workload]
+name = "app"
+version = "v0.0.1"
+base-image-mode = "blacklist"
+image = "app:latest"
+[disks.data]
+index = 10
+size = "10GB"
+encryption = {{ unlock_method = ["tpm"], bind = ["baseimage", "workload"]{integrity} }}
+"#
+            );
+            let cfg: WorkloadConfig = toml::from_str(&source).unwrap();
+            let manifest = build_manifest(
+                &cfg,
+                "app:latest",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            assert_eq!(
+                manifest.meta.format,
+                if integrity.is_empty() { 11 } else { 12 }
+            );
+            let json = serialize_canonical_json(&manifest).unwrap();
+            assert_eq!(json.contains("hmac-sha256"), !integrity.is_empty());
+            assert_eq!(json.contains("integrity"), !integrity.is_empty());
+        }
     }
 
     #[test]
@@ -1029,6 +2716,7 @@ encryption = { unlock_method = [], bind = [] }
             BTreeMap::new(), // dep_environments
             BTreeMap::new(), // hashes
             BTreeSet::new(), // unmeasured_data
+            BTreeMap::new(), // unmeasured_env_files
             BTreeMap::new(), // images
         );
         let json = serialize_canonical_json(&manifest).unwrap();
@@ -1099,6 +2787,7 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         let m_b = build_manifest(
             &cfg_b,
@@ -1108,6 +2797,7 @@ cap-add = ["NET_ADMIN"]
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
 
         let j_a = serialize_canonical_json(&m_a).unwrap();
@@ -1116,12 +2806,67 @@ cap-add = ["NET_ADMIN"]
     }
 
     #[test]
+    fn unmeasured_declarations_do_not_infer_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("no-source");
+        assert_eq!(
+            normalize_unmeasured_data(&["/config/key".into()], &absent).unwrap(),
+            BTreeSet::from(["unmeasured-data/config/key".into()])
+        );
+        assert!(normalize_unmeasured_data(&["/config/".into()], &absent).is_err());
+        std::fs::create_dir(tmp.path().join("config")).unwrap();
+        let error = normalize_unmeasured_data(&["/config".into()], tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("trailing '/'"));
+        assert!(normalize_unmeasured_data(&["/config/".into()], tmp.path())
+            .unwrap()
+            .is_empty());
+        std::fs::write(tmp.path().join("file"), "placeholder").unwrap();
+        assert!(normalize_unmeasured_data(&["/file/".into()], tmp.path()).is_err());
+    }
+
+    #[test]
+    fn unmeasured_enumeration_rejects_links_instead_of_following_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("config")).unwrap();
+        std::os::unix::fs::symlink(".", tmp.path().join("config/loop")).unwrap();
+        assert!(normalize_unmeasured_data(&["/config/".into()], tmp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("links"));
+    }
+
+    #[test]
+    fn unmeasured_selectors_distinguish_files_and_directories() {
+        assert!(data_selector_matches(
+            "unmeasured-data",
+            "/config/",
+            "unmeasured-data/config/key"
+        ));
+        assert!(!data_selector_matches(
+            "unmeasured-data",
+            "/config",
+            "unmeasured-data/config/key"
+        ));
+        assert!(!data_selector_matches(
+            "unmeasured-data",
+            "/config/",
+            "unmeasured-data/config"
+        ));
+        assert!(data_selector_matches(
+            "unmeasured-data",
+            "/config/key",
+            "unmeasured-data/config/key"
+        ));
+    }
+
+    #[test]
     fn unmeasured_data_leaf_and_missing_paths() {
         let tmp = tempfile::tempdir().unwrap();
         // A file that exists, plus a path that does not exist at build time.
         std::fs::write(tmp.path().join("present.bin"), "x").unwrap();
-        let paths = vec!["./present.bin".to_string(), "./secrets/api_key".to_string()];
+        let paths = vec!["/present.bin".to_string(), "/secrets/api_key".to_string()];
         let out: Vec<String> = normalize_unmeasured_data(&paths, tmp.path())
+            .unwrap()
             .into_iter()
             .collect();
         assert_eq!(
@@ -1143,7 +2888,7 @@ cap-add = ["NET_ADMIN"]
         std::fs::write(dir.join("nested/c"), "c").unwrap();
 
         // Declaring the directory expands to its sorted member files...
-        let from_dir = normalize_unmeasured_data(&["./config".to_string()], tmp.path());
+        let from_dir = normalize_unmeasured_data(&["/config/".to_string()], tmp.path()).unwrap();
         assert_eq!(
             from_dir.iter().cloned().collect::<Vec<_>>(),
             vec![
@@ -1157,12 +2902,49 @@ cap-add = ["NET_ADMIN"]
         // (the determinism property the boolean refactor lost).
         let from_files = normalize_unmeasured_data(
             &[
-                "./config/nested/c".to_string(),
-                "./config/a".to_string(),
-                "./config/b".to_string(),
+                "/config/nested/c".to_string(),
+                "/config/a".to_string(),
+                "/config/b".to_string(),
             ],
             tmp.path(),
-        );
+        )
+        .unwrap();
         assert_eq!(from_dir, from_files);
     }
+
+    #[test]
+    fn measured_data_directory_with_trailing_slash_expands_without_double_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.conf"), "x").unwrap();
+
+        let from_dir = normalize_measured_data(&["/config/".to_string()], tmp.path());
+        assert_eq!(
+            from_dir.iter().cloned().collect::<Vec<_>>(),
+            vec!["measured-data/config/app.conf".to_string()]
+        );
+    }
+
+    #[test]
+    fn root_data_directories_expand_without_double_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.txt"), "x").unwrap();
+
+        let measured = normalize_measured_data(&["/".to_string()], tmp.path());
+        assert_eq!(
+            measured.iter().cloned().collect::<Vec<_>>(),
+            vec!["measured-data/root.txt".to_string()]
+        );
+
+        let unmeasured = normalize_unmeasured_data(&["/".to_string()], tmp.path()).unwrap();
+        assert_eq!(
+            unmeasured.iter().cloned().collect::<Vec<_>>(),
+            vec!["unmeasured-data/root.txt".to_string()]
+        );
+    }
+}
+
+fn storage_execution_disabled(value: &Option<bool>) -> bool {
+    storage_access::execution_disabled(value)
 }

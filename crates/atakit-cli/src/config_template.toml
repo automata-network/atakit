@@ -21,11 +21,16 @@
 # session_registry = "0x..."
 # workload_registry = "0x..."
 # base_image_registry = "0x..."
-# expire_offset = 300
-# # ^ default validity window (seconds) for owner-key-signed on-chain
-# # messages: registerCvm in the CVM, plus the operator-side
-# # registerWorkload / deactivateWorkload / registerBaseImage flows.
-# # `--expire-offset` on each CLI command overrides per call.
+# tee_backend = "auto"       # "auto" | "solidity" | "zk"
+# prover = "sp1-network"     # named [provers] profile used by ZK paths
+
+# [owner_operations]
+# op_expiry_seconds = 300
+# challenge_expiry_seconds = 60
+# max_request_body_bytes = 1048576
+# max_waiting_requests = 64
+# max_completed_request_statuses = 256
+# request_status_retention_seconds = 3600
 
 # ─── Keys ────────────────────────────────────────────────────────────
 #
@@ -51,6 +56,21 @@
 # type = "es256k"
 # mode = "provisioned"
 # command = ["vault", "read", "-field=key", "secret/gas"]
+
+# ─── Provers ─────────────────────────────────────────────────────────
+#
+# Prover profiles are deployment policy and do not belong in a workload
+# manifest. A chain references a profile by name. Future backends such as
+# `risc0` use the same shape and are validated at runtime by daemon
+# capability negotiation.
+
+# [provers.sp1-network]
+# backend = "sp1"
+# execution = "network"      # "network" | "local_cpu" | "dev"
+# credential = "gas-provisioned"
+# endpoint = ""              # optional backend-specific endpoint
+# [provers.sp1-network.options]
+# # dcap_rpc_url = "https://..."
 
 # ─── GitHub credentials ───────────────────────────────────────────────
 #
@@ -111,6 +131,37 @@
 # chain = "mainnet"
 # owner_key = "owner"
 # relay_key = "relayer"
+
+# ─── Aliases ──────────────────────────────────────────────────────────
+#
+# Typing shorthand, and nothing more. A base image or workload is named
+# `<publisher>/<name>:<version>`, where `<publisher>` is the fingerprint of
+# the key that published it. That canonical form is what identifiers are
+# derived from.
+#
+# Aliases are expanded here, when a reference is read from the command line
+# or this file. They never reach a manifest, a measurement, or persisted
+# state, so no alias can change what a workload measures to.
+#
+# `[alias.publishers]` gives a fingerprint a name, so you can write
+# `automata/fedora-oci:v0.0.16` instead of the full 66-character form. Every
+# value must be a fingerprint; one that isn't is rejected when this file is
+# loaded, naming the offending entry, rather than at the moment you use it.
+#
+# [alias.publishers]
+# automata = "0x9f2c...e07d"
+#
+# `[alias.apps]` says which publisher owns a bare application name, so
+# `fedora-oci:v0.0.16` resolves with no publisher segment at all. One table
+# covers base images and workloads alike. The value is either a name from
+# `[alias.publishers]` or a fingerprint written out in full.
+#
+# [alias.apps]
+# fedora-oci = "automata"
+#
+# An unresolved name is always an error naming the table it was looked up
+# in. It never falls through to a literal, which would silently bind a
+# reference to a publisher you never named.
 
 # ─── Workload repositories ────────────────────────────────────────────
 #
@@ -173,16 +224,15 @@
 # chain is configured.
 #
 # Active registration requires `owner_key`, but it may be provisioned or
-# `self_generated` when an ephemeral owner is acceptable. `gas_wallet` and
-# `sp1_payer` identify the keys the CVM uses for relay/prover submissions:
-# they may be provisioned keys supplied by the relay owner, or self-generated
-# keys whose public keys are accepted or registered by the relay. With
-# registration = "off", chain/owner_key/gas_wallet/sp1_payer may be omitted.
+# `self_generated` when an ephemeral owner is acceptable. `gas_wallet` pays or
+# relays chain submissions. `prover_credential` selects a fallback key for a
+# ZK prover profile; a profile-level credential takes precedence. With
+# registration = "off", chain/owner_key/gas_wallet/prover_credential may be omitted.
 # [cloud.targets.my-gcp-tdx]
 # provider = "my-gcp"
 # vmtype = "c3-standard-4"        # cc_type inferred as TDX
 # image = "my-baseimage:v0.1.0"
-# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
+# boot_disk = { size = "100GB" }        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
 # registration = "required"
 # owner_key = "owner"
@@ -192,7 +242,7 @@
 # provider = "my-azure"
 # vmtype = "Standard_DC4as_v5"    # cc_type inferred as SEV_SNP
 # image = "my-baseimage:v0.1.0"
-# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
+# boot_disk = { size = "100GB" }        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
 # registration = "optional"
 # owner_key = "owner"
@@ -200,9 +250,9 @@
 
 # [cloud.targets.my-aws-snp]
 # provider = "my-aws"
-# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP (AMD SEV-SNP families: m6a/c6a/r6a/m7a/c7a/r7a)
+# vmtype = "m6a.large"            # cc_type inferred as SEV_SNP; exact supported shared-tenancy types are validated
 # image = "my-baseimage:v0.1.0"
-# boot_disk_size = "100GB"        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
+# boot_disk = { size = "100GB" }        # override OS disk size (default 4GB, min 2GB, must be >= workload minimum)
 # chain = "mainnet"
 # registration = "optional"
 # owner_key = "owner"
@@ -211,7 +261,22 @@
 # [cloud.targets.qemu-local]
 # provider = "qemu"               # vmtype is ignored (fixed 2 vCPU / 4 GiB)
 # image = "my-baseimage:v0.1.0"   # consumes qemu_disk.qcow2 from the image store
-# boot_disk_size = "10GB"         # OS disk overlay size (default 4GB)
+# boot_disk = { size = "10GB" }         # OS disk overlay size (default 4GB)
 # uefi = "~/.local/share/atakit/firmware/ovmf.fd"  # optional override of [cloud.providers.qemu].uefi
 # chain/owner_key/gas_wallet may be omitted — qemu deploys with no chain
 # configured synthesize a local-only init payload with registration="off".
+
+# Disk profiles select settings only for newly created cloud disks.
+# [cloud.disk_profiles.aws-fast]
+# disk_type = "aws-gp3"
+# iops = 6000
+# throughput_mibps = 250
+#
+# Within an AWS target (requires a matching provider platform):
+# boot_disk = { profile = "aws-fast", size = "32GB" }
+# disks.database = { profile = "aws-fast", encryption_workqueues = "bypass" }
+# "database" must be a workload disk name; its size comes from the workload.
+# Queue choices apply on VM reboot. Cloud profiles never retune existing disks.
+# GCP profiles use gcp-pd-balanced/gcp-pd-ssd, or gcp-hyperdisk-balanced.
+# gcp-local-ssd assigns all included Local SSDs to one workload disk (RAID 0
+# for multiple devices). It accepts no performance fields or boot selection.

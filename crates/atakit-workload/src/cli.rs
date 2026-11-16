@@ -33,7 +33,36 @@ pub enum WorkloadCommand {
     Rm(RmArgs),
     /// Initialize a CVM portal directly (e.g. local QEMU)
     #[command(arg_required_else_help = true)]
-    Init(InitArgs),
+    Init(Box<InitArgs>),
+    /// Unlock workload disks on an existing portal
+    #[command(subcommand)]
+    Disk(WorkloadDiskCommand),
+}
+
+#[derive(Subcommand)]
+pub enum WorkloadDiskCommand {
+    /// Supply a disk passphrase without resending initialization
+    Unlock(Box<WorkloadDiskUnlockArgs>),
+}
+
+#[derive(Args)]
+pub struct WorkloadDiskUnlockArgs {
+    /// Portal host or IP address (without a port)
+    pub host: String,
+    /// Persistent portal HTTPS port
+    #[arg(long, default_value_t = 2024)]
+    pub port: u16,
+    /// Disk name from the workload manifest
+    #[arg(long)]
+    pub disk: String,
+    /// Workload reference (<publisher>/<name>:<version>) or local .atawl archive
+    #[arg(long)]
+    pub workload: String,
+    /// Provisioned ES256K owner key from [keys]
+    #[arg(long)]
+    pub owner_key: String,
+    #[command(flatten)]
+    pub verification: atakit_cloud::cli::SessionVerificationArgs,
 }
 
 /// Arguments for `workload create`.
@@ -49,16 +78,27 @@ pub struct BuildArgs {
     /// Workload directory (default: current directory)
     #[arg(short, long)]
     pub dir: Option<PathBuf>,
+    /// Named ES256K key whose owner fingerprint is the publisher. The workload
+    /// identifier is derived from it, so it cannot be computed without one.
+    /// Defaults to [publish] owner_key.
+    #[arg(long)]
+    pub signing_key: Option<String>,
     /// Output directory for .atawl file (default: workload directory)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
     /// Container engine override (docker or podman)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
+    /// Root for logical measured-data paths (default: <workload-dir>/measured-data)
+    #[arg(long, value_name = "DIR")]
+    pub measured_data_root: Option<PathBuf>,
+    /// Source for directory enumeration and env templates; exact file declarations need no local source (default: <workload-dir>/unmeasured-data)
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_root: Option<PathBuf>,
     /// Skip importing the built archive into the local workload store
     #[arg(long)]
     pub no_store: bool,
-    /// Use gzip compression instead of zstd
+    /// Deprecated compatibility flag; workload archives always use zstd
     #[arg(long)]
     pub gz: bool,
 }
@@ -74,6 +114,19 @@ pub struct InfoArgs {
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
+    /// Root for logical measured-data paths in --dir mode
+    #[arg(long, value_name = "DIR")]
+    pub measured_data_root: Option<PathBuf>,
+    /// Root for logical unmeasured-data declarations in --dir mode
+    #[arg(long, value_name = "DIR")]
+    pub unmeasured_data_root: Option<PathBuf>,
+    /// Key whose fingerprint is the publisher, for --dir mode
+    ///
+    /// The publisher is measured, so PCR23 cannot be computed for a directory
+    /// without it. Defaults to `[publish] owner_key`. Ignored when inspecting
+    /// an archive, which already records its publisher.
+    #[arg(long, value_name = "KEY")]
+    pub signing_key: Option<String>,
 }
 
 /// Arguments for `workload deactivate`.
@@ -90,16 +143,17 @@ pub struct DeactivateArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
     /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds. If omitted, falls back to
-    /// `[chains.<name>] expire_offset` (default 300).
+    /// Owner-operation validity window in seconds. If omitted, falls back to
+    /// `[owner_operations] op_expiry_seconds` (default 300).
     #[arg(long)]
-    pub expire_offset: Option<u64>,
+    pub op_expiry_seconds: Option<u64>,
     /// Container engine override (for --dir mode)
     #[arg(long, value_parser = ["docker", "podman"])]
     pub engine: Option<String>,
@@ -116,16 +170,17 @@ pub struct PublishArgs {
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
     /// Owner key name (references [keys.<name>])
     #[arg(long)]
     pub owner_key: Option<String>,
     /// Relay key name for transaction submission (references [keys.<name>])
     #[arg(long)]
     pub relay_key: Option<String>,
-    /// Signature expiration offset in seconds. If omitted, falls back to
-    /// `[chains.<name>] expire_offset` (default 300).
+    /// Owner-operation validity window in seconds. If omitted, falls back to
+    /// `[owner_operations] op_expiry_seconds` (default 300).
     #[arg(long)]
-    pub expire_offset: Option<u64>,
+    pub op_expiry_seconds: Option<u64>,
     /// Session TTL in seconds (overrides config; 0 = contract default of 30 days)
     #[arg(long = "session-ttl")]
     pub session_ttl: Option<u64>,
@@ -231,7 +286,8 @@ pub struct ExportArgs {
 /// Arguments for `workload add`.
 #[derive(Args)]
 pub struct AddArgs {
-    /// Workload reference (name:version or 0x<workload_id>), or path to .atawl file
+    /// Workload reference (<publisher>/<name>:<version> or 0x<workload_id>), or
+    /// path to a .atawl file
     pub reference: String,
     /// Chain config name (references [chains.<name>])
     #[arg(long)]
@@ -254,6 +310,19 @@ pub struct RmArgs {
 /// Arguments for `workload init`.
 #[derive(Args)]
 pub struct InitArgs {
+    /// Erase and initialize every disk declared by the workload (never the boot disk)
+    #[arg(long, conflicts_with = "disk_setup")]
+    pub overwrite_all_disks: bool,
+    /// Authorize one-time disk initialization: NAME=create or NAME=overwrite (erases data)
+    #[arg(long = "disk-setup", value_name = "NAME=ACTION")]
+    pub disk_setup: Vec<String>,
+    /// Private initialization credential for a VM created outside cloud deploy.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "unsafe_skip_tls_attestation"
+    )]
+    pub init_auth_key_file: Option<PathBuf>,
     /// Portal address: "host" or "host:port" (default port 1024;
     /// status port = init port + 1000).
     pub address: String,
@@ -261,17 +330,35 @@ pub struct InitArgs {
     /// Workload source: name:version (store ref) or path to .atawl file
     pub source: Option<String>,
 
+    /// URI the portal should use to download the ATAWL instead of receiving
+    /// the local archive. Requires --atawl-sha256.
+    #[arg(long, value_name = "URI", requires = "atawl_sha256")]
+    pub atawl_uri: Option<String>,
+
+    /// SHA-256 of the complete remote ATAWL. Must match the locally resolved
+    /// workload archive used for manifest and policy planning.
+    #[arg(long, value_name = "SHA256", requires = "atawl_uri")]
+    pub atawl_sha256: Option<String>,
+
     /// Workload directory (default: current directory)
     #[arg(short, long, conflicts_with = "source")]
     pub dir: Option<PathBuf>,
 
     /// Platform string sent as `platform.declared` in the init payload
-    #[arg(long, value_parser = ["gcp", "azure", "qemu"], default_value = "qemu")]
+    #[arg(
+        long,
+        value_parser = ["gcp", "azure", "aws", "qemu"],
+        default_value = "qemu"
+    )]
     pub platform: String,
 
     /// Chain config name override (references [chains.<name>])
     #[arg(long)]
     pub chain: Option<String>,
+
+    /// PCR collection policy used only when effective chain registration is off.
+    #[arg(long, value_name = "PATH")]
+    pub pcr_policy: Option<PathBuf>,
 
     /// Owner key name override (references [keys.<name>])
     #[arg(long)]
@@ -281,9 +368,14 @@ pub struct InitArgs {
     #[arg(long)]
     pub gas_wallet: Option<String>,
 
-    /// Portal wait timeout in seconds
-    #[arg(long, default_value = "300")]
-    pub timeout: u64,
+    /// Timeout in seconds for non-transfer /init work and waiting for portal Running.
+    /// Defaults to 900 seconds plus owner_operations.op_expiry_seconds plus 60 seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub init_timeout: Option<u64>,
+
+    /// Timeout in seconds for the ATAWL upload or portal download only.
+    #[arg(long, default_value = "300", value_name = "SECONDS")]
+    pub init_upload_timeout: u64,
 
     /// Skip confirmation prompt
     #[arg(short, long)]
@@ -293,14 +385,204 @@ pub struct InitArgs {
     #[arg(long)]
     pub skip_freshness_check: bool,
 
-    /// Directory containing unmeasured-data files (overrides workload dir)
+    /// Source directory for unmeasured data; uses <workload-dir>/unmeasured-data when present, otherwise prompts
+    #[arg(long, value_name = "DIR", conflicts_with = "unmeasured_data_dir")]
+    pub unmeasured_data_root: Option<PathBuf>,
+
+    /// Deprecated alias for --unmeasured-data-root
     #[arg(long, value_name = "DIR")]
     pub unmeasured_data_dir: Option<PathBuf>,
 
-    /// Passphrase for an encrypted data disk, as NAME=VALUE. NAME must be a
-    /// disk declared in the workload manifest with `passphrase` in its
-    /// unlock_method. Repeatable (one per disk). Per-VM secret — supply at
-    /// init time rather than persisting in config.
-    #[arg(long, value_name = "NAME=VALUE")]
+    /// Continue without uploading unmeasured data (never prompt for a source)
+    #[arg(long, conflicts_with_all = ["unmeasured_data_root", "unmeasured_data_dir"])]
+    pub no_unmeasured_data: bool,
+
+    /// Removed: use the per-boot disk-unlock command instead.
+    #[arg(long, value_name = "NAME=VALUE", hide = true)]
     pub disk_passphrase: Vec<String>,
+
+    /// Optional expected base-image assertion for portal TLS attestation.
+    #[arg(long, value_name = "NAME:VERSION")]
+    pub base_image: Option<String>,
+
+    /// Explicit signed measurement pack for offline portal TLS verification.
+    #[arg(long, value_name = "PATH")]
+    pub measurements: Option<PathBuf>,
+
+    /// Trusted measurement-pack publisher public key, as SEC1 ES256K hex.
+    #[arg(long, value_name = "HEX")]
+    pub measurement_publisher_key: Vec<String>,
+
+    /// Trusted Azure MAA signing certificate file, PEM or DER. The public key
+    /// and its expiry are both taken from the certificate.
+    #[arg(long, value_name = "PATH")]
+    pub azure_maa_cert: Vec<PathBuf>,
+
+    /// Trusted GCP vTPM AK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub gcp_ak_root_cert: Vec<PathBuf>,
+
+    /// Trusted AWS Nitro Enclaves root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub aws_nitro_root_cert: Vec<PathBuf>,
+
+    /// Maximum accepted age of an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_allowed_future_clock_difference_seconds"
+    )]
+    pub aws_document_maximum_age_seconds: Option<u64>,
+
+    /// Maximum accepted future clock difference for an AWS NitroTPM attestation document.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "aws_document_maximum_age_seconds"
+    )]
+    pub aws_document_allowed_future_clock_difference_seconds: Option<u64>,
+
+    /// Trusted AMD SEV-SNP ARK root certificate file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_ark_root_cert: Vec<PathBuf>,
+
+    /// AMD SEV-SNP certificate revocation list file, PEM or DER.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_crl: Vec<PathBuf>,
+
+    /// Trusted atakit AMD SEV-SNP security policy version 1 JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub amd_snp_security_policy: Option<PathBuf>,
+
+    /// atakit Intel TDX DCAP collateral version 1 JSON file for offline verification.
+    #[arg(long, value_name = "PATH")]
+    pub tdx_dcap_collateral: Option<PathBuf>,
+
+    /// Direct HTTP PCCS/PCS URL for verifier-side Intel TDX DCAP collateral fetch.
+    #[arg(long, value_name = "URL")]
+    pub tdx_dcap_pccs_url: Option<String>,
+
+    /// Automata on-chain collateral RPC URL for verifier-side Intel TDX DCAP lookup.
+    #[arg(long = "tdx-dcap-automata-collateral-rpc-url", value_name = "URL")]
+    pub tdx_dcap_automata_collateral_rpc_url: Option<String>,
+
+    /// Automata PCS DAO address override for verifier-side Intel TDX DCAP collateral lookup.
+    #[arg(long = "tdx-dcap-automata-pcs-dao", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_pcs_dao: Option<String>,
+
+    /// Automata PCCS read strategy. Direct concurrent calls are the default.
+    #[arg(
+        long = "tdx-dcap-automata-read-strategy",
+        value_parser = ["direct-concurrent", "multicall3"],
+        default_value = "direct-concurrent"
+    )]
+    pub tdx_dcap_automata_read_strategy: String,
+
+    /// Multicall3 address override for Automata PCCS reads.
+    #[arg(long = "tdx-dcap-automata-multicall3-address", value_name = "ADDRESS")]
+    pub tdx_dcap_automata_multicall3_address: Option<String>,
+
+    /// One-shot override: trust only this live TLS certificate SHA-256.
+    #[arg(long, value_name = "0xSHA256")]
+    pub trust_tls_cert_sha256: Option<String>,
+
+    /// UNSAFE: skip TLS attestation and accept the portal self-signed certificate.
+    #[arg(long, conflicts_with = "trust_tls_cert_sha256")]
+    pub unsafe_skip_tls_attestation: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn overwrite_all_disks_conflicts_with_per_disk_setup() {
+        use clap::Parser;
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--overwrite-all-disks"])
+            .unwrap();
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected init");
+        };
+        assert!(args.overwrite_all_disks);
+        assert!(TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--overwrite-all-disks",
+            "--disk-setup",
+            "data=create"
+        ])
+        .is_err());
+    }
+    use clap::Parser;
+
+    use super::WorkloadCommand;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    }
+
+    #[test]
+    fn workload_build_still_accepts_legacy_gzip_flag() {
+        let cli = TestCli::try_parse_from(["test", "build", "--gz"]).unwrap();
+        let WorkloadCommand::Build(args) = cli.command else {
+            panic!("expected workload build command");
+        };
+        assert!(args.gz);
+    }
+
+    #[test]
+    fn workload_init_uses_the_shared_initialization_timeout_flag() {
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1"])
+            .expect("workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, None);
+
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--init-timeout", "1400"])
+            .expect("workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.init_timeout, Some(1400));
+
+        assert!(
+            TestCli::try_parse_from(["test", "init", "127.0.0.1", "--timeout", "1400",]).is_err()
+        );
+    }
+
+    #[test]
+    fn workload_init_accepts_aws_as_the_declared_platform() {
+        let cli = TestCli::try_parse_from(["test", "init", "127.0.0.1", "--platform", "aws"])
+            .expect("AWS workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.platform, "aws");
+    }
+
+    #[test]
+    fn workload_init_remote_atawl_flags_must_be_supplied_together() {
+        let hash = "11".repeat(32);
+        let cli = TestCli::try_parse_from([
+            "test",
+            "init",
+            "127.0.0.1",
+            "--atawl-uri",
+            "http://repo.internal/workload.atawl",
+            "--atawl-sha256",
+            &hash,
+        ])
+        .expect("remote ATAWL workload init arguments");
+        let WorkloadCommand::Init(args) = cli.command else {
+            panic!("expected workload init command");
+        };
+        assert_eq!(args.atawl_sha256.as_deref(), Some(hash.as_str()));
+
+        assert!(
+            TestCli::try_parse_from(["test", "init", "127.0.0.1", "--atawl-sha256", &hash,])
+                .is_err()
+        );
+    }
 }

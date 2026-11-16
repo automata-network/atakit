@@ -1,8 +1,8 @@
 # CVM Agent: Dependency Container Support
 
 > **SUPERSEDED.** This document described the pre-v2 migration to multi-container workloads. The current canonical schema lives in:
-> - [`~/docs/specs/atakit-workload-toml-spec.md`](../../docs/specs/atakit-workload-toml-spec.md)
-> - [`~/docs/specs/atawl-archive-spec.md`](../../docs/specs/atawl-archive-spec.md)
+> - [`~/docs/specs/atakit-workload-toml-spec.md`](atakit-workload-toml-spec.md)
+> - [`~/docs/specs/atawl-archive-spec.md`](atawl-archive-spec.md)
 >
 > Content below reflects the pre-v2 design (TOML manifest, `[config]`/`[config.dependencies.*]` sections, `cvm_agent` field, array-form `measured-data`/`unmeasured-data`, `/app/*` mount paths) and is kept for historical reference only.
 
@@ -52,8 +52,10 @@ measured-data = ["config/cert.pem"]
 [config.environment]
 RUST_LOG = "info"
 
-[config.disks]
-app-data = "/data"
+[workload.storage.data]
+disk = "app-data"
+base-path = "/"
+mount-path = "/data"
 
 # NEW: dependency containers
 [config.dependencies.redis]
@@ -65,8 +67,10 @@ measured-data = ["config/cert.pem"]
 [config.dependencies.redis.environment]
 REDIS_MAX_MEMORY = "256mb"
 
-[config.dependencies.redis.disks]
-app-data = "/cache"
+[dependencies.redis.storage.cache]
+disk = "app-data"
+base-path = "/redis"
+mount-path = "/cache"
 
 [config.dependencies.model-server]
 image = "model-server:v0.1.0"
@@ -135,8 +139,8 @@ Mount point: `/atakit-portal/unmeasured-data/<path>` (read-only)
 ### 5. Mount disks per container
 
 Disks can be shared between containers. A disk defined in `[disks.app-data]` might appear in both:
-- `[config.disks] app-data = "/data"` (workload mounts at /data)
-- `[config.dependencies.redis.disks] app-data = "/cache"` (redis mounts at /cache)
+- `[workload.storage.data] disk = "app-data", base-path = "/", mount-path = "/data"` (workload mounts at /data)
+- `[dependencies.redis.storage.cache] disk = "app-data", base-path = "/redis", mount-path = "/cache"` (redis mounts a subdirectory at /cache)
 
 The same underlying disk volume is mounted at different paths in different containers.
 

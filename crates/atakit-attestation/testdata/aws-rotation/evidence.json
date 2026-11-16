@@ -1,0 +1,219 @@
+{
+  "evidence_bundle": {
+    "format": 2,
+    "binding": {
+      "mode": "local",
+      "chain_id": 0,
+      "registry": "0x0000000000000000000000000000000000000000",
+      "owner_nonce": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "qualifying_data": "0x2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "platform": {
+      "cloud": "aws",
+      "tee": "sev-snp",
+      "machine_type": "m6a.large",
+      "attestation_mode": "hardware",
+      "cloud_provenance": {
+        "source": "dmi",
+        "user_provided": null,
+        "detection": {
+          "dmi": {
+            "sys_vendor": null,
+            "product_name": null,
+            "bios_vendor": null,
+            "detected_cloud": "aws"
+          },
+          "metadata": {
+            "gcp": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "azure": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "aws": {
+              "attempted": false,
+              "matched": false,
+              "http_status": null,
+              "response_headers": {},
+              "response_body": null,
+              "error": null
+            },
+            "detected_cloud": "unknown",
+            "conflict": false
+          }
+        }
+      }
+    },
+    "tee_evidence": {
+      "kind": "configfs_tsm",
+      "report": "AwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADjdWzL-C7Afnu1A9yjRaSbQctqs1tYSdG59zNv23zhFRNQb-2Cumj5tGfOJzxj9G96d3vx9mWh7mMDFN35XiWxAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "auxiliary": null
+    },
+    "ak_evidence": {
+      "kind": "aws_nitro_doc",
+      "ak_public": "ACMACwAGAHIAAAAQABgACwADABAAIJWtSSYX5rmkhe8v5rK11nRy0unIFH_qPxIoCGpGvBOjACB915_i9X9fn6hcqRhQvxe8ESsk_-5SkLqccZ7Nq-pRTg",
+      "collateral": "hEShATgioFkI9ahpbW9kdWxlX2lkcHN5bnRoZXRpYy1tb2R1bGVmZGlnZXN0ZlNIQTM4NGl0aW1lc3RhbXAbAAABi8_laABrY2VydGlmaWNhdGVZAZkwggGVMIIBGqADAgECAgECMAoGCCqGSM49BAMDMCQxIjAgBgNVBAMMGVN5bnRoZXRpYyBOaXRybyB0ZXN0IHJvb3QwHhcNMjAwMTAxMDAwMDAwWhcNNDAwMTAxMDAwMDAwWjAkMSIwIAYDVQQDDBlTeW50aGV0aWMgTml0cm8gdGVzdCBsZWFmMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEdzYxBPcJMagUnbytIsbgpPP1BetCqQ5YEplfNSjwq0JQd-O0WRJaI6feCa9K8iG4WsYI0U4zSQFMUlFQFgr25psRvUuXCzwSMPRRP5KDkxbn-Z2yjT-pjTNl0v-hVrpqoyAwHjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB_wQEAwIHgDAKBggqhkjOPQQDAwNpADBmAjEAkr46GEFTdnQkwmdE_2mLgL3QsNAfJrmojMfqaaNuiCSMm68UejI9MOYFZDocd-_UAjEA3mcSuasl-JV1rEnnDTN3Q5H9jQgjjiZPq-bROT68sITii8s45QLMQQ5XgxxtHQ8LaGNhYnVuZGxlgVkBmzCCAZcwggEdoAMCAQICAQEwCgYIKoZIzj0EAwMwJDEiMCAGA1UEAwwZU3ludGhldGljIE5pdHJvIHRlc3Qgcm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00MDAxMDEwMDAwMDBaMCQxIjAgBgNVBAMMGVN5bnRoZXRpYyBOaXRybyB0ZXN0IHJvb3QwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQogsQtlk55-ddmfF1ciSdQneJz7HwHLfNe-2gVpWnHmujoV_ybX5qKpRl9EhxhnwmrHikpagFL4Sn_3Fw3dr0GXvE5Nt1A4BSSsmv2LAvi8kTxQLVq8i3uWhLOojgnGyejIzAhMA8GA1UdEwEB_wQFMAMBAf8wDgYDVR0PAQH_BAQDAgGGMAoGCCqGSM49BAMDA2gAMGUCMFh6lBwg45p_uUOTQpFLv3Mv4OPGhGnk1mIHLvQ4Nh-Opo5JjMrXl_ePibCys_egmwIxAPKcX9u3w8_fT-h8FGg5BHyueMDBCDhJd7Enr4HdJDtLFEOEYtEc6OjBBDBYCtN4qGpwdWJsaWNfa2V5WFswWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASVrUkmF-a5pIXvL-aytdZ0ctLpyBR_6j8SKAhqRrwTo33Xn-L1f1-fqFypGFC_F7wRKyT_7lKQupxxns2r6lFOZW5vbmNlWCAhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhIW1uaXRyb3RwbV9wY3JzuBgAWDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABWDABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQECWDACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIDWDADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMEWDAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQFWDAFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUGWDAGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYHWDAHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcIWDAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJWDAJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkKWDAKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoLWDALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsMWDAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwNWDANDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0OWDAODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4PWDCEMu61zNpz2mqT1720appTsdZmHftnX8l41NvVVZkvjHOLeIZp6wFSOw46C9TlAfYQWDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBARWDARERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERESWDASEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhITWDATExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMUWDAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQVWDAVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUWWDAWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYXWDAXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxdYYNSREuCDAlpvBx2QTwScpn92HcAJLeQuWGvMHS2YEMzQM9t_SPbVcC-JauJf3-ufmD0c-5XNHoIxzs9h4EjvPAU_eeewPAzNSvmM0yqn9LA-Y7eukKApJwDozVEdd72ydA"
+    },
+    "tpm_quote": {
+      "tpms_attest": "AG__VENHgBgAAAAgIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAMAwGAAAAgV5Hn_VjiraLWMWULQ9o5gGfhFshxXQSX4OaPR98PHCs",
+      "tpm_signature": "ABgACwAgrHGUChgEPkMi50SLlcBczvRoQlDhrxQlyTVW2zze-9oAIDBQYMxv1GpenVWsMDk50In7lkhE1SXY8vs5f7egEi0h",
+      "signature_hash": "0xae48b675c11fc736bc42cc8e3cc46c10b968e81c7fda43f21b9e872d636d0754",
+      "pcr0_startup_locality": 0
+    },
+    "tpm_certify": {
+      "tpms_attest": "",
+      "tpm_signature": "",
+      "tpmt_public": "ACMACwAGAHIAAAAQABgACwADABAAIJWtSSYX5rmkhe8v5rK11nRy0unIFH_qPxIoCGpGvBOjACB915_i9X9fn6hcqRhQvxe8ESsk_-5SkLqccZ7Nq-pRTg"
+    },
+    "pcr_values": [
+      {
+        "index": 0,
+        "sha256": null,
+        "sha384": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "index": 15,
+        "sha256": null,
+        "sha384": "0x8432eeb5ccda73da6a93d7bdb46a9a53b1d6661dfb675fc978d4dbd555992f8c738b788669eb01523b0e3a0bd4e501f6"
+      }
+    ],
+    "event_log_hashes": [
+      {
+        "pcr_index": 0,
+        "sha256": [],
+        "sha384": []
+      },
+      {
+        "pcr_index": 15,
+        "sha256": [],
+        "sha384": []
+      }
+    ],
+    "session_key": {
+      "type_id": 2,
+      "bytes": "0x0495ad492617e6b9a485ef2fe6b2b5d67472d2e9c8147fea3f1228086a46bc13a37dd79fe2f57f5f9fa85ca91850bf17bc112b24ffee5290ba9c719ecdabea514e",
+      "fingerprint": "0xe3756ccbf82ec07e7bb503dca345a49b41cb6ab35b5849d1b9f7336fdb7ce115"
+    },
+    "session_key_delegation": {
+      "tpm_signing_key": {
+        "type_id": 2,
+        "bytes": "0x0495ad492617e6b9a485ef2fe6b2b5d67472d2e9c8147fea3f1228086a46bc13a37dd79fe2f57f5f9fa85ca91850bf17bc112b24ffee5290ba9c719ecdabea514e",
+        "fingerprint": "0xe3756ccbf82ec07e7bb503dca345a49b41cb6ab35b5849d1b9f7336fdb7ce115"
+      },
+      "digest": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0x",
+      "session_key_possession_signature": "0x"
+    },
+    "session_id": "0x3333333333333333333333333333333333333333333333333333333333333333",
+    "policy": {
+      "workload_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "base_image_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
+      "platform_profile_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
+      "measurement_variant_id": "0x0404040404040404040404040404040404040404040404040404040404040404",
+      "pcr_bank_selection": "sha384",
+      "invariant_pcr_policy": {
+        "pcr_specs256": [],
+        "pcr_specs384": []
+      },
+      "variant_pcr_policy": {
+        "pcr_specs256": [],
+        "pcr_specs384": []
+      },
+      "workload_pcr_policy": {
+        "pcr_specs256": [],
+        "pcr_specs384": []
+      },
+      "provider_pcr_policy": {
+        "pcr_specs256": [],
+        "pcr_specs384": []
+      }
+    },
+    "owner": {
+      "fingerprint": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "contract_authorization": null
+    },
+    "provider_binding": {
+      "binding": {
+        "mode": "local",
+        "chain_id": 0,
+        "registry": "0x0000000000000000000000000000000000000000",
+        "owner_nonce": "0x2121212121212121212121212121212121212121212121212121212121212121",
+        "qualifying_data": "0x2121212121212121212121212121212121212121212121212121212121212121"
+      },
+      "tpm_quote": {
+        "tpms_attest": "AG__VENHgBgAAAAgISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAMAwGAAAAgV5Hn_VjiraLWMWULQ9o5gGfhFshxXQSX4OaPR98PHCs",
+        "tpm_signature": "ABgACwAg05CJ0YA12LKMJhKXURUajpdztVE1WhvGRJxXBPGVUtcAILHw4Z0xe1Ui8mnlaZj2g3fWYiSJHCpJG3SDNNfwLCEE",
+        "signature_hash": "0x25dafd64a9b9e7ff5edefce1df6a5135d1c0c8d7f842f33663a1cc9250cc16c5",
+        "pcr0_startup_locality": 0
+      },
+      "tpm_certify": {
+        "tpms_attest": "",
+        "tpm_signature": "",
+        "tpmt_public": "ACMACwAGAHIAAAAQABgACwADABAAIJWtSSYX5rmkhe8v5rK11nRy0unIFH_qPxIoCGpGvBOjACB915_i9X9fn6hcqRhQvxe8ESsk_-5SkLqccZ7Nq-pRTg"
+      },
+      "pcr_values": [
+        {
+          "index": 0,
+          "sha256": null,
+          "sha384": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "index": 15,
+          "sha256": null,
+          "sha384": "0x8432eeb5ccda73da6a93d7bdb46a9a53b1d6661dfb675fc978d4dbd555992f8c738b788669eb01523b0e3a0bd4e501f6"
+        }
+      ],
+      "event_log_hashes": [
+        {
+          "pcr_index": 0,
+          "sha256": [],
+          "sha384": []
+        },
+        {
+          "pcr_index": 15,
+          "sha256": [],
+          "sha384": []
+        }
+      ],
+      "tpm_signing_key": {
+        "type_id": 2,
+        "bytes": "0x0495ad492617e6b9a485ef2fe6b2b5d67472d2e9c8147fea3f1228086a46bc13a37dd79fe2f57f5f9fa85ca91850bf17bc112b24ffee5290ba9c719ecdabea514e",
+        "fingerprint": "0xe3756ccbf82ec07e7bb503dca345a49b41cb6ab35b5849d1b9f7336fdb7ce115"
+      },
+      "session_id": "0x3434343434343434343434343434343434343434343434343434343434343434",
+      "policy": {
+        "workload_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+        "base_image_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
+        "platform_profile_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
+        "measurement_variant_id": "0x0404040404040404040404040404040404040404040404040404040404040404",
+        "pcr_bank_selection": "sha384",
+        "invariant_pcr_policy": {
+          "pcr_specs256": [],
+          "pcr_specs384": []
+        },
+        "variant_pcr_policy": {
+          "pcr_specs256": [],
+          "pcr_specs384": []
+        },
+        "workload_pcr_policy": {
+          "pcr_specs256": [],
+          "pcr_specs384": []
+        },
+        "provider_pcr_policy": {
+          "pcr_specs256": [],
+          "pcr_specs384": []
+        }
+      }
+    }
+  }
+}

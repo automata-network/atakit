@@ -13,37 +13,45 @@ use crate::config::Config;
 pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> Result<()> {
     let engine = match args.engine {
         Some(ref e) => Some(atakit_workload::ContainerEngine::from_str_opt(e)?),
-        None if config.build.container_engine != "auto" => Some(
-            atakit_workload::ContainerEngine::from_str_opt(&config.build.container_engine)?,
+        None if config.build.container_engine != crate::config::ContainerEngine::Auto => Some(
+            atakit_workload::ContainerEngine::from_str_opt(config.build.container_engine.as_str())?,
         ),
         None => None,
     };
 
+    // Only a store reference names a publisher, so only that form yields an
+    // identifier to query the chain with. Inspecting an archive by path gives a
+    // name and version and no way to know whose they are.
+    let mut store_workload_id: Option<String> = None;
     let opts = if let Some(ref archive_arg) = args.archive {
         // Check if it looks like a store reference (name:version)
         let archive_str = archive_arg.to_string_lossy();
         if looks_like_store_ref(&archive_str) {
             let store = WorkloadStore::new(&env.workload_dir);
-            let (name, version) = archive_str
-                .split_once(':')
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .unwrap();
-            let blob = store.blob_path(&name, &version)?;
+            let workload_id = super::parse_workload_ref(&archive_str, &config.alias)?.workload_id();
+            store_workload_id = Some(workload_id.clone());
+            let blob = store.blob_path(&workload_id)?;
             if !blob.exists() {
-                anyhow::bail!("no archive blob for {name}:{version} in store");
+                anyhow::bail!("no archive blob for {archive_str} in store");
             }
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(blob),
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: Some(archive_arg.clone()),
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         }
     } else {
@@ -56,45 +64,53 @@ pub async fn run(args: InfoArgs, env: &Env, config: &Config, verbose: bool) -> R
         let archive = find_archive(&dir);
         if archive.is_some() {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive,
                 workload_dir: None,
                 engine,
                 verbose,
+                measured_data_root: None,
+                unmeasured_data_root: None,
             }
         } else {
             atakit_workload::InspectOptions {
+                publisher: None,
                 archive: None,
                 workload_dir: Some(dir),
                 engine,
                 verbose,
+                measured_data_root: args.measured_data_root,
+                unmeasured_data_root: args.unmeasured_data_root,
             }
         }
     };
 
     let result = atakit_workload::inspect_workload(&opts).await?;
-    let name = &result.manifest.meta.name;
-    let version = &result.manifest.meta.version;
-
-    // Check on-chain status if RPC is configured
-    let chain_data = refresh_chain(name, version, env, config).await;
+    // Check on-chain status if RPC is configured and the input identified a
+    // publisher.
+    let chain_data = match store_workload_id.as_deref() {
+        Some(workload_id) => refresh_chain(workload_id, env, config).await,
+        None => None,
+    };
 
     print_info(
         &result.manifest,
         &result.sha256,
-        &result.pcr23,
+        &result.pcr23_sha256,
+        store_workload_id.as_deref(),
         chain_data.as_ref(),
     );
     Ok(())
 }
 
 /// Query on-chain data and update local store. Returns None if chain not configured.
-async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) -> Option<ChainData> {
+async fn refresh_chain(workload_id_hex: &str, env: &Env, config: &Config) -> Option<ChainData> {
     // Best-effort: resolve publish chain, skip if not configured.
     let chain_name = config.publish.chain.as_deref()?;
     let chain_config = config.chains.get(chain_name)?;
     let rpc_url = &chain_config.rpc_url;
     let session_registry = &chain_config.session_registry;
-    let workload_id = super::compute_workload_id(name, version);
+    let workload_id: alloy_ext::core::primitives::B256 = workload_id_hex.parse().ok()?;
 
     let chain = query_chain_data(workload_id, rpc_url, session_registry)
         .await
@@ -102,7 +118,7 @@ async fn refresh_chain(name: &str, version: &str, env: &Env, config: &Config) ->
 
     // Update store with chain data
     let store = WorkloadStore::new(&env.workload_dir);
-    if let Ok(Some(entry)) = store.get(name, version) {
+    if let Ok(Some(entry)) = store.get(workload_id_hex) {
         let mut meta = entry.meta;
         apply_chain_data_to_meta(&mut meta, &chain);
         let _ = store.save_meta(&meta);
@@ -121,7 +137,13 @@ fn section_header(name: &str) {
     println!("{}", format!("{prefix}{pad}").cyan().bold());
 }
 
-fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&ChainData>) {
+fn print_info(
+    m: &Manifest,
+    sha256: &str,
+    pcr23: &str,
+    workload_id: Option<&str>,
+    chain_info: Option<&ChainData>,
+) {
     // Title
     println!(
         "{}",
@@ -136,6 +158,30 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if !m.config.base_image.is_empty() {
         print_multi("Base Images:", &m.config.base_image);
     }
+    if m.config.attributes.is_empty() {
+        println!("  {:<18}none", "Attributes:");
+    } else {
+        for (index, (name, values)) in m.config.attributes.iter().enumerate() {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    atakit_core::tee_attributes::AttributeValue::Boolean(value) => {
+                        value.to_string()
+                    }
+                    atakit_core::tee_attributes::AttributeValue::String(value) => {
+                        format!("{value:?}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  {:<18}{} = [{}]",
+                if index == 0 { "Attributes:" } else { "" },
+                name,
+                values
+            );
+        }
+    }
     println!();
 
     // --- Runtime ---
@@ -149,6 +195,9 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!("  {:<18}{}", "GID Group:", m.config.gid_group);
     if !m.config.ports.is_empty() {
         print_multi("Ports:", &m.config.ports);
+    }
+    if !m.config.depends_on.is_empty() {
+        print_multi("Depends on:", &m.config.depends_on);
     }
     if let Some(ref cmd) = m.config.command {
         println!("  {:<18}{}", "Command:", format_string_or_array(cmd));
@@ -175,12 +224,12 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     println!();
 
     // --- Data ---
-    if m.config.measured_data || m.config.unmeasured_data {
+    if m.config.measured_data.is_enabled() || m.config.unmeasured_data.is_enabled() {
         section_header("Data");
-        if m.config.measured_data {
+        if m.config.measured_data.is_enabled() {
             println!("  {:<20}enabled (directory mounted)", "Measured:");
         }
-        if m.config.unmeasured_data {
+        if m.config.unmeasured_data.is_enabled() {
             println!("  {:<20}enabled (directory mounted)", "Unmeasured:");
         }
         println!();
@@ -190,17 +239,23 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
     if !m.disks.is_empty() {
         section_header("Disks");
         for (name, disk) in &m.disks {
-            let mount = m.config.disks.get(name).map(|s| s.as_str()).unwrap_or("-");
             let mut flags = vec![&disk.size[..]];
             if !disk.encryption.unlock_method.is_empty() {
                 flags.push("encrypted");
             }
-            println!(
-                "  {:<18}{}  {}",
-                format!("{name}:"),
-                mount,
-                flags.join("  ")
-            );
+            println!("  {:<18}{}", format!("{name}:"), flags.join("  "));
+        }
+        if !m.config.storage.is_empty() {
+            for (label, storage) in &m.config.storage {
+                let mode = storage_access_label(storage.read_only(), storage.executable());
+                println!(
+                    "  {:<18}{}:{} -> {} ({mode})",
+                    format!("{label}:"),
+                    storage.disk,
+                    storage.base_path,
+                    storage.mount_path
+                );
+            }
         }
         println!();
     }
@@ -222,9 +277,13 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
                 if !dep.depends_on.is_empty() {
                     println!("    {:<16}{}", "Depends on:", dep.depends_on.join(", "));
                 }
-                if !dep.disks.is_empty() {
-                    for (dk, mount) in &dep.disks {
-                        println!("    {:<16}{} -> {}", "Disk:", dk, mount);
+                if !dep.storage.is_empty() {
+                    for (label, storage) in &dep.storage {
+                        let mode = storage_access_label(storage.read_only(), storage.executable());
+                        println!(
+                            "    {:<16}{}: {}:{} -> {} ({mode})",
+                            "Storage:", label, storage.disk, storage.base_path, storage.mount_path
+                        );
                     }
                 }
             }
@@ -278,14 +337,17 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
         }
     }
 
-    // Compute workload ID: keccak256(abi.encode(WORKLOAD_DOMAIN, name, version))
-    // where WORKLOAD_DOMAIN = keccak256("CVM_WORKLOAD_V1")
-    let workload_id = super::compute_workload_id(&m.meta.name, &m.meta.version);
-    println!(
-        "  {:<18}{}",
-        "Workload ID:",
-        format!("0x{}", hex::encode(workload_id)).dimmed()
-    );
+    // A manifest cannot know its own identifier: the identifier is derived from
+    // the publisher, and nothing in the archive records who that is. It is
+    // shown only when the caller named one.
+    match workload_id {
+        Some(workload_id) => println!("  {:<18}{}", "Workload ID:", workload_id.dimmed()),
+        None => println!(
+            "  {:<18}{}",
+            "Workload ID:",
+            "unknown without a publisher".dimmed()
+        ),
+    }
     match chain_info {
         Some(info) => match info.status.as_str() {
             "active" => println!("  {:<18}{}", "On-chain:", "active".green().bold()),
@@ -299,7 +361,7 @@ fn print_info(m: &Manifest, sha256: &str, pcr23: &str, chain_info: Option<&Chain
 fn print_multi(label: &str, items: &[String]) {
     for (i, item) in items.iter().enumerate() {
         if i == 0 {
-            println!("  {:<18}{}", format!("{label}"), item);
+            println!("  {:<18}{}", label, item);
         } else {
             println!("  {:<18}{}", "", item);
         }
@@ -316,4 +378,13 @@ fn format_string_or_array(s: &atakit_workload::manifest::StringOrArrayOut) -> St
 
 fn format_fw_port(p: &ManifestFirewallPort) -> String {
     format!("{}/{}", p.port, p.protocol)
+}
+
+fn storage_access_label(read_only: bool, executable: bool) -> &'static str {
+    match (read_only, executable) {
+        (true, false) => "read",
+        (false, false) => "read, write",
+        (true, true) => "read, execute",
+        (false, true) => "read, write, execute",
+    }
 }

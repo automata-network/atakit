@@ -5,18 +5,22 @@ use atakit_workload::WorkloadStore;
 use owo_colors::OwoColorize;
 
 use super::parse_workload_ref;
+use crate::config::Config;
 
-pub fn run(args: ExportArgs, env: &Env) -> Result<()> {
+pub fn run(args: ExportArgs, env: &Env, config: &Config) -> Result<()> {
     let store = WorkloadStore::new(&env.workload_dir);
 
-    let wref = parse_workload_ref(&args.reference)?;
-    let (name, version) = super::resolve_ref(&wref, &store)?;
+    let workload_id = parse_workload_ref(&args.reference, &config.alias)?.workload_id();
+    let entry = store
+        .get(&workload_id)?
+        .ok_or_else(|| anyhow::anyhow!("workload not found in store: {workload_id}"))?;
+    let (name, version) = (entry.meta.name.clone(), entry.meta.version.clone());
 
-    if !store.has_blob(&name, &version) {
+    if !entry.has_blob {
         anyhow::bail!("no archive blob for {name}:{version} in store");
     }
 
-    let src = store.blob_path(&name, &version)?;
+    let src = store.blob_path(&workload_id)?;
     let output_dir = match args.output {
         Some(path) => path,
         None => std::env::current_dir()
